@@ -51,8 +51,8 @@ Our core contributions include:
 ### Experimental Results
 
 - **Machine Configuration**: 2 nodes with 16 H20 GPUs each
-   - Generation: 4 GPUs
-   - Training: 12 GPUs
+    - Generation: 4 GPUs
+    - Training: 12 GPUs
 - **Model**: Qwen2.5-Math-7B
 - **Rollout Configuration**:
 - **Max Response Length**: FSDP2: 20,480 tokens; Megatron: 8,192 tokens
@@ -66,8 +66,8 @@ Our core contributions include:
 | colocate sync          | VLLM+Megatron | 699  | 207 | -             | 162                | 119          | 344          | 18h21m        | 0.605            | 0.4217          |
 | one-step-overlap async | VLLM+Megatron | 566  | -   | 59            | 501                | 120          | 347          | 13h06m (+40%) | 0.6569           | 0.4038          |
 
-* colocate sync: step = gen + old_log_prob + update_actor
-* one-step-overlap async: step = max(wait_prev_gen + generate_sequences, old_log_prob + update_actor)
+* colocate sync: step ≈ gen + old_log_prob + update_actor
+* one-step-overlap async: step ≈ wait_prev_gen + old_log_prob + update_actor
 
 ![One Step Off Megatron Performance](
 https://raw.githubusercontent.com/eric-haibin-lin/verl-community/refs/heads/main/docs/one_step_off_megatron.png)
@@ -87,27 +87,27 @@ via `create_continuous_iterator`.
 ```python
 # iterator generator, simplify one-step integration of the training process
 def _create_continuous_iterator(self):
-   for epoch in range(self.config.trainer.total_epochs):
-      iterator = iter(self.train_dataloader)
-      for batch_dict in iterator:
-         yield epoch, batch_dict
+    for epoch in range(self.config.trainer.total_epochs):
+        iterator = iter(self.train_dataloader)
+        for batch_dict in iterator:
+            yield epoch, batch_dict
 
 
 # read next batch samples, parameters sync and launch asyn gen_seq
 def _async_gen_next_batch(self, continuous_iterator):
-   # read train_data
-   try:
-      epoch, batch_dict = next(continuous_iterator)
-   except StopIteration:
-      return None
-   batch = DataProto.from_single_dict(batch_dict)
-   gen_batch = batch_pocess(batch)
-   # sync weights from actor to rollout
-   self.sync_rollout_weights()
-   # async generation
-   gen_batch_output = self.rollout_wg.async_generate_sequences(gen_batch)
-   # future encapsulated
-   return GenerationBatchFuture(epoch, batch, gen_batch_output)
+    # read train_data
+    try:
+        epoch, batch_dict = next(continuous_iterator)
+    except StopIteration:
+        return None
+    batch = DataProto.from_single_dict(batch_dict)
+    gen_batch = batch_pocess(batch)
+    # sync weights from actor to rollout
+    self.sync_rollout_weights()
+    # async generation
+    gen_batch_output = self.rollout_wg.async_generate_sequences(gen_batch)
+    # future encapsulated
+    return GenerationBatchFuture(epoch, batch, gen_batch_output)
 
 
 continuous_iterator = self._create_continuous_iterator()
@@ -115,51 +115,50 @@ continuous_iterator = self._create_continuous_iterator()
 batch_data_future = self._async_gen_next_batch(continuous_iterator)
 
 while batch_data_future is not None:
-   # wait for the gen_seq result from the previous step
-   batch = batch_data_future.get()
-   # launch the next async call to generate sequences
-   batch_data_future = self._async_gen_next_batch(continuous_iterator)
+    # wait for the gen_seq result from the previous step
+    batch = batch_data_future.get()
+    # launch the next async call to generate sequences
+    batch_data_future = self._async_gen_next_batch(continuous_iterator)
 
-   # compute advantages 
-   batch = critic.compute_values(batch)
-   batch = reference.compute_log_prob(batch)
-   batch = reward.compute_reward(batch)
-   batch = compute_advantages(batch)
+    # compute advantages 
+    batch = critic.compute_values(batch)
+    batch = reference.compute_log_prob(batch)
+    batch = reward.compute_reward(batch)
+    batch = compute_advantages(batch)
 
-   # model update
-   critic_metrics = critic.update_critic(batch)
-   actor_metrics = actor.update_actor(batch)
+    # model update
+    critic_metrics = critic.update_critic(batch)
+    actor_metrics = actor.update_actor(batch)
 ```
 
 ### Parameter Synchronization
 
 The exciting point is that our nccl based weights updating for rollout model has great performance.
 At most of time, the latency is under 300ms, which is negligible for RLHF.
-Although it is only implemented with fsdp and vllm now, we think it is not complex to extend it to the other backend.
 
 > **sync_rollout_weights**：The time for synchronizing parameters from actor to rollout is extremely fast and can almost
 > be ignored because it is implemented with nccl.
 
 ```python
 class ActorRolloutRefWorker:
-   # actor acquires the meta-info of model parameters for parameter sync
-   @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-   def get_actor_weights_info(self):
-      params = self._get_actor_params()
-      ret = []
-      for key, tensor in params.items():
-         ret.append((key, tensor.size(), tensor.dtype))
-      self._weights_info = ret
-      return ret
+    # actor acquires the meta-info of model parameters for parameter sync
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_actor_weights_info(self):
+        params = self._get_actor_params()
+        ret = []
+        for key, tensor in params.items():
+            ret.append((key, tensor.size(), tensor.dtype))
+        self._weights_info = ret
+        return ret
 
-   # rollout sets the meta-info of model parameters for parameter sync
-   @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-   def set_actor_weights_info(self, weights_info):
-      self._weights_info = weights_info
+    # rollout sets the meta-info of model parameters for parameter sync
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_actor_weights_info(self, weights_info):
+        self._weights_info = weights_info
 
 
 class AsyncRayPPOTrainer(RayPPOTrainer):
-   def init_workers(self):
+    def init_workers(self):
 
 
 ...
@@ -170,45 +169,45 @@ self.rollout_wg.set_actor_weights_info(weights_info)
 # Create an actor-rollout communication group for parameter sync
 actor_rollout_workers = self.actor_wg.workers + self.rollout_wg.workers
 collective.create_collective_group(
-   actor_rollout_workers,
-   len(actor_rollout_workers),
-   list(range(0, len(actor_rollout_workers))),
-   backend="nccl",
-   group_name="actor_rollout"
+    actor_rollout_workers,
+    len(actor_rollout_workers),
+    list(range(0, len(actor_rollout_workers))),
+    backend="nccl",
+    group_name="actor_rollout"
 )
 ```
 
 ```python
 # drive process call the actor and rollout respectively to sync parameters by nccl 
 def sync_rollout_weights(self):
-   self.actor_wg.sync_rollout_weights()
-   ray.get(self.rollout_wg.sync_rollout_weights())
+    self.actor_wg.sync_rollout_weights()
+    ray.get(self.rollout_wg.sync_rollout_weights())
 
 
 # fsdp model parameter sync
 @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
 def sync_rollout_weights(self):
-   params = self._get_actor_params() if self._is_actor else None
-   if self._is_rollout:
-      inference_model = (
-         self.rollout.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
-      )
-      patch_vllm_moe_model_weight_loader(inference_model)
-   # Model parameters are broadcast tensor-by-tensor from actor to rollout
-   for key, shape, dtype in self._weights_info:
-      tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
-      if self._is_actor:
-         assert key in params
-         origin_data = params[key]
-         if hasattr(origin_data, "full_tensor"):
-            origin_data = origin_data.full_tensor()
-         if torch.distributed.get_rank() == 0:
-            tensor.copy_(origin_data)
-      from ray.util.collective import collective
+    params = self._get_actor_params() if self._is_actor else None
+    if self._is_rollout:
+        inference_model = (
+            self.rollout.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+        )
+        patch_vllm_moe_model_weight_loader(inference_model)
+    # Model parameters are broadcast tensor-by-tensor from actor to rollout
+    for key, shape, dtype in self._weights_info:
+        tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
+        if self._is_actor:
+            assert key in params
+            origin_data = params[key]
+            if hasattr(origin_data, "full_tensor"):
+                origin_data = origin_data.full_tensor()
+            if torch.distributed.get_rank() == 0:
+                tensor.copy_(origin_data)
+        from ray.util.collective import collective
 
-      collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
-      if self._is_rollout:
-         inference_model.load_weights([(key, tensor)])
+        collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
+        if self._is_rollout:
+            inference_model.load_weights([(key, tensor)])
 ```
 
 ## Usage
@@ -249,10 +248,10 @@ python3 -m recipe.one_step_off_policy.async_main_ppo \
 
 1. **Card Number Relationships**  
    Maintain either of these relationships for optimal batch distribution:
-   - `actor_rollout_ref.rollout.n` should be an integer divisor of:  
-     `trainer.n_gpus_per_node * trainer.nnodes`
-   - `actor_rollout_ref.rollout.n * data.train_batch_size` should be evenly divisible by:  
-     `trainer.n_gpus_per_node * trainer.nnodes`
+    - `actor_rollout_ref.rollout.n` should be an integer divisor of:  
+      `trainer.n_gpus_per_node * trainer.nnodes`
+    - `actor_rollout_ref.rollout.n * data.train_batch_size` should be evenly divisible by:  
+      `trainer.n_gpus_per_node * trainer.nnodes`
 
    > Rationale: Ensures training samples can be evenly distributed across training GPUs when using partial resources for
    generation.
@@ -260,26 +259,26 @@ python3 -m recipe.one_step_off_policy.async_main_ppo \
 2. **Dynamic Resource Tuning**  
    Adjust `trainer.nnodes` `trainer.n_gpus_per_node` `rollout.nnodes` `rollout.n_gpus_per_node` based on phase
    durations:
-   - **Ideal state**: Rollout and training phases have comparable durations
-   - **Diagnostic metrics**:
-      - Monitor `wait_prev_gen` duration
-      - Analyze `sequence_length` distribution
-   - **Adjustment strategy**:
-      - High `wait_prev_gen` + uniform sequence lengths → Increase rollout resources
-      - High `wait_prev_gen` + long-tail sequences → Optimize stopping criteria (resource increase won't help)
+    - **Ideal state**: Rollout and training phases have comparable durations
+    - **Diagnostic metrics**:
+        - Monitor `wait_prev_gen` duration
+        - Analyze `sequence_length` distribution
+    - **Adjustment strategy**:
+        - High `wait_prev_gen` + uniform sequence lengths → Increase rollout resources
+        - High `wait_prev_gen` + long-tail sequences → Optimize stopping criteria (resource increase won't help)
    > **wait_prev_gen**：The time consumed waiting for the previous rollout to end (the part that is not fully
    overlapped).
    **Resource Configuration Strategies:**
-   - **Resource-constrained scenario**: Optimize resource utilization by adjusting GPU allocation ratios,
-     keeping the number of nodes equal to allow training and rollout to share nodes;
-      - Configure `trainer.nnodes = rollout.nnodes` with
-        `trainer.n_gpus_per_node + rollout.n_gpus_per_node = physical_gpus_per_node`. Control rollout resource
-        allocation by adjusting `n_gpus_per_node`.
-   - **Resource-abundant scenario**: Optimize performance by adjusting the number of nodes,
-     keeping the number of GPUs per node equal to enable independent scaling of training and rollout
-     parallelism.
-      - Configure `trainer.n_gpus_per_node = rollout.n_gpus_per_node` and control rollout resource allocation by
-        adjusting `trainer.nnodes` and `rollout.nnodes`to achieve optimal performance.
+    - **Resource-constrained scenario**: Optimize resource utilization by adjusting GPU allocation ratios,
+      keeping the number of nodes equal to allow training and rollout to share nodes;
+        - Configure `trainer.nnodes = rollout.nnodes` with
+          `trainer.n_gpus_per_node + rollout.n_gpus_per_node = physical_gpus_per_node`. Control rollout resource
+          allocation by adjusting `n_gpus_per_node`.
+    - **Resource-abundant scenario**: Optimize performance by adjusting the number of nodes,
+      keeping the number of GPUs per node equal to enable independent scaling of training and rollout
+      parallelism.
+        - Configure `trainer.n_gpus_per_node = rollout.n_gpus_per_node` and control rollout resource allocation by
+          adjusting `trainer.nnodes` and `rollout.nnodes`to achieve optimal performance.
    > **Note**: The total number of nodes required by the system is not simply `trainer.nnodes + rollout.nnodes`. The
    > actual calculation depends on GPU capacity:
    > - When `trainer.n_gpus_per_node + rollout.n_gpus_per_node <= physical_gpus_per_node`,
