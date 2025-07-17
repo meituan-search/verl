@@ -1,6 +1,6 @@
 # Recipe: One Step Off Policy Async Trainer
 
-**Author:**  `https://github.com/meituan-search>`
+**Author:**  `https://github.com/meituan-search`
 
 Last updated: 07/16/2025.
 
