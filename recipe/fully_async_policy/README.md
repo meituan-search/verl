@@ -5,7 +5,7 @@
 ### 方案1 (StreamRL, AsyncFlow)
 
 ![StreamRL](
-https://raw.githubusercontent.com/ArronHZG/verl-community/205b491d169ac026261c1433cfe8e8696dc46fab/docs/StreamRL.png)
+https://github.com/ArronHZG/verl-community/blob/recipe/async_policy/docs/StreamRL.png?raw=true)
 
 在分离架构的基础上，修改在Rollout和Train的样本传递过程中，将离线策略生成一批global样本修改为生成一批batch的方式，实现生成和训练两阶段的高度重叠。
 训练阶段一收到足够样本就开始处理，训练一定步数后，将参数同步到PS侧， Rollout在每次样本生成完成后，check是否有新的参数，如果有就进行一次同步。
@@ -13,7 +13,7 @@ https://raw.githubusercontent.com/ArronHZG/verl-community/205b491d169ac026261c14
 ### 方案2 (Mistralai, Areal)
 
 ![mistralai](
-https://raw.githubusercontent.com/ArronHZG/verl-community/205b491d169ac026261c1433cfe8e8696dc46fab/docs/mistralai.png)
+https://github.com/ArronHZG/verl-community/blob/recipe/async_policy/docs/mistralai.png?raw=true)
 
 在分离架构的基础上，实现Rollout的partial rollout逻辑。样本仍然修改为batch的方式进行传递，实现生成和训练两阶段的高度重叠。
 在参数同步方面，训练阶段主动触发Rollout的暂停，参数同步以及恢复。 Rollout使用Rollout Server的方式，支持样本生成的中断与恢复，
@@ -29,7 +29,7 @@ https://raw.githubusercontent.com/ArronHZG/verl-community/205b491d169ac026261c14
 ### 架构图
 
 ![full_async](
-https://raw.githubusercontent.com/ArronHZG/verl-community/205b491d169ac026261c1433cfe8e8696dc46fab/docs/full_async.svg)
+https://github.com/ArronHZG/verl-community/blob/recipe/async_policy/docs/full_async.svg?raw=true)
 
 为实现纯异步训练工作流，基于已有的 one step off policy 代码，扩增实现 Rollouter 以及 Message Queue，以及对Trainer进行更新。
 
