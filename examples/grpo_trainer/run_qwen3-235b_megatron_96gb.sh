@@ -147,8 +147,8 @@ python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.actor.megatron.override_transformer_config.apply_rope_fusion=False \
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_router_dtype=fp32 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_shared_expert_overlap=False \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_enable_deepep=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_token_dispatcher_type=flex \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_enable_deepep=False \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_token_dispatcher_type=alltoall \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
