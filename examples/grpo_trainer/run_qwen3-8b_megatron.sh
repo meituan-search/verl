@@ -9,8 +9,8 @@ TEST_FILE=/mnt/dolphinfs/hdd_pool/docker/user/hadoop-djst-algoplat/houzhenggang/
 NNODES=1
 NGPUS_PER_NODE=8
 
-max_prompt_length=$((1024 * 1))
-max_response_length=$((1024 * 4))
+max_prompt_length=$((1024 * 2))
+max_response_length=$((1024 * 8))
 actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
 infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3))
 
@@ -20,11 +20,14 @@ ppo_micro_batch_size=32
 total_training_steps=20
 n_resp_per_prompt=16
 
+offload=True
 gen_tp=2
-sp_size=4
-fsdp_size=2
+train_pp=2
+train_tp=2
 
 python3 -m verl.trainer.main_ppo \
+    --config-path=config \
+    --config-name='ppo_megatron_trainer.yaml' \
     algorithm.adv_estimator=grpo \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
@@ -35,16 +38,12 @@ python3 -m verl.trainer.main_ppo \
     data.train_batch_size=${train_prompt_bsz} \
     actor_rollout_ref.model.path=${HF_MODEL_PATH} \
     actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_batch_size} \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${ppo_micro_batch_size} \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
-    actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=False \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${ppo_micro_batch_size} \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
@@ -52,7 +51,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${ppo_micro_batch_size} \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len} \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
@@ -67,5 +65,13 @@ python3 -m verl.trainer.main_ppo \
     trainer.total_epochs=15 \
     trainer.total_training_steps=${total_training_steps} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
-    actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
-    actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size}
+    actor_rollout_ref.actor.strategy=megatron \
+    critic.strategy=megatron \
+    actor_rollout_ref.actor.megatron.param_offload=${offload} \
+    actor_rollout_ref.actor.megatron.optimizer_offload=${offload} \
+    actor_rollout_ref.actor.megatron.grad_offload=${offload} \
+    actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${train_pp} \
+    actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${train_tp} \
+    actor_rollout_ref.ref.megatron.param_offload=${offload} \
+    actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=${train_pp} \
+    actor_rollout_ref.ref.megatron.tensor_model_parallel_size=${train_tp}

@@ -36,15 +36,11 @@ n_resp_per_prompt=8
 train_prompt_mini_bsz=16
 
 # minimum nodes need for qwen3-235B-A22B
-NNODES=${NNODES:-4}
+NNODES=${NNODES:-8}
 # Paths
-
-RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-
-MODEL_PATH=$RAY_DATA_HOME/models/Qwen3-235B-A22B
-
-TRAIN_FILE=$RAY_DATA_HOME/dataset/dapo-math-17k.parquet
-TEST_FILE=$RAY_DATA_HOME/dataset/aime-2024.parquet
+HF_MODEL_PATH=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/.friday/models/basemodel/Qwen/Qwen3-235B-A22B
+TRAIN_FILE=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/data/dapo/dapo-math-17k.parquet
+TEST_FILE=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/data/dapo/aime-2024.parquet
 
 # Algorithm
 temperature=1.0
@@ -61,7 +57,7 @@ gen_tp=8
 train_tp=${TP:-4}
 train_pp=${PP:-8}
 
-EP=${EP:-4}
+EP=${EP:-8}
 ETP=1
 CP=1
 optimizer_offload_fraction=${OFFLOAD_FRACTION:-1.}
@@ -69,11 +65,12 @@ last_layer=${LAST_LAYER:-10}
 
 project_name='verl-qwen3'
 exp_name="235B-${NNODES}-pp${train_pp}-tp${train_tp}-ep${EP}-actor-length${actor_ppo_max_token_len}"
-CKPTS_DIR=$RAY_DATA_HOME/ckpt/${project_name}/${exp_name}
+CKPTS_DIR=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/ckpt/${project_name}/${exp_name}
 
 # TODO: support cuda graph for rollout by setting the following config
     # actor_rollout_ref.rollout.cudagraph_capture_sizes=[1,2,4,8,16,32]
     # actor_rollout_ref.rollout.enforce_eager=False
+total_training_steps=20
 
 python3 -m verl.trainer.main_ppo \
     --config-path=config \
@@ -107,7 +104,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len} \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
-    actor_rollout_ref.model.path="${MODEL_PATH}" \
+    actor_rollout_ref.model.path="${HF_MODEL_PATH}" \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
@@ -166,15 +163,15 @@ python3 -m verl.trainer.main_ppo \
     +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
     +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
-    trainer.logger=['console','wandb'] \
+    trainer.logger=['console','tensorboard'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes="${NNODES}" \
     trainer.val_before_train=False \
     trainer.test_freq=10 \
-    trainer.save_freq=100 \
+    trainer.save_freq=-1 \
     trainer.total_epochs=10 \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.resume_mode=auto \
-    trainer.log_val_generations=10
+    trainer.total_training_steps=${total_training_steps}
