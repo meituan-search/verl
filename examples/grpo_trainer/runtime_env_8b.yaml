@@ -1,0 +1,5 @@
+env_vars:
+  TENSORBOARD_DIR: "/home/hadoop-djst-algoplat/projects/verl/tensorboard/GRPO/run_qwen3-8b"
+  NCCL_DEBUG: "INFO"
+  HYDRA_FULL_ERROR: "1"
+  CUDA_DEVICE_MAX_CONNECTIONS: "1"
