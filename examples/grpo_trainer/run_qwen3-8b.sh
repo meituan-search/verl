@@ -21,8 +21,8 @@ total_training_steps=20
 n_resp_per_prompt=16
 
 gen_tp=2
-sp_size=4
-fsdp_size=2
+sp_size=1
+fsdp_size=4
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \

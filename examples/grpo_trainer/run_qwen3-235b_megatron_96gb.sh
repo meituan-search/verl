@@ -70,7 +70,7 @@ CKPTS_DIR=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhengg
 # TODO: support cuda graph for rollout by setting the following config
     # actor_rollout_ref.rollout.cudagraph_capture_sizes=[1,2,4,8,16,32]
     # actor_rollout_ref.rollout.enforce_eager=False
-total_training_steps=20
+total_training_steps=200
 
 python3 -m verl.trainer.main_ppo \
     --config-path=config \
