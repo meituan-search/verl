@@ -1659,9 +1659,13 @@ class SGLangAsyncRollout:
         elif method == "load_model":
             return self.load_model(*args, **kwargs)
         elif method == "sleep":
-            return self.sleep(*args, **kwargs)
+            # For async methods, we need to run them in the event loop
+            loop = asyncio.get_event_loop()
+            return loop.run_until_complete(self.sleep(*args, **kwargs))
         elif method == "wake_up":
-            return self.wake_up(*args, **kwargs)
+            # For async methods, we need to run them in the event loop
+            loop = asyncio.get_event_loop()
+            return loop.run_until_complete(self.wake_up(*args, **kwargs))
         else:
             # For other methods, delegate to the inference engine
             if hasattr(self.inference_engine, method):
