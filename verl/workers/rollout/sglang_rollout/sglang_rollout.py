@@ -1626,20 +1626,27 @@ class SGLangAsyncRollout:
         # SGLang engine is initialized in init_worker, no separate load_model needed
         pass
 
-    def sleep(self, *args, **kwargs):
-        """Offload model weights and discard kv cache."""
+    async def sleep(self, *args, **kwargs):
+        """Offload model weights and discard kv cache (async)."""
         if self.is_sleep:
             return
         if self.sharding_manager:
+            # Keep compatibility with sharding manager context if provided
             self.sharding_manager.__exit__(None, None, None)
+        # Prefer engine-level release if engine exists
+        if self.inference_engine is not None and hasattr(self.inference_engine, "release_memory_occupation"):
+            await self.inference_engine.release_memory_occupation()
         self.is_sleep = True
 
-    def wake_up(self, *args, **kwargs):
-        """Load model weights and build kv cache."""
+    async def wake_up(self, *args, **kwargs):
+        """Load model weights and build kv cache (async)."""
         if not self.is_sleep:
             return
         if self.sharding_manager:
             self.sharding_manager.__enter__()  # pylint: disable=C2801
+        # Prefer engine-level resume if engine exists
+        if self.inference_engine is not None and hasattr(self.inference_engine, "resume_memory_occupation"):
+            await self.inference_engine.resume_memory_occupation()
         self.is_sleep = False
 
     def execute_method(self, method: str | bytes, *args, **kwargs):

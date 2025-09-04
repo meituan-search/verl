@@ -20,7 +20,6 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from verl import DataProto
 from verl.protocol import all_gather_data_proto
-# Use DeviceMesh for TP group selection to remain backend-agnostic
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.device import get_torch_device
 from verl.utils.torch_functional import check_device_is_available
