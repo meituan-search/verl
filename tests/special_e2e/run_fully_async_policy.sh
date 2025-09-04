@@ -14,8 +14,8 @@ MODEL_PATH=${MODEL_PATH:-${HOME}/models/${MODEL_ID}}
 huggingface-cli download "${MODEL_ID}" --local-dir "${MODEL_PATH}"
 
 
-rollout_mode="async"
-rollout_name="vllm" # sglang or vllm
+export rollout_mode="async"
+rollout_name="sglang" # sglang or vllm
 if [ "$rollout_mode" = "async" ]; then
     export VLLM_USE_V1=1
     return_raw_chat="True"
@@ -69,8 +69,8 @@ echo "Total GPUs: ${NUM_GPUS}, Rollout GPUs: ${n_gpus_rollout}, Training GPUs: $
 
 # Common parameters for both FSDP2 and Megatron
 common_params=(
-    data.train_files="${HOME}/data/gsm8k/train.parquet"
-    data.val_files="${HOME}/data/gsm8k/test.parquet"
+    data.train_files="/data/pengzhang/data/gsm8k/main/train-00000-of-00001.parquet"
+    data.val_files="/data/pengzhang/data/gsm8k/main/test-00000-of-00001.parquet"
     data.prompt_key=prompt
     data.truncation='left'
     data.max_prompt_length=${max_prompt_length}
