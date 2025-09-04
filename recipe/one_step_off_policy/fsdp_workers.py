@@ -65,10 +65,14 @@ def get_inference_model(rollout):
     elif hasattr(inference_engine, "worker"):
         # WorkerWrapperBase类型 - vLLMAsyncRollout
         inference_model = inference_engine.worker.model_runner.model
+    elif hasattr(inference_engine, "model_executor"):
+        # AsyncEngine类型 - SGLangAsyncRollout
+        inference_model = inference_engine.model_executor.driver_worker.worker.model_runner.model
     else:
         raise AttributeError(
             f"Unsupported inference_engine type: {type(inference_engine)}. "
-            f"Expected LLM (with llm_engine attribute) or WorkerWrapperBase (with worker attribute)."
+            f"Expected LLM (with llm_engine attribute), WorkerWrapperBase (with worker attribute), "
+            f"or AsyncEngine (with model_executor attribute)."
         )
     return inference_model
 
@@ -210,23 +214,35 @@ class DetachRolloutWorker(DetachNcclSync):
             device_name, mesh_shape=(dp, infer_tp), mesh_dim_names=["dp", "infer_tp"]
         )
         rollout_name = self.config.rollout.name
-        assert rollout_name == "vllm"
 
-        from verl.workers.rollout.vllm_rollout import vLLMRollout
+        from verl.workers.rollout.vllm_rollout import vLLMRollout, vLLMAsyncRollout
+        from verl.workers.rollout.sglang_rollout import SGLangRollout, SGLangAsyncRollout
 
         log_gpu_memory_usage(f"Before building {rollout_name} rollout", logger=logger)
 
-        from verl.workers.rollout.vllm_rollout import vLLMAsyncRollout
+        if rollout_name == "vllm":
+            vllm_rollout_cls = vLLMRollout if self.config.rollout.mode == "sync" else vLLMAsyncRollout
+            rollout = vllm_rollout_cls(
+                model_path=local_path,
+                config=self.config.rollout,
+                tokenizer=self.tokenizer,
+                model_hf_config=actor_model_config,
+                device_mesh=rollout_device_mesh,
+                trust_remote_code=trust_remote_code,
+            )
+        elif rollout_name == "sglang":
+            sglang_rollout_cls = SGLangRollout if self.config.rollout.mode == "sync" else SGLangAsyncRollout
+            rollout = sglang_rollout_cls(
+                actor_module=local_path,
+                config=self.config.rollout,
+                processing_class=self.processor if self.processor is not None else self.tokenizer,
+                model_hf_config=actor_model_config,
+                device_mesh=rollout_device_mesh,
+                trust_remote_code=trust_remote_code,
+            )
+        else:
+            raise NotImplementedError(f"Rollout name: {rollout_name} is not supported")
 
-        vllm_rollout_cls = vLLMRollout if self.config.rollout.mode == "sync" else vLLMAsyncRollout
-        rollout = vllm_rollout_cls(
-            model_path=local_path,
-            config=self.config.rollout,
-            tokenizer=self.tokenizer,
-            model_hf_config=actor_model_config,
-            device_mesh=rollout_device_mesh,
-            trust_remote_code=trust_remote_code,
-        )
         log_gpu_memory_usage(f"After building {rollout_name} rollout", logger=logger)
 
         from .detach_sharding_manager import DetachShardingManager

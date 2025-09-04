@@ -19,6 +19,9 @@ import asyncio
 import logging
 import multiprocessing as mp
 import os
+import pickle
+import socket
+import threading
 import time
 from copy import deepcopy
 from json import JSONDecodeError
@@ -26,9 +29,12 @@ from typing import Any, List, Optional, Tuple
 from uuid import uuid4
 
 import numpy as np
+import ray
 import sglang.srt.entrypoints.engine
 import torch
 import torch.distributed as dist
+import zmq
+from filelock import FileLock
 from omegaconf import DictConfig
 from sglang.srt.managers.tokenizer_manager import (
     ReleaseMemoryOccupationReqInput,
@@ -468,6 +474,8 @@ class SGLangRollout(BaseRollout):
         else:
             self._engine = None
 
+        # For compatibility with DetachShardingManager
+        self.inference_engine = self._engine
         self.sharding_manager = None
         self.is_sleep = True
 
@@ -1400,3 +1408,252 @@ class SGLangRollout(BaseRollout):
             return
         await self.sharding_manager.sleep()
         self.is_sleep = True
+
+
+class SGLangAsyncRollout:
+    """SGLangAsyncRollout is a thin wrapper of AsyncEngine,
+    which is engine in single worker process.
+    """
+
+    def __init__(
+        self,
+        actor_module: str,
+        config: DictConfig,
+        processing_class: PreTrainedTokenizer | PreTrainedTokenizerFast | ProcessorMixin,
+        model_hf_config,
+        port=None,
+        trust_remote_code: bool = False,
+        device_mesh: DeviceMesh | None = None,
+        **kwargs,
+    ):
+        """Asynchronous SGLang rollout engine.
+
+        Args:
+            actor_module: Huggingface model name or path to the model. The
+                model should be supported by SGLang.
+            config: A DictConfig object containing SGLang-specific operational
+                parameters and rollout settings.
+                Refer to https://docs.sglang.ai/backend/server_arguments.html
+            processing_class: The tokenizer or processor instance compatible with the actor_module.
+            model_hf_config: The Hugging Face model's configuration (e.g.,
+                `transformers.PretrainedConfig`). It provides architectural
+                details and hyperparameters like `max_position_embeddings`,
+                used by SGLang for correct model initialization. This is
+                the model's inherent design, not SGLang's runtime behavior.
+            port: Optional port for multi-node initialization when nnodes > 1.
+            trust_remote_code: Whether or not to allow for custom models
+                defined on the Hub in their own modeling files.
+            device_mesh: Optional `DeviceMesh` object for distributed setup.
+            **kwargs: Additional keyword arguments, primarily `train_tp` for
+                Megatron Backend integration to initialize hybrid engine
+                process groups.
+        """
+        self.processing_class = processing_class
+        self.actor_module = actor_module
+        self.port = port
+        self.trust_remote_code = trust_remote_code
+        self.device_mesh = device_mesh
+
+        # Engine is deferred to be initialized in init_worker
+        self.config = config
+        self.inference_engine: AsyncEngine = None
+        self.sharding_manager = None
+        self.is_sleep = False
+        self.address = self._init_zeromq()
+
+    def _init_zeromq(self) -> str:
+        tensor_parallel_size = self.config.tensor_model_parallel_size
+
+        # single node: ipc, multi nodes: tcp
+        local_world_size = int(os.environ["RAY_LOCAL_WORLD_SIZE"])
+        socket_type = "ipc" if tensor_parallel_size <= local_world_size else "tcp"
+
+        # File lock to prevent multiple workers listen to same port
+        with FileLock("/tmp/verl_sglang_zmq.lock"):
+            if socket_type == "ipc":
+                pid = os.getpid()
+                address = f"ipc:///tmp/verl_sglang_zmq_{pid}.ipc"
+            else:
+                ip, port = self._get_free_port()
+                address = f"tcp://{ip}:{port}"
+            context = zmq.Context()
+            self.socket = context.socket(zmq.REP)
+            self.socket.bind(address)
+
+        self.loop_thread = threading.Thread(target=self._loop_forever)
+        self.loop_thread.start()
+
+        return address
+
+    def _get_free_port(self):
+        ip = ray.util.get_node_ip_address()
+        with socket.socket() as sock:
+            sock.bind(("", 0))
+            port = sock.getsockname()[1]
+        return ip, port
+
+    def _loop_forever(self):
+        while True:
+            message = self.socket.recv()
+            method, args, kwargs = pickle.loads(message)
+            result = self.execute_method(method, *args, **kwargs)
+            self.socket.send(pickle.dumps(result))
+
+    def get_zeromq_address(self):
+        return self.address
+
+    def _init_distributed_env(self, device_mesh_cpu, **kwargs):
+        self._device_mesh_cpu = device_mesh_cpu
+        os.environ.setdefault("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK", "true")
+        self.tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
+        assert self.tensor_parallel_size <= dist.get_world_size(), (
+            "tensor parallel size should be less than or equal to the world size"
+        )
+        self.train_tp = kwargs.get("train_tp", None)
+        if self.train_tp is not None:
+            # deployed with megatron
+            os.environ["CUDA_TIMER_STREAM_KAFKA_ENABLE"] = "0"
+            os.environ["MEGATRON_IMPORT_TIMERS"] = "0"
+            train_tp = kwargs.get("train_tp", None)
+            num_tp_per_train_tp = train_tp // self.tensor_parallel_size
+            sglang_ps.initialize_parallel_state(
+                tensor_model_parallel_size=self.tensor_parallel_size,
+                num_tp_per_train_tp=num_tp_per_train_tp,
+            )
+
+        tp_size = self.tensor_parallel_size
+        world_size = int(os.getenv("WORLD_SIZE", "-1"))
+
+        # init device mesh
+        if self._device_mesh_cpu is None:
+            device_mesh_kwargs = dict(
+                mesh_shape=(world_size // tp_size, tp_size, 1),
+                mesh_dim_names=["dp", "tp", "pp"],
+            )
+
+            self._device_mesh_cpu = init_device_mesh("cpu", **device_mesh_kwargs)
+
+        self._rank = self._device_mesh_cpu.get_rank()
+        self._tp_rank = self._device_mesh_cpu["tp"].get_local_rank()
+        self._tp_size = self._device_mesh_cpu["tp"].size()
+        if self._rank == 0:
+            logger.info(f"_init_distributed_env: :tp_world: {self._tp_size}, global_world: {world_size}")
+        # get tp_rank of this process in this tp group
+        visible_devices = [None] * self._device_mesh_cpu.size(1)
+
+        torch.distributed.all_gather_object(
+            visible_devices, os.environ["CUDA_VISIBLE_DEVICES"], self._device_mesh_cpu.get_group("tp")
+        )
+        self.visible_devices_set = set(",".join(visible_devices).split(","))
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(sorted(list(self.visible_devices_set)))
+
+    def _init_inference_engine(self, trust_remote_code, actor_module, port):
+        # initialize the inference engine
+        nnodes = -(-self._tp_size // len(self.visible_devices_set))
+        if nnodes > 1:
+            ip = get_ip()
+            port = get_open_port() if port is None else port
+            [ip, port] = broadcast_pyobj(
+                [ip, port],
+                rank=self._rank,
+                dist_group=self._device_mesh_cpu.get_group("tp"),
+                src=self._device_mesh_cpu["tp"].mesh[0].item(),
+                force_cpu_device=False,
+            )
+            dist_init_addr = f"[{ip}]:{port}" if is_ipv6(ip) else f"{ip}:{port}"
+        else:
+            dist_init_addr = None
+
+        load_format = "dummy" if self.config.load_format.startswith("dummy") else self.config.load_format
+        tp_size_per_node = self._tp_size // nnodes
+        node_rank = self._tp_rank // tp_size_per_node
+        first_rank_in_node = self._tp_rank % tp_size_per_node == 0
+
+        if first_rank_in_node:
+            rank = dist.get_rank()
+            os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
+            self.inference_engine = AsyncEngine(
+                model_path=actor_module,
+                dtype=self.config.dtype,
+                mem_fraction_static=self.config.gpu_memory_utilization,
+                enable_memory_saver=True,
+                base_gpu_id=0,
+                gpu_id_step=1,
+                tp_size=self._tp_size,
+                node_rank=node_rank,
+                load_format=load_format,
+                dist_init_addr=dist_init_addr,
+                nnodes=nnodes,
+                trust_remote_code=trust_remote_code,
+                # NOTE(linjunrong): add rank to prevent SGLang generate same port inside PortArgs.init_new
+                # when random.seed is being set during training
+                port=30000 + rank,
+                # NOTE(Chenyang): if you want to debug the SGLang engine output
+                # please set the following parameters
+                # Otherwise, it will make the engine run too slow
+                # log_level="INFO",
+                # log_requests=True,
+                # log_requests_level=2,
+                # max_running_requests=1,
+                mm_attention_backend="fa3",
+                attention_backend="fa3",
+                # In async mode, we want token in token out.
+                skip_tokenizer_init=self.config.mode == "async",
+            )
+        else:
+            self.inference_engine = None
+
+        self.sharding_manager = None
+        self.is_sleep = True
+
+    def init_worker(self, all_kwargs: list[dict[str, Any]]):
+        """Initialize worker engine."""
+
+        all_kwargs[0]["rank"] = int(os.environ["RANK"])
+        all_kwargs[0]["local_rank"] = 0
+
+        # Initialize distributed environment similar to SGLangRollout
+        self._init_distributed_env(self.device_mesh, **all_kwargs[0])
+        
+        # Initialize the inference engine
+        self._init_inference_engine(
+            self.trust_remote_code, 
+            self.actor_module, 
+            self.port
+        )
+
+    def load_model(self, *args, **kwargs):
+        # SGLang engine is initialized in init_worker, no separate load_model needed
+        pass
+
+    def sleep(self, *args, **kwargs):
+        """Offload model weights and discard kv cache."""
+        if self.is_sleep:
+            return
+        if self.sharding_manager:
+            self.sharding_manager.__exit__(None, None, None)
+        self.is_sleep = True
+
+    def wake_up(self, *args, **kwargs):
+        """Load model weights and build kv cache."""
+        if not self.is_sleep:
+            return
+        if self.sharding_manager:
+            self.sharding_manager.__enter__()  # pylint: disable=C2801
+        self.is_sleep = False
+
+    def execute_method(self, method: str | bytes, *args, **kwargs):
+        if method == "init_worker":
+            return self.init_worker(*args, **kwargs)
+        elif method == "load_model":
+            return self.load_model(*args, **kwargs)
+        elif method == "sleep":
+            return self.sleep(*args, **kwargs)
+        elif method == "wake_up":
+            return self.wake_up(*args, **kwargs)
+        else:
+            # For other methods, delegate to the inference engine
+            if hasattr(self.inference_engine, method):
+                return getattr(self.inference_engine, method)(*args, **kwargs)
+            else:
+                raise AttributeError(f"Method {method} not found in SGLangAsyncRollout or AsyncEngine")
