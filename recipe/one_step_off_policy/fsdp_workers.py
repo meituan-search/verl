@@ -57,7 +57,10 @@ def get_inference_model(rollout):
     Returns:
         model: 模型对象
     """
-    inference_engine = rollout.inference_engine
+    inference_engine = getattr(rollout, "inference_engine", None)
+    if inference_engine is None:
+        # Engine might be deferred-initialized (e.g., Async SGLang/vLLM). Skip for now.
+        return None
     # 判断inference_engine的类型
     if hasattr(inference_engine, "llm_engine"):
         # LLM类型 - vLLMRollout
@@ -69,11 +72,7 @@ def get_inference_model(rollout):
         # AsyncEngine类型 - SGLangAsyncRollout
         inference_model = inference_engine.model_executor.driver_worker.worker.model_runner.model
     else:
-        raise AttributeError(
-            f"Unsupported inference_engine type: {type(inference_engine)}. "
-            f"Expected LLM (with llm_engine attribute), WorkerWrapperBase (with worker attribute), "
-            f"or AsyncEngine (with model_executor attribute)."
-        )
+        return None
     return inference_model
 
 
@@ -89,6 +88,9 @@ class DetachNcclSync(ActorRolloutRefWorker):
         params = self._get_actor_params() if self._is_actor else None
         if self._is_rollout:
             inference_model = get_inference_model(self.rollout)
+            if inference_model is None:
+                # Engine not ready; skip sync for now
+                continue
             patch_vllm_moe_model_weight_loader(inference_model)
         for key, shape, dtype in self._weights_info:
             tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
