@@ -90,7 +90,7 @@ class DetachNcclSync(ActorRolloutRefWorker):
             inference_model = get_inference_model(self.rollout)
             if inference_model is None:
                 # Engine not ready; skip sync for now
-                continue
+                return
             patch_vllm_moe_model_weight_loader(inference_model)
         for key, shape, dtype in self._weights_info:
             tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
