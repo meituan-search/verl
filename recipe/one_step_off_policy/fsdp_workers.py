@@ -58,21 +58,39 @@ def get_inference_model(rollout):
         model: 模型对象
     """
     inference_engine = getattr(rollout, "inference_engine", None)
+    print(f"[get_inference_model] Debug: inference_engine = {inference_engine}")
     if inference_engine is None:
         # Engine might be deferred-initialized (e.g., Async SGLang/vLLM). Skip for now.
+        print(f"[get_inference_model] Debug: inference_engine is None, returning None")
         return None
+    
     # 判断inference_engine的类型
+    print(f"[get_inference_model] Debug: inference_engine type = {type(inference_engine)}")
+    print(f"[get_inference_model] Debug: has llm_engine = {hasattr(inference_engine, 'llm_engine')}")
+    print(f"[get_inference_model] Debug: has worker = {hasattr(inference_engine, 'worker')}")
+    print(f"[get_inference_model] Debug: has model_executor = {hasattr(inference_engine, 'model_executor')}")
+    print(f"[get_inference_model] Debug: has model = {hasattr(inference_engine, 'model')}")
+    
     if hasattr(inference_engine, "llm_engine"):
         # LLM类型 - vLLMRollout
+        print(f"[get_inference_model] Debug: Using vLLMRollout path")
         inference_model = inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
     elif hasattr(inference_engine, "worker"):
         # WorkerWrapperBase类型 - vLLMAsyncRollout
+        print(f"[get_inference_model] Debug: Using vLLMAsyncRollout path")
         inference_model = inference_engine.worker.model_runner.model
     elif hasattr(inference_engine, "model_executor"):
         # AsyncEngine类型 - SGLangAsyncRollout
+        print(f"[get_inference_model] Debug: Using SGLangAsyncRollout path")
         inference_model = inference_engine.model_executor.driver_worker.worker.model_runner.model
+    elif hasattr(inference_engine, "model"):
+        # SGLang Engine类型 - SGLangRollout (同步)
+        print(f"[get_inference_model] Debug: Using SGLangRollout path")
+        inference_model = inference_engine.model
     else:
+        print(f"[get_inference_model] Debug: No matching attributes found, returning None")
         return None
+    print(f"[get_inference_model] Debug: Final inference_model = {inference_model}")
     return inference_model
 
 
@@ -87,9 +105,11 @@ class DetachNcclSync(ActorRolloutRefWorker):
 
         params = self._get_actor_params() if self._is_actor else None
         if self._is_rollout:
+            print(f"[DetachNcclSync] Debug: rollout.inference_engine = {getattr(self.rollout, 'inference_engine', 'NOT_FOUND')}")
             inference_model = get_inference_model(self.rollout)
+            print(f"[DetachNcclSync] Debug: get_inference_model returned = {inference_model}")
             if inference_model is None:
-                print(f"Engine not ready; skip sync for now")
+                print(f"[DetachNcclSync] Engine not ready; skip sync for now")
                 return
             
             rollout_name = self.config.rollout.name
