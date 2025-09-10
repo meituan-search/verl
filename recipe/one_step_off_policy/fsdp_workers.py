@@ -105,21 +105,27 @@ class DetachNcclSync(ActorRolloutRefWorker):
 
         params = self._get_actor_params() if self._is_actor else None
         if self._is_rollout:
-            print(f"[DetachNcclSync] Debug: rollout.inference_engine = {getattr(self.rollout, 'inference_engine', 'NOT_FOUND')}")
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else "N/A"
+            print(f"[DetachNcclSync] Debug: rank={rank}, rollout.inference_engine = {getattr(self.rollout, 'inference_engine', 'NOT_FOUND')}")
             inference_model = get_inference_model(self.rollout)
             print(f"[DetachNcclSync] Debug: get_inference_model returned = {inference_model}")
             if inference_model is None:
-                print(f"[DetachNcclSync] Engine not ready; skip sync for now")
-                return
+                # 在分布式 SGLang 中，只有主进程有 inference_engine
+                # 非主进程应该跳过权重同步，但继续执行广播逻辑
+                print(f"[DetachNcclSync] Engine not ready; skip weight loading but continue with broadcast (rank={rank})")
+                # 不要 return，继续执行广播逻辑
             
-            rollout_name = self.config.rollout.name
-            if rollout_name == "vllm":
-                patch_vllm_moe_model_weight_loader(inference_model)
-            elif rollout_name == "sglang":
-                # SGLang 不需要 patch
-                pass
-            else:
-                print(f"[DetachNcclSync] Warning: Unknown rollout name {rollout_name}, skipping weight loader patch")
+            # 只有在有 inference_model 时才进行权重加载相关的处理
+            if inference_model is not None:
+                rollout_name = self.config.rollout.name
+                if rollout_name == "vllm":
+                    patch_vllm_moe_model_weight_loader(inference_model)
+                elif rollout_name == "sglang":
+                    # SGLang 不需要 patch
+                    pass
+                else:
+                    print(f"[DetachNcclSync] Warning: Unknown rollout name {rollout_name}, skipping weight loader patch")
         for key, shape, dtype in self._weights_info:
             tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
             if self._is_actor:
@@ -132,7 +138,7 @@ class DetachNcclSync(ActorRolloutRefWorker):
             from ray.util.collective import collective
 
             collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
-            if self._is_rollout:
+            if self._is_rollout and inference_model is not None:
                 # 根据推理引擎类型使用不同的权重加载方法
                 rollout_name = self.config.rollout.name
                 if rollout_name == "vllm":
