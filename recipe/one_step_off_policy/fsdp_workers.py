@@ -89,9 +89,17 @@ class DetachNcclSync(ActorRolloutRefWorker):
         if self._is_rollout:
             inference_model = get_inference_model(self.rollout)
             if inference_model is None:
-                # Engine not ready; skip sync for now
+                print(f"Engine not ready; skip sync for now")
                 return
-            patch_vllm_moe_model_weight_loader(inference_model)
+            
+            rollout_name = self.config.rollout.name
+            if rollout_name == "vllm":
+                patch_vllm_moe_model_weight_loader(inference_model)
+            elif rollout_name == "sglang":
+                # SGLang 不需要 patch
+                pass
+            else:
+                print(f"[DetachNcclSync] Warning: Unknown rollout name {rollout_name}, skipping weight loader patch")
         for key, shape, dtype in self._weights_info:
             tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
             if self._is_actor:
@@ -105,7 +113,17 @@ class DetachNcclSync(ActorRolloutRefWorker):
 
             collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
             if self._is_rollout:
-                inference_model.load_weights([(key, tensor)])
+                # 根据推理引擎类型使用不同的权重加载方法
+                rollout_name = self.config.rollout.name
+                if rollout_name == "vllm":
+                    inference_model.load_weights([(key, tensor)])
+                elif rollout_name == "sglang":
+                    # SGLang 使用 update_weights_from_tensor 方法
+                    # 注意：这里需要异步调用，但当前方法是同步的
+                    # 可能需要重构为异步方法或使用其他同步机制
+                    print(f"[DetachNcclSync] Warning: SGLang weight sync requires async method, skipping {key}")
+                else:
+                    print(f"[DetachNcclSync] Warning: Unknown rollout name {rollout_name}, skipping weight loading for {key}")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def get_actor_weights_info(self):
