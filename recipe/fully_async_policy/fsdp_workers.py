@@ -211,7 +211,7 @@ class DetachRolloutWorker(DetachNcclSync):
             device_name, mesh_shape=(dp, infer_tp), mesh_dim_names=["dp", "infer_tp"]
         )
         rollout_name = self.config.rollout.name
-        assert rollout_name == "vllm"
+        assert rollout_name == "vllm" or rollout_name == "sglang"
 
         from verl.workers.rollout.vllm_rollout import vLLMRollout
 

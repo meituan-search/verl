@@ -267,9 +267,11 @@ class FullyAsyncRollouter(RayPPOTrainer):
 
     # 添加样本到待处理队列的协程
     async def _feed_samples(self):
+        print("[FullyAsyncRollouter][Feed] Starting _feed_samples...")
         continuous_iterator = self._create_continuous_iterator()
 
         for epoch, batch_dict in continuous_iterator:
+            print(f"[FullyAsyncRollouter][Feed] Processing epoch {epoch}, step {self.global_steps}")
             # 类似 _prepare_generate_batch 的逻辑：分离数据
             full_batch = prepare_single_generation_data(
                 batch_dict, self.global_steps, self.config.actor_rollout_ref.rollout.n
@@ -287,7 +289,9 @@ class FullyAsyncRollouter(RayPPOTrainer):
                 rollout_status={},
             )
 
+            print(f"[FullyAsyncRollouter][Feed] Putting sample {sample_id} to pending_queue (size: {self.pending_queue.qsize()})")
             await self.pending_queue.put(rollout_sample)
+            print(f"[FullyAsyncRollouter][Feed] Successfully put sample {sample_id} to pending_queue")
 
             # 检查是否到达最后一步
             if self.global_steps >= self.total_rollout_steps:
@@ -301,19 +305,24 @@ class FullyAsyncRollouter(RayPPOTrainer):
             self.global_steps += 1
 
         # 发送结束信号
+        print("[FullyAsyncRollouter][Feed] Putting DONE signal to pending_queue...")
         await self.pending_queue.put("DONE")
         print(f"[FullyAsyncRollouter][Feed] 样本添加完成，总共添加了 {self.global_steps} 个步骤的样本")
 
     async def _processor_worker(self):
         """流式处理工作协程 - 逐个样本立即提交处理，不等待批次"""
+        print("[FullyAsyncRollouter][Processor] Starting _processor_worker...")
 
         while True:
             simple_from_cancel_queue = False
             if not self.cancel_queue.empty():
+                print("[FullyAsyncRollouter][Processor] Getting sample from cancel_queue...")
                 rollout_sample = await self.cancel_queue.get()
                 simple_from_cancel_queue = True
             else:
+                print(f"[FullyAsyncRollouter][Processor] Getting sample from pending_queue (size: {self.pending_queue.qsize()})...")
                 rollout_sample = await self.pending_queue.get()
+                print(f"[FullyAsyncRollouter][Processor] Got sample from pending_queue: {rollout_sample}")
                 self.staleness_samples += 1
 
             # 判断是否需要暂停
@@ -445,8 +454,11 @@ class FullyAsyncRollouter(RayPPOTrainer):
         print(f"[FullyAsyncRollouter] 启动流式处理模式，最大并发样本数: {self.max_concurrent_samples}")
 
         # 启动流式处理协程和消费者协程
+        print("[FullyAsyncRollouter][Debug] Starting feed_task...")
         self.feed_task = asyncio.create_task(self._feed_samples())
+        print("[FullyAsyncRollouter][Debug] Starting processor_task...")
         self.processor_task = asyncio.create_task(self._processor_worker())
+        print("[FullyAsyncRollouter][Debug] Starting consumer_task...")
         self.consumer_task = asyncio.create_task(self._consumer_worker())
         # 启动样本添加协程
 

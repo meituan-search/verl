@@ -66,12 +66,32 @@ class ActorRolloutRefWorker(ARRWorker):
         assert (self._is_actor or self._is_rollout) and not self.config.hybrid_engine
         assert hasattr(self, "_weights_info") and self._weights_info is not None
 
+        print(f"[DetachNcclSync] Debug: rollout_name = {self.config.rollout.name}")
         params = self._get_actor_params() if self._is_actor else None
         if self._is_rollout:
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else "N/A"
+            print(f"[DetachNcclSync] Debug: rank={rank}, rollout.inference_engine = {getattr(self.rollout, 'inference_engine', 'NOT_FOUND')}")
             inference_model = (
                 self.rollout.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
             )
-            patch_vllm_moe_model_weight_loader(inference_model)
+            print(f"[DetachNcclSync] Debug: get_inference_model returned = {inference_model}")
+            if inference_model is None:
+                # 在分布式 SGLang 中，只有主进程有 inference_engine
+                # 非主进程应该跳过权重同步，但继续执行广播逻辑
+                print(f"[DetachNcclSync] Engine not ready; skip weight loading but continue with broadcast (rank={rank})")
+                # 不要 return，继续执行广播逻辑
+            
+            # 只有在有 inference_model 时才进行权重加载相关的处理
+            if inference_model is not None:
+                rollout_name = self.config.rollout.name
+                if rollout_name == "vllm":
+                    patch_vllm_moe_model_weight_loader(inference_model)
+                elif rollout_name == "sglang":
+                    # SGLang 不需要 patch
+                    pass
+                else:
+                    print(f"[DetachNcclSync] Warning: Unknown rollout name {rollout_name}, skipping weight loader patch")
         for key, shape, dtype in self._weights_info:
             tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
             if self._is_actor:
@@ -85,7 +105,14 @@ class ActorRolloutRefWorker(ARRWorker):
 
             collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
             if self._is_rollout:
-                inference_model.load_weights([(key, tensor)])
+                # 根据推理引擎类型使用不同的权重加载方法
+                rollout_name = self.config.rollout.name
+                if rollout_name == "vllm":
+                    inference_model.load_weights([(key, tensor)])
+                elif rollout_name == "sglang":
+                    inference_model.update_weights_from_tensor([(key, tensor)])
+                else:
+                    print(f"[DetachNcclSync] Warning: Unknown rollout name {rollout_name}, skipping weight loading for {key}")
         get_torch_device().empty_cache()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -185,23 +212,35 @@ class RolloutWorker(ActorRolloutRefWorker):
             device_name, mesh_shape=(dp, infer_tp), mesh_dim_names=["dp", "infer_tp"]
         )
         rollout_name = self.config.rollout.name
-        assert rollout_name == "vllm"
 
-        from verl.workers.rollout.vllm_rollout import vLLMRollout
+        from verl.workers.rollout.vllm_rollout import vLLMRollout, vLLMAsyncRollout
+        from verl.workers.rollout.sglang_rollout import SGLangRollout, SGLangAsyncRollout
 
         log_gpu_memory_usage(f"Before building {rollout_name} rollout", logger=logger)
 
-        from verl.workers.rollout.vllm_rollout import vLLMAsyncRollout
+        if rollout_name == "vllm":
+            vllm_rollout_cls = vLLMRollout if self.config.rollout.mode == "sync" else vLLMAsyncRollout
+            rollout = vllm_rollout_cls(
+                model_path=local_path,
+                config=self.config.rollout,
+                tokenizer=self.tokenizer,
+                model_hf_config=actor_model_config,
+                device_mesh=rollout_device_mesh,
+                trust_remote_code=trust_remote_code,
+            )
+        elif rollout_name == "sglang":
+            sglang_rollout_cls = SGLangRollout if self.config.rollout.mode == "sync" else SGLangAsyncRollout
+            rollout = sglang_rollout_cls(
+                actor_module=local_path,
+                config=self.config.rollout,
+                processing_class=self.processor if self.processor is not None else self.tokenizer,
+                model_hf_config=actor_model_config,
+                device_mesh=rollout_device_mesh,
+                trust_remote_code=trust_remote_code,
+            )
+        else:
+            raise NotImplementedError(f"Rollout name: {rollout_name} is not supported")
 
-        vllm_rollout_cls = vLLMRollout if self.config.rollout.mode == "sync" else vLLMAsyncRollout
-        rollout = vllm_rollout_cls(
-            model_path=local_path,
-            config=self.config.rollout,
-            tokenizer=self.tokenizer,
-            model_hf_config=actor_model_config,
-            device_mesh=rollout_device_mesh,
-            trust_remote_code=trust_remote_code,
-        )
         log_gpu_memory_usage(f"After building {rollout_name} rollout", logger=logger)
         from .vllm_sharding_manager import VLLMShardingManager
 
