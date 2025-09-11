@@ -103,6 +103,7 @@ class DetachNcclSync(ActorRolloutRefWorker):
         assert (self._is_actor or self._is_rollout) and not self.config.hybrid_engine
         assert hasattr(self, "_weights_info") and self._weights_info is not None
 
+        print(f"[DetachNcclSync] Debug: rollout_name = {self.config.rollout.name}")
         params = self._get_actor_params() if self._is_actor else None
         if self._is_rollout:
             import torch.distributed as dist
@@ -144,10 +145,7 @@ class DetachNcclSync(ActorRolloutRefWorker):
                 if rollout_name == "vllm":
                     inference_model.load_weights([(key, tensor)])
                 elif rollout_name == "sglang":
-                    # SGLang 使用 update_weights_from_tensor 方法
-                    # 注意：这里需要异步调用，但当前方法是同步的
-                    # 可能需要重构为异步方法或使用其他同步机制
-                    print(f"[DetachNcclSync] Warning: SGLang weight sync requires async method, skipping {key}")
+                    inference_model.update_weights_from_tensor([(key, tensor)])
                 else:
                     print(f"[DetachNcclSync] Warning: Unknown rollout name {rollout_name}, skipping weight loading for {key}")
 
