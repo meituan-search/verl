@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name='DAPO'
-exp_name='DAPO-Qwen2.5-7b-MATH-0527a1-fsdp2-fully-async-8-8'
+exp_name='DAPO-Qwen2.5-7b-MATH-0527a1-fsdp2-fully-async-4-4'
 
 # Ray
 # RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -69,16 +69,16 @@ NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
 # Fully async specific parameters
-n_gpus_rollout=8
-n_gpus_training=8
+n_gpus_rollout=2
+n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
 
 train_prompt_bsz=0
 gen_prompt_bsz=1
 n_resp_per_prompt=16
 train_prompt_mini_bsz=64
 total_rollout_steps=$(((512*100)))
-test_freq=10
-staleness_threshold=1
+test_freq=2
+staleness_threshold=0.1
 trigger_parameter_sync_step=16
 partial_rollout=True
 
@@ -140,12 +140,12 @@ $PYTHON_INTERPRETER -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
+    actor_rollout_ref.rollout.calculate_log_probs=True \
     actor_rollout_ref.ref.fsdp_config.param_offload=${ref_offload} \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
     actor_rollout_ref.rollout.name=${rollout_name} \
     actor_rollout_ref.rollout.mode=${rollout_mode} \
-    actor_rollout_ref.rollout.calculate_log_probs=True \
     reward_model.reward_manager=dapo \
     +reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
@@ -155,8 +155,7 @@ $PYTHON_INTERPRETER -m recipe.fully_async_policy.fully_async_main \
     trainer.logger=['console','tensorboard'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
-    trainer.val_before_train=True \
-    trainer.test_freq="${test_freq}" \
+    trainer.val_before_train=False \
     trainer.save_freq=-1 \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.resume_mode=auto \
@@ -166,6 +165,7 @@ $PYTHON_INTERPRETER -m recipe.fully_async_policy.fully_async_main \
     rollout.n_gpus_per_node="${n_gpus_rollout}" \
     rollout.total_rollout_steps="${total_rollout_steps}" \
     rollout.total_epochs=10 \
+    rollout.test_freq="${test_freq}" \
     async_training.staleness_threshold="${staleness_threshold}" \
     async_training.trigger_parameter_sync_step="${trigger_parameter_sync_step}" \
     async_training.partial_rollout="${partial_rollout}"

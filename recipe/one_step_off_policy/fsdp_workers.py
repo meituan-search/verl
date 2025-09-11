@@ -39,64 +39,27 @@ from verl.utils.fsdp_utils import (
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import get_generation_config, update_model_config
 from verl.utils.vllm_utils import patch_vllm_moe_model_weight_loader
-from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
+from verl.workers.fsdp_workers import ActorRolloutRefWorker as ARRWorker
+from verl.workers.fsdp_workers import CriticWorker
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
 
-__all__ = ["DetachActorWorker", "DetachRolloutWorker", "DetachAsyncRolloutWorker", "CriticWorker"]
+__all__ = ["ActorRolloutRefWorker", "AsyncActorRolloutRefWorker", "CriticWorker", "RolloutWorker"]
 
 
-def get_inference_model(rollout):
-    """
-    根据不同类型的inference_engine获取模型对象
-    Args:
-        rollout: rollout对象，包含inference_engine
-    Returns:
-        model: 模型对象
-    """
-    inference_engine = getattr(rollout, "inference_engine", None)
-    print(f"[get_inference_model] Debug: inference_engine = {inference_engine}")
-    if inference_engine is None:
-        # Engine might be deferred-initialized (e.g., Async SGLang/vLLM). Skip for now.
-        print(f"[get_inference_model] Debug: inference_engine is None, returning None")
-        return None
-    
-    # 判断inference_engine的类型
-    print(f"[get_inference_model] Debug: inference_engine type = {type(inference_engine)}")
-    print(f"[get_inference_model] Debug: has llm_engine = {hasattr(inference_engine, 'llm_engine')}")
-    print(f"[get_inference_model] Debug: has worker = {hasattr(inference_engine, 'worker')}")
-    print(f"[get_inference_model] Debug: has model_executor = {hasattr(inference_engine, 'model_executor')}")
-    print(f"[get_inference_model] Debug: has model = {hasattr(inference_engine, 'model')}")
-    
-    if hasattr(inference_engine, "llm_engine"):
-        # LLM类型 - vLLMRollout
-        print(f"[get_inference_model] Debug: Using vLLMRollout path")
-        inference_model = inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
-    elif hasattr(inference_engine, "worker"):
-        # WorkerWrapperBase类型 - vLLMAsyncRollout
-        print(f"[get_inference_model] Debug: Using vLLMAsyncRollout path")
-        inference_model = inference_engine.worker.model_runner.model
-    elif hasattr(inference_engine, "model_executor"):
-        # AsyncEngine类型 - SGLangAsyncRollout
-        print(f"[get_inference_model] Debug: Using SGLangAsyncRollout path")
-        inference_model = inference_engine.model_executor.driver_worker.worker.model_runner.model
-    elif hasattr(inference_engine, "model"):
-        # SGLang Engine类型 - SGLangRollout (同步)
-        print(f"[get_inference_model] Debug: Using SGLangRollout path")
-        inference_model = inference_engine.model
-    else:
-        print(f"[get_inference_model] Debug: No matching attributes found, returning None")
-        return None
-    print(f"[get_inference_model] Debug: Final inference_model = {inference_model}")
-    return inference_model
-
-
-class DetachNcclSync(ActorRolloutRefWorker):
+class ActorRolloutRefWorker(ARRWorker):
     def _get_actor_params(self):
-        pass
+        assert self._is_actor
+        params = self.actor_module_fsdp.state_dict()
+        from verl.utils.model import convert_weight_keys
+
+        params = convert_weight_keys(
+            params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+        )
+        return params
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def sync_rollout_weights(self):
@@ -109,7 +72,9 @@ class DetachNcclSync(ActorRolloutRefWorker):
             import torch.distributed as dist
             rank = dist.get_rank() if dist.is_initialized() else "N/A"
             print(f"[DetachNcclSync] Debug: rank={rank}, rollout.inference_engine = {getattr(self.rollout, 'inference_engine', 'NOT_FOUND')}")
-            inference_model = get_inference_model(self.rollout)
+            inference_model = (
+                self.rollout.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+            )
             print(f"[DetachNcclSync] Debug: get_inference_model returned = {inference_model}")
             if inference_model is None:
                 # 在分布式 SGLang 中，只有主进程有 inference_engine
@@ -139,7 +104,7 @@ class DetachNcclSync(ActorRolloutRefWorker):
             from ray.util.collective import collective
 
             collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
-            if self._is_rollout and inference_model is not None:
+            if self._is_rollout:
                 # 根据推理引擎类型使用不同的权重加载方法
                 rollout_name = self.config.rollout.name
                 if rollout_name == "vllm":
@@ -148,6 +113,7 @@ class DetachNcclSync(ActorRolloutRefWorker):
                     inference_model.update_weights_from_tensor([(key, tensor)])
                 else:
                     print(f"[DetachNcclSync] Warning: Unknown rollout name {rollout_name}, skipping weight loading for {key}")
+        get_torch_device().empty_cache()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def get_actor_weights_info(self):
@@ -170,19 +136,7 @@ class DetachNcclSync(ActorRolloutRefWorker):
         return ret
 
 
-class DetachActorWorker(DetachNcclSync):
-    def _get_actor_params(self):
-        assert self._is_actor
-        params = self.actor_module_fsdp.state_dict()
-        from verl.utils.model import convert_weight_keys
-
-        params = convert_weight_keys(
-            params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
-        )
-        return params
-
-
-class DetachRolloutWorker(DetachNcclSync):
+class RolloutWorker(ActorRolloutRefWorker):
     def __init__(self, config: DictConfig, role: str):
         Worker.__init__(self)
         assert role == "rollout"
@@ -288,17 +242,16 @@ class DetachRolloutWorker(DetachNcclSync):
             raise NotImplementedError(f"Rollout name: {rollout_name} is not supported")
 
         log_gpu_memory_usage(f"After building {rollout_name} rollout", logger=logger)
+        from .vllm_sharding_manager import VLLMShardingManager
 
-        from .detach_sharding_manager import DetachShardingManager
-
-        sharding_manager = DetachShardingManager(
+        rollout_sharding_manager = VLLMShardingManager(
             inference_engine=rollout.inference_engine, device_mesh=rollout_device_mesh
         )
 
         log_gpu_memory_usage("After building sharding manager", logger=logger)
 
         self.rollout = rollout
-        self.rollout_sharding_manager = sharding_manager
+        self.rollout_sharding_manager = rollout_sharding_manager
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
     def async_generate_sequences(self, *args, **kwargs):
@@ -310,19 +263,6 @@ class DetachRolloutWorker(DetachNcclSync):
         self._weights_info = weights_info
 
 
-class DetachAsyncRolloutWorker(AsyncActorRolloutRefWorker, DetachRolloutWorker):
-    def __init__(self, config: DictConfig, role: str):
-        print(f"[DetachAsyncRolloutWorker] {DetachAsyncRolloutWorker.__mro__}")
-        DetachRolloutWorker.__init__(self, config, role)
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def init_model(self):
-        print("[DetachAsyncRolloutWorker] init_model")
-        DetachRolloutWorker.init_model(self)
-
-        self.vllm_tp_size = self.config.rollout.tensor_model_parallel_size
-        self.vllm_dp_rank = int(os.environ["RANK"]) // self.vllm_tp_size
-        self.vllm_tp_rank = int(os.environ["RANK"]) % self.vllm_tp_size
-
-        # used for sleep/wake_up
-        self.rollout.sharding_manager = self.rollout_sharding_manager
+class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
+    def __init__(self, *args, **kwargs):
+        raise NotImplementedError

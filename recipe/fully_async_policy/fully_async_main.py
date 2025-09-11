@@ -81,7 +81,7 @@ def create_role_worker_mapping(config):
     # Select worker class based on strategy
     if config.actor_rollout_ref.actor.strategy == "fsdp2":
         assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
-        from recipe.one_step_off_policy.fsdp_workers import (
+        from recipe.fully_async_policy.fsdp_workers import (
             CriticWorker,
             DetachActorWorker,
             DetachAsyncRolloutWorker,
@@ -92,7 +92,7 @@ def create_role_worker_mapping(config):
 
     elif config.actor_rollout_ref.actor.strategy == "megatron":
         assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
-        from recipe.one_step_off_policy.megatron_workers import (
+        from recipe.fully_async_policy.megatron_workers import (
             CriticWorker,
             DetachActorWorker,
             DetachAsyncRolloutWorker,
@@ -216,7 +216,10 @@ class FullyAsyncTaskRunner:
         )
         ray.get(self.components["trainer"].set_parameter_synchronizer.remote(param_synchronizer))
 
-        ray.get(param_synchronizer.sync_weights.remote(0))
+        # load checkpoint and sync parameter before doing anything
+        val_before_train = val_reward_fn is not None and config.trainer.get("val_before_train", True)
+        ray.get(self.components["trainer"].load_checkpoint.remote())
+        ray.get(param_synchronizer.sync_weights.remote(version=0, validate=val_before_train))
 
         self.components["param_synchronizer"] = param_synchronizer
         print("[ASYNC MAIN] All components initialized successfully")
