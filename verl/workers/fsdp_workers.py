@@ -1687,14 +1687,14 @@ class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
 
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
     async def wake_up(self):
-        if self.config.rollout.free_cache_engine:
+        if self.config.rollout.free_cache_engine and self.rollout is not None:
             await self.rollout.wake_up()
         # return something to block the caller
         return True
 
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
     async def sleep(self):
-        if self.config.rollout.free_cache_engine:
+        if self.config.rollout.free_cache_engine and self.rollout is not None:
             await self.rollout.sleep()
         # return something to block the caller
         return True
