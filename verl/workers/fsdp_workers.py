@@ -1695,6 +1695,7 @@ class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
     async def sleep(self):
         if self.config.rollout.free_cache_engine and self.rollout is not None:
+            print(f"DEBUG: About to call self.rollout.sleep(), self.rollout type: {type(self.rollout)}")
             await self.rollout.sleep()
         # return something to block the caller
         return True
