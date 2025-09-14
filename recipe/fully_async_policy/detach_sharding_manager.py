@@ -20,10 +20,11 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from verl import DataProto
 from verl.protocol import all_gather_data_proto
-from verl.third_party.vllm import parallel_state as vllm_ps
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.device import get_torch_device
 from verl.utils.torch_functional import check_device_is_available
+from verl.third_party.vllm import parallel_state as vllm_ps
+from verl.third_party.sglang import parallel_state as sglang_ps
 from verl.workers.sharding_manager.base import BaseShardingManager
 
 logger = logging.getLogger(__file__)
@@ -62,7 +63,19 @@ class DetachShardingManager(BaseShardingManager):
         if self.tp_size == 1:
             return data
 
-        group = vllm_ps.get_tensor_model_parallel_group().device_group
+        # Prefer backend-specific TP groups if initialized; otherwise fall back to DeviceMesh
+        group = None
+        try:
+            if hasattr(vllm_ps, "model_parallel_is_initialized") and vllm_ps.model_parallel_is_initialized():
+                group = vllm_ps.get_tensor_model_parallel_group().device_group
+        except Exception:
+            group = None
+        if group is None:
+            try:
+                if hasattr(sglang_ps, "model_parallel_is_initialized") and sglang_ps.model_parallel_is_initialized():
+                    group = sglang_ps.get_tensor_model_parallel_group()
+            except Exception:
+                group = None
 
         all_gather_data_proto(data=data, process_group=group)
         return data

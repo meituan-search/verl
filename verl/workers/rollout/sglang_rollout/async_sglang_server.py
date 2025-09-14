@@ -37,6 +37,11 @@ class AsyncSGLangServer(AsyncServerBase):
         self.wg_prefix = wg_prefix
         self.workers = []
         self.master_worker = None
+        
+        # For cancel mechanism (similar to AsyncvLLMServer)
+        self.paused = False
+        self.lock = asyncio.Lock()
+        self.cancel_event: dict[str, asyncio.Event] = {}
 
     async def init_engine(self):
         if self.workers:
@@ -78,6 +83,52 @@ class AsyncSGLangServer(AsyncServerBase):
     async def generate(self, prompt_ids: list[int], sampling_params: dict[str, Any], request_id: str) -> list[int]:
         return await self.master_worker.generate.remote(prompt_ids, sampling_params, request_id)
 
+    async def generate_for_partial(
+        self, prompt_ids: list[int], sampling_params: dict[str, Any], request_id: str
+    ) -> tuple[list[int], list[float], bool]:
+        """Generate with cancellation support for partial rollout, similar to AsyncvLLMServer."""
+        async with self.lock:
+            if self.paused:
+                # If paused, return empty result immediately to indicate cancellation
+                return [], [], True
+            self.cancel_event[request_id] = asyncio.Event()
+            cancel_handle = asyncio.create_task(self.cancel_event[request_id].wait())
+            generation_handle = asyncio.create_task(
+                self.master_worker.generate.remote(prompt_ids, sampling_params, request_id)
+            )
+
+        done, pend = await asyncio.wait([generation_handle, cancel_handle], return_when=asyncio.FIRST_COMPLETED)
+
+        # Wait for completed tasks to avoid warnings
+        for task in done:
+            try:
+                await task
+            except Exception:
+                pass  # Task might have been cancelled
+
+        # Cancel pending tasks
+        for task in pend:
+            task.cancel()
+
+        async with self.lock:
+            is_cancel = generation_handle not in done
+            self.cancel_event.pop(request_id, None)
+            
+            if is_cancel:
+                # For partial rollout, when cancelled, we should return empty results
+                # The caller will handle the partial state
+                return [], [], True
+            else:
+                # Generation completed successfully
+                try:
+                    token_ids = await generation_handle
+                    # For SGLang, we don't have logprobs in the same way as vLLM
+                    # Return empty logprobs for now
+                    return token_ids, [], False
+                except Exception:
+                    # If generation failed, treat as cancelled
+                    return [], [], True
+
     async def wake_up(self):
         if not self.config.rollout.free_cache_engine:
             return
@@ -93,3 +144,15 @@ class AsyncSGLangServer(AsyncServerBase):
         tasks = [worker.sleep.remote() for worker in self.workers]
         if tasks:
             await asyncio.gather(*tasks)
+
+    async def cancel(self):
+        """Cancel ongoing requests by setting pause flag and triggering cancel events."""
+        async with self.lock:
+            self.paused = True
+            for request_id in self.cancel_event:
+                self.cancel_event[request_id].set()
+
+    async def resume(self):
+        """Resume processing requests by clearing pause flag."""
+        async with self.lock:
+            self.paused = False
