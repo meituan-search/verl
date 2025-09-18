@@ -38,7 +38,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
 )
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer, compute_advantage
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer, compute_advantage, compute_response_mask, apply_kl_penalty
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.utils import Role
 from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
@@ -51,9 +51,6 @@ from verl.utils.rollout_skip import RolloutSkip
 
 
 class FullyAsyncRayPPOTrainer(RayPPOTrainer):
-    def __init__(self, *args, **kwargs):
-        pass
-
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
 
@@ -164,10 +161,10 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
         if self.config.actor_rollout_ref.rollout.mode == "async":
-            from recipe.fully_async_policy.agent_loop.agent_loop import PartialAgentLoopManager
+            from recipe.fully_async_policy.agent_loop.agent_loop import FullyAsyncAgentLoopManager
 
             self.async_rollout_mode = True
-            self.async_rollout_manager = PartialAgentLoopManager(
+            self.async_rollout_manager = FullyAsyncAgentLoopManager(
                 config=self.config,
                 worker_group=self.actor_rollout_wg,
             )

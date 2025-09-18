@@ -281,15 +281,15 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
     async def _init_async_rollout_manager(self):
         # create async rollout manager and request scheduler
         assert self.config.actor_rollout_ref.rollout.mode == "async"
-        from recipe.fully_async_policy.agent_loop import PartialAgentLoopManager
+        from recipe.fully_async_policy.agent_loop import FullyAsyncAgentLoopManager
+
         self.async_rollout_mode = True
         print(f"{self.async_rollout_mode}")
-        self.async_rollout_manager = await PartialAgentLoopManager.create(
+        self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
             config=self.config,
             worker_group=self.rollout_wg,
         )
         print(f"self.async_rollout_manager {self.async_rollout_manager}")
-
 
     # 添加样本到待处理队列的协程
     async def _feed_samples(self):
@@ -407,7 +407,12 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """流式处理单个样本"""
+
         # 调用异步生成方法
+        rollout_sample.full_batch.non_tensor_batch["param_version"] = [self.current_param_version] * len(
+            rollout_sample.full_batch
+        )
+
         agent_loop_output_list = await self.async_rollout_manager.generate_single_sample_async(
             rollout_sample.full_batch, rollout_sample.agent_loop_output_list
         )
@@ -604,8 +609,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         return False
 
     async def pause(self):
-        """pause rollout
-        """
+        """pause rollout"""
         print("[FullyAsyncRollouter][Public][Pause]")
         async with self.lock:
             self.paused = True
@@ -616,7 +620,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 await asyncio.gather(*self.active_tasks, return_exceptions=True)
                 self.active_tasks.clear()
                 print("[FullyAsyncRollouter][Public][Pause] All active tasks completed")
-            # TODO async_rollout_manager clear kv cache
+            await self.async_rollout_manager.reset_prefix_cache()
             self.monitor_loop_trigger = False
 
     async def resume(self):

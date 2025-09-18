@@ -13,8 +13,7 @@
 # limitations under the License.
 
 from .partial_single_turn_agent_loop import PartialSingleTurnAgentLoop
+from .agent_loop import FullyAsyncAgentLoopManager
 
 _ = [PartialSingleTurnAgentLoop]
-
-
-from .agent_loop import PartialAgentLoopManager
+__all__ = ["FullyAsyncAgentLoopManager"]

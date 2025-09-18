@@ -14,7 +14,7 @@
 import asyncio
 import logging
 import os
-from typing import Optional, Any
+from typing import Any, Optional
 
 import hydra
 import numpy as np
@@ -23,9 +23,16 @@ import torch
 from omegaconf import DictConfig
 
 from recipe.fully_async_policy.vllm_rollout.vllm_async_server import FullyAsyncvLLMReplica
-from verl.experimental.agent_loop.agent_loop import (AgentLoopOutput, _agent_loop_registry, _DummyConfig,
-                                                     AsyncLLMServerManager, AgentLoopWorkerBase, BatchExecutor,
-                                                     get_trajectory_info, AgentLoopManager)
+from verl.experimental.agent_loop.agent_loop import (
+    AgentLoopManager,
+    AgentLoopOutput,
+    AgentLoopWorkerBase,
+    AsyncLLMServerManager,
+    BatchExecutor,
+    _agent_loop_registry,
+    _DummyConfig,
+    get_trajectory_info,
+)
 from verl.protocol import DataProto
 from verl.single_controller.ray import RayWorkerGroup
 from verl.utils.rollout_trace import rollout_trace_attr
@@ -49,6 +56,7 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
 
 class FullyAsyncAgentLoopOutput(AgentLoopOutput):
     """Agent loop output."""
+
     is_cancel: bool = False
     """Indicates whether the request was interrupted"""
     log_probs: list[float] = None
@@ -58,16 +66,17 @@ class FullyAsyncAgentLoopOutput(AgentLoopOutput):
     param_version_end: int = 0
     """Indicate end parameter version when this response is generated, used for partial rollout"""
 
+
 @ray.remote
 class FullyAsyncAgentLoopWorker(AgentLoopWorkerBase):
     def __init__(
-            self, config: DictConfig, server_handles: list[ray.actor.ActorHandle], rm_executor: BatchExecutor = None
+        self, config: DictConfig, server_handles: list[ray.actor.ActorHandle], rm_executor: BatchExecutor = None
     ):
-        self.server_manager_class = FullyAsyncLLMServerManager(config, server_handles)
+        self.server_manager = FullyAsyncLLMServerManager(config, server_handles)
         super().__init__(config, server_handles, rm_executor)
 
     async def generate_sequences_no_post(
-            self, batch: DataProto, partial_output_list: Optional[list[AgentLoopOutput]]
+        self, batch: DataProto, partial_output_list: Optional[list[AgentLoopOutput]]
     ) -> list[AgentLoopOutput]:
         """Generate sequences from agent loop.
 
@@ -117,19 +126,19 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorkerBase):
         return await asyncio.gather(*tasks)
 
     async def _partial_run_agent_loop(
-            self,
-            sampling_params: dict[str, Any],
-            trajectory: dict[str, Any],
-            *,
-            agent_name: str,
-            **kwargs,
+        self,
+        sampling_params: dict[str, Any],
+        trajectory: dict[str, Any],
+        *,
+        agent_name: str,
+        **kwargs,
     ) -> AgentLoopOutput:
         with rollout_trace_attr(
-                step=trajectory["step"],
-                sample_index=trajectory["sample_index"],
-                rollout_n=trajectory["rollout_n"],
-                validate=trajectory["validate"],
-                name="agent_loop",
+            step=trajectory["step"],
+            sample_index=trajectory["sample_index"],
+            rollout_n=trajectory["rollout_n"],
+            validate=trajectory["validate"],
+            name="agent_loop",
         ):
             assert agent_name in _agent_loop_registry, (
                 f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
@@ -146,9 +155,8 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorkerBase):
             return await agent_loop.run(sampling_params, **kwargs)
 
 
-class PartialAgentLoopManager(AgentLoopManager):
+class FullyAsyncAgentLoopManager(AgentLoopManager):
     def __init__(self, config: DictConfig, worker_group: RayWorkerGroup = None, rm_wg: RayWorkerGroup = None):
-        # 初始化基本属性，但不执行异步操作
         self.config = config
         self.worker_group = worker_group
         self.rm_executor = None
@@ -156,7 +164,6 @@ class PartialAgentLoopManager(AgentLoopManager):
         self.agent_loop_workers_class = FullyAsyncAgentLoopWorker
         self.rollout_replica_class = FullyAsyncvLLMReplica
 
-        # 初始化其他必要属性为None，稍后在异步初始化中设置
         self.rm_wg = rm_wg
         self.rollout_replicas = None
         self.server_handles = None
@@ -165,14 +172,11 @@ class PartialAgentLoopManager(AgentLoopManager):
 
     @classmethod
     async def create(cls, config: DictConfig, worker_group: RayWorkerGroup = None, rm_wg: RayWorkerGroup = None):
-        """异步工厂方法来创建和初始化 PartialAgentLoopManager 实例"""
         instance = cls(config, worker_group, rm_wg)
         await instance._async_init()
         return instance
 
     async def _async_init(self):
-        """异步初始化方法"""
-        # 处理 rm_wg 相关初始化
         if self.rm_wg:
             def batch_fn(data_list: list[DataProto]) -> list[torch.Tensor]:
                 new_data_list = []
@@ -198,7 +202,6 @@ class PartialAgentLoopManager(AgentLoopManager):
         self._init_agent_loop_workers()
 
     async def _initialize_llm_servers_async(self):
-        """异步初始化 LLM 服务器"""
         rollout_world_size = self.config.actor_rollout_ref.rollout.tensor_model_parallel_size
         world_size = (
             self.worker_group.world_size
@@ -223,17 +226,15 @@ class PartialAgentLoopManager(AgentLoopManager):
         self.server_addresses = [server._server_address for server in self.rollout_replicas]
 
     async def generate_single_sample_async(
-            self,
-            sample: DataProto,
-            partial_output_list: Optional[list[AgentLoopOutput]],
+        self,
+        sample: DataProto,
+        partial_output_list: Optional[list[AgentLoopOutput]],
     ) -> list[AgentLoopOutput]:
         """
         异步处理单个样本
-
         Args:
             sample: 单个样本数据
             partial_output_list: Optional[List[AgentLoopOutput]]: 已经 rollout 的结果
-
         Returns:
             list[AgentLoopOutput]: 处理结果列表
         """
@@ -242,10 +243,8 @@ class PartialAgentLoopManager(AgentLoopManager):
         return await asyncio.wrap_future(output_future.future())
 
     def _select_best_worker(self):
-        """选择最佳的 worker（简单的轮询负载均衡）"""
         if not hasattr(self, "_worker_index"):
             self._worker_index = 0
-
         worker = self.agent_loop_workers[self._worker_index]
         self._worker_index = (self._worker_index + 1) % len(self.agent_loop_workers)
         return worker
@@ -261,3 +260,6 @@ class PartialAgentLoopManager(AgentLoopManager):
 
     async def sleep(self):
         await asyncio.gather(*[replica.sleep() for replica in self.rollout_replicas])
+
+    async def reset_prefix_cache(self):
+        await asyncio.gather(*[replica.reset_prefix_cache() for replica in self.rollout_replicas])

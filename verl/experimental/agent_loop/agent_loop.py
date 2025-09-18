@@ -365,8 +365,8 @@ class AgentLoopWorkerBase:
         self.config = config
 
         # for recipe to change
-        if not hasattr(self, 'server_manager_class'):
-            self.server_manager_class = AsyncLLMServerManager(config, server_handles)
+        if not hasattr(self, "server_manager"):
+            self.server_manager = AsyncLLMServerManager(config, server_handles)
 
         self.rm_executor = rm_executor
 
@@ -480,7 +480,7 @@ class AgentLoopWorkerBase:
             agent_loop = hydra.utils.instantiate(
                 config=agent_loop_config,
                 trainer_config=_DummyConfig(config=self.config),
-                server_manager=self.server_manager_class,
+                server_manager=self.server_manager,
                 tokenizer=self.tokenizer,
                 processor=self.processor,
             )
@@ -756,9 +756,9 @@ class AgentLoopManager:
             self.rm_micro_batch_size = rm_wg.world_size
 
         # for recipe to change
-        if not hasattr(self, 'rollout_replica_class'):
+        if not hasattr(self, "rollout_replica_class"):
             self.rollout_replica_class = get_rollout_replica_class(self.config.actor_rollout_ref.rollout.name)
-        if not hasattr(self, 'agent_loop_workers_class'):
+        if not hasattr(self, "agent_loop_workers_class"):
             self.agent_loop_workers_class = AgentLoopWorker
 
         self._initialize_llm_servers()
@@ -789,7 +789,6 @@ class AgentLoopManager:
             self._run_all([server.init_standalone() for server in self.rollout_replicas])
         self.server_handles = [server._server_handle for server in self.rollout_replicas]
         self.server_addresses = [server._server_address for server in self.rollout_replicas]
-
 
     def _init_agent_loop_workers(self):
         self.agent_loop_workers = []

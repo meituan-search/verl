@@ -25,8 +25,8 @@ from vllm.outputs import RequestOutput
 from verl.workers.rollout.replica import RolloutMode
 from verl.workers.rollout.vllm_rollout.vllm_async_server import (
     _qwen2_5_vl_dedup_image_tokens,
-    vLLMHttpServer,
-    vLLMReplica, vLLMHttpServerBase,
+    vLLMHttpServerBase,
+    vLLMReplica,
 )
 
 logger = logging.getLogger(__file__)
@@ -124,6 +124,10 @@ class vLLMHttpServerForPartial(vLLMHttpServerBase):
         async with self.lock:
             self.paused = False
 
+    async def reset_prefix_cache(self):
+        async with self.lock:
+            await self.engine.reset_prefix_cache()
+
 
 class FullyAsyncvLLMReplica(vLLMReplica):
     def __init__(self, replica_rank: int, config: DictConfig, gpus_per_node: int = 8):
@@ -137,3 +141,7 @@ class FullyAsyncvLLMReplica(vLLMReplica):
     async def resume(self):
         """Resume each rollout server."""
         await asyncio.gather(*[server.resume.remote() for server in self.servers])
+
+    async def reset_prefix_cache(self):
+        """Resume each rollout server."""
+        await asyncio.gather(*[server.reset_prefix_cache.remote() for server in self.servers])
