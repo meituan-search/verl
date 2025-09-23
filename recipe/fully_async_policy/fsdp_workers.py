@@ -24,10 +24,10 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers import AutoConfig
 
 from verl.single_controller.base import Worker
-from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
+from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils import hf_processor, hf_tokenizer, omega_conf_to_dataclass
+from verl.utils.debug import DistProfiler, DistProfilerExtension, log_gpu_memory_usage
 from verl.utils.device import (
-    get_device_id,
     get_device_name,
     get_nccl_backend,
     get_torch_device,
@@ -38,44 +38,41 @@ from verl.utils.fsdp_utils import (
 )
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import get_generation_config, update_model_config
-from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
-from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
-from verl.workers.config import HFModelConfig, RolloutConfig
-from verl.workers.fsdp_workers import ActorRolloutRefWorker as ARRWorker
-from verl.workers.fsdp_workers import CriticWorker
-from verl.workers.rollout import get_rollout_class
-
-from .distributed_util import stateless_init_process_group
+from verl.utils.vllm_utils import patch_vllm_moe_model_weight_loader
+from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
 
-__all__ = ["ActorRolloutRefWorker", "AsyncActorRolloutRefWorker", "CriticWorker", "RolloutWorker"]
+__all__ = ["DetachActorWorker", "DetachRolloutWorker", "DetachAsyncRolloutWorker", "CriticWorker"]
 
 
-class ActorRolloutRefWorker(ARRWorker):
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    def create_weight_sync_group(self, master_address, master_port, rank_offset, world_size):
-        rank = torch.distributed.get_rank() + rank_offset
-        self._weight_sync_group = stateless_init_process_group(
-            master_address,
-            master_port,
-            rank,
-            world_size,
-            get_torch_device().current_device(),
+def get_inference_model(rollout):
+    """
+    get models according to different types of inference_engine
+    Args:
+        rollout: rollout object
+    Returns:
+        model: 模型对象
+    """
+    inference_engine = rollout.inference_engine
+    if hasattr(inference_engine, "llm_engine"):
+        inference_model = inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+    elif hasattr(inference_engine, "worker"):
+        inference_model = inference_engine.worker.model_runner.model
+    else:
+        raise AttributeError(
+            f"Unsupported inference_engine type: {type(inference_engine)}. "
+            f"Expected LLM (with llm_engine attribute) or WorkerWrapperBase (with worker attribute)."
         )
+    return inference_model
 
+
+class DetachNcclSync(ActorRolloutRefWorker):
     def _get_actor_params(self):
-        assert self._is_actor
-        params = self.actor_module_fsdp.state_dict()
-        from verl.utils.model import convert_weight_keys
-
-        params = convert_weight_keys(
-            params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
-        )
-        return params
+        pass
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def sync_rollout_weights(self):
@@ -84,11 +81,7 @@ class ActorRolloutRefWorker(ARRWorker):
 
         params = self._get_actor_params() if self._is_actor else None
         if self._is_rollout:
-            inference_model = (
-                self.rollout.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
-            )
-            from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
-
+            inference_model = get_inference_model(self.rollout)
             patch_vllm_moe_model_weight_loader(inference_model)
         for key, shape, dtype in self._weights_info:
             tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
@@ -99,8 +92,9 @@ class ActorRolloutRefWorker(ARRWorker):
                     origin_data = origin_data.full_tensor()
                 if torch.distributed.get_rank() == 0:
                     tensor.copy_(origin_data)
+            from ray.util.collective import collective
 
-            self._weight_sync_group.broadcast(tensor, src=0, stream=get_torch_device().current_stream())
+            collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
             if self._is_rollout:
                 inference_model.load_weights([(key, tensor)])
         get_torch_device().empty_cache()
@@ -126,7 +120,19 @@ class ActorRolloutRefWorker(ARRWorker):
         return ret
 
 
-class RolloutWorker(ActorRolloutRefWorker):
+class DetachActorWorker(DetachNcclSync):
+    def _get_actor_params(self):
+        assert self._is_actor
+        params = self.actor_module_fsdp.state_dict()
+        from verl.utils.model import convert_weight_keys
+
+        params = convert_weight_keys(
+            params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+        )
+        return params
+
+
+class DetachRolloutWorker(DetachNcclSync):
     def __init__(self, config: DictConfig, role: str):
         Worker.__init__(self)
         assert role == "rollout"
@@ -148,17 +154,8 @@ class RolloutWorker(ActorRolloutRefWorker):
         # We can still use ProfilerConfig for testing purpose (tests/utils/test_nvtx_profile.py)
         # as they provides DictConfig-like interface
         # The benefit of creating the dataclass config is to perform validation during __post_init__
-        omega_profiler_config = config.get("profiler", {})
-        profiler_config = omega_conf_to_dataclass(omega_profiler_config, dataclass_type=ProfilerConfig)
-        if omega_profiler_config.get("tool", None) in ["npu", "nsys", "torch", "torch_memory"]:
-            tool_config = omega_conf_to_dataclass(
-                omega_profiler_config.get("tool_config", {}).get(omega_profiler_config.get("tool"))
-            )
-        else:
-            tool_config = None
-        DistProfilerExtension.__init__(
-            self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
-        )
+        profiler_config = omega_conf_to_dataclass(config.rollout.get("profiler", {}))
+        DistProfilerExtension.__init__(self, DistProfiler(rank=self.rank, config=profiler_config))
         self._is_rollout = True
         self._is_actor = False
 
@@ -210,80 +207,40 @@ class RolloutWorker(ActorRolloutRefWorker):
         rollout_device_mesh = init_device_mesh(
             device_name, mesh_shape=(dp, infer_tp), mesh_dim_names=["dp", "infer_tp"]
         )
-
-        is_collect = rollout_device_mesh["infer_tp"].get_local_rank() == 0
-        self._register_dispatch_collect_info(
-            "rollout", dp_rank=rollout_device_mesh["dp"].get_local_rank(), is_collect=is_collect
-        )
-
         rollout_name = self.config.rollout.name
         assert rollout_name == "vllm"
 
-        rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
-        model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
-        self.model_config = model_config
+        from verl.workers.rollout.vllm_rollout import vLLMRollout
 
         log_gpu_memory_usage(f"Before building {rollout_name} rollout", logger=logger)
-        rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
-            config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
+
+        from verl.workers.rollout.vllm_rollout import vLLMAsyncRollout
+
+        vllm_rollout_cls = vLLMRollout if self.config.rollout.mode == "sync" else vLLMAsyncRollout
+        rollout = vllm_rollout_cls(
+            model_path=local_path,
+            config=self.config.rollout,
+            tokenizer=self.tokenizer,
+            model_hf_config=actor_model_config,
+            device_mesh=rollout_device_mesh,
+            trust_remote_code=trust_remote_code,
         )
         log_gpu_memory_usage(f"After building {rollout_name} rollout", logger=logger)
-        from .vllm_sharding_manager import VLLMShardingManager
 
-        rollout_sharding_manager = VLLMShardingManager(
+        from .detach_sharding_manager import DetachShardingManager
+
+        sharding_manager = DetachShardingManager(
             inference_engine=rollout.inference_engine, device_mesh=rollout_device_mesh
         )
 
         log_gpu_memory_usage("After building sharding manager", logger=logger)
 
         self.rollout = rollout
-        self.rollout_sharding_manager = rollout_sharding_manager
+        self.rollout_sharding_manager = sharding_manager
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"), blocking=False)
-    def async_generate_sequences(self, prompts):
-        # Support all hardwares
-        prompts = prompts.to(get_device_id())
-
-        assert self._is_rollout
-
-        meta_info = {
-            "eos_token_id": self.generation_config.eos_token_id
-            if self.generation_config is not None
-            else self.tokenizer.eos_token_id,
-            "pad_token_id": self.generation_config.pad_token_id
-            if self.generation_config is not None
-            else self.tokenizer.pad_token_id,
-        }
-        prompts.meta_info.update(meta_info)
-        timing_generate = {}
-        with self.rollout_sharding_manager:
-            log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
-
-            with simple_timer("generate_sequences", timing_generate):
-                output = self.rollout.generate_sequences(prompts=prompts)
-
-            log_gpu_memory_usage("After rollout generation", logger=logger)
-
-        timing_generate.update(self.rollout_sharding_manager.timing)
-        # We calculate the average timing across all ranks
-        # to make sure meta_info["timing"] is the same
-        timing_generate_topk_ratio, timing_generate_min, timing_generate_max = topk_reduce_ratio_min_max(
-            timing_generate["generate_sequences"]
-        )
-        timing_generate = reduce_timing(timing_generate)
-        timing_generate.update(
-            {
-                "generation_timing/max": timing_generate_max,
-                "generation_timing/min": timing_generate_min,
-                "generation_timing/topk_ratio": timing_generate_topk_ratio,
-            }
-        )
-        output.meta_info["timing"] = timing_generate
-        output = output.to("cpu")
-
-        # clear kv cache
-        get_torch_device().empty_cache()
-        return output
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
+    def async_generate_sequences(self, *args, **kwargs):
+        return super().generate_sequences(*args, **kwargs)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_actor_weights_info(self, weights_info):
@@ -291,6 +248,19 @@ class RolloutWorker(ActorRolloutRefWorker):
         self._weights_info = weights_info
 
 
-class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
-    def __init__(self, *args, **kwargs):
-        raise NotImplementedError
+class DetachAsyncRolloutWorker(AsyncActorRolloutRefWorker, DetachRolloutWorker):
+    def __init__(self, config: DictConfig, role: str):
+        print(f"[DetachAsyncRolloutWorker] {DetachAsyncRolloutWorker.__mro__}")
+        DetachRolloutWorker.__init__(self, config, role)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        print("[DetachAsyncRolloutWorker] init_model")
+        DetachRolloutWorker.init_model(self)
+
+        self.vllm_tp_size = self.config.rollout.tensor_model_parallel_size
+        self.vllm_dp_rank = int(os.environ["RANK"]) // self.vllm_tp_size
+        self.vllm_tp_rank = int(os.environ["RANK"]) % self.vllm_tp_size
+
+        # used for sleep/wake_up
+        self.rollout.sharding_manager = self.rollout_sharding_manager
