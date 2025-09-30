@@ -242,9 +242,15 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         if val_data:
             val_data: ValidateMetrics = ray.cloudpickle.loads(val_data)
             if val_data.metrics:
-                self.logger.log(data=val_data.metrics, step=val_data.param_version)
+                try:
+                    self.logger.log(data=val_data.metrics, step=val_data.param_version)
+                except Exception as e:
+                    print(f"[FullyAsyncTrainer] Warning: Failed to log: {e}")
                 pprint(f"[FullyAsyncTrainer] Initial validation metrics: {val_data.metrics}")
-            self.logger.log(data=val_data.timing_raw, step=val_data.param_version)
+            try:
+                self.logger.log(data=val_data.timing_raw, step=val_data.param_version)
+            except Exception as e:
+                print(f"[FullyAsyncTrainer] Warning: Failed to log: {e}")
 
         # Use queue mode, no need for traditional dataloader iterator
         # Initialize to get the first batch of data
@@ -280,12 +286,18 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             if val_data:
                 val_data: ValidateMetrics = ray.cloudpickle.loads(val_data)
                 if val_data.metrics:
-                    self.logger.log(data=val_data.metrics, step=val_data.param_version)
+                    try:
+                        self.logger.log(data=val_data.metrics, step=val_data.param_version)
+                    except Exception as e:
+                        print(f"[FullyAsyncTrainer] Warning: Failed to log: {e}")
                     pprint(
                         f"[FullyAsyncTrainer] parameter version: {val_data.param_version} \
                         Validation metrics: {val_data.metrics}"
                     )
-                self.logger.log(data=val_data.timing_raw, step=val_data.param_version)
+                try:
+                    self.logger.log(data=val_data.timing_raw, step=val_data.param_version)
+                except Exception as e:
+                    print(f"[FullyAsyncTrainer] Warning: Failed to log: {e}")
             self.global_steps += 1
 
         # final parameter sync and validate
@@ -296,9 +308,15 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             if val_data:
                 val_data: ValidateMetrics = ray.cloudpickle.loads(val_data)
                 if val_data.metrics:
-                    self.logger.log(data=val_data.metrics, step=val_data.param_version)
+                    try:
+                        self.logger.log(data=val_data.metrics, step=val_data.param_version)
+                    except Exception as e:
+                        print(f"[FullyAsyncTrainer] Warning: Failed to log: {e}")
                     pprint(f"[FullyAsyncTrainer] Final validation metrics: {val_data.metrics}")
-                self.logger.log(data=val_data.timing_raw, step=val_data.param_version)
+                try:  
+                    self.logger.log(data=val_data.timing_raw, step=val_data.param_version)
+                except Exception as e:
+                    print(f"[FullyAsyncTrainer] Warning: Failed to log: {e}")
         else:
             pprint(f"[FullyAsyncTrainer] Final validation metrics: {val_data.metrics}")
         self.progress_bar.close()
@@ -341,10 +359,13 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
         self.current_param_version += 1
         self.local_trigger_step = 1
-        self.logger.log(
-            data=self.metrics_aggregator.get_aggregated_metrics(),
-            step=self.current_param_version,
-        )
+        try:
+            self.logger.log(
+                data=self.metrics_aggregator.get_aggregated_metrics(),
+                step=self.current_param_version,
+            )
+        except Exception as e:
+            print(f"[FullyAsyncTrainer] Warning: Failed to log: {e}")
         self.progress_bar.update(1)
         self.metrics_aggregator.reset()
         timing_param_sync = {}
@@ -356,4 +377,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     self.current_param_version, validate=validate, global_steps=global_steps
                 )
             )
-        self.logger.log(data=timing_param_sync, step=self.current_param_version)
+        try: 
+            self.logger.log(data=timing_param_sync, step=self.current_param_version)
+        except Exception as e:
+            print(f"[FullyAsyncTrainer] Warning: Failed to log: {e}")

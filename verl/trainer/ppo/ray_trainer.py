@@ -1205,8 +1205,10 @@ class RayPPOTrainer:
                     self.train_dataloader.sampler.update(batch=batch)
 
                 # TODO: make a canonical logger that supports various backend
-                logger.log(data=metrics, step=self.global_steps)
-
+                try:
+                    logger.log(data=metrics, step=self.global_steps)
+                except Exception as e:
+                    print(f"[FullyAsyncTrainer] Warning: Failed to log: {e}")
                 progress_bar.update(1)
                 self.global_steps += 1
 
