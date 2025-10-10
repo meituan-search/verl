@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name='DAPO'
-exp_name='dapo_qwen2-7B-math_28k_fsdp2_fsdpsize8_colocate64_mbs32'
+exp_name='dapo_qwen2-7B-math_28k_fsdp2_fsdpsize8_colocate64_mbs32_retry'
 
 adv_estimator=grpo
 

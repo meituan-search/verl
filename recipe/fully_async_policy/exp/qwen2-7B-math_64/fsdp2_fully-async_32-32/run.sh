@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name='DAPO'
-exp_name='dapo_qwen2-7B-math_28k_fsdp2_fsdpsize8_fully-async-32-32_mbs32_tpf16'
+exp_name='dapo_qwen2-7B-math_28k_fsdp2_fsdpsize8_fully-async-32-32_mbs32_tpf8_requiresize2'
 
 # Ray
 MODEL_PATH=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/model/Qwen2___5-Math-7B
@@ -67,7 +67,8 @@ train_prompt_mini_bsz=32
 total_rollout_steps=$(((512*400)))
 test_freq=20
 staleness_threshold=0.1
-trigger_parameter_sync_step=16
+trigger_parameter_sync_step=8
+require_batches=2
 partial_rollout=True
 
 python -m recipe.fully_async_policy.fully_async_main \
@@ -151,5 +152,6 @@ python -m recipe.fully_async_policy.fully_async_main \
     rollout.test_freq="${test_freq}" \
     async_training.staleness_threshold="${staleness_threshold}" \
     async_training.trigger_parameter_sync_step="${trigger_parameter_sync_step}" \
+    async_training.require_batches="${require_batches}" \
     async_training.partial_rollout="${partial_rollout}" \
     async_training.use_rollout_log_probs=True

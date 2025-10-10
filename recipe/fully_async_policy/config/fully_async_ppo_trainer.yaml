@@ -14,7 +14,10 @@ async_training:
   # Frequency of parameter synchronization between rollouter and trainer, 
   # One step means trainer obtains a batch of required samples
   trigger_parameter_sync_step: 4
-  
+
+  # The number of mini_batches that the trainer obtains once
+  require_batches: 1
+
   # When synchronizing parameters, whether to interrupt rollouter and perform partial rollout
   partial_rollout: True
 

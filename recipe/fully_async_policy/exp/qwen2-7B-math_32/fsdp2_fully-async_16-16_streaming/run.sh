@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name='DAPO'
-exp_name='dapo_qwen2-7B-math_28k_fsdp2_fsdpsize8_fully-async-16-16_mbs32_tpf16_streaming'
+exp_name='dapo_qwen2-7B-math_28k_fsdp2_fsdpsize8_fully-async-16-16_mbs32_tpf16_streaming_retry'
 
 # Ray
 MODEL_PATH=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/model/Qwen2___5-Math-7B

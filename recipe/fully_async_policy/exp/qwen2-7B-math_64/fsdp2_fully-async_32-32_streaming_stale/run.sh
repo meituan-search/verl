@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name='DAPO'
-exp_name='dapo_qwen2-7B-math_28k_fsdp2_fsdpsize8_fully-async-16-16_mbs32_tpf16_retry'
+exp_name='dapo_qwen2-7B-math_28k_fsdp2_fsdpsize8_fully-async-32-32_mbs32_tpf16_streaming_stale'
 
 # Ray
 MODEL_PATH=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/model/Qwen2___5-Math-7B
@@ -55,8 +55,8 @@ sp_size=4
 fsdp_size=8
 
 # Fully async specific parameters
-NNODES_ROLLOUT=${NNODES_ROLLOUT:-2}
-NNODES_TRAIN=${NNODES_TRAIN:-2}
+NNODES_ROLLOUT=${NNODES_ROLLOUT:-4}
+NNODES_TRAIN=${NNODES_TRAIN:-4}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
 
@@ -68,7 +68,7 @@ total_rollout_steps=$(((512*400)))
 test_freq=20
 staleness_threshold=0.1
 trigger_parameter_sync_step=16
-partial_rollout=True
+partial_rollout=False
 
 python -m recipe.fully_async_policy.fully_async_main \
     data.train_files="${TRAIN_FILE}" \

@@ -98,7 +98,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self.trigger_parameter_sync_step = config.async_training.trigger_parameter_sync_step
 
         # required_samples use ppo_mini_batch_size as the minimum number of samples.
-        self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size
+        self.require_batches = config.async_training.require_batches
+        self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
         total_gpus = (
             config.trainer.nnodes * config.trainer.n_gpus_per_node
             + config.rollout.nnodes * config.rollout.n_gpus_per_node
@@ -313,7 +314,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     except Exception as e:
                         print(f"[FullyAsyncTrainer] Warning: Failed to log: {e}")
                     pprint(f"[FullyAsyncTrainer] Final validation metrics: {val_data.metrics}")
-                try:  
+                try:
                     self.logger.log(data=val_data.timing_raw, step=val_data.param_version)
                 except Exception as e:
                     print(f"[FullyAsyncTrainer] Warning: Failed to log: {e}")
@@ -377,7 +378,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     self.current_param_version, validate=validate, global_steps=global_steps
                 )
             )
-        try: 
+        try:
             self.logger.log(data=timing_param_sync, step=self.current_param_version)
         except Exception as e:
             print(f"[FullyAsyncTrainer] Warning: Failed to log: {e}")
