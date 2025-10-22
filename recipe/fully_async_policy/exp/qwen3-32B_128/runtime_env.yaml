@@ -1,0 +1,5 @@
+env_vars:
+  VLLM_USE_V1: "1"
+  NCCL_DEBUG: "INFO"
+  HYDRA_FULL_ERROR: "1"
+  TENSORBOARD_DIR: "/cfs_shtx5_serving_3/mlp/training/docker/user/hadoop-ai-search/houzhenggang/main/qwen3-30B/64-64_mbs32_sta0.5_tri4_req1_par1"
