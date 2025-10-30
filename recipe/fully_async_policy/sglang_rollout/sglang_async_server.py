@@ -16,8 +16,7 @@ import logging
 from typing import Any, Optional, Sequence
 
 import ray
-import sglang.srt.entrypoints.engine
-
+from ray.actor import ActorHandle
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.weight_sync.utils import update_weights as sgl_update_weights
@@ -25,13 +24,15 @@ from verl.workers.rollout.sglang_rollout.async_sglang_server import (
     SGLangHttpServer,
     SGLangReplica
 )
+from verl.workers.config import HFModelConfig, RewardModelConfig, RolloutConfig
+from verl.workers.rollout.replica import RolloutMode
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 
 @ray.remote(num_cpus=1)
-class SGLangHttpServerForPartial(SGLangHttpServerBase):
+class SGLangHttpServerForPartial(SGLangHttpServer):
     def __init__(
         self,
         config: RolloutConfig | RewardModelConfig,
@@ -49,7 +50,7 @@ class SGLangHttpServerForPartial(SGLangHttpServerBase):
         self.paused = False
         self.lock = asyncio.Lock()
         self.cancel_event: dict[str, asyncio.Event] = {}
-        self.req_output: dict[str, Optional[RequestOutput]] = {}
+        # self.req_output: dict[str, Optional[RequestOutput]] = {}
 
     async def _generate_step(
         self,
@@ -62,16 +63,16 @@ class SGLangHttpServerForPartial(SGLangHttpServerBase):
         sampling_params["logprobs"] = 1
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
-        prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
-        prompt = TokensPrompt(
-            prompt_token_ids=prompt_ids, multi_modal_data={"image": image_data} if image_data else None
-        )
-        generator = self.engine.generate(prompt=prompt, sampling_params=sampling_params, request_id=request_id)
+        # prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+        # prompt = TokensPrompt(
+        #     prompt_token_ids=prompt_ids, multi_modal_data={"image": image_data} if image_data else None
+        # )
+        # generator = self.engine.generate(prompt=prompt, sampling_params=sampling_params, request_id=request_id)
 
         # Get final response
-        async for output in generator:
-            self.req_output[request_id] = output
-        assert self.req_output[request_id] is not None
+        # async for output in generator:
+        #     self.req_output[request_id] = output
+        # assert self.req_output[request_id] is not None
 
     async def generate_for_partial(
         self,
@@ -84,7 +85,7 @@ class SGLangHttpServerForPartial(SGLangHttpServerBase):
             if self.paused:
                 # After cancel, all tasks will return directly and wait for the next submission
                 return [], [], True
-            self.req_output[request_id]: Optional[RequestOutput] = None
+            # self.req_output[request_id]: Optional[RequestOutput] = None
             self.cancel_event[request_id] = asyncio.Event()
             cancel_handle = asyncio.create_task(self.cancel_event[request_id].wait())
             generation_handle = asyncio.create_task(
