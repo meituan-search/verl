@@ -6,16 +6,16 @@ export VLLM_USE_V1=1
 HDFS_ROOT=${HDFS_ROOT:-$PWD}
 DATA_ROOT=${DATA_ROOT:-$PWD}
 
-dapo_math_17k=/mnt/dolphinfs/hdd_pool/docker/user/hadoop-djst-algoplat/wangshulin02/data/BytedTsinghua-SIA/DAPO-Math-17k
-aime_2024=/mnt/dolphinfs/hdd_pool/docker/user/hadoop-djst-algoplat/wangshulin02/data/tmp/Maxwell-Jia/AIME_2024
-aime_2025=/mnt/dolphinfs/hdd_pool/docker/user/hadoop-djst-algoplat/wangshulin02/data/tmp/yentinglin/aime_2025
-model_path=/mnt/dolphinfs/hdd_pool/docker/user/hadoop-djst-algoplat/wangshulin02/model/checkpoint/multiturn-sft-qwen-2.5-7b-instruct/global_step_372-merged_hf_model
+dapo_math_17k=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/data/BytedTsinghua-SIA/DAPO-Math-17k
+aime_2024=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/data/Maxwell-Jia/AIME_2024
+aime_2025=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/data/yentinglin/aime_2025
+model_path=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/model/checkpoint/multiturn-sft-qwen-2.5-7b-instruct/global_step_372-merged_hf_model
 train_files="['$dapo_math_17k']"
 test_files="['$aime_2025', '$aime_2024']"
 
 # tool
-tool_config_path=/mnt/dolphinfs/hdd_pool/docker/user/hadoop-djst-algoplat/wangshulin02/verl/recipe/fully_async_policy/exp_tool/sandbox_fusion_tool_config.yaml
-retool_path=/mnt/dolphinfs/hdd_pool/docker/user/hadoop-djst-algoplat/wangshulin02/verl/recipe/retool/retool.py
+tool_config_path=recipe/fully_async_policy/exp_tool/sandbox_fusion_tool_config.yaml
+retool_path=recipe/retool/retool.py
 
 # wandb / tensorboard
 project_name=retool
@@ -38,6 +38,11 @@ max_prompt_length=2048
 max_response_length=16384
 actor_lr=1e-6
 
+# train_batch_size=64
+# ppo_mini_batch_size=16
+n_resp_per_prompt=16
+n_resp_per_prompt_val=30
+
 # ================= perfomance =================
 infer_tp=4 # vllm
 train_sp=4 # train
@@ -51,17 +56,15 @@ log_prob_max_token_len_per_gpu=$(( actor_max_token_len_per_gpu * 4 ))
 rollout_name="vllm"
 rollout_mode="async"
 
-NNODES=${NNODES:-1}
+NNODES_ROLLOUT=${NNODES_ROLLOUT:-1}
+NNODES_TRAIN=${NNODES_TRAIN:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
-n_gpus_rollout=4
-n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
 
 train_batch_size=0
-ppo_mini_batch_size=16
 gen_prompt_bsz=1
 n_resp_per_prompt=16
-n_resp_per_prompt_val=30
-total_rollout_steps=$(((64*250)))
+ppo_mini_batch_size=16
+total_rollout_steps=$(((64*100)))
 test_freq=10
 staleness_threshold=0.5
 trigger_parameter_sync_step=4
@@ -126,10 +129,10 @@ python3 -m recipe.fully_async_policy.fully_async_main \
     trainer.save_freq=-1 \
     trainer.default_local_dir=$default_local_dir \
     data.gen_batch_size=${gen_prompt_bsz} \
-    trainer.nnodes=$NNODES \
-    trainer.n_gpus_per_node=$n_gpus_training \
-    rollout.nnodes=$NNODES \
-    rollout.n_gpus_per_node=$n_gpus_rollout \
+    trainer.nnodes=$NNODES_TRAIN \
+    trainer.n_gpus_per_node=$NGPUS_PER_NODE \
+    rollout.nnodes=$NNODES_ROLLOUT \
+    rollout.n_gpus_per_node=$NGPUS_PER_NODE \
     rollout.total_rollout_steps=$total_rollout_steps \
     rollout.total_epochs=10 \
     rollout.test_freq=$test_freq \
