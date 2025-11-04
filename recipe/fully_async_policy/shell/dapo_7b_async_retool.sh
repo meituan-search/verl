@@ -19,7 +19,7 @@ retool_path=/mnt/dolphinfs/hdd_pool/docker/user/hadoop-djst-algoplat/wangshulin0
 
 # wandb / tensorboard
 project_name=retool
-experiment_name=qwen2.5-7b_dapo_async_tool
+experiment_name=qwen2.5-7b_dapo_async_tool_fixcancel_event
 default_local_dir=$DATA_ROOT/checkpoint/$experiment_name
 
 # ================= algorithm =================
@@ -121,7 +121,7 @@ python3 -m recipe.fully_async_policy.fully_async_main \
     trainer.logger=['console','tensorboard'] \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.log_val_generations=20 \
     trainer.save_freq=-1 \
     trainer.default_local_dir=$default_local_dir \

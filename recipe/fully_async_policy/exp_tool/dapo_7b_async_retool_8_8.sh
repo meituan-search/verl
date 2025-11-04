@@ -19,7 +19,7 @@ retool_path=recipe/retool/retool.py
 
 # wandb / tensorboard
 project_name=retool
-experiment_name=qwen2.5-7b_dapo_async_tool
+experiment_name=qwen2.5-7b_dapo_async_tool_8_8_mbs32_tfs4_reqbatch4
 default_local_dir=$DATA_ROOT/checkpoint/$experiment_name
 
 # ================= algorithm =================
@@ -38,15 +38,10 @@ max_prompt_length=2048
 max_response_length=16384
 actor_lr=1e-6
 
-# train_batch_size=64
-# ppo_mini_batch_size=16
-n_resp_per_prompt=16
-n_resp_per_prompt_val=30
-
 # ================= perfomance =================
 infer_tp=4 # vllm
 train_sp=4 # train
-fsdp_size=4 # train
+fsdp_size=8 # train
 offload=True
 
 actor_max_token_len_per_gpu=$(( (max_prompt_length + max_response_length) * 1 ))
@@ -63,12 +58,13 @@ NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 train_batch_size=0
 gen_prompt_bsz=1
 n_resp_per_prompt=16
-ppo_mini_batch_size=16
-total_rollout_steps=$(((64*100)))
-test_freq=10
+n_resp_per_prompt_val=30
+ppo_mini_batch_size=32
+total_rollout_steps=$(((512*400)))
+test_freq=20
 staleness_threshold=0.5
 trigger_parameter_sync_step=4
-require_batches=1
+require_batches=4
 partial_rollout=True
 
 python3 -m recipe.fully_async_policy.fully_async_main \

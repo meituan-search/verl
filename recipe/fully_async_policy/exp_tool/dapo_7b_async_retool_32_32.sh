@@ -19,7 +19,7 @@ retool_path=recipe/retool/retool.py
 
 # wandb / tensorboard
 project_name=retool
-experiment_name=qwen2.5-7b_dapo_async_tool_4_4_mbs16_tfs4_reqbatch1
+experiment_name=qwen2.5-7b_dapo_async_tool_32_32_mbs32_tfs4_reqbatch4
 default_local_dir=$DATA_ROOT/checkpoint/$experiment_name
 
 # ================= algorithm =================
@@ -41,7 +41,7 @@ actor_lr=1e-6
 # ================= perfomance =================
 infer_tp=4 # vllm
 train_sp=4 # train
-fsdp_size=4 # train
+fsdp_size=8 # train
 offload=True
 
 actor_max_token_len_per_gpu=$(( (max_prompt_length + max_response_length) * 1 ))
@@ -51,21 +51,20 @@ log_prob_max_token_len_per_gpu=$(( actor_max_token_len_per_gpu * 4 ))
 rollout_name="vllm"
 rollout_mode="async"
 
-NNODES=${NNODES:-1}
+NNODES_ROLLOUT=${NNODES_ROLLOUT:-4}
+NNODES_TRAIN=${NNODES_TRAIN:-4}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
-n_gpus_rollout=4
-n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
 
 train_batch_size=0
 gen_prompt_bsz=1
 n_resp_per_prompt=16
 n_resp_per_prompt_val=30
-ppo_mini_batch_size=16
-total_rollout_steps=$(((64*250)))
+ppo_mini_batch_size=32
+total_rollout_steps=$(((512*400)))
 test_freq=20
 staleness_threshold=0.5
 trigger_parameter_sync_step=4
-require_batches=1
+require_batches=4
 partial_rollout=True
 
 python3 -m recipe.fully_async_policy.fully_async_main \
@@ -126,10 +125,10 @@ python3 -m recipe.fully_async_policy.fully_async_main \
     trainer.save_freq=-1 \
     trainer.default_local_dir=$default_local_dir \
     data.gen_batch_size=${gen_prompt_bsz} \
-    trainer.nnodes=$NNODES \
-    trainer.n_gpus_per_node=$n_gpus_training \
-    rollout.nnodes=$NNODES \
-    rollout.n_gpus_per_node=$n_gpus_rollout \
+    trainer.nnodes=$NNODES_TRAIN \
+    trainer.n_gpus_per_node=$NGPUS_PER_NODE \
+    rollout.nnodes=$NNODES_ROLLOUT \
+    rollout.n_gpus_per_node=$NGPUS_PER_NODE \
     rollout.total_rollout_steps=$total_rollout_steps \
     rollout.total_epochs=10 \
     rollout.test_freq=$test_freq \
