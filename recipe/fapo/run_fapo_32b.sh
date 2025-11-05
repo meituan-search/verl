@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name='FAPO-Reproduce'
-exp_name='FAPO-7B'
+exp_name='FAPO-32B'
 
 adv_estimator=grpo
 
@@ -15,7 +15,7 @@ clip_ratio_low=0.2
 clip_ratio_high=0.28
 
 max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 8))
+max_response_length=$((1024 * 20))
 enable_overlong_buffer=True
 overlong_buffer_len=$((1024 * 4))
 overlong_penalty_factor=1.0
@@ -34,12 +34,11 @@ NNODES=${NNODES:-2}
 RM_NODES=${RM_NODES:-2}
 # Paths
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-# very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen2.5-Math-7B"}
+MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen2.5-32B"}
 GRM_PATH=${GRM_PATH:-"${RAY_DATA_HOME}/models/FAPO-GenRM-4B"}
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k-boxed.parquet"}
-TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/dapo-test-full-boxed.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/fapo-train-boxed.parquet"}
+TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/fapo-test-full-boxed.parquet"}
 
 # Algorithm
 temperature=1.0
@@ -48,13 +47,13 @@ top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_top_p=0.7
 
 # Performance Related Parameter
-sp_size=1
+sp_size=8
 use_dynamic_bsz=True
-actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
-infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3))
+actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
+infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
 offload=True
-gen_tp=1
-fsdp_size=8
+gen_tp=4
+fsdp_size=32
 
 PROJECT_DIR="$(pwd)"
 CONFIG_PATH="$PROJECT_DIR/recipe/fapo/config"
@@ -85,7 +84,6 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     actor_rollout_ref.actor.clip_ratio_c=10.0 \
     actor_rollout_ref.model.use_remove_padding=True \
-    +actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
@@ -127,7 +125,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     reward_model.nnodes="${RM_NODES}" \
     reward_model.model.path=${GRM_PATH} \
     reward_model.rollout.name=sglang \
-    reward_model.rollout.gpu_memory_utilization=0.90 \
+    reward_model.rollout.gpu_memory_utilization=0.95 \
     reward_model.rollout.tensor_model_parallel_size=1 \
     reward_model.rollout.free_cache_engine=False \
     reward_model.reward_manager=dapo \
@@ -147,7 +145,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     trainer.test_freq=10 \
     trainer.save_freq=-1 \
     trainer.total_epochs=10 \
-    trainer.total_training_steps=200 \
+    trainer.total_training_steps=600 \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.resume_mode=auto \
     trainer.log_val_generations=10
