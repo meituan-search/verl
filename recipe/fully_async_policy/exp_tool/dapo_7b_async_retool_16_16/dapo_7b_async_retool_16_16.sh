@@ -14,12 +14,12 @@ train_files="['$dapo_math_17k']"
 test_files="['$aime_2025', '$aime_2024']"
 
 # tool
-tool_config_path=recipe/fully_async_policy/exp_tool/sandbox_fusion_tool_config.yaml
+tool_config_path=recipe/fully_async_policy/exp_tool/dapo_7b_async_retool_16_16/sandbox_fusion_tool_config.yaml
 retool_path=recipe/retool/retool.py
 
 # wandb / tensorboard
 project_name=retool
-experiment_name=qwen2.5-7b_dapo_async_tool_64_64_mbs32_tfs4_reqbatch4
+experiment_name=qwen2.5-7b_dapo_async_tool_16_16_mbs16_tfs4_reqbatch1
 default_local_dir=$DATA_ROOT/checkpoint/$experiment_name
 
 # ================= algorithm =================
@@ -51,23 +51,23 @@ log_prob_max_token_len_per_gpu=$(( actor_max_token_len_per_gpu * 4 ))
 rollout_name="vllm"
 rollout_mode="async"
 
-NNODES_ROLLOUT=${NNODES_ROLLOUT:-8}
-NNODES_TRAIN=${NNODES_TRAIN:-8}
+NNODES_ROLLOUT=${NNODES_ROLLOUT:-2}
+NNODES_TRAIN=${NNODES_TRAIN:-2}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
 train_batch_size=0
 gen_prompt_bsz=1
 n_resp_per_prompt=16
 n_resp_per_prompt_val=30
-ppo_mini_batch_size=32
-total_rollout_steps=$(((512*400)))
+ppo_mini_batch_size=16
+total_rollout_steps=$(((64*250)))
 test_freq=20
 staleness_threshold=0.5
 trigger_parameter_sync_step=4
-require_batches=4
+require_batches=1
 partial_rollout=True
 
-python3 -m recipe.fully_async_policy.fully_async_main \
+python -X faulthandler -m recipe.fully_async_policy.fully_async_main \
     algorithm.adv_estimator=$adv_estimator \
     algorithm.use_kl_in_reward=$use_kl_in_reward \
     algorithm.kl_ctrl.kl_coef=$kl_coef \

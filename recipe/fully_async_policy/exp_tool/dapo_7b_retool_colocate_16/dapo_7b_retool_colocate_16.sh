@@ -14,12 +14,11 @@ train_files="['$dapo_math_17k']"
 test_files="['$aime_2025', '$aime_2024']"
 
 # tool
-tool_config_path=recipe/fully_async_policy/exp_tool/sandbox_fusion_tool_config.yaml
+tool_config_path=recipe/fully_async_policy/exp_tool/dapo_7b_retool_colocate_16/sandbox_fusion_tool_config.yaml
 retool_path=recipe/retool/retool.py
 
 # wandb / tensorboard
-project_name=retool
-experiment_name=qwen2.5-7b_dapo_async_tool_8_8_mbs32_tfs4_reqbatch4
+experiment_name=qwen2.5-7b_dapo_retool_colocate_16_mbs16_tbs64
 default_local_dir=$DATA_ROOT/checkpoint/$experiment_name
 
 # ================= algorithm =================
@@ -38,36 +37,27 @@ max_prompt_length=2048
 max_response_length=16384
 actor_lr=1e-6
 
+train_batch_size=64
+ppo_mini_batch_size=16
+total_training_steps=250
+n_resp_per_prompt=16
+n_resp_per_prompt_val=30
+
+test_freq=20
+
 # ================= perfomance =================
 infer_tp=4 # vllm
 train_sp=4 # train
 fsdp_size=8 # train
 offload=True
 
+nnodes=2
+n_gpus_per_node=8
+
 actor_max_token_len_per_gpu=$(( (max_prompt_length + max_response_length) * 1 ))
 log_prob_max_token_len_per_gpu=$(( actor_max_token_len_per_gpu * 4 ))
 
-# ================= async policy =================
-rollout_name="vllm"
-rollout_mode="async"
-
-NNODES_ROLLOUT=${NNODES_ROLLOUT:-1}
-NNODES_TRAIN=${NNODES_TRAIN:-1}
-NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
-
-train_batch_size=0
-gen_prompt_bsz=1
-n_resp_per_prompt=16
-n_resp_per_prompt_val=30
-ppo_mini_batch_size=32
-total_rollout_steps=$(((512*400)))
-test_freq=20
-staleness_threshold=0.5
-trigger_parameter_sync_step=4
-require_batches=4
-partial_rollout=True
-
-python3 -m recipe.fully_async_policy.fully_async_main \
+python -X faulthandler -m verl.trainer.main_ppo \
     algorithm.adv_estimator=$adv_estimator \
     algorithm.use_kl_in_reward=$use_kl_in_reward \
     algorithm.kl_ctrl.kl_coef=$kl_coef \
@@ -83,7 +73,6 @@ python3 -m recipe.fully_async_policy.fully_async_main \
     data.custom_cls.name=CustomRLHFDataset \
     custom_reward_function.path=$retool_path \
     custom_reward_function.name=compute_score \
-    actor_rollout_ref.hybrid_engine=False \
     actor_rollout_ref.model.path=$model_path \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
@@ -98,8 +87,8 @@ python3 -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$actor_max_token_len_per_gpu \
     actor_rollout_ref.actor.strategy=fsdp2 \
     critic.strategy=fsdp2 \
-    actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=$train_sp \
+    actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
     actor_rollout_ref.actor.fsdp_config.param_offload=$offload \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=$offload \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=$log_prob_max_token_len_per_gpu \
@@ -116,24 +105,15 @@ python3 -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.6 \
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
     actor_rollout_ref.rollout.val_kwargs.n=$n_resp_per_prompt_val \
-    actor_rollout_ref.rollout.calculate_log_probs=True \
     trainer.logger=['console','tensorboard'] \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
+    trainer.n_gpus_per_node=$n_gpus_per_node \
     trainer.val_before_train=True \
     trainer.log_val_generations=20 \
+    trainer.nnodes=$nnodes \
     trainer.save_freq=-1 \
     trainer.default_local_dir=$default_local_dir \
-    data.gen_batch_size=${gen_prompt_bsz} \
-    trainer.nnodes=$NNODES_TRAIN \
-    trainer.n_gpus_per_node=$NGPUS_PER_NODE \
-    rollout.nnodes=$NNODES_ROLLOUT \
-    rollout.n_gpus_per_node=$NGPUS_PER_NODE \
-    rollout.total_rollout_steps=$total_rollout_steps \
-    rollout.total_epochs=10 \
-    rollout.test_freq=$test_freq \
-    async_training.staleness_threshold=$staleness_threshold \
-    async_training.trigger_parameter_sync_step=$trigger_parameter_sync_step \
-    async_training.require_batches=$require_batches \
-    async_training.partial_rollout=$partial_rollout \
-    async_training.use_rollout_log_probs=True
+    trainer.test_freq=$test_freq \
+    trainer.total_training_steps=$total_training_steps \
+    trainer.total_epochs=1 $@

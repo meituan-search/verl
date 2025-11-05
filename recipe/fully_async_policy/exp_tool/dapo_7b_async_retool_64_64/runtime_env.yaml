@@ -1,0 +1,5 @@
+env_vars:
+  VLLM_USE_V1: "1"
+  NCCL_DEBUG: "INFO"
+  HYDRA_FULL_ERROR: "1"
+  TENSORBOARD_DIR: "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/expeirments_qwen2_5_7B_tool/qwen2.5-7b_dapo_async_tool_64_64_mbs32_tfs4_reqbatch4"
