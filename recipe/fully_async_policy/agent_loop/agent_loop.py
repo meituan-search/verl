@@ -22,6 +22,7 @@ import ray
 from omegaconf import DictConfig
 
 from recipe.fully_async_policy.vllm_rollout.vllm_async_server import FullyAsyncvLLMReplica
+from recipe.fully_async_policy.sglang_rollout.sglang_async_server import FullyAsyncSGLangReplica
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopManager,
     AgentLoopOutput,
@@ -161,7 +162,18 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         self.reward_model_manager = None
         self.reward_router_address = None
         self.agent_loop_workers_class = FullyAsyncAgentLoopWorker
-        self.rollout_replica_class = FullyAsyncvLLMReplica
+        
+        # Select rollout replica class based on rollout name
+        rollout_name = config.actor_rollout_ref.rollout.name
+        if rollout_name == "sglang":
+            self.rollout_replica_class = FullyAsyncSGLangReplica
+        elif rollout_name == "vllm":
+            self.rollout_replica_class = FullyAsyncvLLMReplica
+        else:
+            raise ValueError(
+                f"Unsupported rollout name: {rollout_name}. "
+                f"Supported values are 'sglang' and 'vllm'."
+            )
 
         self.rm_wg = rm_wg
         self.rollout_replicas = None
