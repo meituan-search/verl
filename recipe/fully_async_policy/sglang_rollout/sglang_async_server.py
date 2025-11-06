@@ -237,12 +237,6 @@ class SGLangHttpServerForPartial(SGLangHttpServer):
             self.paused = False
 
     async def reset_prefix_cache(self):
-        """Reset prefix cache (equivalent to flush_cache in SGLang).
-        
-        Note:
-            SGLang uses flush_cache() instead of reset_prefix_cache().
-            This method provides compatibility with the vLLM interface.
-        """
         async with self.lock:
             # SGLang uses flush_cache instead of reset_prefix_cache
             await self.tokenizer_manager.flush_cache()
