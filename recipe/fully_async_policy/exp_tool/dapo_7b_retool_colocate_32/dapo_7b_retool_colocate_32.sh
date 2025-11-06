@@ -11,14 +11,14 @@ aime_2024=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhengg
 aime_2025=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/data/yentinglin/aime_2025
 model_path=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/model/checkpoint/multiturn-sft-qwen-2.5-7b-instruct/global_step_372-merged_hf_model
 train_files="['$dapo_math_17k']"
-test_files="['$aime_2025', '$aime_2024']"
+test_files="['$aime_2025']"
 
 # tool
 tool_config_path=recipe/fully_async_policy/exp_tool/dapo_7b_retool_colocate_32/sandbox_fusion_tool_config.yaml
 retool_path=recipe/retool/retool.py
 
 # wandb / tensorboard
-experiment_name=qwen2.5-7b_dapo_retool_colocate_32_mbs16_tbs64
+experiment_name=qwen2.5-7b_dapo_retool_colocate_32_mbs16_tbs64_new
 default_local_dir=$DATA_ROOT/checkpoint/$experiment_name
 
 # ================= algorithm =================
@@ -39,7 +39,7 @@ actor_lr=1e-6
 
 train_batch_size=64
 ppo_mini_batch_size=16
-total_training_steps=400
+total_training_steps=800
 n_resp_per_prompt=16
 n_resp_per_prompt_val=30
 
@@ -116,4 +116,4 @@ python -X faulthandler -m verl.trainer.main_ppo \
     trainer.default_local_dir=$default_local_dir \
     trainer.test_freq=$test_freq \
     trainer.total_training_steps=$total_training_steps \
-    trainer.total_epochs=1 $@
+    trainer.total_epochs=10 $@

@@ -6,21 +6,20 @@ export VLLM_USE_V1=1
 HDFS_ROOT=${HDFS_ROOT:-$PWD}
 DATA_ROOT=${DATA_ROOT:-$PWD}
 
-dapo_math_17k=/mnt/dolphinfs/hdd_pool/docker/user/hadoop-djst-algoplat/wangshulin02/data/BytedTsinghua-SIA/DAPO-Math-17k
-aime_2024=/mnt/dolphinfs/hdd_pool/docker/user/hadoop-djst-algoplat/wangshulin02/data/tmp/Maxwell-Jia/AIME_2024
-aime_2025=/mnt/dolphinfs/hdd_pool/docker/user/hadoop-djst-algoplat/wangshulin02/data/tmp/yentinglin/aime_2025
-model_path=/mnt/dolphinfs/hdd_pool/docker/user/hadoop-djst-algoplat/wangshulin02/model/checkpoint/multiturn-sft-qwen-2.5-7b-instruct/global_step_372-merged_hf_model
+dapo_math_17k=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/data/BytedTsinghua-SIA/DAPO-Math-17k
+aime_2024=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/data/Maxwell-Jia/AIME_2024
+aime_2025=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/data/yentinglin/aime_2025
+model_path=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/model/checkpoint/multiturn-sft-qwen-2.5-7b-instruct/global_step_372-merged_hf_model
 train_files="['$dapo_math_17k']"
-test_files="['$aime_2024']"
+test_files="['$aime_2025']"
 
 # tool
-tool_config_path=/mnt/dolphinfs/hdd_pool/docker/user/hadoop-djst-algoplat/wangshulin02/verl/recipe/fully_async_policy/exp_tool/sandbox_fusion_tool_config.yaml
-retool_path=/mnt/dolphinfs/hdd_pool/docker/user/hadoop-djst-algoplat/wangshulin02/verl/recipe/retool/retool.py
+tool_config_path=recipe/fully_async_policy/exp_tool/dapo_7b_async_retool_24_8_streaming/sandbox_fusion_tool_config.yaml
+retool_path=recipe/retool/retool.py
 
 # wandb / tensorboard
 project_name=retool
-experiment_name=qwen2.5-7b_dapo_async_tool_fixcancel_event
-export TENSORBOARD_DIR=/mnt/dolphinfs/hdd_pool/docker/user/hadoop-djst-algoplat/wangshulin02/verl/outputs/tensorboard_log/$experiment_name
+experiment_name=qwen2.5-7b_dapo_async_tool_24_8_mbs16_tfs4_reqbatch1_streaming_new
 default_local_dir=$DATA_ROOT/checkpoint/$experiment_name
 
 # ================= algorithm =================
@@ -42,7 +41,7 @@ actor_lr=1e-6
 # ================= perfomance =================
 infer_tp=4 # vllm
 train_sp=4 # train
-fsdp_size=4 # train
+fsdp_size=8 # train
 offload=True
 
 actor_max_token_len_per_gpu=$(( (max_prompt_length + max_response_length) * 1 ))
@@ -52,24 +51,23 @@ log_prob_max_token_len_per_gpu=$(( actor_max_token_len_per_gpu * 4 ))
 rollout_name="vllm"
 rollout_mode="async"
 
-NNODES=${NNODES:-1}
+NNODES_ROLLOUT=${NNODES_ROLLOUT:-3}
+NNODES_TRAIN=${NNODES_TRAIN:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
-n_gpus_rollout=4
-n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
 
 train_batch_size=0
-ppo_mini_batch_size=16
 gen_prompt_bsz=1
 n_resp_per_prompt=16
 n_resp_per_prompt_val=30
-total_rollout_steps=$(((64*250)))
-test_freq=10
-staleness_threshold=0.5
+ppo_mini_batch_size=16
+total_rollout_steps=$(((64*800)))
+test_freq=20
+staleness_threshold=0
 trigger_parameter_sync_step=4
 require_batches=1
-partial_rollout=True
+partial_rollout=False
 
-python3 -m recipe.fully_async_policy.fully_async_main \
+python -X faulthandler -m recipe.fully_async_policy.fully_async_main \
     algorithm.adv_estimator=$adv_estimator \
     algorithm.use_kl_in_reward=$use_kl_in_reward \
     algorithm.kl_ctrl.kl_coef=$kl_coef \
@@ -122,15 +120,15 @@ python3 -m recipe.fully_async_policy.fully_async_main \
     trainer.logger=['console','tensorboard'] \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     trainer.log_val_generations=20 \
     trainer.save_freq=-1 \
     trainer.default_local_dir=$default_local_dir \
     data.gen_batch_size=${gen_prompt_bsz} \
-    trainer.nnodes=$NNODES \
-    trainer.n_gpus_per_node=$n_gpus_training \
-    rollout.nnodes=$NNODES \
-    rollout.n_gpus_per_node=$n_gpus_rollout \
+    trainer.nnodes=$NNODES_TRAIN \
+    trainer.n_gpus_per_node=$NGPUS_PER_NODE \
+    rollout.nnodes=$NNODES_ROLLOUT \
+    rollout.n_gpus_per_node=$NGPUS_PER_NODE \
     rollout.total_rollout_steps=$total_rollout_steps \
     rollout.total_epochs=10 \
     rollout.test_freq=$test_freq \

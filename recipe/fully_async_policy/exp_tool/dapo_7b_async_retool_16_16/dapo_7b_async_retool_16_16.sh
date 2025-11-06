@@ -11,7 +11,7 @@ aime_2024=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhengg
 aime_2025=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/data/yentinglin/aime_2025
 model_path=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/model/checkpoint/multiturn-sft-qwen-2.5-7b-instruct/global_step_372-merged_hf_model
 train_files="['$dapo_math_17k']"
-test_files="['$aime_2025', '$aime_2024']"
+test_files="['$aime_2025']"
 
 # tool
 tool_config_path=recipe/fully_async_policy/exp_tool/dapo_7b_async_retool_16_16/sandbox_fusion_tool_config.yaml
@@ -19,7 +19,7 @@ retool_path=recipe/retool/retool.py
 
 # wandb / tensorboard
 project_name=retool
-experiment_name=qwen2.5-7b_dapo_async_tool_16_16_mbs16_tfs4_reqbatch1
+experiment_name=qwen2.5-7b_dapo_async_tool_16_16_mbs16_tfs4_reqbatch1_new
 default_local_dir=$DATA_ROOT/checkpoint/$experiment_name
 
 # ================= algorithm =================
@@ -60,7 +60,7 @@ gen_prompt_bsz=1
 n_resp_per_prompt=16
 n_resp_per_prompt_val=30
 ppo_mini_batch_size=16
-total_rollout_steps=$(((64*250)))
+total_rollout_steps=$(((64*800)))
 test_freq=20
 staleness_threshold=0.5
 trigger_parameter_sync_step=4
