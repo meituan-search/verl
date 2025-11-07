@@ -264,7 +264,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     batch, reward_extra_infos_dict = self._process_batch_common(batch, metrics, timing_raw)
                     self._log_rollout(batch, reward_extra_infos_dict, timing_raw)
 
-                last_val_metrics = self._validate_metrics(is_last_step, last_val_metrics, metrics, timing_raw)
+                last_val_metrics = self._validate_last_metrics(is_last_step, last_val_metrics, metrics, timing_raw)
                 self._check_save_checkpoint(is_last_step, timing_raw)
 
                 with marked_timer("stop_profile", timing_raw):
@@ -487,7 +487,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     dump_path=rollout_data_dir,
                 )
 
-    def _validate_metrics(self, is_last_step, last_val_metrics, metrics, timing_raw):
+    def _validate_last_metrics(self, is_last_step, last_val_metrics, metrics, timing_raw):
         if (
             self.val_reward_fn is not None
             and self.config.trainer.test_freq > 0
