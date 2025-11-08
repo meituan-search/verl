@@ -291,7 +291,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
         # final parameter sync and validate
         if val_data is None or val_data.metrics is None:
-            self._trigger_parameter_sync_after_step(validate=True, global_steps=self.global_steps - 1)
+            self._trigger_parameter_sync_after_step(trigger_validate=True, global_steps=self.global_steps - 1)
             ray.get(self.param_synchronizer.wait_last_valid.remote())
             val_data = self.message_queue_client.get_validate_sync()
             if val_data:
@@ -331,12 +331,12 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 if key.startswith("fully_async"):
                     metrics[key] = value
 
-    def _trigger_parameter_sync_after_step(self, validate: bool = False, global_steps: int = None):
+    def _trigger_parameter_sync_after_step(self, trigger_validate: bool = False, global_steps: int = None):
         """
         Trigger parameter synchronization after training step
         This ensures rollouter always uses the latest trained parameters
         """
-        if self.local_trigger_step < self.trigger_parameter_sync_step and not validate:
+        if self.local_trigger_step < self.trigger_parameter_sync_step and not trigger_validate:
             self.local_trigger_step += 1
             return
 
@@ -349,12 +349,10 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self.progress_bar.update(1)
         self.metrics_aggregator.reset()
         timing_param_sync = {}
-        with marked_timer("timing_s/wait_last_valid", timing_param_sync):
-            ray.get(self.param_synchronizer.wait_last_valid.remote())
         with marked_timer("timing_s/param_sync", timing_param_sync):
             ray.get(
                 self.param_synchronizer.sync_weights.remote(
-                    self.current_param_version, validate=validate, global_steps=global_steps
+                    self.current_param_version, trigger_validate=trigger_validate, global_steps=global_steps
                 )
             )
         self.logger.log(data=timing_param_sync, step=self.current_param_version)

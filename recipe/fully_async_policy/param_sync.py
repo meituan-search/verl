@@ -73,7 +73,7 @@ class ParameterSynchronizer:
             group_name=self.sync_group_name,
         )
 
-    def sync_weights(self, version, validate=False, global_steps=0):
+    def sync_weights(self, version, trigger_validate=False, global_steps=0):
         """Sync weights between trainer and rollouter, and update parameter version"""
         start_time = time.time()
 
@@ -88,18 +88,13 @@ class ParameterSynchronizer:
         # sync weights
         self.actor_wg.sync_rollout_weights()
         ray.get(self.rollout_wg.sync_rollout_weights())
+
+        # Async Update rollout version & validation
+        ray.get(self.rollouter.update_param_version.remote(version, global_steps))
+        ray.get(self.rollouter.resume.remote(self.wait_last_update, trigger_validate))
+
         end_time = time.time()
         print(f"[ParameterSynchronizer] sync_weights success. cost {end_time - start_time:.2f} seconds")
 
-        # Async Update rollout version & validation
-        self.wait_last_update = self.rollouter.update_param_version.remote(version, validate, global_steps)
-        self.wait_last_resume = self.rollouter.resume.remote(self.wait_last_update)
-
-    def wait_last_valid(self):
-        print("[ParameterSynchronizer] Waiting last sync and validate...")
-        start_time = time.time()
-        if self.wait_last_update:
-            ray.get(self.wait_last_update)
-        if self.wait_last_resume:
-            ray.get(self.wait_last_resume)
-        print(f"[ParameterSynchronizer] Wait last validate cost: {time.time() - start_time:.2f} seconds")
+    def wait_validate(self):
+        ray.get(self.rollouter.wait_validate.remote())
