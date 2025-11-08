@@ -73,7 +73,7 @@ class ParameterSynchronizer:
             group_name=self.sync_group_name,
         )
 
-    def sync_weights(self, version, trigger_validate=False, global_steps=0):
+    def sync_weights(self, version, trigger_validate=False):
         """Sync weights between trainer and rollouter, and update parameter version"""
         start_time = time.time()
 
@@ -90,7 +90,7 @@ class ParameterSynchronizer:
         ray.get(self.rollout_wg.sync_rollout_weights())
 
         # Async Update rollout version & validation
-        ray.get(self.rollouter.update_param_version.remote(version, global_steps))
+        ray.get(self.rollouter.update_param_version.remote(version))
         ray.get(self.rollouter.resume.remote(self.wait_last_update, trigger_validate))
 
         end_time = time.time()

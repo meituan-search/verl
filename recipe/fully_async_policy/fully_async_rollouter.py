@@ -163,6 +163,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.result_queue_validate = asyncio.Queue()
         self.cancel_queue_validate = asyncio.Queue()
         self.total_generated_samples_validate = 0
+        self.global_steps_validate = 0
 
     async def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         """Set message queue client"""
@@ -204,7 +205,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
     def get_total_train_steps(self):
         return self.total_train_steps
 
-    async def update_param_version(self, version: int, global_steps: int = 0):
+    async def update_param_version(self, version: int):
         """Update current parameter version"""
         async with self.lock:
             old_version = self.current_param_version
@@ -232,9 +233,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 f",reset staleness_samples to: {self.staleness_samples}"
                 f",idle_ratio: {idle_ratio}"
             )
-            data = ValidateMetrics(
-                timing_raw=timing_raw, metrics=None, global_steps=global_steps, param_version=version
-            )
+            data = ValidateMetrics(timing_raw=timing_raw, metrics=None, param_version=version)
             await self.message_queue_client.put_validate(ray.cloudpickle.dumps(data))
             self.version_start_time = time.time()
 
@@ -326,9 +325,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
         for epoch, batch_dict in continuous_iterator:
             # Similar to _prepare_generate_batch: Separate data
-            full_batch = prepare_single_generation_data(
-                batch_dict, self.global_steps, self.config.actor_rollout_ref.rollout.n
-            )
+            full_batch = prepare_single_generation_data(batch_dict, self.config.actor_rollout_ref.rollout.n)
 
             sample_id = f"sample_{epoch}_{self.global_steps}"
 
@@ -712,13 +709,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             yield 0, batch_dict
 
     async def _feed_samples_validate(self):
-        feed_i = 0
-
         for epoch, batch_dict in self._create_continuous_iterator_validate():
-            full_batch = prepare_single_generation_data(
-                batch_dict, self.global_steps, self.config.actor_rollout_ref.rollout.n
-            )
-            sample_id = f"validate_sample_{epoch}_{self.global_steps}"
+            full_batch = prepare_single_generation_data(batch_dict, self.config.actor_rollout_ref.rollout.val_kwargs.n)
+            sample_id = f"validate_sample_{epoch}_{self.global_steps_validate}"
             rollout_sample = RolloutSample(
                 full_batch=full_batch,
                 agent_loop_output_list=[None] * self.config.actor_rollout_ref.rollout.n,
@@ -731,15 +724,12 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 rollout_status={},
             )
             await self.pending_queue_validate.put(rollout_sample)
-            feed_i += 1
-
-            if feed_i >= 16:
-                break
+            self.global_steps_validate += 1
 
         # End signal
         await self.pending_queue_validate.put("DONE")
         print(
-            f"[FullyAsyncRollouter][Validate][Feed] Sample addition is complete, {self.global_steps} samples have been added"
+            f"[FullyAsyncRollouter][Validate][Feed] Sample addition is complete, {self.global_steps_validate} samples have been added"
         )
 
     async def _processor_worker_validate(self):
@@ -860,7 +850,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     f"Collected {len(queue_samples)} samples"
                 )
                 break
-            # sample = merge_rollout_sample(self.config, self.tokenizer, sample, self.processor)
+            sample = merge_rollout_sample(self.config, self.tokenizer, sample, self.processor)
             self.total_generated_samples_validate += 1
             queue_samples.append(sample)
 
@@ -877,16 +867,13 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         # Assemble batch - now working directly with RolloutSample objects
         test_batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
 
-        print(f"test_batch {test_batch}")
-
         timing_raw = {}
         val_metrics = await self._validate_metrics(test_batch)
 
-        print(f"[Validate] {val_metrics}")
+        print(f"[FullyAsyncRollouter][Validate] {val_metrics}")
         data = ValidateMetrics(
             timing_raw=timing_raw,
             metrics=val_metrics,
-            global_steps=self.global_steps,
             param_version=self.current_param_version,
         )
         await self.message_queue_client.put_validate(ray.cloudpickle.dumps(data))
@@ -903,8 +890,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         sample_scores = []
         sample_turns = []
         sample_uids = []
-
-        print(f"test_batch :{test_batch}")
 
         # we only do validation on rule-based rm
         if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
