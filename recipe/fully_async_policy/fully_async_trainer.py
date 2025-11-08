@@ -352,7 +352,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         with marked_timer("timing_s/param_sync", timing_param_sync):
             ray.get(
                 self.param_synchronizer.sync_weights.remote(
-                    self.current_param_version, trigger_validate=trigger_validate, global_steps=global_steps
+                    self.current_param_version, trigger_validate=trigger_validate
                 )
             )
         self.logger.log(data=timing_param_sync, step=self.current_param_version)
