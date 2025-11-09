@@ -6,10 +6,10 @@ export VLLM_USE_V1=1
 HDFS_ROOT=${HDFS_ROOT:-$PWD}
 DATA_ROOT=${DATA_ROOT:-$PWD}
 
-dapo_math_17k=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/data/BytedTsinghua-SIA/DAPO-Math-17k
-aime_2024=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/data/Maxwell-Jia/AIME_2024
-aime_2025=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/data/yentinglin/aime_2025
-model_path=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/model/checkpoint/multiturn-sft-qwen-2.5-7b-instruct/global_step_372-merged_hf_model
+dapo_math_17k=/cfs_shtx5_serving_3/mlp/training/docker/user/hadoop-ai-search/wangshulin02/data/BytedTsinghua-SIA/DAPO-Math-17k
+aime_2024=/cfs_shtx5_serving_3/mlp/training/docker/user/hadoop-ai-search/wangshulin02/data/Maxwell-Jia/AIME_2024
+aime_2025=/cfs_shtx5_serving_3/mlp/training/docker/user/hadoop-ai-search/wangshulin02/data/yentinglin/aime_2025
+model_path=/cfs_shtx5_serving_3/mlp/training/docker/user/hadoop-ai-search/wangshulin02/model/checkpoint/multiturn-sft-qwen-2.5-7b-instruct
 train_files="['$dapo_math_17k']"
 test_files="['$aime_2025']"
 
@@ -19,7 +19,7 @@ retool_path=recipe/retool/retool.py
 
 # wandb / tensorboard
 project_name=retool
-experiment_name=qwen2.5-7b_dapo_async_tool_16_16_mbs16_tfs4_reqbatch1_new
+experiment_name=qwen2.5-7b_dapo_async_tool_16_16_mbs16_tfs4_reqbatch1_test_tooltime
 default_local_dir=$DATA_ROOT/checkpoint/$experiment_name
 
 # ================= algorithm =================
@@ -60,9 +60,9 @@ gen_prompt_bsz=1
 n_resp_per_prompt=16
 n_resp_per_prompt_val=30
 ppo_mini_batch_size=16
-total_rollout_steps=$(((64*800)))
+total_rollout_steps=$(((64*200)))
 test_freq=20
-staleness_threshold=0.5
+staleness_threshold=1
 trigger_parameter_sync_step=4
 require_batches=1
 partial_rollout=True
@@ -120,7 +120,7 @@ python -X faulthandler -m recipe.fully_async_policy.fully_async_main \
     trainer.logger=['console','tensorboard'] \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.log_val_generations=20 \
     trainer.save_freq=-1 \
     trainer.default_local_dir=$default_local_dir \

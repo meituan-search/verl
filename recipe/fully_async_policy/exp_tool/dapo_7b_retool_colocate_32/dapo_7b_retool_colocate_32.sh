@@ -6,10 +6,10 @@ export VLLM_USE_V1=1
 HDFS_ROOT=${HDFS_ROOT:-$PWD}
 DATA_ROOT=${DATA_ROOT:-$PWD}
 
-dapo_math_17k=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/data/BytedTsinghua-SIA/DAPO-Math-17k
-aime_2024=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/data/Maxwell-Jia/AIME_2024
-aime_2025=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/data/yentinglin/aime_2025
-model_path=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/model/checkpoint/multiturn-sft-qwen-2.5-7b-instruct/global_step_372-merged_hf_model
+dapo_math_17k=/cfs_shtx5_serving_3/mlp/training/docker/user/hadoop-ai-search/wangshulin02/data/BytedTsinghua-SIA/DAPO-Math-17k
+aime_2024=/cfs_shtx5_serving_3/mlp/training/docker/user/hadoop-ai-search/wangshulin02/data/Maxwell-Jia/AIME_2024
+aime_2025=/cfs_shtx5_serving_3/mlp/training/docker/user/hadoop-ai-search/wangshulin02/data/yentinglin/aime_2025
+model_path=/cfs_shtx5_serving_3/mlp/training/docker/user/hadoop-ai-search/wangshulin02/model/checkpoint/multiturn-sft-qwen-2.5-7b-instruct
 train_files="['$dapo_math_17k']"
 test_files="['$aime_2025']"
 
@@ -18,7 +18,7 @@ tool_config_path=recipe/fully_async_policy/exp_tool/dapo_7b_retool_colocate_32/s
 retool_path=recipe/retool/retool.py
 
 # wandb / tensorboard
-experiment_name=qwen2.5-7b_dapo_retool_colocate_32_mbs16_tbs64_new
+experiment_name=qwen2.5-7b_dapo_retool_colocate_32_mbs32_tbs512
 default_local_dir=$DATA_ROOT/checkpoint/$experiment_name
 
 # ================= algorithm =================
@@ -37,9 +37,9 @@ max_prompt_length=2048
 max_response_length=16384
 actor_lr=1e-6
 
-train_batch_size=64
-ppo_mini_batch_size=16
-total_training_steps=800
+train_batch_size=512
+ppo_mini_batch_size=32
+total_training_steps=200
 n_resp_per_prompt=16
 n_resp_per_prompt_val=30
 
