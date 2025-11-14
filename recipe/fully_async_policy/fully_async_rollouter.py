@@ -659,6 +659,12 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 await asyncio.gather(*self.active_tasks, return_exceptions=True)
                 self.active_tasks.clear()
                 print("[FullyAsyncRollouter][Public][Pause] All active tasks completed")
+
+            if self.active_tasks_validate:
+                await asyncio.gather(*self.active_tasks, return_exceptions=True)
+                self.active_tasks.clear()
+                print("[FullyAsyncRollouter][Public][Pause] All validate active tasks completed")
+
             await self.async_rollout_manager.reset_prefix_cache()
             self.monitor_loop_trigger = False
 
