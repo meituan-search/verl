@@ -870,6 +870,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     f"[FullyAsyncRollouter][Validate][Consumer] Detected termination signal (None), stopping sample collection. "
                     f"Collected {len(queue_samples)} samples"
                 )
+                self.result_queue_validate.task_done()  # Mark the None signal as processed
                 break
             sample = merge_rollout_sample(self.config, self.tokenizer, sample, self.processor)
             self.total_generated_samples_validate += 1
@@ -877,6 +878,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
             if len(queue_samples) % 32 == 0:
                 print(f"[FullyAsyncRollouter][Validate][Consumer] Collected {len(queue_samples)} samples. ")
+
+            self.result_queue_validate.task_done()
+
 
         consumer_end = time.time()
         total_wait_time = consumer_end - consumer_start
@@ -898,7 +902,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             param_version=self.current_param_version,
         )
         await self.message_queue_client.put_validate(ray.cloudpickle.dumps(data))
-        self.result_queue_validate.task_done()
 
     async def _validate_metrics(self, test_batch: DataProto):
         data_source_lst = []
@@ -1038,17 +1041,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     self.processor_task_validate.cancel()
                 if self.consumer_task_validate:
                     self.consumer_task_validate.cancel()
-
-                tasks_to_wait = []
-                if self.feed_task_validate:
-                    tasks_to_wait.append(self.feed_task_validate)
-                if self.processor_task_validate:
-                    tasks_to_wait.append(self.processor_task_validate)
-                if self.consumer_task_validate:
-                    tasks_to_wait.append(self.consumer_task_validate)
-
-                if tasks_to_wait:
-                    await asyncio.gather(*tasks_to_wait, return_exceptions=True)
 
                 self.feed_task_validate = None
                 self.processor_task_validate = None
