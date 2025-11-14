@@ -28,7 +28,7 @@ rollout_name="sglang" # sglang or vllm
 #     export VLLM_USE_V1=1
 #     return_raw_chat="True"
 # fi
-
+return_raw_chat="True"
 # Algorithm parameters
 adv_estimator=grpo
 

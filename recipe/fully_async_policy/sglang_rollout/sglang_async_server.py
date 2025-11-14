@@ -21,8 +21,8 @@ from ray.actor import ActorHandle
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.sampling.sampling_params import SamplingParams
 from verl.workers.rollout.sglang_rollout.async_sglang_server import (
-    SGLangHttpServer,
-    SGLangReplica
+    SGLangHttpServerBase,
+    SGLangReplica,
 )
 from verl.workers.config import HFModelConfig, RewardModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode
@@ -31,8 +31,7 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 
-@ray.remote(num_cpus=1)
-class SGLangHttpServerForPartial(SGLangHttpServer):
+class SGLangHttpServerForPartialBase(SGLangHttpServerBase):
     def __init__(
         self,
         config: RolloutConfig | RewardModelConfig,
@@ -41,10 +40,19 @@ class SGLangHttpServerForPartial(SGLangHttpServer):
         workers: list[ActorHandle],
         replica_rank: int,
         node_rank: int,
-        gpus_per_node: int,
         nnodes: int,
+        cuda_visible_devices: str,
     ):
-        super().__init__(config, model_config, rollout_mode, workers, replica_rank, node_rank, gpus_per_node, nnodes)
+        super().__init__(
+            config=config,
+            model_config=model_config,
+            rollout_mode=rollout_mode,
+            workers=workers,
+            replica_rank=replica_rank,
+            node_rank=node_rank,
+            nnodes=nnodes,
+            cuda_visible_devices=cuda_visible_devices,
+        )
 
         # for cancel LLMServer
         self.paused = False
@@ -240,6 +248,31 @@ class SGLangHttpServerForPartial(SGLangHttpServer):
         async with self.lock:
             # SGLang uses flush_cache instead of reset_prefix_cache
             await self.tokenizer_manager.flush_cache()
+
+
+@ray.remote(num_cpus=1)
+class SGLangHttpServerForPartial(SGLangHttpServerForPartialBase):
+    def __init__(
+        self,
+        config: RolloutConfig | RewardModelConfig,
+        model_config: HFModelConfig,
+        rollout_mode: RolloutMode,
+        workers: list[ActorHandle],
+        replica_rank: int,
+        node_rank: int,
+        nnodes: int,
+        cuda_visible_devices: str,
+    ):
+        super().__init__(
+            config=config,
+            model_config=model_config,
+            rollout_mode=rollout_mode,
+            workers=workers,
+            replica_rank=replica_rank,
+            node_rank=node_rank,
+            nnodes=nnodes,
+            cuda_visible_devices=cuda_visible_devices,
+        )
 
 
 class FullyAsyncSGLangReplica(SGLangReplica):
