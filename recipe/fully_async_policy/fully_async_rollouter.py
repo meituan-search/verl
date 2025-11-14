@@ -18,7 +18,6 @@ from pprint import pformat
 
 import numpy as np
 import ray
-from ray import ObjectRef
 
 from recipe.fully_async_policy.detach_utils import (
     RolloutSample,
@@ -142,10 +141,14 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.version_start_time = None
 
         # Concurrency control
-        # Modified by self.pause() or self._should_pause_generation()
-        self.paused = False
         self.running = True
         self.monitor_loop_trigger = True
+
+        # Pause state separation:
+        # - self.global_paused: Controlled by pause()/resume(), stops ALL tasks
+        # - self.conditional_paused: Controlled by _should_pause_generation(), conditional pause
+        self.global_paused = False
+        self.conditional_paused = False
 
         # Initialize async locks directly
         self.lock = asyncio.Lock()
@@ -365,12 +368,12 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         Streaming worker coroutines, a sample is submitted for processing without waiting for batches
         """
         while True:
-            if self.paused or await self._should_pause_generation():
+            # Separate global pause from conditional pause logic
+            self.conditional_paused = await self._should_pause_generation()
+            if self.global_paused or self.conditional_paused:
                 print(
-                    "[FullyAsyncRollouter][Processor] Received pause signal, waiting for remaining tasks to return..."
+                    "[FullyAsyncRollouter][Processor] Received global pause signal, waiting for remaining tasks to return..."
                 )
-                async with self.lock:
-                    self.paused = True
                 while self.active_tasks:
                     async with self.lock:
                         # After acquiring the lock, the number of active_tasks may change, need to be verified again
@@ -382,7 +385,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                                 await task
 
                 async with self.lock:
-                    while self.paused:
+                    while self.global_paused or self.conditional_paused:
                         self.idle_start_time = time.time()
                         await self.condition.wait()
                 continue
@@ -431,7 +434,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             async with self.lock:
                 # After the pause is over, the lock is acquired and it is necessary
                 # to determine whether it is the pause phase, otherwise continue to wait
-                while self.paused:
+                while self.global_paused:
                     await self.condition.wait()
                 await self.safe_create_task(
                     self._process_single_sample_streaming(rollout_sample),
@@ -568,7 +571,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
         # Set the running status flag
         async with self.lock:
-            self.paused = False
+            self.global_paused = False
+            self.conditional_paused = False
             self.running = True
 
         # Create the main asynchronous task
@@ -620,7 +624,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             if self.monitor_loop_trigger:
                 if not await self._should_pause_generation():
                     async with self.lock:
-                        self.paused = False
+                        self.conditional_paused = False  # Only clear conditional pause, not global pause
                         self.condition.notify_all()
 
     async def _should_pause_generation(self) -> bool:
@@ -629,7 +633,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         queue_size = queue_stats["queue_size"]
 
         if queue_size >= self.max_queue_size:
-            if not self.paused:
+            if not self.conditional_paused:
                 print(
                     f"[FullyAsyncRollouter][ShouldPause]  "
                     f"due to full queue: size={queue_size}, max={self.max_queue_size}"
@@ -637,7 +641,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             return True
 
         if self.staleness_samples >= self.max_required_samples:
-            if not self.paused:
+            if not self.conditional_paused:
                 print(
                     "[FullyAsyncRollouter][ShouldPause] "
                     f"due to "
@@ -651,7 +655,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         """pause rollout"""
         print("[FullyAsyncRollouter][Public][Pause]")
         async with self.lock:
-            self.paused = True
+            self.global_paused = True  # Set global pause flag
             # Cancel all rollout tasks
             if self.config.async_training.partial_rollout:
                 await self.async_rollout_manager.cancel()
@@ -661,8 +665,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 print("[FullyAsyncRollouter][Public][Pause] All active tasks completed")
 
             if self.active_tasks_validate:
-                await asyncio.gather(*self.active_tasks, return_exceptions=True)
-                self.active_tasks.clear()
+                await asyncio.gather(*self.active_tasks_validate, return_exceptions=True)
+                self.active_tasks_validate.clear()
                 print("[FullyAsyncRollouter][Public][Pause] All validate active tasks completed")
 
             await self.async_rollout_manager.reset_prefix_cache()
@@ -674,11 +678,12 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             if self.config.async_training.partial_rollout:
                 await self.async_rollout_manager.resume()
 
-            self.paused = False
+            self.global_paused = False
+            self.conditional_paused = False  # Reset both pause states
             self.monitor_loop_trigger = True
             self.condition.notify_all()
 
-        # Async Validate
+        # Async Validate - Avoid lock contention when creating validation tasks
         if (
             self.val_reward_fn is not None
             and self.config.rollout.test_freq > 0
@@ -687,7 +692,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             and not trigger_sync_validate
         ):
             # Create the validate asynchronous task
-            await self.safe_create_task(self._validate_main(), "validate_task", self.validate_task)
+            task_name = f"validate_task_v{self.current_param_version}"
+            await self.safe_create_task(self._validate_main(), task_name, self.validate_task)
 
         elif self.val_reward_fn is not None and trigger_sync_validate:
             await self._validate_main()
@@ -756,9 +762,10 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
     async def _processor_worker_validate(self):
         while True:
-            if self.paused:
+            # Validate tasks only need to handle global pause, not conditional pause
+            if self.global_paused:
                 print(
-                    "[FullyAsyncRollouter][Validate][Processor] Received pause signal, waiting for remaining tasks to return..."
+                    "[FullyAsyncRollouter][Validate][Processor] Received global pause signal, waiting for remaining tasks to return..."
                 )
                 while self.active_tasks_validate:
                     async with self.lock:
@@ -771,7 +778,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                                 await task
 
                 async with self.lock:
-                    while self.paused:
+                    while self.global_paused:
                         await self.condition.wait()
                 continue
 
@@ -820,7 +827,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             async with self.lock:
                 # After the pause is over, the lock is acquired and it is necessary
                 # to determine whether it is the pause phase, otherwise continue to wait
-                while self.paused:
+                while self.global_paused:
                     await self.condition.wait()
                 await self.safe_create_task(
                     self._process_single_sample_streaming_validate(rollout_sample),
@@ -901,7 +908,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         timing_raw = {}
         val_metrics = await self._validate_metrics(test_batch)
 
-        print(f"[FullyAsyncRollouter][Validate] {val_metrics}")
+        print(f"[FullyAsyncRollouter][Validate] step: {self.current_param_version} {val_metrics}")
         data = ValidateMetrics(
             timing_raw=timing_raw,
             metrics=val_metrics,
@@ -1013,13 +1020,13 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
             # Start sample feed coroutine, streaming process coroutine and consumer coroutine
             self.feed_task_validate = await self.safe_create_task(
-                self._feed_samples_validate(), name="feed_task_validate"
+                self._feed_samples_validate(), name=f"feed_task_validate_v{self.current_param_version}"
             )
             self.processor_task_validate = await self.safe_create_task(
-                self._processor_worker_validate(), name="processor_task_validate"
+                self._processor_worker_validate(), name=f"processor_task_validate_v{self.current_param_version}"
             )
             self.consumer_task_validate = await self.safe_create_task(
-                self._consumer_worker_validate(), name="consumer_task_validate"
+                self._consumer_worker_validate(), name=f"consumer_task_validate_v{self.current_param_version}"
             )
 
             exception_occurred = None
