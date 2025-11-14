@@ -1015,8 +1015,11 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             print(
                 f"[FullyAsyncRollouter][Validate] Start async validate, "
                 f"current_param_version {self.current_param_version} "
+                f"current validate task {len(self.validate_task)} "
                 f"maximum concurrent samples: {self.max_concurrent_samples}"
             )
+
+            self.global_steps_validate = 0
 
             # Start sample feed coroutine, streaming process coroutine and consumer coroutine
             self.feed_task_validate = await self.safe_create_task(
