@@ -684,8 +684,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             await self.safe_create_task(self._validate_main(), "validate_task", self.validate_task)
 
         elif self.val_reward_fn is not None and trigger_sync_validate:
-            validate_task = await self.safe_create_task(self._validate_main(), name="validate_task")
-            await validate_task
+            await self._validate_main()
 
     async def get_statistics(self) -> dict:
         queue_stats = self.message_queue_client.get_statistics_sync()
