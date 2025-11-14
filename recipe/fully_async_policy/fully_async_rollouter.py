@@ -157,7 +157,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.result_queue = asyncio.Queue()
         self.cancel_queue = asyncio.Queue()
 
-        self.validate_task = None
+        # All async validate task, execute in a queue
+        self.validate_task = set()
         self.validate_lock = asyncio.Lock()
         self.pending_queue_validate = asyncio.Queue(maxsize=128)
         self.active_tasks_validate = set()
@@ -589,9 +590,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
 
         # wait lask validate task
-        if self.validate_task:
-            await self.validate_task
-            self.validate_task = None
+        await asyncio.gather(*self.validate_task, return_exceptions=True)
 
         print("[FullyAsyncRollouter] Rollouter fit completed")
 
@@ -663,10 +662,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             await self.async_rollout_manager.reset_prefix_cache()
             self.monitor_loop_trigger = False
 
-    async def resume(self, dependency_ref: ObjectRef = None, trigger_validate=False):
-        if dependency_ref is not None:
-            ray.get(dependency_ref)
-
+    async def resume(self, trigger_sync_validate=False):
         print("[FullyAsyncRollouter][Public][Resume]")
         async with self.lock:
             if self.config.async_training.partial_rollout:
@@ -682,9 +678,14 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             and self.config.rollout.test_freq > 0
             and self.current_param_version % self.config.rollout.test_freq == 0
             and self.current_param_version > 0  # don't test here in the initial parameter sync
-        ) or (self.val_reward_fn is not None and trigger_validate):
+            and not trigger_sync_validate
+        ):
             # Create the validate asynchronous task
-            self.validate_task = await self.safe_create_task(self._validate_main(), name="validate_task")
+            await self.safe_create_task(self._validate_main(), "validate_task", self.validate_task)
+
+        elif self.val_reward_fn is not None and trigger_sync_validate:
+            validate_task = await self.safe_create_task(self._validate_main(), name="validate_task")
+            await validate_task
 
     async def get_statistics(self) -> dict:
         queue_stats = self.message_queue_client.get_statistics_sync()
@@ -1057,7 +1058,3 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             # Re-raise the exception after cleanup
             if exception_occurred is not None:
                 raise exception_occurred
-
-    async def wait_validate(self):
-        if self.validate_task:
-            await self.validate_task
