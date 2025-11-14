@@ -290,18 +290,18 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             self.global_steps += 1
 
         # final parameter sync and validate
-        if val_data is None or val_data.metrics is None:
-            self._trigger_parameter_sync_after_step(trigger_validate=True, global_steps=self.global_steps - 1)
-            ray.get(self.param_synchronizer.wait_last_valid.remote())
-            val_data = self.message_queue_client.get_validate_sync()
-            if val_data:
-                val_data: ValidateMetrics = ray.cloudpickle.loads(val_data)
-                if val_data.metrics:
-                    self.logger.log(data=val_data.metrics, step=val_data.param_version)
-                    pprint(f"[FullyAsyncTrainer] Final validation metrics: {val_data.metrics}")
-                self.logger.log(data=val_data.timing_raw, step=val_data.param_version)
-        else:
-            pprint(f"[FullyAsyncTrainer] Final validation metrics: {val_data.metrics}")
+        # if val_data is None or val_data.metrics is None:
+        #     self._trigger_parameter_sync_after_step(trigger_validate=True, global_steps=self.global_steps - 1)
+        #     ray.get(self.param_synchronizer.wait_last_valid.remote())
+        #     val_data = self.message_queue_client.get_validate_sync()
+        #     if val_data:
+        #         val_data: ValidateMetrics = ray.cloudpickle.loads(val_data)
+        #         if val_data.metrics:
+        #             self.logger.log(data=val_data.metrics, step=val_data.param_version)
+        #             pprint(f"[FullyAsyncTrainer] Final validation metrics: {val_data.metrics}")
+        #         self.logger.log(data=val_data.timing_raw, step=val_data.param_version)
+        # else:
+        #     pprint(f"[FullyAsyncTrainer] Final validation metrics: {val_data.metrics}")
         self.progress_bar.close()
 
         self._check_save_checkpoint(True, timing_raw)  # TODO: check checkpoint
