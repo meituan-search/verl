@@ -2,15 +2,6 @@ set -x
 ENGINE=${1:-vllm}
 export CUDA_DEVICE_MAX_CONNECTIONS=1 # For megatron communication/computation overlapping
 
-
-# dependency: vllm>=0.11.0, megatron-lm>=0.13, mbridge with qwen3vl_cp branch
-# environment option1: use a stable container later than docker://verlai/verl:vllm011.dev6 
-    # and install mbridge in it by following the instruction in the container
-            # pip remove mbridge if you have installed it
-            # pip install git+https://github.com/ISEEKYAN/mbridge.git@qwen3vl_cp # for correct mbridge
-# environment option2: use container docker://verlai/verl:vllm011.dev_qwenvl_cp
- 
-
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0 # for vllm0.11.0 with TP
 
 
@@ -79,6 +70,9 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.gradient_accumulation_fusion=True \
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_permute_fusion=True \
+    # Use aux_loss and z_loss to mitigate expert load imbalance when training MoE models
+    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_aux_loss_coeff=0.01 \
+    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_z_loss_coeff=0.001 \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
