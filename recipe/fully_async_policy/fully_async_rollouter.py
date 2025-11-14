@@ -477,6 +477,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             rollout_sample = await self.result_queue.get()
 
             if rollout_sample is None:
+                self.result_queue.task_done()
                 break
 
             rollout_sample = merge_rollout_sample(self.config, self.tokenizer, rollout_sample, self.processor)
@@ -526,6 +527,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             exception_occurred = e
 
         finally:
+            print(f"[FullyAsyncRollouter] Clear Resource")
             if self.feed_task:
                 self.feed_task.cancel()
             if self.processor_task:
@@ -667,7 +669,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
         print("[FullyAsyncRollouter][Public][Resume]")
         async with self.lock:
-
             if self.config.async_training.partial_rollout:
                 await self.async_rollout_manager.resume()
 
@@ -881,7 +882,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
             self.result_queue_validate.task_done()
 
-
         consumer_end = time.time()
         total_wait_time = consumer_end - consumer_start
 
@@ -997,7 +997,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         return metric_dict
 
     async def _validate_main(self):
-
         # Only one validate task is allowed to execute at a time.
         async with self.validate_lock:
             print(
@@ -1007,7 +1006,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             )
 
             # Start sample feed coroutine, streaming process coroutine and consumer coroutine
-            self.feed_task_validate = await self.safe_create_task(self._feed_samples_validate(), name="feed_task_validate")
+            self.feed_task_validate = await self.safe_create_task(
+                self._feed_samples_validate(), name="feed_task_validate"
+            )
             self.processor_task_validate = await self.safe_create_task(
                 self._processor_worker_validate(), name="processor_task_validate"
             )
@@ -1041,6 +1042,13 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     self.processor_task_validate.cancel()
                 if self.consumer_task_validate:
                     self.consumer_task_validate.cancel()
+
+                await asyncio.gather(
+                    self.feed_task_validate,
+                    self.processor_task_validate,
+                    self.consumer_task_validate,
+                    return_exceptions=True,
+                )
 
                 self.feed_task_validate = None
                 self.processor_task_validate = None

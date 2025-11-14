@@ -366,7 +366,7 @@ class MetricsAggregator:
     """Metrics aggregator, used to combine metrics from multiple training steps"""
 
     def __init__(self, total_gpus: int):
-        # Store all values ​​for each metric
+        # Store all values for each metric
         self.metric_values: dict[str, list[float]] = defaultdict(list)
         # Store the number of samples at each step for weighted averaging
         self.sample_counts: list[int] = []
