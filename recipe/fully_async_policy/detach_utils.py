@@ -183,11 +183,10 @@ class ValidateMetrics:
 
     timing_raw: dict[str, Any]
     metrics: Optional[dict[str, Any]] = None
-    global_steps: Optional[int] = None
     param_version: Optional[int] = None
 
 
-def prepare_single_generation_data(batch_dict, global_steps, rollout_n) -> DataProto:
+def prepare_single_generation_data(batch_dict, rollout_n) -> DataProto:
     """
     Similar to the logic of ray_trainer._prepare_generate_batch, but for a single sample.
     Separate the data used for generation from the original data.
@@ -367,7 +366,7 @@ class MetricsAggregator:
     """Metrics aggregator, used to combine metrics from multiple training steps"""
 
     def __init__(self, total_gpus: int):
-        # Store all values ​​for each metric
+        # Store all values for each metric
         self.metric_values: dict[str, list[float]] = defaultdict(list)
         # Store the number of samples at each step for weighted averaging
         self.sample_counts: list[int] = []

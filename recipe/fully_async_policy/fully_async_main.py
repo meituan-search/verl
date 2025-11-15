@@ -210,8 +210,7 @@ class FullyAsyncTaskRunner:
         # load checkpoint and sync parameter before doing anything
         val_before_train = val_reward_fn is not None and config.trainer.get("val_before_train", True)
         ray.get(self.components["trainer"].load_checkpoint.remote())
-        ray.get(param_synchronizer.sync_weights.remote(version=0, validate=val_before_train))
-        ray.get(param_synchronizer.wait_last_valid.remote())
+        ray.get(param_synchronizer.sync_weights.remote(version=0, trigger_sync_validate=val_before_train))
 
         self.components["param_synchronizer"] = param_synchronizer
         print("[ASYNC MAIN] All components initialized successfully")
@@ -266,32 +265,36 @@ class FullyAsyncTaskRunner:
         trainer_future = self.components["trainer"].fit.remote()
 
         futures = [rollouter_future, trainer_future]
+        ray.get(futures)
 
-        try:
-            while futures:
-                # Use ray.wait to monitor all futures and return when any one is completed.
-                done_futures, remaining_futures = ray.wait(futures, num_returns=1, timeout=None)
-
-                for future in done_futures:
-                    try:
-                        ray.get(future)
-                        print("[ASYNC MAIN] One component completed successfully")
-                    except Exception as e:
-                        print(f"[ASYNC MAIN] Component failed with error: {e}")
-                        for remaining_future in remaining_futures:
-                            ray.cancel(remaining_future)
-                        raise e
-
-                futures = remaining_futures
-
-        except Exception as e:
-            print(f"[ASYNC MAIN] Training failed: {e}")
-            for future in futures:
-                ray.cancel(future)
-            raise
-        finally:
-            self.components["message_queue_client"].clear_queue()
-            print("[ASYNC MAIN] Training completed or interrupted")
+        self.components["message_queue_client"].clear_queue()
+        print("[ASYNC MAIN] Training completed or interrupted")
+        #
+        # try:
+        #     while futures:
+        #         # Use ray.wait to monitor all futures and return when any one is completed.
+        #         done_futures, remaining_futures = ray.wait(futures, num_returns=1, timeout=None)
+        #
+        #         for future in done_futures:
+        #             try:
+        #                 ray.get(future)
+        #                 print("[ASYNC MAIN] One component completed successfully")
+        #             except Exception as e:
+        #                 print(f"[ASYNC MAIN] Component failed with error: {e}")
+        #                 for remaining_future in remaining_futures:
+        #                     ray.cancel(remaining_future)
+        #                 raise e
+        #
+        #         futures = remaining_futures
+        #
+        # except Exception as e:
+        #     print(f"[ASYNC MAIN] Training failed: {e}")
+        #     for future in futures:
+        #         ray.cancel(future)
+        #     raise
+        # finally:
+        #     self.components["message_queue_client"].clear_queue()
+        #     print("[ASYNC MAIN] Training completed or interrupted")
 
 
 @hydra.main(config_path="config", config_name="fully_async_ppo_trainer", version_base=None)

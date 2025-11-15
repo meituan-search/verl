@@ -276,7 +276,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 f"trigger_parameter_sync_step: {self.trigger_parameter_sync_step} "
                 f"{time_str}"
             )
-            self._trigger_parameter_sync_after_step(global_steps=self.global_steps)
+            self._trigger_parameter_sync_after_step()
             val_data = self.message_queue_client.get_validate_sync()
             if val_data:
                 val_data: ValidateMetrics = ray.cloudpickle.loads(val_data)
@@ -289,19 +289,49 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 self.logger.log(data=val_data.timing_raw, step=val_data.param_version)
             self.global_steps += 1
 
-        # final parameter sync and validate
+        # final validate on sync mode
         if val_data is None or val_data.metrics is None:
-            self._trigger_parameter_sync_after_step(validate=True, global_steps=self.global_steps - 1)
-            ray.get(self.param_synchronizer.wait_last_valid.remote())
-            val_data = self.message_queue_client.get_validate_sync()
-            if val_data:
-                val_data: ValidateMetrics = ray.cloudpickle.loads(val_data)
-                if val_data.metrics:
-                    self.logger.log(data=val_data.metrics, step=val_data.param_version)
-                    pprint(f"[FullyAsyncTrainer] Final validation metrics: {val_data.metrics}")
-                self.logger.log(data=val_data.timing_raw, step=val_data.param_version)
+            self._trigger_parameter_sync_after_step(trigger_sync_validate=True)
+            # Loop to wait for validation metrics
+            max_wait_time = 600  # 10 minutes timeout
+            start_time = time.time()
+
+            while True:
+                val_data = self.message_queue_client.get_validate_sync()
+                if val_data:
+                    val_data: ValidateMetrics = ray.cloudpickle.loads(val_data)
+                    if val_data.metrics:
+                        print(
+                            f"[FullyAsyncTrainer] Final validation metrics received after {time.time() - start_time:.1f}s"
+                        )
+                        pprint(f"[FullyAsyncTrainer] Final validation metrics: {val_data.metrics}")
+                        self.logger.log(data=val_data.metrics, step=val_data.param_version)
+                        self.logger.log(data=val_data.timing_raw, step=val_data.param_version)
+                        break
+                    else:
+                        print(f"[FullyAsyncTrainer] Received validation data but no metrics, waiting...")
+
+                # Check timeout
+                if time.time() - start_time > max_wait_time:
+                    print(f"[FullyAsyncTrainer] Timeout waiting for final validation metrics after {max_wait_time}s")
+                    break
+                time.sleep(10)
+                print(
+                    f"[FullyAsyncTrainer] Still waiting for validation metrics... (elapsed: {time.time() - start_time:.1f}s)"
+                )
         else:
             pprint(f"[FullyAsyncTrainer] Final validation metrics: {val_data.metrics}")
+
+        #     self._trigger_parameter_sync_after_step(trigger_sync_validate=True)
+        #     val_data = self.message_queue_client.get_validate_sync()
+        #     if val_data:
+        #         val_data: ValidateMetrics = ray.cloudpickle.loads(val_data)
+        #         if val_data.metrics:
+        #             self.logger.log(data=val_data.metrics, step=val_data.param_version)
+        #             pprint(f"[FullyAsyncTrainer] Final validation metrics: {val_data.metrics}")
+        #         self.logger.log(data=val_data.timing_raw, step=val_data.param_version)
+        # else:
+        #     pprint(f"[FullyAsyncTrainer] Final validation metrics: {val_data.metrics}")
         self.progress_bar.close()
 
         self._check_save_checkpoint(True, timing_raw)  # TODO: check checkpoint
@@ -331,12 +361,12 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 if key.startswith("fully_async"):
                     metrics[key] = value
 
-    def _trigger_parameter_sync_after_step(self, validate: bool = False, global_steps: int = None):
+    def _trigger_parameter_sync_after_step(self, trigger_sync_validate: bool = False):
         """
         Trigger parameter synchronization after training step
         This ensures rollouter always uses the latest trained parameters
         """
-        if self.local_trigger_step < self.trigger_parameter_sync_step and not validate:
+        if self.local_trigger_step < self.trigger_parameter_sync_step and not trigger_sync_validate:
             self.local_trigger_step += 1
             return
 
@@ -349,12 +379,10 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self.progress_bar.update(1)
         self.metrics_aggregator.reset()
         timing_param_sync = {}
-        with marked_timer("timing_s/wait_last_valid", timing_param_sync):
-            ray.get(self.param_synchronizer.wait_last_valid.remote())
         with marked_timer("timing_s/param_sync", timing_param_sync):
             ray.get(
                 self.param_synchronizer.sync_weights.remote(
-                    self.current_param_version, validate=validate, global_steps=global_steps
+                    self.current_param_version, trigger_sync_validate=trigger_sync_validate
                 )
             )
         self.logger.log(data=timing_param_sync, step=self.current_param_version)
