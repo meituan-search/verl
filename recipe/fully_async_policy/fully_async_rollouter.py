@@ -390,12 +390,13 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                         await self.condition.wait()
                 continue
 
-            simple_from_cancel_queue = False
+            # Get sample from appropriate queue and immediately mark task as done
             if not self.cancel_queue.empty():
                 rollout_sample = await self.cancel_queue.get()
-                simple_from_cancel_queue = True
+                self.cancel_queue.task_done()  # We do not use join for control，immediately mark as done
             else:
                 rollout_sample = await self.pending_queue.get()
+                self.pending_queue.task_done()
                 self.staleness_samples += 1
 
             if rollout_sample is None:
@@ -411,14 +412,20 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                             for task in done_tasks:
                                 await task
 
-                # all task success
-                await self.result_queue.put(None)
-
-                if simple_from_cancel_queue:
-                    self.cancel_queue.task_done()
+                # Check if there are cancelled samples to process
+                if not self.cancel_queue.empty():
+                    print(
+                        f"[FullyAsyncRollouter][Processor] "
+                        f"Found {self.cancel_queue.qsize()} cancelled samples, continuing processing..."
+                    )
+                    # Put None back to pending_queue to continue processing later
+                    await self.pending_queue.put(None)
+                    await asyncio.sleep(1)
+                    continue  # Continue processing cancelled samples
                 else:
-                    self.pending_queue.task_done()
-                break
+                    # all task success
+                    await self.result_queue.put(None)
+                    break
 
             # Check whether the number of concurrent tasks exceeds the limit
             while len(self.active_tasks) >= self.max_concurrent_samples:
@@ -442,10 +449,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     task_set=self.active_tasks,
                 )
 
-            if simple_from_cancel_queue:
-                self.cancel_queue.task_done()
-            else:
-                self.pending_queue.task_done()
 
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
@@ -479,9 +482,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         """
         while True:
             rollout_sample = await self.result_queue.get()
+            self.result_queue.task_done()
 
             if rollout_sample is None:
-                self.result_queue.task_done()
                 break
 
             rollout_sample = merge_rollout_sample(self.config, self.tokenizer, rollout_sample, self.processor)
@@ -496,7 +499,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             else:
                 self.dropped_stale_samples += 1
 
-            self.result_queue.task_done()
 
     async def _streaming_generation_main(self):
         """The main entry method for stream processing"""
@@ -782,12 +784,13 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                         await self.condition.wait()
                 continue
 
-            simple_from_cancel_queue = False
+            # Get sample from appropriate queue and immediately mark task as done
             if not self.cancel_queue_validate.empty():
                 rollout_sample = await self.cancel_queue_validate.get()
-                simple_from_cancel_queue = True
+                self.cancel_queue_validate.task_done()
             else:
                 rollout_sample = await self.pending_queue_validate.get()
+                self.pending_queue_validate.task_done()
 
             if rollout_sample is None:
                 print(
@@ -803,15 +806,20 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                             for task in done_tasks:
                                 await task
 
-                # all task success
-                await self.result_queue_validate.put(None)
-
-                if simple_from_cancel_queue:
-                    self.cancel_queue_validate.task_done()
+                # Check if there are cancelled samples to process
+                if not self.cancel_queue_validate.empty():
+                    print(
+                        f"[FullyAsyncRollouter][Validate][Processor] "
+                        f"Found {self.cancel_queue_validate.qsize()} cancelled samples, continuing processing..."
+                    )
+                    # Put None back to pending_queue to continue processing later
+                    await self.pending_queue_validate.put(None)
+                    await asyncio.sleep(1)
+                    continue  # Continue processing cancelled samples
                 else:
-                    self.pending_queue_validate.task_done()
-
-                break
+                    # all task success
+                    await self.result_queue_validate.put(None)
+                    break
 
             # Check whether the number of concurrent tasks exceeds the limit
             while len(self.active_tasks_validate) + len(self.active_tasks) >= self.max_concurrent_samples:
@@ -834,11 +842,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     name=rollout_sample.sample_id,
                     task_set=self.active_tasks_validate,
                 )
-
-            if simple_from_cancel_queue:
-                self.cancel_queue_validate.task_done()
-            else:
-                self.pending_queue_validate.task_done()
 
     async def _process_single_sample_streaming_validate(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
@@ -879,12 +882,12 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         while True:
             # Get a single sample and wait until there is a sample or None is received
             sample = await self.result_queue_validate.get()
+            self.result_queue_validate.task_done()
             if sample is None:
                 print(
                     f"[FullyAsyncRollouter][Validate][Consumer] Detected termination signal (None), stopping sample collection. "
                     f"Collected {len(queue_samples)} samples"
                 )
-                self.result_queue_validate.task_done()  # Mark the None signal as processed
                 break
             sample = merge_rollout_sample(self.config, self.tokenizer, sample, self.processor)
             self.total_generated_samples_validate += 1
@@ -893,7 +896,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             if len(queue_samples) % 32 == 0:
                 print(f"[FullyAsyncRollouter][Validate][Consumer] Collected {len(queue_samples)} samples. ")
 
-            self.result_queue_validate.task_done()
 
         consumer_end = time.time()
         total_wait_time = consumer_end - consumer_start
