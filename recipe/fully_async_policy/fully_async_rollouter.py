@@ -517,7 +517,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
             # Check consumer task concurrency limit and wait if necessary
             while len(self.consumer_active_tasks) >= self.max_consumer_concurrency:
-                if self.active_tasks:
+                if self.consumer_active_tasks:
                     done_tasks, self.consumer_active_tasks = await asyncio.wait(
                         self.consumer_active_tasks, return_when=asyncio.FIRST_COMPLETED
                     )
