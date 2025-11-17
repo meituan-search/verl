@@ -170,6 +170,11 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.total_generated_samples_validate = 0
         self.global_steps_validate = 0
 
+        # Consumer task concurrency control
+        self.max_consumer_concurrency = 32
+        self.consumer_active_tasks = set()
+        self.consumer_lock = asyncio.Lock()
+
     async def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         """Set message queue client"""
         async with self.lock:
@@ -475,10 +480,33 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             rollout_sample.rollout_status = await self.get_statistics()
             await self.result_queue.put(rollout_sample)
 
+    async def _merge_rollout_sample_task(self, rollout_sample: RolloutSample):
+        """Async task for processing a single rollout sample"""
+        try:
+            # Run merge_rollout_sample synchronously in the task
+            processed_sample = merge_rollout_sample(self.config, self.tokenizer, rollout_sample, self.processor)
+
+            # Put RolloutSample into the message queue
+            success = await self.message_queue_client.put_sample(
+                sample=ray.cloudpickle.dumps(processed_sample),
+                param_version=processed_sample.param_version,
+            )
+
+            async with self.consumer_lock:
+                if success:
+                    self.total_generated_samples += 1
+                else:
+                    self.dropped_stale_samples += 1
+
+        except Exception as e:
+            print(f"[FullyAsyncRollouter][ConsumerTask] Error processing sample {rollout_sample.sample_id}: {e}")
+            # Clean up from active tasks when done
+
     async def _consumer_worker(self):
         """
         The consumer coroutine is responsible for obtaining the processing results
         from the result queue and putting them into the message queue
+        Uses concurrent tasks to process merge_rollout_sample with max concurrency of 32
         """
         while True:
             rollout_sample = await self.result_queue.get()
@@ -487,18 +515,20 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             if rollout_sample is None:
                 break
 
-            rollout_sample = merge_rollout_sample(self.config, self.tokenizer, rollout_sample, self.processor)
+            # Check consumer task concurrency limit and wait if necessary
+            while len(self.consumer_active_tasks) >= self.max_consumer_concurrency:
+                if self.active_tasks:
+                    done_tasks, self.consumer_active_tasks = await asyncio.wait(
+                        self.consumer_active_tasks, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for task in done_tasks:
+                        await task
 
-            # Put RolloutSample into the message queue
-            success = await self.message_queue_client.put_sample(
-                sample=ray.cloudpickle.dumps(rollout_sample),
-                param_version=rollout_sample.param_version,
+            await self.safe_create_task(
+                self._merge_rollout_sample_task(rollout_sample),
+                name=f"consumer_task_{rollout_sample.sample_id}",
+                task_set=self.consumer_active_tasks,
             )
-            if success:
-                self.total_generated_samples += 1
-            else:
-                self.dropped_stale_samples += 1
-
 
     async def _streaming_generation_main(self):
         """The main entry method for stream processing"""
@@ -710,6 +740,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             "monitor/queue/cancel_queue_size": self.cancel_queue.qsize(),
             "monitor/queue/result_queue_size": self.result_queue.qsize(),
             "monitor/queue/mq_queue_size": queue_stats["queue_size"],
+            # consumer task stats
+            "monitor/consumer/active_tasks_size": len(self.consumer_active_tasks),
             # counting stats
             "count/current_param_version": self.current_param_version,
             "count/total_generated_samples": self.total_generated_samples,
