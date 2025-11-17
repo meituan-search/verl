@@ -171,7 +171,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.global_steps_validate = 0
 
         # Consumer task concurrency control
-        self.max_consumer_concurrency = 32
+        self.max_consumer_concurrency = 64
         self.consumer_active_tasks = set()
         self.consumer_lock = asyncio.Lock()
 
@@ -640,6 +640,10 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         stats_interval = 60.0
         check_interval = 10.0
 
+        # Use a deque with max length 10 to store result queue sizes
+        from collections import deque
+        result_queue_size_list = deque(maxlen=10)
+
         while True:
             async with self.lock:
                 if not self.running:
@@ -651,6 +655,15 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 stats = await self.get_statistics()
                 print(f"[FullyAsyncRollouter][MonitorLoop][Statistics] {pformat(stats)}")
                 last_stats_time = current_time
+
+                # Automatically scale the execution concurrency of consumer_worker
+                result_queue_size_list.append(stats['monitor/queue/result_queue_size'])
+                # Calculate mean only when we have enough data
+                if len(result_queue_size_list) >= 10:
+                    mean_result = sum(result_queue_size_list) / len(result_queue_size_list)
+                    if mean_result > 128:
+                        self.max_consumer_concurrency = min(int(self.max_consumer_concurrency * 1.1), 128)
+                        print(f"[FullyAsyncRollouter][MonitorLoop] Increased max_consumer_concurrency to {self.max_consumer_concurrency}")
 
             # Trigger rollout recovery
             if self.monitor_loop_trigger:

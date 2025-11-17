@@ -258,20 +258,24 @@ def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
     # Step 2: Add uid
     rs.full_batch.non_tensor_batch["uid"] = np.array([f"uid_{rs.sample_id}"] * len(rs.full_batch), dtype=object)
 
-    # Step 2: Merge batches
+    # Step 3: Add epoch
+    rs.full_batch.non_tensor_batch["epoch"] = np.array([rs.epoch] * len(rs.full_batch), dtype=int)
+
+    # Step 4: Merge batches
     # Merge the non_tensor_batch and meta_info of original_batch into final_batch
     for key, value in rs.full_batch.non_tensor_batch.items():
         gen_batch_output.non_tensor_batch[key] = value
     gen_batch_output.meta_info.update(rs.full_batch.meta_info)
 
-    # Step 3, set full_batch
+    # Step 5, set full_batch
     rs.full_batch = gen_batch_output
     rs.processing_times = []
     for agent_loop in rs.agent_loop_output_list:
         rs.processing_times.append(agent_loop.metrics.generate_sequences)
     rs.param_version_start = [agent_loop.param_version_start for agent_loop in rs.agent_loop_output_list]
     rs.param_version_end = [agent_loop.param_version_end for agent_loop in rs.agent_loop_output_list]
-    # Step 4, clear agent_loop_output_list
+
+    # Step 6, clear agent_loop_output_list
     rs.agent_loop_output_list = []
     return rs
 

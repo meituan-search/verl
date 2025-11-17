@@ -168,7 +168,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
         print(
             f"[FullyAsyncTrainer] Loop collection completed: {len(queue_samples)}/{self.required_samples} samples, "
-            f"total wait time: {total_wait_time:.2f} seconds."
+            f"total wait time: {total_wait_time:.2f} seconds. "
             f"mq_len: {queue_len}"
         )
 
