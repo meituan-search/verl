@@ -25,6 +25,7 @@ from recipe.fully_async_policy.detach_utils import (
     merge_rollout_sample,
     prepare_single_generation_data,
     assemble_batch_from_rollout_samples,
+    safe_create_task,
 )
 from recipe.fully_async_policy.message_queue import MessageQueueClient
 from recipe.fully_async_policy.ray_trainer import FullyAsyncRayPPOTrainer
@@ -253,33 +254,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             raise ValueError("[FullyAsyncRollouter] Missing async_training configuration")
         assert self.config.actor_rollout_ref.rollout.calculate_log_probs, "must rollout calculate log_probs"
 
-    def _task_exception_handler(self, task: asyncio.Task):
-        """Handle task exceptions and log them"""
-        try:
-            task.result()
-        except asyncio.CancelledError:
-            pass  # Task was cancelled, this is expected
-        except Exception as e:
-            print(f"[FullyAsyncRollouter] Task {task.get_name()} failed with exception: {e}")
-            raise e
-
-    async def safe_create_task(self, coro, name: str, task_set: set = None):
-        """Safely create a task with exception handling
-
-        Args:
-            coro: The coroutine to run
-            name: Name for the task
-            task_set: Optional set to add the task to
-
-        Returns:
-            The created asyncio.Task
-        """
-        task = asyncio.create_task(coro, name=name)
-        task.add_done_callback(self._task_exception_handler)
-        if task_set is not None:
-            task_set.add(task)
-        return task
-
     async def init_workers(self):
         """Initialize distributed training workers using Ray backend.
 
@@ -448,12 +422,11 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 # to determine whether it is the pause phase, otherwise continue to wait
                 while self.global_paused:
                     await self.condition.wait()
-                await self.safe_create_task(
+                await safe_create_task(
                     self._process_single_sample_streaming(rollout_sample),
                     name=rollout_sample.sample_id,
                     task_set=self.active_tasks,
                 )
-
 
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
@@ -524,7 +497,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     for task in done_tasks:
                         await task
 
-            await self.safe_create_task(
+            await safe_create_task(
                 self._merge_rollout_sample_task(rollout_sample),
                 name=f"consumer_task_{rollout_sample.sample_id}",
                 task_set=self.consumer_active_tasks,
@@ -540,9 +513,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         print(f"[FullyAsyncRollouter] Start streaming mode, maximum concurrent samples: {self.max_concurrent_samples}")
 
         # Start sample feed coroutine, streaming process coroutine and consumer coroutine
-        self.feed_task = await self.safe_create_task(self._feed_samples(), name="feed_task")
-        self.processor_task = await self.safe_create_task(self._processor_worker(), name="processor_task")
-        self.consumer_task = await self.safe_create_task(self._consumer_worker(), name="consumer_task")
+        self.feed_task = await safe_create_task(self._feed_samples(), name="feed_task")
+        self.processor_task = await safe_create_task(self._processor_worker(), name="processor_task")
+        self.consumer_task = await safe_create_task(self._consumer_worker(), name="consumer_task")
 
         exception_occurred = None
 
@@ -608,8 +581,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             self.running = True
 
         # Create the main asynchronous task
-        generation_task = await self.safe_create_task(self._streaming_generation_main(), name="generation_task")
-        monitor_task = await self.safe_create_task(self._async_monitor_loop(), name="monitor_task")
+        generation_task = await safe_create_task(self._streaming_generation_main(), name="generation_task")
+        monitor_task = await safe_create_task(self._async_monitor_loop(), name="monitor_task")
 
         try:
             # Run build and monitoring tasks concurrently
@@ -642,6 +615,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
         # Use a deque with max length 10 to store result queue sizes
         from collections import deque
+
         result_queue_size_list = deque(maxlen=10)
 
         while True:
@@ -657,13 +631,15 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 last_stats_time = current_time
 
                 # Automatically scale the execution concurrency of consumer_worker
-                result_queue_size_list.append(stats['monitor/queue/result_queue_size'])
+                result_queue_size_list.append(stats["monitor/queue/result_queue_size"])
                 # Calculate mean only when we have enough data
                 if len(result_queue_size_list) >= 10:
                     mean_result = sum(result_queue_size_list) / len(result_queue_size_list)
                     if mean_result > 128:
                         self.max_consumer_concurrency = min(int(self.max_consumer_concurrency * 1.1), 128)
-                        print(f"[FullyAsyncRollouter][MonitorLoop] Increased max_consumer_concurrency to {self.max_consumer_concurrency}")
+                        print(
+                            f"[FullyAsyncRollouter][MonitorLoop] Increased max_consumer_concurrency to {self.max_consumer_concurrency}"
+                        )
 
             # Trigger rollout recovery
             if self.monitor_loop_trigger:
@@ -738,7 +714,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         ):
             # Create the validate asynchronous task
             task_name = f"validate_task_v{self.current_param_version}"
-            await self.safe_create_task(self._validate_main(), task_name, self.validate_task)
+            await safe_create_task(self._validate_main(), task_name, self.validate_task)
 
         elif self.val_reward_fn is not None and trigger_sync_validate:
             await self._validate_main()
@@ -882,7 +858,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 # to determine whether it is the pause phase, otherwise continue to wait
                 while self.global_paused:
                     await self.condition.wait()
-                await self.safe_create_task(
+                await safe_create_task(
                     self._process_single_sample_streaming_validate(rollout_sample),
                     name=rollout_sample.sample_id,
                     task_set=self.active_tasks_validate,
@@ -940,7 +916,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
             if len(queue_samples) % 32 == 0:
                 print(f"[FullyAsyncRollouter][Validate][Consumer] Collected {len(queue_samples)} samples. ")
-
 
         consumer_end = time.time()
         total_wait_time = consumer_end - consumer_start
@@ -1069,13 +1044,13 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             self.global_steps_validate = 0
 
             # Start sample feed coroutine, streaming process coroutine and consumer coroutine
-            self.feed_task_validate = await self.safe_create_task(
+            self.feed_task_validate = await safe_create_task(
                 self._feed_samples_validate(), name=f"feed_task_validate_v{self.current_param_version}"
             )
-            self.processor_task_validate = await self.safe_create_task(
+            self.processor_task_validate = await safe_create_task(
                 self._processor_worker_validate(), name=f"processor_task_validate_v{self.current_param_version}"
             )
-            self.consumer_task_validate = await self.safe_create_task(
+            self.consumer_task_validate = await safe_create_task(
                 self._consumer_worker_validate(), name=f"consumer_task_validate_v{self.current_param_version}"
             )
 

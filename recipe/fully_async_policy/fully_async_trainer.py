@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import time
 from datetime import datetime
 from pprint import pprint
@@ -25,6 +26,7 @@ from recipe.fully_async_policy.detach_utils import (
     MetricsAggregator,
     ValidateMetrics,
     assemble_batch_from_rollout_samples,
+    safe_create_task,
 )
 from recipe.fully_async_policy.message_queue import MessageQueueClient
 from recipe.fully_async_policy.ray_trainer import FullyAsyncRayPPOTrainer
@@ -106,6 +108,23 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             + config.rollout.nnodes * config.rollout.n_gpus_per_node
         )
         self.metrics_aggregator = MetricsAggregator(total_gpus=total_gpus)
+
+        # ==================== Data Pipeline Config ====================
+        # Async queues for data pipeline
+        self.data_collection_task = None
+        self.batch_assembly_task = None
+        self.fit_task = None
+
+        self.sample_queue = asyncio.Queue()  # Queue for individual samples
+        self.batch_queue = asyncio.Queue()  # Queue for assembled batches
+        self.data_pipeline_running = False
+        self.data_pipeline_task = None
+
+        # Pipeline statistics
+        self.samples_collected = 0
+        self.batches_produced = 0
+        self.total_wait_time = 0.0
+        self.pipeline_lock = asyncio.Lock()
 
     def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         """Set message queue client"""
@@ -210,17 +229,139 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self.actor_wg.init_model()
         self.actor_rollout_wg = self.actor_wg  # to be compatible with the functions that not be modified
 
-    def _init_async_rollout_manager(self):
-        pass
-
-    def fit(self):
+    async def _data_collection_worker(self):
         """
-        The training loop of PPO.
+        Data collection worker that continuously fetches samples from message queue
+        and puts them into the sample queue for batch assembly
+        """
+        print(f"[FullyAsyncTrainer][DataPipeline] Starting data collection worker")
+
+        while self.data_pipeline_running:
+            try:
+                # Get a single sample from message queue
+                sample, queue_len = self.message_queue_client.get_sample_sync()
+
+                if sample is None:
+                    print("[FullyAsyncTrainer][DataPipeline] Detected termination signal, stopping collection")
+                    break
+
+                # Deserialize samples
+                sample = ray.cloudpickle.loads(sample)
+
+                # Put the sample into the sample queue
+                await self.sample_queue.put(sample)
+                self.samples_collected += 1
+
+                # Log progress periodically
+                if self.samples_collected % 64 == 0:
+                    print(
+                        f"[FullyAsyncTrainer][DataPipeline] Collected {self.samples_collected} samples, "
+                        f"sample_queue_size: {self.sample_queue.qsize()}, mq_len: {queue_len}"
+                    )
+
+            except Exception as e:
+                print(f"[FullyAsyncTrainer][DataPipeline] Error in data collection: {e}")
+                raise e
+
+        # Signal end of data collection
+        await self.sample_queue.put(None)
+        print(f"[FullyAsyncTrainer][DataPipeline] Data collection completed, total samples: {self.samples_collected}")
+
+    async def _batch_assembly_worker(self):
+        """
+        Batch assembly worker that collects samples and assembles them into batches
+        when enough samples are available
+        """
+        print(f"[FullyAsyncTrainer][DataPipeline] Starting batch assembly worker")
+
+        while self.data_pipeline_running:
+            # Collect samples until we have enough for a batch
+            batch_samples = []
+            batch_start_time = time.time()
+
+            while len(batch_samples) < self.required_samples and self.data_pipeline_running:
+                # Get sample from sample queue
+                sample = await self.sample_queue.get()
+                self.sample_queue.task_done()
+
+                if sample is None:
+                    print("[FullyAsyncTrainer][DataPipeline] End of samples signal received")
+                    self.data_pipeline_running = False
+                    break
+                batch_samples.append(sample)
+
+            # If we don't have enough samples and pipeline is ending, break
+            if len(batch_samples) < self.required_samples:
+                print("[FullyAsyncTrainer] not enough samples collected after loop")
+                break
+
+            # Assemble batch from collected samples
+            try:
+                batch_end_time = time.time()
+                self.total_wait_time += batch_end_time - batch_start_time
+                # Assemble batch
+                if self.config.trainer.balance_batch:
+                    batch = assemble_batch_from_rollout_samples(
+                        batch_samples, self.tokenizer, self.config, self._balance_batch
+                    )
+                else:
+                    batch = assemble_batch_from_rollout_samples(batch_samples, self.tokenizer, self.config, None)
+
+                batch.meta_info["fully_async/total_wait_time"] = self.total_wait_time
+                batch.meta_info["fully_async/batch_assembly_time"] = time.time() - batch_end_time
+
+                # Put assembled batch into batch queue
+                await self.batch_queue.put(batch)
+                self.batches_produced += 1
+
+                print(
+                    f"[FullyAsyncTrainer][DataPipeline] Assembled batch {self.batches_produced}: "
+                    f"assembly_time: {time.time() - batch_end_time:.3f}s, "
+                    f"batch_queue_size: {self.batch_queue.qsize()}"
+                )
+
+            except Exception as e:
+                print(f"[FullyAsyncTrainer][DataPipeline] Error assembling batch: {e}")
+                raise e
+
+        # Signal end of batch production
+        await self.batch_queue.put(None)
+        print(f"[FullyAsyncTrainer][DataPipeline] Batch assembly completed, total batches: {self.batches_produced}")
+
+    async def _get_batch_from_pipeline(self) -> tuple[None, None] | tuple[int, Any]:
+        """
+        Get assembled batch from the batch queue
+        This replaces the synchronous _get_samples_from_queue method
+
+        Returns:
+            tuple: (epoch, batch)
+        """
+        try:
+            # Wait for batch from the pipeline
+            batch = self.batch_queue.get()
+            self.batch_queue.task_done()
+
+            if batch is None:
+                print("[FullyAsyncTrainer] End of batches signal received")
+                return None, None
+
+            print(f"[FullyAsyncTrainer] Retrieved batch for training, batch_queue_size: {self.batch_queue.qsize()}")
+
+            # TODO: add epoch message
+            return 0, batch
+
+        except Exception as e:
+            print(f"[FullyAsyncTrainer] Error getting batch from pipeline: {e}")
+            return None, None
+
+    async def _async_fit(self):
+        """
+        The training loop of PPO using data pipeline.
         The driver process only need to call the compute functions of the worker group through RPC
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
-        print("[FullyAsyncTrainer] Starting FullyAsyncTrainer...")
+        print("[FullyAsyncTrainer] Starting FullyAsyncTrainer with data pipeline...")
         if self.message_queue_client is None:
             raise ValueError("MessageQueue client not set. Call set_message_queue_client() first.")
         if self.param_synchronizer is None:
@@ -254,7 +395,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
             with marked_timer("step", timing_raw):
                 with marked_timer("gen", timing_raw, color="red"):
-                    epoch, batch = self._get_samples_from_queue()
+                    epoch, batch = await self._get_batch_from_pipeline()
                     if batch is None:
                         break
                     self._collect_metrics_from_samples(batch, metrics)
@@ -322,19 +463,52 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         else:
             pprint(f"[FullyAsyncTrainer] Final validation metrics: {val_data.metrics}")
 
-        #     self._trigger_parameter_sync_after_step(trigger_sync_validate=True)
-        #     val_data = self.message_queue_client.get_validate_sync()
-        #     if val_data:
-        #         val_data: ValidateMetrics = ray.cloudpickle.loads(val_data)
-        #         if val_data.metrics:
-        #             self.logger.log(data=val_data.metrics, step=val_data.param_version)
-        #             pprint(f"[FullyAsyncTrainer] Final validation metrics: {val_data.metrics}")
-        #         self.logger.log(data=val_data.timing_raw, step=val_data.param_version)
-        # else:
-        #     pprint(f"[FullyAsyncTrainer] Final validation metrics: {val_data.metrics}")
         self.progress_bar.close()
+        self._check_save_checkpoint(True, timing_raw)
 
-        self._check_save_checkpoint(True, timing_raw)  # TODO: check checkpoint
+    async def fit(self):
+        """The main entry method for stream processing"""
+
+        # Start sample feed coroutine, streaming process coroutine and consumer coroutine
+        self.data_collection_task = await safe_create_task(
+            self._data_collection_worker(), name="data_collection_worker"
+        )
+        self.batch_assembly_task = await safe_create_task(self._batch_assembly_worker(), name="batch_assembly_worker")
+        self.fit_task = await safe_create_task(self._async_fit(), name="async_fit")
+
+        exception_occurred = None
+
+        try:
+            await self.data_collection_task
+            await self.batch_assembly_task
+            await self.fit_task
+            await self.sample_queue.join()
+            await self.batch_queue.join()
+
+        except Exception as e:
+            print(f"[FullyAsyncRollouter] Streaming process exception:{e}")
+            exception_occurred = e
+
+        finally:
+            print(f"[FullyAsyncRollouter] Clear Resource")
+            if self.data_collection_task:
+                self.data_collection_task.cancel()
+            if self.batch_assembly_task:
+                self.batch_assembly_task.cancel()
+            if self.fit_task:
+                self.fit_task.cancel()
+
+            await asyncio.gather(
+                self.data_collection_task, self.batch_assembly_task, self.fit_task, return_exceptions=True
+            )
+
+            self.data_collection_task = None
+            self.batch_assembly_task = None
+            self.fit_task = None
+
+        # Re-raise the exception after cleanup
+        if exception_occurred is not None:
+            raise exception_occurred
 
     def load_checkpoint(self):
         return self._load_checkpoint()
