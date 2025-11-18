@@ -9,3 +9,4 @@ env_vars:
   NCCL_SOCKET_IFNAME: "eth0"
   CUDA_CACHE_PATH: "/tmp/cuda_cache"
   TENSORBOARD_DIR: "/cfs_shtx5_serving_3/mlp/training/docker/user/hadoop-ai-search/houzhenggang/main/qwen2-7b/4-4_validate"
+  VLLM_USE_FLASHINFER_SAMPLER: "0"

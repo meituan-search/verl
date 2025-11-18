@@ -246,7 +246,7 @@ class SGLangHttpServerForPartialBase(SGLangHttpServerBase):
 
     async def reset_prefix_cache(self):
         async with self.lock:
-            # SGLang uses flush_cache instead of reset_prefix_cache
+            print("Reset prefix cache ...")
             await self.tokenizer_manager.flush_cache()
 
 
