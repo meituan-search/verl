@@ -338,7 +338,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         """
         try:
             # Wait for batch from the pipeline
-            batch = self.batch_queue.get()
+            batch = await self.batch_queue.get()
             self.batch_queue.task_done()
 
             if batch is None:
