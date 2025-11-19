@@ -62,177 +62,101 @@ class SGLangHttpServerForPartialBase(SGLangHttpServerBase):
 
     async def _generate_step(
         self,
-        prompt_ids: list[int] | torch.Tensor,
+        prompt_ids: torch.Tensor,
         sampling_params: dict[str, Any],
         request_id: str,
         image_data: Optional[list[Any]] = None,
-    ):
-        """Generate tokens using SGLang tokenizer_manager.
-        
-        Args:
-            prompt_ids: List of token IDs for the prompt
-            sampling_params: Sampling parameters dict
-            request_id: Unique request ID
-            image_data: Optional image data for multimodal generation
-            
-        Note:
-            This method collects all outputs from the async generator and stores
-            the final output in self.req_output[request_id].
-        """
-        try:
-            # Check if cancelled before starting
-            if request_id in self.cancel_event and self.cancel_event[request_id].is_set():
-                return
-            
-            # Prepare sampling params
-            max_new_tokens = min(
-                self.config.response_length,
-                self.config.max_model_len - len(prompt_ids) - 1
-            )
-            
-            # Create a copy to avoid modifying the original
-            sglang_sampling_params = sampling_params.copy()
-            sglang_sampling_params["max_new_tokens"] = max_new_tokens
-            return_logprob = sglang_sampling_params.pop("logprobs", False)
-            
-            # Convert to SGLang SamplingParams
-            sglang_sp = SamplingParams(
-                max_new_tokens=max_new_tokens,
-                return_logprob=return_logprob,
-                **{k: v for k, v in sglang_sampling_params.items() if k != "max_new_tokens"}
-            )
-            
-            # Convert prompt_ids to torch.Tensor if needed (SGLang expects list[int] or tensor)
-            if isinstance(prompt_ids, torch.Tensor):
-                prompt_ids_list = prompt_ids.tolist()
-            else:
-                prompt_ids_list = list(prompt_ids)
-            
-            # Create GenerateReqInput
-            request = GenerateReqInput(
-                rid=request_id,
-                input_ids=prompt_ids_list,
-                sampling_params=sglang_sp,
-                return_logprob=return_logprob,
-                image_data=image_data,
-            )
-            
-            # Generate using tokenizer_manager
-            generator = self.tokenizer_manager.generate_request(request, None)
-            
-            # Collect all outputs from the async generator
-            final_output = None
-            async for output in generator:
-                # Check for cancellation during generation
-                if request_id in self.cancel_event and self.cancel_event[request_id].is_set():
-                    # Abort the request if cancelled
-                    await self.tokenizer_manager.abort_request(rid=request_id, abort_all=False)
-                    raise asyncio.CancelledError(f"Request {request_id} was cancelled")
-                
-                final_output = output
-            
-            # Store the final output
-            if final_output is not None:
-                self.req_output[request_id] = final_output
-            else:
-                logger.warning(f"Request {request_id} generated no output")
-                self.req_output[request_id] = None
-                
-        except asyncio.CancelledError:
-            # Request was cancelled, clean up
-            if request_id in self.req_output:
-                self.req_output[request_id] = None
-            raise
-        except Exception as e:
-            logger.error(f"Error in _generate_step for request {request_id}: {e}", exc_info=True)
-            self.req_output[request_id] = None
-            raise
+    ) -> None:
+        sampling_params = dict(sampling_params)
+
+        max_new_tokens = min(
+            self.config.response_length,
+            self.config.max_model_len - len(prompt_ids) - 1,
+        )
+        sampling_params["max_new_tokens"] = max_new_tokens
+
+        sampling_params.setdefault(
+            "repetition_penalty",
+            self.config.get("repetition_penalty", 1.0),
+        )
+
+        sampling_params.pop("logprobs", None)
+        return_logprob = True
+
+        request = GenerateReqInput(
+            rid=request_id,
+            input_ids=prompt_ids,
+            sampling_params=sampling_params,
+            return_logprob=return_logprob,
+            image_data=image_data,
+        )
+
+        generator = self.tokenizer_manager.generate_request(request, None)
+
+        async for output in generator:
+            self.req_output[request_id] = output
+
+        assert self.req_output[request_id] is not None
+
 
     async def generate_for_partial(
         self,
-        prompt_ids: list[int] | torch.Tensor,
+        prompt_ids: torch.Tensor,
         sampling_params: dict[str, Any],
         request_id: str,
         image_data: Optional[list[Any]] = None,
-    ) -> tuple[Sequence[int], list[float], bool]:
-        """Generate tokens for partial rollout with cancellation support.
-        
-        Args:
-            prompt_ids: List of token IDs for the prompt
-            sampling_params: Sampling parameters dict
-            request_id: Unique request ID
-            image_data: Optional image data for multimodal generation
-            
-        Returns:
-            Tuple of (token_ids, log_probs, is_cancel):
-            - token_ids: Generated token IDs
-            - log_probs: Log probabilities for each token
-            - is_cancel: Whether the request was cancelled
-        """
+    ) -> tuple[list[int], list[float], bool]:
         async with self.lock:
             if self.paused:
-                # After cancel, all tasks will return directly and wait for the next submission
                 return [], [], True
+
             self.req_output[request_id] = None
             self.cancel_event[request_id] = asyncio.Event()
+
             cancel_handle = asyncio.create_task(self.cancel_event[request_id].wait())
             generation_handle = asyncio.create_task(
                 self._generate_step(prompt_ids, sampling_params, request_id, image_data)
             )
 
-        done, pend = await asyncio.wait([generation_handle, cancel_handle], return_when=asyncio.FIRST_COMPLETED)
+        done, pending = await asyncio.wait(
+            [generation_handle, cancel_handle],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
 
-        # Wait for completed tasks
         for task in done:
-            try:
-                await task
-            except asyncio.CancelledError:
-                logger.debug(f"Task for request {request_id} was cancelled")
+            await task
 
-        # Cancel pending tasks
-        for task in pend:
+        for task in pending:
             task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
 
         async with self.lock:
-            # Check if generation was cancelled or failed
-            if request_id not in self.req_output or self.req_output[request_id] is None:
-                is_cancel = generation_handle not in done or generation_handle.cancelled()
+            output = self.req_output.get(request_id)
+            if output is None:
                 self.cancel_event.pop(request_id, None)
                 self.req_output.pop(request_id, None)
-                return [], [], is_cancel
-            
-            # Extract output from SGLang format (dict, not RequestOutput)
-            output = self.req_output[request_id]
-            
-            # Extract token_ids
-            token_ids = output.get("output_ids", [])
-            if isinstance(token_ids, torch.Tensor):
-                token_ids = token_ids.tolist()
-            elif not isinstance(token_ids, list):
-                token_ids = list(token_ids)
-            
-            # Extract log_probs
+                return [], [], True
+
+            meta_info = output.get("meta_info", {})
+            output_token_logprobs = meta_info.get("output_token_logprobs")
+
+            token_ids: list[int] = []
             log_probs: list[float] = []
-            if "meta_info" in output and "output_token_logprobs" in output["meta_info"]:
-                output_token_logprobs = output["meta_info"]["output_token_logprobs"]
-                # SGLang format: [(log_prob, token_ids, ...), ...]
+
+            if output_token_logprobs is not None:
                 for log_prob, token_id, _ in output_token_logprobs:
+                    token_ids.append(int(token_id))
                     log_probs.append(float(log_prob))
             else:
-                # If no logprobs, create empty list
-                log_probs = [0.0] * len(token_ids)
-            
-            is_cancel = generation_handle not in done or generation_handle.cancelled()
-            
-            # Clean up
+                token_ids = list(output["output_ids"])
+                log_probs = []
+
+            is_cancel = generation_handle not in done
+
             self.cancel_event.pop(request_id, None)
             self.req_output.pop(request_id, None)
-            
+
         return token_ids, log_probs, is_cancel
+
 
     async def cancel(self):
         async with self.lock:
