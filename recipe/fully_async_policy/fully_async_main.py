@@ -253,30 +253,21 @@ class FullyAsyncTaskRunner:
         futures = [rollouter_future, trainer_future]
 
         try:
-            while futures:
-                # Use ray.wait to monitor all futures and return when any one is completed.
-                done_futures, remaining_futures = ray.wait(futures, num_returns=1, timeout=None)
-
-                for future in done_futures:
-                    try:
-                        ray.get(future)
-                        print("[ASYNC MAIN] One component completed successfully")
-                    except Exception as e:
-                        print(f"[ASYNC MAIN] Component failed with error: {e}")
-                        for remaining_future in remaining_futures:
-                            ray.cancel(remaining_future)
-                        raise e
-
-                futures = remaining_futures
+            # Wait for all futures to complete
+            # If any future fails, ray.get will raise the exception immediately
+            results = ray.get(futures)
+            print("[ASYNC MAIN] All components completed successfully")
 
         except Exception as e:
-            print(f"[ASYNC MAIN] Training failed: {e}")
+            print(f"[ASYNC MAIN] Training failed with error: {e}")
+            # Cancel any remaining futures
             for future in futures:
                 ray.cancel(future)
+            print("[ASYNC MAIN] Training Error Interrupted")
             raise
         finally:
             self.components["message_queue_client"].clear_queue()
-            print("[ASYNC MAIN] Training completed or interrupted")
+            print("[ASYNC MAIN] Training completed")
 
 
 @hydra.main(config_path="config", config_name="fully_async_ppo_trainer", version_base=None)
