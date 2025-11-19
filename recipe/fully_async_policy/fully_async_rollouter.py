@@ -44,16 +44,16 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
     """
 
     def __init__(
-            self,
-            config,
-            tokenizer,
-            role_worker_mapping: dict[Role, WorkerType],
-            resource_pool_manager: ResourcePoolManager,
-            ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
-            processor=None,
-            reward_fn=None,
-            val_reward_fn=None,
-            device_name=None,
+        self,
+        config,
+        tokenizer,
+        role_worker_mapping: dict[Role, WorkerType],
+        resource_pool_manager: ResourcePoolManager,
+        ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
+        processor=None,
+        reward_fn=None,
+        val_reward_fn=None,
+        device_name=None,
     ):
         # Store the tokenizer for text processing
         self.tokenizer = tokenizer
@@ -209,10 +209,10 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             self.current_param_version = version
             # every time param change, reset staleness_samples
             self.staleness_samples = (
-                    len(self.active_tasks)
-                    + self.result_queue.qsize()
-                    + self.cancel_queue.qsize()
-                    + await self.message_queue_client.get_queue_size()
+                len(self.active_tasks)
+                + self.result_queue.qsize()
+                + self.cancel_queue.qsize()
+                + await self.message_queue_client.get_queue_size()
             )
             timing_raw = {}
             idle_ratio = None
@@ -232,10 +232,10 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             )
             val_metrics = None
             if (
-                    self.val_reward_fn is not None
-                    and self.config.rollout.test_freq > 0
-                    and self.current_param_version % self.config.rollout.test_freq == 0
-                    and self.current_param_version > 0  # don't test here in the initial parameter sync
+                self.val_reward_fn is not None
+                and self.config.rollout.test_freq > 0
+                and self.current_param_version % self.config.rollout.test_freq == 0
+                and self.current_param_version > 0  # don't test here in the initial parameter sync
             ) or (validate and self.val_reward_fn is not None):
                 with marked_timer("rollouter/validate_time", timing_raw, color="green"):
                     val_metrics: dict = self._validate()

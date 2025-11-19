@@ -197,7 +197,7 @@ class ValidateMetrics:
     param_version: Optional[int] = None
 
 
-def     prepare_single_generation_data(batch_dict, config) -> DataProto:
+def prepare_single_generation_data(batch_dict, config) -> DataProto:
     """
     Similar to the logic of ray_trainer._prepare_generate_batch, but for a single sample.
     Separate the data used for generation from the original data.
@@ -371,18 +371,7 @@ def _task_exception_handler(task: asyncio.Task):
         pass  # Task was cancelled, this is expected
     except Exception as e:
         # Print detailed traceback to locate the exact line causing the error
-        import traceback
         print(f"Task {task.get_name()} failed with exception: {e}")
-        print("=" * 80)
-        print(f"FULL TRACEBACK FOR TASK {task.get_name()}:")
-        print("=" * 80)
-        traceback.print_exc()
-        print("=" * 80)
-        print(f"Task details - name: {task.get_name()}, done: {task.done()}, cancelled: {task.cancelled()}")
-        if task.exception():
-            print(f"Exception type: {type(task.exception())}")
-            print(f"Exception value: {task.exception()}")
-        print("=" * 80)
         raise e
 
 
