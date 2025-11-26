@@ -143,10 +143,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.version_start_time = None
 
         # Concurrency control
-        # Modified by self.pause() or self._should_pause_generation()
         self.paused = False
         self.running = True
-        self.monitor_loop_trigger = True
 
         # Add dataloader lock
         self.dataloader_lock = asyncio.Lock()
@@ -158,14 +156,10 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.cancel_queue = asyncio.Queue()
 
     def _init_async_objects(self):
-        # Initialize asyncio synchronization primitives.
-        # We let asyncio.Condition create the Lock internally to ensure they share the same Event Loop.
-        # This avoids 'ValueError: loop argument must agree with lock' which can occur in Ray environments
-        # where the lock's captured loop (get_running_loop) differs from Condition's default loop check.
-        # Explicitly passing the loop is deprecated/removed in Python 3.10+, so this reverse-initialization
-        # is the most robust workaround.
-        self.condition = asyncio.Condition()
-        self.lock = self.condition._lock
+        # Use asyncio.Event for simpler pause/resume control
+        self.resume_event = asyncio.Event()
+        self.resume_event.set()  # Initially running
+        self.lock = asyncio.Lock()
 
     async def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         """Set message queue client"""
@@ -421,71 +415,84 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         await self.pending_queue.put("DONE")
         print(f"[FullyAsyncRollouter][Feed] Sample addition is complete, {self.global_steps} samples have been added")
 
+    async def _wait_and_clear_tasks(self):
+        """Helper: Wait for all active tasks to complete and clear the set"""
+        # async with self.lock:
+        tasks = list(self.active_tasks)
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        # async with self.lock:
+        self.active_tasks.clear()
+
     async def _processor_worker(self):
         """
         Streaming worker coroutines, a sample is submitted for processing without waiting for batches
+        Simplified version with better concurrency control and no lock contention.
         """
         while True:
-            if self.paused or await self._should_pause_generation():
-                print(
-                    "[FullyAsyncRollouter][Processor] Received pause signal, waiting for remaining tasks to return..."
-                )
-                async with self.lock:
-                    self.paused = True
-                while self.active_tasks:
-                    async with self.lock:
-                        # After acquiring the lock, the number of active_tasks may change, need to be verified again
-                        if self.active_tasks:
-                            done_tasks, self.active_tasks = await asyncio.wait(
-                                self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-                            )
-                        for task in done_tasks:
-                            await task
-
-                async with self.lock:
-                    while self.paused:
-                        self.idle_start_time = time.time()
-                        await self.condition.wait()
-                continue
-
-            simple_from_cancel_queue = False
-            if not self.cancel_queue.empty():
-                rollout_sample = await self.cancel_queue.get()
-                simple_from_cancel_queue = True
-            else:
-                rollout_sample = await self.pending_queue.get()
-                self.staleness_samples += 1
-
-            if rollout_sample == "DONE":
-                print(
-                    "[FullyAsyncRollouter][Processor] Received end signal, waiting for remaining tasks to complete..."
-                )
-                while self.active_tasks:
-                    async with self.lock:
-                        if self.active_tasks:
-                            done_tasks, self.active_tasks = await asyncio.wait(
-                                self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-                            )
-                        for task in done_tasks:
-                            await task
+            # 1. Check running status
+            if not self.running:
                 break
 
-            # Check whether the number of concurrent tasks exceeds the limit
-            while len(self.active_tasks) >= self.max_concurrent_samples:
-                async with self.lock:
-                    if self.active_tasks:
-                        done_tasks, self.active_tasks = await asyncio.wait(
-                            self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-                        )
-                    for task in done_tasks:
-                        await task
+            # 2. Wait for resume signal
+            await self.resume_event.wait()
 
-            # Submit single sample processing
+            # 3. Auto-pause check
+            if self.staleness_samples >= self.max_required_samples:
+                print(
+                    "[FullyAsyncRollouter][ShouldPause] "
+                    f"due to "
+                    f"staleness_samples {self.staleness_samples} >= max_required_samples {self.max_required_samples} "
+                )
+                # async with self.lock:
+                self.paused = True
+                self.resume_event.clear()
+                continue
+
+            # 4. Fetch sample (Priority: Cancel Queue > Pending Queue)
+            try:
+                if not self.cancel_queue.empty():
+                    rollout_sample = self.cancel_queue.get_nowait()
+                    simple_from_cancel_queue = True
+                else:
+                    # Use wait_for to allow responding to pause signals periodically
+                    rollout_sample = await asyncio.wait_for(self.pending_queue.get(), timeout=1.0)
+                    simple_from_cancel_queue = False
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.QueueEmpty:
+                continue
+
+            if rollout_sample == "DONE":
+                print("[FullyAsyncRollouter][Processor] Received end signal, waiting for remaining tasks...")
+                await self._wait_and_clear_tasks()
+                break
+
+            if not simple_from_cancel_queue:
+                self.staleness_samples += 1
+
+            # 5. Concurrency Control (Wait outside lock)
+            while True:
+                # async with self.lock:
+                if len(self.active_tasks) < self.max_concurrent_samples:
+                    break
+                tasks = list(self.active_tasks)
+
+                if tasks:
+                    done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                    # async with self.lock:
+                    self.active_tasks.difference_update(done)
+
+            # 6. Submit Task
             async with self.lock:
-                # After the pause is over, the lock is acquired and it is necessary
-                # to determine whether it is the pause phase, otherwise continue to wait
-                while self.paused:
-                    await self.condition.wait()
+                # Double check pause status
+                if self.paused:
+                    # If paused, put sample back to cancel_queue for retry
+                    await self.cancel_queue.put(rollout_sample)
+                    continue
+
                 task = asyncio.create_task(
                     self._process_single_sample_streaming(rollout_sample),
                     name=rollout_sample.sample_id,
@@ -559,8 +566,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
         try:
             # Wait for sample feed to complete
-            # Use asyncio.wait to monitor all tasks. If processor/consumer exits early,
-            # detect it instead of blocking on feed_task (it might be stuck on a full queue).
             done, pending = await asyncio.wait(
                 [self.feed_task, self.processor_task, self.consumer_task], return_when=asyncio.FIRST_COMPLETED
             )
@@ -614,9 +619,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             raise ValueError("MessageQueue client not set. Call set_message_queue_client() first.")
 
         # Set the running status flag
-        async with self.lock:
-            self.paused = False
-            self.running = True
+        self.paused = False
+        self.running = True
+        self.resume_event.set()
 
         # Create the main asynchronous task
         generation_task = asyncio.create_task(self._streaming_generation_main())
@@ -649,9 +654,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         check_interval = 10.0
 
         while True:
-            async with self.lock:
-                if not self.running:
-                    break
+            if not self.running:
+                break
             await asyncio.sleep(check_interval)
             # Print statistics periodically
             current_time = time.time()
@@ -660,62 +664,38 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 print(f"[FullyAsyncRollouter][MonitorLoop][Statistics] {pformat(stats)}")
                 last_stats_time = current_time
 
-            # Trigger rollout recovery
-            if self.monitor_loop_trigger:
-                if not await self._should_pause_generation():
-                    async with self.lock:
-                        self.paused = False
-                        self.condition.notify_all()
-
-    async def _should_pause_generation(self) -> bool:
-        """Determine whether the build should be paused"""
-        queue_stats = self.message_queue_client.get_statistics_sync()
-        queue_size = queue_stats["queue_size"]
-
-        if queue_size >= self.max_queue_size:
-            if not self.paused:
-                print(
-                    f"[FullyAsyncRollouter][ShouldPause]  "
-                    f"due to full queue: size={queue_size}, max={self.max_queue_size}"
-                )
-            return True
-
-        if self.staleness_samples >= self.max_required_samples:
-            if not self.paused:
-                print(
-                    "[FullyAsyncRollouter][ShouldPause] "
-                    f"due to "
-                    f"staleness_samples {self.staleness_samples} >= max_required_samples {self.max_required_samples} "
-                )
-            return True
-
-        return False
-
     async def pause(self):
         """pause rollout"""
         print("[FullyAsyncRollouter][Public][Pause]")
-        async with self.lock:
-            self.paused = True
-            # Cancel all rollout tasks
-            if self.config.async_training.partial_rollout:
-                await self.async_rollout_manager.cancel()
-            if self.active_tasks:
-                await asyncio.gather(*self.active_tasks, return_exceptions=True)
-                self.active_tasks.clear()
-                print("[FullyAsyncRollouter][Public][Pause] All active tasks completed")
-            await self.async_rollout_manager.reset_prefix_cache()
-            self.monitor_loop_trigger = False
+        t0 = time.time()
+        # async with self.lock:
+        self.paused = True
+        self.resume_event.clear()
+        print(f"[FullyAsyncRollouter][Public][Pause] set siginal,cost: {time.time()-t0}")
+        t1 = time.time()
+        # Cancel all rollout tasks (Outside lock)
+        if self.config.async_training.partial_rollout:
+            await self.async_rollout_manager.cancel()
+        print(f"[FullyAsyncRollouter][Public][Pause] async_rollout_manager.cancel(), cost: {time.time()-t1}")
+        t2 = time.time()
+        # Wait for active tasks to finish (Outside lock)
+        await self._wait_and_clear_tasks()
+        print(f"[FullyAsyncRollouter][Public][Pause] _wait_and_clear_tasks(), cost: {time.time()-t2}")
+        print("[FullyAsyncRollouter][Public][Pause] All active tasks completed")
+
+        await self.async_rollout_manager.reset_prefix_cache()
 
     async def resume(self, dependency_ref: ObjectRef = None):
         if dependency_ref is not None:
             ray.get(dependency_ref)
         print("[FullyAsyncRollouter][Public][Resume]")
-        async with self.lock:
-            if self.config.async_training.partial_rollout:
-                await self.async_rollout_manager.resume()
-            self.paused = False
-            self.monitor_loop_trigger = True
-            self.condition.notify_all()
+
+        if self.config.async_training.partial_rollout:
+            await self.async_rollout_manager.resume()
+
+        # async with self.lock:
+        self.paused = False
+        self.resume_event.set()
 
     async def get_statistics(self) -> dict:
         queue_stats = self.message_queue_client.get_statistics_sync()
