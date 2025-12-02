@@ -37,7 +37,7 @@ from verl.utils.profiler import marked_timer
 from verl.utils.tracking import ValidationGenerationsLogger
 
 
-@ray.remote(num_cpus=10, max_concurrency=100)
+@ray.remote(num_cpus=10, concurrency_groups={"control": 1})
 class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
     """
     Asynchronous sample generator, responsible for continuously generating training samples
@@ -53,8 +53,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         resource_pool_manager: ResourcePoolManager,
         ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
         processor=None,
-        reward_fn=None,
-        val_reward_fn=None,
         device_name=None,
     ):
         # Store the tokenizer for text processing
@@ -160,35 +158,34 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.resume_event.set()  # Initially running
         self.lock = asyncio.Lock()
 
-    async def set_message_queue_client(self, message_queue_client: MessageQueueClient):
+    def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         """Set message queue client"""
-        async with self.lock:
-            self.message_queue_client = message_queue_client
+        self.message_queue_client = message_queue_client
 
-    async def set_max_required_samples(self):
-        async with self.lock:
-            self.max_required_samples = int(
-                self.required_samples
-                * (self.staleness_threshold + 1)
-                * self.config.async_training.trigger_parameter_sync_step
-            )
-            self.total_train_steps = int(
-                self.total_rollout_steps
-                / (self.required_samples * self.config.async_training.trigger_parameter_sync_step)
-            )
+    def set_max_required_samples(self):
+        """set max required samples """
+        self.max_required_samples = int(
+            self.required_samples
+            * (self.staleness_threshold + 1)
+            * self.config.async_training.trigger_parameter_sync_step
+        )
+        self.total_train_steps = int(
+            self.total_rollout_steps
+            / (self.required_samples * self.config.async_training.trigger_parameter_sync_step)
+        )
 
-            self.max_concurrent_samples = len(self.async_rollout_manager.server_handles) * 16
-            self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
-            self.max_queue_size = self.max_required_samples
+        self.max_concurrent_samples = len(self.async_rollout_manager.server_handles) * 16
+        self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
+        self.max_queue_size = self.max_required_samples
 
-            print(
-                f"[FullyAsyncRollouter] required_samples : {self.required_samples} "
-                f"max_required_samples: {self.max_required_samples} "
-                f"max_queue_size: {self.max_queue_size} "
-                f"total_train_steps: {self.total_train_steps} "
-                f"total_rollout_steps: {self.total_rollout_steps} "
-                f"max_concurrent_samples: {self.max_concurrent_samples} "
-            )
+        print(
+            f"[FullyAsyncRollouter] required_samples : {self.required_samples} "
+            f"max_required_samples: {self.max_required_samples} "
+            f"max_queue_size: {self.max_queue_size} "
+            f"total_train_steps: {self.total_train_steps} "
+            f"total_rollout_steps: {self.total_rollout_steps} "
+            f"max_concurrent_samples: {self.max_concurrent_samples} "
+        )
 
     def get_rollout_wg(self):
         """Get rollout worker group"""
@@ -641,6 +638,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 print(f"[FullyAsyncRollouter][MonitorLoop][Statistics] {pformat(stats)}")
                 last_stats_time = current_time
 
+    @ray.method(concurrency_group="control")
     async def pause(self):
         """pause rollout"""
         print("[FullyAsyncRollouter][Public][Pause]")
@@ -662,6 +660,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
         await self.async_rollout_manager.reset_prefix_cache()
 
+    @ray.method(concurrency_group="control")
     async def resume(self, dependency_ref: ObjectRef = None):
         if dependency_ref is not None:
             ray.get(dependency_ref)
