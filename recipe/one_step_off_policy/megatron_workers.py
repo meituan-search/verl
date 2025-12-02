@@ -18,7 +18,7 @@ import os
 
 import torch
 import torch.distributed
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.utils.config import omega_conf_to_dataclass
