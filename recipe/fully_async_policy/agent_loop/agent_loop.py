@@ -76,7 +76,7 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         return output
 
 
-@ray.remote
+@ray.remote(concurrency_groups={"control": 1})
 class FullyAsyncAgentLoopWorker(AgentLoopWorkerBase):
     def __init__(
         self, config: DictConfig, server_handles: list[ray.actor.ActorHandle], reward_router_address: str = None
@@ -199,10 +199,12 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorkerBase):
             logger.exception("Agent_loop run failed")
             raise
 
+    @ray.method(concurrency_group="control")
     async def cancel_agent_loops(self):
         """Set the shared cancellation event to stop all agent loops."""
         self.cancellation_event.set()
 
+    @ray.method(concurrency_group="control")
     async def resume_agent_loops(self):
         """Clear the shared cancellation event."""
         self.cancellation_event.clear()
