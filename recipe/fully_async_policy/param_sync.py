@@ -82,16 +82,21 @@ class ParameterSynchronizer:
 
         ray.get(self.rollouter.pause.remote())
 
+        print(f"[ParameterSynchronizer] rollout paused. cost {time.time() - start_time:.2f} seconds")
         # Update MQ version
         self.mq_client.update_param_version_sync(version)
 
         # sync weights
         self.actor_wg.sync_rollout_weights()
         ray.get(self.rollout_wg.sync_rollout_weights())
+        end_time = time.time()
+        print(f"[ParameterSynchronizer] sync_weights success. cost {end_time - start_time:.2f} seconds")
 
         # Async Update rollout version & validation
         ray.get(self.rollouter.update_param_version.remote(version))
         ray.get(self.rollouter.resume.remote(trigger_sync_validate))
 
-        end_time = time.time()
-        print(f"[ParameterSynchronizer] sync_weights success. cost {end_time - start_time:.2f} seconds")
+    def rollouter_save_checkpoint(self, local_global_step_folder: str):
+        """Trigger rollout to save checkpoint(dataloader)"""
+        print(f"[ParameterSynchronizer] Triggering checkpoint save at {local_global_step_folder} ...")
+        return ray.get(self.rollouter.save_checkpoint.remote(local_global_step_folder))

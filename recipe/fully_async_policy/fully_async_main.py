@@ -25,7 +25,6 @@ from recipe.fully_async_policy.fully_async_rollouter import FullyAsyncRollouter
 from recipe.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
 from recipe.fully_async_policy.message_queue import MessageQueue, MessageQueueClient
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
-from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import Role
 from verl.utils.fs import copy_to_local
 
@@ -109,7 +108,8 @@ def create_role_worker_mapping(config):
     if config.reward_model.enable:
         if config.reward_model.strategy in ["fsdp", "fsdp2"]:
             from verl.workers.fsdp_workers import RewardModelWorker
-        # TODO megatron support
+        elif config.reward_model.strategy == "megatron":
+            from verl.workers.megatron_workers import RewardModelWorker
         else:
             raise NotImplementedError(f"Unsupported reward model strategy: {config.reward_model.strategy}")
 
@@ -164,16 +164,6 @@ class FullyAsyncTaskRunner:
         self.components["role_worker_mapping"] = role_worker_mapping
         self.components["ray_worker_group_cls"] = ray_worker_group_cls
 
-        print("[ASYNC MAIN] Loading reward functions...")
-        reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
-        )
-        val_reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
-        )
-        self.components["reward_fn"] = reward_fn
-        self.components["val_reward_fn"] = val_reward_fn
-
         print("[ASYNC MAIN] Creating FullyAsyncRollouter...")
         self._create_rollouter(config)
 
@@ -208,9 +198,11 @@ class FullyAsyncTaskRunner:
         ray.get(self.components["trainer"].set_parameter_synchronizer.remote(param_synchronizer))
 
         # load checkpoint and sync parameter before doing anything
-        val_before_train = val_reward_fn is not None and config.trainer.get("val_before_train", True)
-        ray.get(self.components["trainer"].load_checkpoint.remote())
-        ray.get(param_synchronizer.sync_weights.remote(version=0, trigger_sync_validate=val_before_train))
+        val_before_train = config.trainer.get("val_before_train", True)
+        # param_version resume from ckpt or default 0
+        param_version = ray.get(self.components["trainer"].load_checkpoint.remote())
+        ray.get(self.components["rollouter"].load_checkpoint.remote())
+        ray.get(param_synchronizer.sync_weights.remote(version=param_version, trigger_sync_validate=val_before_train))
 
         self.components["param_synchronizer"] = param_synchronizer
         print("[ASYNC MAIN] All components initialized successfully")
@@ -223,8 +215,6 @@ class FullyAsyncTaskRunner:
             resource_pool_manager=create_resource_pool_manager(config, roles=[Role.Rollout]),
             ray_worker_group_cls=self.components["ray_worker_group_cls"],
             processor=self.components["processor"],
-            reward_fn=self.components["reward_fn"],
-            val_reward_fn=self.components["val_reward_fn"],
             device_name=config.trainer.device,
         )
 
@@ -267,35 +257,7 @@ class FullyAsyncTaskRunner:
         futures = [rollouter_future, trainer_future]
         ray.get(futures)
 
-        self.components["message_queue_client"].clear_queue()
         print("[ASYNC MAIN] Training completed or interrupted")
-        #
-        # try:
-        #     while futures:
-        #         # Use ray.wait to monitor all futures and return when any one is completed.
-        #         done_futures, remaining_futures = ray.wait(futures, num_returns=1, timeout=None)
-        #
-        #         for future in done_futures:
-        #             try:
-        #                 ray.get(future)
-        #                 print("[ASYNC MAIN] One component completed successfully")
-        #             except Exception as e:
-        #                 print(f"[ASYNC MAIN] Component failed with error: {e}")
-        #                 for remaining_future in remaining_futures:
-        #                     ray.cancel(remaining_future)
-        #                 raise e
-        #
-        #         futures = remaining_futures
-        #
-        # except Exception as e:
-        #     print(f"[ASYNC MAIN] Training failed: {e}")
-        #     for future in futures:
-        #         ray.cancel(future)
-        #     raise
-        # finally:
-        #     self.components["message_queue_client"].clear_queue()
-        #     print("[ASYNC MAIN] Training completed or interrupted")
-
 
 @hydra.main(config_path="config", config_name="fully_async_ppo_trainer", version_base=None)
 def main(config):
