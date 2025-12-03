@@ -73,8 +73,10 @@ class ParameterSynchronizer:
             group_name=self.sync_group_name,
         )
 
-    def sync_weights(self, version, trigger_sync_validate=False):
-        """Sync weights between trainer and rollouter, and update parameter version"""
+    def sync_weights(self, version):
+        """
+        Sync weights between trainer and rollouter, and update parameter version
+        """
         start_time = time.time()
 
         self.current_version = version
@@ -92,9 +94,16 @@ class ParameterSynchronizer:
         end_time = time.time()
         print(f"[ParameterSynchronizer] sync_weights success. cost {end_time - start_time:.2f} seconds")
 
-        # Async Update rollout version & validation
+        # Update rollout version
         ray.get(self.rollouter.update_param_version.remote(version))
-        ray.get(self.rollouter.resume.remote(trigger_sync_validate))
+        ray.get(self.rollouter.resume.remote())
+
+    def validate(self, validate_mode):
+        """
+        validate_mode: "sync" or "async"
+        "sync" while return result, "async" while send result to MQ
+        """
+        return ray.get(self.rollouter.validate.remote(validate_mode))
 
     def rollouter_save_checkpoint(self, local_global_step_folder: str):
         """Trigger rollout to save checkpoint(dataloader)"""

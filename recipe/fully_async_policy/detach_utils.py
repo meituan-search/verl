@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -56,7 +57,7 @@ class ValidateMetrics:
     param_version: Optional[int] = None
 
 
-def prepare_single_generation_data(batch_dict, rollout_n) -> DataProto:
+def prepare_single_generation_data(batch_dict, config, is_training) -> DataProto:
     """
     Similar to the logic of ray_trainer._prepare_generate_batch, but for a single sample.
     Separate the data used for generation from the original data.
@@ -85,8 +86,11 @@ def prepare_single_generation_data(batch_dict, rollout_n) -> DataProto:
             ["partial_single_turn_agent"] * len(full_batch), dtype=object
         )
 
-    # Add global step count to generated data
-    full_batch = full_batch.repeat(repeat_times=config.actor_rollout_ref.rollout.n, interleave=True)
+    if is_training:
+        full_batch = full_batch.repeat(repeat_times=config.actor_rollout_ref.rollout.n, interleave=True)
+    else:
+        full_batch = full_batch.repeat(repeat_times=config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True)
+
     return full_batch
 
 
@@ -356,3 +360,32 @@ class MetricsAggregator:
             "total_samples": sum(self.sample_counts),
             "metric_names": list(self.metric_values.keys()),
         }
+
+
+def task_exception_handler(task: asyncio.Task):
+    """Handle task exceptions and log them"""
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass  # Task was cancelled, this is expected
+    except Exception as e:
+        print(f"[FullyAsyncRollouter] Task {task.get_name()} failed with exception: {e}")
+        raise e
+
+
+async def safe_create_task(coro, name: str, task_set: set = None):
+    """Safely create a task with exception handling
+
+    Args:
+        coro: The coroutine to run
+        name: Name for the task
+        task_set: Optional set to add the task to
+
+    Returns:
+        The created asyncio.Task
+    """
+    task = asyncio.create_task(coro, name=name)
+    task.add_done_callback(task_exception_handler)
+    if task_set is not None:
+        task_set.add(task)
+    return task

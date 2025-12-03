@@ -197,12 +197,15 @@ class FullyAsyncTaskRunner:
         )
         ray.get(self.components["trainer"].set_parameter_synchronizer.remote(param_synchronizer))
 
-        # load checkpoint and sync parameter before doing anything
-        val_before_train = config.trainer.get("val_before_train", True)
         # param_version resume from ckpt or default 0
         param_version = ray.get(self.components["trainer"].load_checkpoint.remote())
         ray.get(self.components["rollouter"].load_checkpoint.remote())
-        ray.get(param_synchronizer.sync_weights.remote(version=param_version, trigger_sync_validate=val_before_train))
+        ray.get(param_synchronizer.sync_weights.remote(version=param_version))
+
+        # load checkpoint and sync parameter before doing anything
+        val_before_train = config.trainer.get("val_before_train", True)
+        if val_before_train:
+            ray.get(param_synchronizer.validate.remote("async"))
 
         self.components["param_synchronizer"] = param_synchronizer
         print("[ASYNC MAIN] All components initialized successfully")
@@ -238,8 +241,6 @@ class FullyAsyncTaskRunner:
             resource_pool_manager=create_resource_pool_manager(config, roles=list(trainer_role_mapping.keys())),
             ray_worker_group_cls=self.components["ray_worker_group_cls"],
             processor=self.components["processor"],
-            reward_fn=self.components["reward_fn"],
-            val_reward_fn=self.components["val_reward_fn"],
             device_name=config.trainer.device,
         )
 
@@ -256,8 +257,8 @@ class FullyAsyncTaskRunner:
 
         futures = [rollouter_future, trainer_future]
         ray.get(futures)
-
         print("[ASYNC MAIN] Training completed or interrupted")
+
 
 @hydra.main(config_path="config", config_name="fully_async_ppo_trainer", version_base=None)
 def main(config):

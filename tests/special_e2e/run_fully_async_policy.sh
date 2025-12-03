@@ -57,7 +57,7 @@ gen_prompt_bsz=1
 n_resp_per_prompt=16
 train_prompt_mini_bsz=16
 total_rollout_steps=$(((128)))
-test_freq=-1
+test_freq=1
 staleness_threshold=0.1
 trigger_parameter_sync_step=4
 partial_rollout=True
@@ -146,7 +146,7 @@ if [ "${ACTOR_STRATEGY}" == "fsdp2" ]; then
     ref_offload=True
     actor_offload=False
 
-    python3 -m recipe.fully_async_policy.fully_async_main \
+    python -X faulthandler -m recipe.fully_async_policy.fully_async_main \
         "${common_params[@]}" \
         actor_rollout_ref.model.enable_gradient_checkpointing=True \
         actor_rollout_ref.actor.strategy=fsdp2 \
