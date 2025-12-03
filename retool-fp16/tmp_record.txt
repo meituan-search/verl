@@ -1,0 +1,17 @@
+curl  "http://10.110.137.235:8080/run_code"   -H 'Content-Type: application/json'   --data-raw '{"code": "print(\"Hello, world!\")", "language": "python"}'
+curl  "http://10.110.134.100:8080/run_code"   -H 'Content-Type: application/json'   --data-raw '{"code": "print(\"Hello, world!\")", "language": "python"}'
+
+
+1.fp16
+RAY_ADDRESS='http://33.253.74.169:44390' \
+ray job submit \
+--runtime-env retool-fp16/qwen2.5_7b/fp16/runtime_env.yaml \
+--working-dir . \
+-- bash retool-fp16/qwen2.5_7b/fp16/test_dapo_2.5_7b_fsdp_fp16.sh
+
+2.bf16
+RAY_ADDRESS='http://33.253.158.82:44390' \
+ray job submit \
+--runtime-env retool-fp16/qwen2.5_7b/bf16/runtime_env.yaml \
+--working-dir . \
+-- bash retool-fp16/qwen2.5_7b/bf16/test_dapo_2.5_7b_fsdp_bf16.sh
