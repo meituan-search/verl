@@ -12,8 +12,10 @@ DATA_ROOT=/cfs_shtx5_serving_3/mlp/training/docker/user/hadoop-ai-search/wangshu
 TRAIN_DATA=$DATA_ROOT/ReTool-SFT/data/train-00000-of-00001.parquet
 EVAL_DATA=$DATA_ROOT/ReTool-SFT/data/train-00000-of-00001.parquet
 MODEL_PATH=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/model/huggingface.co/Qwen/Qwen3-8B-Base
-SAVE_PATH=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/model/checkpoint/$experiment_name
-# SAVE_PATH=/cfs_shtx5_serving_3/mlp/training/docker/user/hadoop-ai-search/wangshulin02/model/checkpoint/$experiment_name
+# SAVE_PATH=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/model/checkpoint/$experiment_name
+SAVE_PATH=/cfs_shtx5_serving_3/mlp/training/docker/user/hadoop-ai-search/wangshulin02/model/checkpoint/$experiment_name
+
+export TENSORBOARD_DIR=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/tensorboard/retool_fp16/$experiment_name
 
 torchrun --nnodes=1 --nproc_per_node=$nproc_per_node \
      -m verl.trainer.fsdp_sft_trainer \

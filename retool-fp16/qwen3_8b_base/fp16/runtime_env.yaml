@@ -1,0 +1,9 @@
+env_vars:
+  VLLM_USE_V1: "1"
+  HYDRA_FULL_ERROR: "1"
+  NCCL_NVLS_ENABLE: "0"
+  NCCL_SOCKET_IFNAME: "eth0"
+  TENSORBOARD_DIR: "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/tensorboard/retool_fp16/retool-qwen3-8b-base-sft372-fp16"
+
+excludes:
+    - .git
