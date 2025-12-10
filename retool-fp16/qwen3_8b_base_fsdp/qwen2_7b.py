@@ -3,24 +3,23 @@ set -x
 export VLLM_USE_V1=1
 
 # ================= data/model/tool =================
+HDFS_ROOT=${HDFS_ROOT:-$PWD}
+DATA_ROOT=${DATA_ROOT:-$PWD}
+RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
+
 dapo_math_17k=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/data/BytedTsinghua-SIA/DAPO-Math-17k
 aime_2024=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/data/Maxwell-Jia/AIME_2024
-# model_path=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/model/huggingface.co/Qwen/Qwen3-8B-Base
-# model_path=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/checkpoints/multiturn-sft-qwen3-8b-base/merged_hf_model_global_step_372
-model_path=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/checkpoints/multiturn-sft-qwen3-8b-base/merged_hf_model_global_step_620
-
+aime_2025=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/data/yentinglin/aime_2025
+model_path=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/model/checkpoint/multiturn-sft-qwen-2.5-7b-instruct/global_step_372-merged_hf_model
 train_files="['$dapo_math_17k']"
-test_files="['$aime_2024']"
+test_files="['$aime_2025', '$aime_2024']"
 
 # tool
-tool_config_path=retool-fp16/qwen3_8b_base/fp16/sandbox_fusion_tool_config.yaml
-retool_path=verl-recipe/retool/retool.py 
+tool_config_path=recipe/fully_async_policy/exp_tool/dapo_7b_retool_colocate_8/sandbox_fusion_tool_config.yaml
+retool_path=recipe/retool/retool.py
 
-dtype="float16" # ["bfloat16", "float16"]
-
-# wandb
-project_name=retool
-experiment_name=qwen3-8b-base_dapo_fp16_sft620
+# wandb / tensorboard
+experiment_name=qwen2.5-7b_dapo_retool_colocate_8_mbs16_tbs64
 default_local_dir=$DATA_ROOT/checkpoint/$experiment_name
 
 # ================= algorithm =================
@@ -41,24 +40,22 @@ actor_lr=1e-6
 
 train_batch_size=64
 ppo_mini_batch_size=16
-total_training_steps=500
+total_training_steps=250
 n_resp_per_prompt=16
 n_resp_per_prompt_val=30
 
 test_freq=20
 
 # ================= perfomance =================
-infer_tp=1 # vllm
+infer_tp=4 # vllm
+train_sp=4 # train
+fsdp_size=8 # train
 offload=True
-train_tp=2
-train_pp=1
 
 actor_max_token_len_per_gpu=$(( (max_prompt_length + max_response_length) * 1 ))
 log_prob_max_token_len_per_gpu=$(( actor_max_token_len_per_gpu * 4 ))
 
 python -X faulthandler -m verl.trainer.main_ppo \
-    --config-path=config \
-    --config-name='ppo_megatron_trainer.yaml' \
     algorithm.adv_estimator=$adv_estimator \
     algorithm.use_kl_in_reward=$use_kl_in_reward \
     algorithm.kl_ctrl.kl_coef=$kl_coef \
@@ -74,8 +71,6 @@ python -X faulthandler -m verl.trainer.main_ppo \
     data.custom_cls.name=CustomRLHFDataset \
     custom_reward_function.path=$retool_path \
     custom_reward_function.name=compute_score \
-    actor_rollout_ref.rollout.dtype=${dtype} \
-    actor_rollout_ref.actor.megatron.dtype=${dtype} \
     actor_rollout_ref.model.path=$model_path \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
@@ -88,13 +83,12 @@ python -X faulthandler -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=$ppo_mini_batch_size \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$actor_max_token_len_per_gpu \
-    actor_rollout_ref.actor.megatron.param_offload=${offload} \
-    actor_rollout_ref.actor.megatron.optimizer_offload=${offload} \
-    actor_rollout_ref.actor.megatron.grad_offload=${offload} \
-    actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${train_pp} \
-    actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${train_tp} \
-    actor_rollout_ref.actor.megatron.use_mbridge=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.apply_rope_fusion=True \
+    actor_rollout_ref.actor.strategy=fsdp2 \
+    critic.strategy=fsdp2 \
+    actor_rollout_ref.actor.ulysses_sequence_parallel_size=$train_sp \
+    actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
+    actor_rollout_ref.actor.fsdp_config.param_offload=$offload \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=$offload \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=$log_prob_max_token_len_per_gpu \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.mode=async \
@@ -104,7 +98,7 @@ python -X faulthandler -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=$max_turns \
     actor_rollout_ref.rollout.multi_turn.tool_config_path=$tool_config_path \
     actor_rollout_ref.rollout.multi_turn.format=hermes \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     actor_rollout_ref.rollout.n=$n_resp_per_prompt \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.6 \
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \

@@ -22,14 +22,13 @@ sandbox:
 curl  "http://10.110.134.100:8080/run_code"   -H 'Content-Type: application/json'   --data-raw '{"code": "print(\"Hello, world!\")", "language": "python"}'
 curl  "http://10.110.137.235:8080/run_code"   -H 'Content-Type: application/json'   --data-raw '{"code": "print(\"Hello, world!\")", "language": "python"}'
 curl  "http://10.110.135.200:8080/run_code"   -H 'Content-Type: application/json'   --data-raw '{"code": "print(\"Hello, world!\")", "language": "python"}'
-
-
+curl  "http://10.110.135.240:8080/run_code"   -H 'Content-Type: application/json'   --data-raw '{"code": "print(\"Hello, world!\")", "language": "python"}'
 ```
 
 
 ``` shell
-1.fp16 qwen3-8b-base
-RAY_ADDRESS='http://33.253.74.169:44390' \
+1.fp16 qwen2.5-7b
+RAY_ADDRESS='http://33.32.26.71:44390' \
 ray job submit \
 --runtime-env retool-fp16/qwen2.5_7b/fp16/runtime_env.yaml \
 --working-dir . \
@@ -81,4 +80,28 @@ ray job submit \
 --runtime-env retool-fp16/qwen3_8b_base/fp16/runtime_env.yaml \
 --working-dir . \
 -- bash retool-fp16/qwen3_8b_base/fp16/run_qwen3_8b_dapo_fp16.sh
+
+4.fp16 qwen3-8b-base-sft620
+RAY_ADDRESS='http://33.18.250.44:44390' \
+ray job submit \
+--runtime-env retool-fp16/qwen3_8b_base/fp16/runtime_env.yaml \
+--working-dir . \
+-- bash retool-fp16/qwen3_8b_base/fp16/run_qwen3_8b_dapo_fp16.sh
+```
+
+
+``` shell fsdp
+2.bf16 qwen3-8b-base-sft620
+RAY_ADDRESS='http://33.32.53.67:44390' \
+ray job submit \
+--runtime-env retool-fp16/qwen3_8b_base/bf16/runtime_env.yaml \
+--working-dir . \
+-- bash retool-fp16/qwen3_8b_base/bf16/run_qwen3_8b_dapo_bf16.sh
+
+4.fp16 qwen3-8b-base-sft620
+RAY_ADDRESS='http://33.253.195.189:44390' \
+ray job submit \
+--runtime-env retool-fp16/qwen3_8b_base_fsdp/fp16/runtime_env.yaml \
+--working-dir . \
+-- bash retool-fp16/qwen3_8b_base_fsdp/fp16/run_qwen3_8b_dapo_fp16.sh
 ```
