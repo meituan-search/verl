@@ -6,23 +6,25 @@ export VLLM_USE_V1=1
 dapo_math_17k=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/data/BytedTsinghua-SIA/DAPO-Math-17k
 aime_2024=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/data/Maxwell-Jia/AIME_2024
 # model_path=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/model/huggingface.co/Qwen/Qwen3-8B-Base
-# model_path=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/checkpoints/multiturn-sft-qwen3-8b-base/merged_hf_model_global_step_372
+model_path=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/checkpoints/multiturn-sft-qwen3-8b-base/merged_hf_model_global_step_372
 # model_path=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/checkpoints/multiturn-sft-qwen3-8b-base/merged_hf_model_global_step_620
-model_path=/cfs_shtx5_serving_3/mlp/training/docker/user/hadoop-ai-search/wangshulin02/model/checkpoint/multiturn-sft-qwen3-8b-base/merged_hf_model_global_step_620
+# model_path=/cfs_shtx5_serving_3/mlp/training/docker/user/hadoop-ai-search/wangshulin02/model/checkpoint/multiturn-sft-qwen3-8b-base/merged_hf_model_global_step_620
+# model_path=/cfs_shtx5_serving_3/mlp/training/docker/user/hadoop-ai-search/wangshulin02/model/checkpoint/multiturn-sft-qwen3-8b-base-20epoch-fp16/merged_hf_model_global_step_620
+# model_path=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/checkpoints/multiturn-sft-qwen3-8b-base-20epoch-fp16/merged_hf_model_global_step_620
 
 train_files="['$dapo_math_17k']"
 test_files="['$aime_2024']"
 
 # tool
-tool_config_path=retool-fp16/qwen3_8b_base/bf16/sandbox_fusion_tool_config.yaml
+tool_config_path=retool-fp16/qwen3_8b_base_fsdp/bf16/sandbox_fusion_tool_config.yaml
 retool_path=verl-recipe/retool/retool.py 
 
 dtype="bfloat16" # ["bfloat16", "float16"]
 
 # wandb
 project_name=retool
-experiment_name=qwen3-8b-base_dapo_bf16_sft620_fsdp
-default_local_dir=/cfs_shtx5_serving_3/mlp/training/docker/user/hadoop-ai-search/wangshulin02/model/checkpoint/multiturn-sft-qwen3-8b-base
+experiment_name=qwen3-8b-base_dapo_bp16_sft372_fsdp
+default_local_dir=/cfs_shtx5_serving_3/mlp/training/docker/user/hadoop-ai-search/wangshulin02/model/checkpoint/$experiment_name
 
 # ================= algorithm =================
 adv_estimator=grpo
@@ -73,7 +75,6 @@ python -X faulthandler -m verl.trainer.main_ppo \
     custom_reward_function.path=$retool_path \
     custom_reward_function.name=compute_score \
     actor_rollout_ref.rollout.dtype=${dtype} \
-    actor_rollout_ref.actor.dtype=${dtype} \
     actor_rollout_ref.model.path=$model_path \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
@@ -89,6 +90,7 @@ python -X faulthandler -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=$train_sp \
     actor_rollout_ref.actor.fsdp_config.param_offload=$offload \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=$offload \
+    actor_rollout_ref.actor.fsdp_config.dtype=${dtype} \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=$log_prob_max_token_len_per_gpu \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.mode=async \
@@ -103,6 +105,7 @@ python -X faulthandler -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.6 \
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
     actor_rollout_ref.rollout.val_kwargs.n=$n_resp_per_prompt_val \
+    actor_rollout_ref.rollout.calculate_log_probs=True \
     trainer.logger=['console','tensorboard'] \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \

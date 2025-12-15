@@ -23,6 +23,10 @@ curl  "http://10.110.134.100:8080/run_code"   -H 'Content-Type: application/json
 curl  "http://10.110.137.235:8080/run_code"   -H 'Content-Type: application/json'   --data-raw '{"code": "print(\"Hello, world!\")", "language": "python"}'
 curl  "http://10.110.135.200:8080/run_code"   -H 'Content-Type: application/json'   --data-raw '{"code": "print(\"Hello, world!\")", "language": "python"}'
 curl  "http://10.110.135.240:8080/run_code"   -H 'Content-Type: application/json'   --data-raw '{"code": "print(\"Hello, world!\")", "language": "python"}'
+curl  "http://10.110.138.150:8080/run_code"   -H 'Content-Type: application/json'   --data-raw '{"code": "print(\"Hello, world!\")", "language": "python"}'
+curl  "http://10.110.138.172:8080/run_code"   -H 'Content-Type: application/json'   --data-raw '{"code": "print(\"Hello, world!\")", "language": "python"}'
+
+
 ```
 
 
@@ -91,17 +95,61 @@ ray job submit \
 
 
 ``` shell fsdp
-2.bf16 qwen3-8b-base-sft620
+2.bf16 qwen3-8b-base-sft620-ckpt
 RAY_ADDRESS='http://33.32.53.67:44390' \
 ray job submit \
 --runtime-env retool-fp16/qwen3_8b_base/bf16/runtime_env.yaml \
 --working-dir . \
 -- bash retool-fp16/qwen3_8b_base/bf16/run_qwen3_8b_dapo_bf16.sh
 
-4.fp16 qwen3-8b-base-sft620
+4.fp16 qwen3-8b-base-sft620-ckpt
 RAY_ADDRESS='http://33.253.195.189:44390' \
 ray job submit \
 --runtime-env retool-fp16/qwen3_8b_base_fsdp/fp16/runtime_env.yaml \
 --working-dir . \
 -- bash retool-fp16/qwen3_8b_base_fsdp/fp16/run_qwen3_8b_dapo_fp16.sh
+
+5.fp16 qwen3-8b-base-fsdpsft620-fsdp
+RAY_ADDRESS='http://33.18.244.88:44390' \
+ray job submit \
+--runtime-env retool-fp16/qwen3_8b_base_fsdp/fp16/runtime_env.yaml \
+--working-dir . \
+-- bash retool-fp16/qwen3_8b_base_fsdp/fp16/run_qwen3_8b_dapo_fp16.sh
+```
+
+todo !!
+
+``` shell
+bf16-fsdp-620 "http://10.110.138.150:8080/run_code"
+RAY_ADDRESS='http://33.32.4.100:44390' \
+ray job submit \
+--runtime-env retool-fp16/qwen3_8b_base_fsdp/bf16/runtime_env.yaml \
+--working-dir . \
+-- bash retool-fp16/qwen3_8b_base_fsdp/bf16/run_qwen3_8b_dapo_bf16.sh
+
+fp16-fsdp-620-retry qwen3-8b-base-fsdpsft620-fsdp-retry
+"http://10.110.134.100:8080/run_code"
+
+RAY_ADDRESS='http://33.32.40.27:44390' \
+ray job submit \
+--runtime-env retool-fp16/qwen3_8b_base_fsdp/fp16/runtime_env.yaml \
+--working-dir . \
+-- bash retool-fp16/qwen3_8b_base_fsdp/fp16/run_qwen3_8b_dapo_fp16.sh
+
+bf16-fsdp-372
+"http://10.110.137.235:8080/run_code"
+RAY_ADDRESS='http://33.18.250.44:44390' \
+ray job submit \
+--runtime-env retool-fp16/qwen3_8b_base_fsdp/bf16/runtime_env.yaml \
+--working-dir . \
+-- bash retool-fp16/qwen3_8b_base_fsdp/bf16/run_qwen3_8b_dapo_bf16.sh
+
+fp16-fsdp-372
+"http://10.110.138.172:8080/run_code"
+RAY_ADDRESS='http://33.18.244.88:44390' \
+ray job submit \
+--runtime-env retool-fp16/qwen3_8b_base_fsdp/fp16/runtime_env.yaml \
+--working-dir . \
+-- bash retool-fp16/qwen3_8b_base_fsdp/fp16/run_qwen3_8b_dapo_fp16.sh
+
 ```

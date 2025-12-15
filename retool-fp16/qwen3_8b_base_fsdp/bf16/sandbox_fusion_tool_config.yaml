@@ -1,7 +1,7 @@
 tools:
   - class_name: "verl-recipe.retool.retool.CustomSandboxFusionTool"
     config:
-      sandbox_fusion_url: "http://10.110.135.200:8080/run_code"
+      sandbox_fusion_url: "http://10.110.137.235:8080/run_code"
       num_workers: 128
       enable_global_rate_limit: true
       rate_limit: 128
