@@ -52,9 +52,41 @@ class DAPORewardManager(AbstractRewardManager):
 
     def __call__(self, data: DataProto, return_dict: bool = False):
         """We will expand this function gradually based on the available datasets"""
-
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
         if "rm_scores" in data.batch.keys():
+            if self.num_examine > 0 and len(data) > 0:
+                try:
+                    data_item = data[0]  # Get first item
+                    print(f"[DAPORewardManager] prompts in data_item.batch and responses in data_item.batch: {("prompts" in data_item.batch)} and {("responses" in data_item.batch)}", flush=True)
+                    print(f"return_dict exists?: {return_dict==None}", flush=True)
+                    # Decode prompt and response if available
+                    if "prompts" in data_item.batch and "responses" in data_item.batch:
+                        prompt_ids = data_item.batch["prompts"]
+                        prompt_length = prompt_ids.shape[-1]
+                        
+                        valid_prompt_length = data_item.batch["attention_mask"][:prompt_length].sum()
+                        valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+                        
+                        response_ids = data_item.batch["responses"]
+                        valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
+                        valid_response_ids = response_ids[:valid_response_length]
+                        
+                        # decode
+                        prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
+                        response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+                        
+                        # Get ground truth and score
+                        ground_truth = data_item.non_tensor_batch.get("reward_model", {}).get("ground_truth", "N/A")
+                        rm_scores = data.batch["rm_scores"]
+                        score = rm_scores[0, valid_response_length - 1].item() if rm_scores.shape[0] > 0 else "N/A"
+                        
+                        # Print similar to lines 132-139
+                        print("[prompt]", prompt_str, flush=True)
+                        print("[response]", response_str, flush=True)
+                        print("[ground_truth]", ground_truth, flush=True)
+                        print("[score]", score, flush=True)
+                except Exception as e:
+                    print(f"[DAPORewardManager] Error printing response: {e}", flush=True)
             if return_dict:
                 reward_extra_keys = data.meta_info.get("reward_extra_keys", [])
                 reward_extra_info = {key: data.non_tensor_batch[key] for key in reward_extra_keys}
@@ -143,6 +175,7 @@ class DAPORewardManager(AbstractRewardManager):
                         print(f"[{key}]", value)
                 else:
                     print("[score]", score)
+
 
         if return_dict:
             return {
