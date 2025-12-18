@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import asyncio
 import os
 import socket
 import threading
@@ -112,7 +111,7 @@ def create_role_worker_mapping(config):
         elif config.reward_model.strategy == "megatron":
             from verl.workers.megatron_workers import RewardModelWorker
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f"Unsupported reward model strategy: {config.reward_model.strategy}")
 
         role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
 
@@ -198,13 +197,15 @@ class FullyAsyncTaskRunner:
         )
         ray.get(self.components["trainer"].set_parameter_synchronizer.remote(param_synchronizer))
 
-        # load checkpoint and sync parameter before doing anything
-        val_before_train = config.trainer.get("val_before_train", True)
         # param_version resume from ckpt or default 0
         param_version = ray.get(self.components["trainer"].load_checkpoint.remote())
         ray.get(self.components["rollouter"].load_checkpoint.remote())
-        ray.get(param_synchronizer.sync_weights.remote(version=param_version, validate=val_before_train))
-        ray.get(param_synchronizer.wait_last_valid.remote())
+        ray.get(param_synchronizer.sync_weights.remote(version=param_version))
+
+        # load checkpoint and sync parameter before doing anything
+        val_before_train = config.trainer.get("val_before_train", True)
+        if val_before_train:
+            ray.get(param_synchronizer.validate.remote("async"))
 
         self.components["param_synchronizer"] = param_synchronizer
         print("[ASYNC MAIN] All components initialized successfully")
@@ -255,32 +256,8 @@ class FullyAsyncTaskRunner:
         trainer_future = self.components["trainer"].fit.remote()
 
         futures = [rollouter_future, trainer_future]
-
-        try:
-            while futures:
-                # Use ray.wait to monitor all futures and return when any one is completed.
-                done_futures, remaining_futures = ray.wait(futures, num_returns=1, timeout=None)
-
-                for future in done_futures:
-                    try:
-                        ray.get(future)
-                        print("[ASYNC MAIN] One component completed successfully")
-                    except Exception as e:
-                        print(f"[ASYNC MAIN] Component failed with error: {e}")
-                        for remaining_future in remaining_futures:
-                            ray.cancel(remaining_future)
-                        raise e
-
-                futures = remaining_futures
-
-        except Exception as e:
-            print(f"[ASYNC MAIN] Training failed: {e}")
-            for future in futures:
-                ray.cancel(future)
-            raise
-        finally:
-            asyncio.run(self.components["message_queue_client"].clear_queue())
-            print("[ASYNC MAIN] Training completed or interrupted")
+        ray.get(futures)
+        print("[ASYNC MAIN] Training completed or interrupted")
 
 
 @hydra.main(config_path="config", config_name="fully_async_ppo_trainer", version_base=None)

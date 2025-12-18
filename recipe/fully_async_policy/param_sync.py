@@ -43,8 +43,6 @@ class ParameterSynchronizer:
         self.weights_info = None
         self.sync_group_initialized = False
         self.sync_group_name = "actor_rollout"
-        self.wait_last_update = None
-        self.wait_last_resume = None
 
         # Statistics
         self.current_version = 0
@@ -75,8 +73,10 @@ class ParameterSynchronizer:
             group_name=self.sync_group_name,
         )
 
-    def sync_weights(self, version, validate=False, global_steps=0):
-        """Sync weights between trainer and rollouter, and update parameter version"""
+    def sync_weights(self, version):
+        """
+        Sync weights between trainer and rollouter, and update parameter version
+        """
         start_time = time.time()
 
         self.current_version = version
@@ -94,18 +94,16 @@ class ParameterSynchronizer:
         end_time = time.time()
         print(f"[ParameterSynchronizer] sync_weights success. cost {end_time - start_time:.2f} seconds")
 
-        # Async Update rollout version & validation
-        self.wait_last_update = self.rollouter.update_param_version.remote(version, validate, global_steps)
-        self.wait_last_resume = self.rollouter.resume.remote(self.wait_last_update)
+        # Update rollout version
+        ray.get(self.rollouter.update_param_version.remote(version))
+        ray.get(self.rollouter.resume.remote())
 
-    def wait_last_valid(self):
-        print("[ParameterSynchronizer] Waiting last sync and validate...")
-        start_time = time.time()
-        if self.wait_last_update:
-            ray.get(self.wait_last_update)
-        if self.wait_last_resume:
-            ray.get(self.wait_last_resume)
-        print(f"[ParameterSynchronizer] Wait last validate cost: {time.time() - start_time:.2f} seconds")
+    def validate(self, validate_mode):
+        """
+        validate_mode: "sync" or "async"
+        "sync" while return result, "async" while send result to MQ
+        """
+        return ray.get(self.rollouter.validate.remote(validate_mode))
 
     def rollouter_save_checkpoint(self, local_global_step_folder: str):
         """Trigger rollout to save checkpoint(dataloader)"""

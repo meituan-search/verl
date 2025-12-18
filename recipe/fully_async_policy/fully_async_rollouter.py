@@ -15,26 +15,28 @@
 import asyncio
 import os
 import time
+from collections import defaultdict
 from pprint import pformat
 
 import numpy as np
 import ray
 import torch
-from ray import ObjectRef
 
 from recipe.fully_async_policy.detach_utils import (
     RolloutSample,
     ValidateMetrics,
+    assemble_batch_from_rollout_samples,
     prepare_single_generation_data,
+    safe_create_task,
 )
 from recipe.fully_async_policy.message_queue import MessageQueueClient
 from recipe.fully_async_policy.ray_trainer import FullyAsyncRayPPOTrainer
+from verl import DataProto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
-from verl.trainer.ppo.ray_trainer import ResourcePoolManager
+from verl.trainer.ppo.ray_trainer import ResourcePoolManager, process_validation_metrics
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import Role, WorkerType
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
-from verl.utils.profiler import marked_timer
 from verl.utils.tracking import ValidationGenerationsLogger
 
 
@@ -73,9 +75,10 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         assert not self.hybrid_engine
         assert self.config.data.train_batch_size == 0, "train_batch_size must be zero"
         assert self.config.data.gen_batch_size == 1, "gen_batch_size must be one"
+        assert self.config.data.val_batch_size == 1, "val_batch_size must be one"
         assert self.config.async_training.staleness_threshold >= 0, "staleness_threshold must larger than 0"
         assert self.config.async_training.trigger_parameter_sync_step >= 1, (
-            "trigger_parameter_sync_step must larger than 1"
+            "trigger_parameter_sync_step must larger or equal than 1"
         )
 
         self.role_worker_mapping = role_worker_mapping
@@ -144,10 +147,14 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.version_start_time = None
 
         # Concurrency control
-        # Modified by self.pause() or self._should_pause_generation()
-        self.paused = False
         self.running = True
         self.monitor_loop_trigger = True
+
+        # Pause state separation:
+        # - self.global_paused: Controlled by pause()/resume(), stops ALL tasks
+        # - self.conditional_paused: Controlled by _should_pause_generation(), conditional pause
+        self.global_paused = False
+        self.conditional_paused = False
 
         # Add dataloader lock
         self.dataloader_lock = asyncio.Lock()
@@ -156,6 +163,21 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.pending_queue = asyncio.Queue(maxsize=128)
         self.active_tasks = set()
         self.cancel_queue = asyncio.Queue()
+
+        # Store the tokenizer for text processing
+        self.consumer_task_validate = None
+        self.processor_task_validate = None
+        self.feed_task_validate = None
+
+        # All async validate task, execute in a queue
+        self.validate_task = set()
+        self.validate_lock = asyncio.Lock()
+        self.pending_queue_validate = asyncio.Queue(maxsize=64)
+        self.active_tasks_validate = set()
+        self.cancel_queue_validate = asyncio.Queue()
+        self.result_queue_validate = asyncio.Queue()
+        self.total_generated_samples_validate = 0
+        self.global_steps_validate = 0
 
     def _init_async_objects(self):
         # Initialize asyncio synchronization primitives.
@@ -207,7 +229,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
     def get_total_train_steps(self):
         return self.total_train_steps
 
-    async def update_param_version(self, version: int, validate: bool = False, global_steps: int = 0):
+    async def update_param_version(self, version: int):
         """Update current parameter version"""
         async with self.lock:
             old_version = self.current_param_version
@@ -232,20 +254,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 f",reset staleness_samples to: {self.staleness_samples}"
                 f",idle_ratio: {idle_ratio}"
             )
-            val_metrics = None
-            if (
-                self.val_reward_fn is not None
-                and self.config.rollout.test_freq > 0
-                and self.current_param_version % self.config.rollout.test_freq == 0
-                and self.current_param_version > 0  # don't test here in the initial parameter sync
-            ) or (validate and self.val_reward_fn is not None):
-                with marked_timer("rollouter/validate_time", timing_raw, color="green"):
-                    val_metrics: dict = self._validate()
-            data = ValidateMetrics(
-                timing_raw=timing_raw, metrics=val_metrics, global_steps=global_steps, param_version=version
-            )
+            data = ValidateMetrics(timing_raw=timing_raw, metrics=None, param_version=version)
             await self.message_queue_client.put_validate(ray.cloudpickle.dumps(data))
-
             self.version_start_time = time.time()
 
     async def save_checkpoint(self, local_global_step_folder: str):
@@ -384,7 +394,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
         for epoch, batch_dict in continuous_iterator:
             # Similar to _prepare_generate_batch: Separate data
-            full_batch = prepare_single_generation_data(batch_dict, self.config)
+            full_batch = prepare_single_generation_data(batch_dict, self.config, is_training=True)
 
             sample_id = f"sample_{epoch}_{self.global_steps}"
 
@@ -415,7 +425,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             self.global_steps += 1
 
         # End signal
-        await self.pending_queue.put("DONE")
+        await self.pending_queue.put(None)
         print(f"[FullyAsyncRollouter][Feed] Sample addition is complete, {self.global_steps} samples have been added")
 
     async def _processor_worker(self):
@@ -423,12 +433,12 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         Streaming worker coroutines, a sample is submitted for processing without waiting for batches
         """
         while True:
-            if self.paused or await self._should_pause_generation():
+            # Separate global pause from conditional pause logic
+            self.conditional_paused = await self._should_pause_generation()
+            if self.global_paused or self.conditional_paused:
                 print(
-                    "[FullyAsyncRollouter][Processor] Received pause signal, waiting for remaining tasks to return..."
+                    "[FullyAsyncRollouter][Processor] Received global pause signal, waiting for remaining tasks to return..."
                 )
-                async with self.lock:
-                    self.paused = True
                 while self.active_tasks:
                     async with self.lock:
                         # After acquiring the lock, the number of active_tasks may change, need to be verified again
@@ -436,24 +446,25 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                             done_tasks, self.active_tasks = await asyncio.wait(
                                 self.active_tasks, return_when=asyncio.FIRST_COMPLETED
                             )
-                        for task in done_tasks:
-                            await task
+                            for task in done_tasks:
+                                await task
 
                 async with self.lock:
-                    while self.paused:
+                    while self.global_paused or self.conditional_paused:
                         self.idle_start_time = time.time()
                         await self.condition.wait()
                 continue
 
-            simple_from_cancel_queue = False
+            # Get sample from appropriate queue and immediately mark task as done
             if not self.cancel_queue.empty():
                 rollout_sample = await self.cancel_queue.get()
-                simple_from_cancel_queue = True
+                self.cancel_queue.task_done()  # We do not use join for control，immediately mark as done
             else:
                 rollout_sample = await self.pending_queue.get()
+                self.pending_queue.task_done()
                 self.staleness_samples += 1
 
-            if rollout_sample == "DONE":
+            if rollout_sample is None:
                 print(
                     "[FullyAsyncRollouter][Processor] Received end signal, waiting for remaining tasks to complete..."
                 )
@@ -463,9 +474,23 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                             done_tasks, self.active_tasks = await asyncio.wait(
                                 self.active_tasks, return_when=asyncio.FIRST_COMPLETED
                             )
-                        for task in done_tasks:
-                            await task
-                break
+                            for task in done_tasks:
+                                await task
+
+                # Check if there are cancelled samples to process
+                if not self.cancel_queue.empty():
+                    print(
+                        f"[FullyAsyncRollouter][Processor] "
+                        f"Found {self.cancel_queue.qsize()} cancelled samples, continuing processing..."
+                    )
+                    # Put None back to pending_queue to continue processing later
+                    await self.pending_queue.put(None)
+                    await asyncio.sleep(1)
+                    continue  # Continue processing cancelled samples
+                else:
+                    # all task success
+                    await self.message_queue_client.put_sample(None, param_version=self.current_param_version)
+                    break
 
             # Check whether the number of concurrent tasks exceeds the limit
             while len(self.active_tasks) >= self.max_concurrent_samples:
@@ -474,25 +499,20 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                         done_tasks, self.active_tasks = await asyncio.wait(
                             self.active_tasks, return_when=asyncio.FIRST_COMPLETED
                         )
-                    for task in done_tasks:
-                        await task
+                        for task in done_tasks:
+                            await task
 
             # Submit single sample processing
             async with self.lock:
                 # After the pause is over, the lock is acquired and it is necessary
                 # to determine whether it is the pause phase, otherwise continue to wait
-                while self.paused:
+                while self.global_paused:
                     await self.condition.wait()
-                task = asyncio.create_task(
+                await safe_create_task(
                     self._process_single_sample_streaming(rollout_sample),
                     name=rollout_sample.sample_id,
+                    task_set=self.active_tasks,
                 )
-                self.active_tasks.add(task)
-
-            if simple_from_cancel_queue:
-                self.cancel_queue.task_done()
-            else:
-                self.pending_queue.task_done()
 
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
@@ -536,8 +556,10 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         print(f"[FullyAsyncRollouter] Start streaming mode, maximum concurrent samples: {self.max_concurrent_samples}")
 
         # Start sample feed coroutine, streaming process coroutine
-        self.feed_task = asyncio.create_task(self._feed_samples())
-        self.processor_task = asyncio.create_task(self._processor_worker())
+        self.feed_task = await safe_create_task(self._feed_samples(), name="feed_task")
+        self.processor_task = await safe_create_task(self._processor_worker(), name="processor_task")
+
+        exception_occurred = None
 
         try:
             # Wait for sample feed to complete
@@ -560,14 +582,22 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             await self.processor_task
             print("[FullyAsyncRollouter] Streaming process completed")
 
+            await self.cancel_queue.join()
+            print("[FullyAsyncRollouter] cancel_queue is empty")
+
         except Exception as e:
             print(f"[FullyAsyncRollouter] Streaming process exception:{e}")
+            exception_occurred = e
 
         finally:
+            print("[FullyAsyncRollouter] Clear Resource")
             if self.processor_task:
                 self.processor_task.cancel()
 
             await asyncio.gather(self.processor_task, return_exceptions=True)
+
+            self.feed_task = None
+            self.processor_task = None
 
         # Send a finish signal
         await self.message_queue_client.put_sample(
@@ -577,6 +607,10 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
         async with self.lock:
             self.running = False
+
+        # Re-raise the exception after cleanup
+        if exception_occurred is not None:
+            raise exception_occurred
 
     async def fit(self):
         """
@@ -591,18 +625,20 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
         # Set the running status flag
         async with self.lock:
-            self.paused = False
+            self.global_paused = False
+            self.conditional_paused = False
             self.running = True
 
         # Create the main asynchronous task
-        generation_task = asyncio.create_task(self._streaming_generation_main())
-        monitor_task = asyncio.create_task(self._async_monitor_loop())
+        generation_task = await safe_create_task(self._streaming_generation_main(), name="generation_task")
+        monitor_task = await safe_create_task(self._async_monitor_loop(), name="monitor_task")
 
         try:
             # Run build and monitoring tasks concurrently
             await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
         except Exception as e:
             print(f"[FullyAsyncRollouter] Asynchronous task execution error: {e}")
+            raise e
         finally:
             if not generation_task.done():
                 generation_task.cancel()
@@ -611,7 +647,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
             # Wait for the task to complete
             await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
-
         print("[FullyAsyncRollouter] Rollouter fit completed")
 
     async def _async_monitor_loop(self):
@@ -640,7 +675,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             if self.monitor_loop_trigger:
                 if not await self._should_pause_generation():
                     async with self.lock:
-                        self.paused = False
+                        self.conditional_paused = False  # Only clear conditional pause, not global pause
                         self.condition.notify_all()
 
     async def _should_pause_generation(self) -> bool:
@@ -649,7 +684,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         queue_size = queue_stats["queue_size"]
 
         if queue_size >= self.max_queue_size:
-            if not self.paused:
+            if not self.conditional_paused:
                 print(
                     f"[FullyAsyncRollouter][ShouldPause]  "
                     f"due to full queue: size={queue_size}, max={self.max_queue_size}"
@@ -657,7 +692,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             return True
 
         if self.staleness_samples >= self.max_required_samples:
-            if not self.paused:
+            if not self.conditional_paused:
                 print(
                     "[FullyAsyncRollouter][ShouldPause] "
                     f"due to "
@@ -671,7 +706,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         """pause rollout"""
         print("[FullyAsyncRollouter][Public][Pause]")
         async with self.lock:
-            self.paused = True
+            self.global_paused = True  # Set global pause flag
             # Cancel all rollout tasks
             if self.config.async_training.partial_rollout:
                 await self.async_rollout_manager.cancel()
@@ -679,17 +714,26 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 await asyncio.gather(*self.active_tasks, return_exceptions=True)
                 self.active_tasks.clear()
                 print("[FullyAsyncRollouter][Public][Pause] All active tasks completed")
+
+            if self.active_tasks_validate:
+                await asyncio.gather(*self.active_tasks_validate, return_exceptions=True)
+                self.active_tasks_validate.clear()
+                print("[FullyAsyncRollouter][Public][Pause] All validate active tasks completed")
+
             await self.async_rollout_manager.clear_kv_cache()
             self.monitor_loop_trigger = False
 
-    async def resume(self, dependency_ref: ObjectRef = None):
-        if dependency_ref is not None:
-            ray.get(dependency_ref)
+    async def resume(self):
         print("[FullyAsyncRollouter][Public][Resume]")
         async with self.lock:
             if self.config.async_training.partial_rollout:
                 await self.async_rollout_manager.resume()
             self.paused = False
+            if self.config.async_training.partial_rollout:
+                await self.async_rollout_manager.resume()
+
+            self.global_paused = False
+            self.conditional_paused = False  # Reset both pause states
             self.monitor_loop_trigger = True
             self.condition.notify_all()
 
@@ -713,6 +757,380 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             "static/staleness_threshold": self.staleness_threshold,
             "static/max_queue_size": self.max_queue_size,
             "static/max_concurrent_samples": self.max_concurrent_samples,
+            # validate stats
+            "monitor/validate/active_tasks_size": len(self.active_tasks_validate),
+            "monitor/validate/pending_queue_size": self.pending_queue_validate.qsize(),
+            "monitor/validate/cancel_queue_size": self.cancel_queue_validate.qsize(),
+            "monitor/validate/result_queue_size": self.result_queue_validate.qsize(),
+            "monitor/validate/total_generated_samples": self.total_generated_samples_validate,
         }
 
         return stats
+
+    async def validate(self, validate_mode="sync"):
+        """
+        validate_mode: "sync" or "async"
+        "sync":  wait validate end
+        "async":  immediately return
+        """
+        print("[FullyAsyncRollouter][Public][Validate] Validate start")
+
+        if self.val_reward_fn is None:
+            return
+        task_name = f"validate_task_v{self.current_param_version}"
+        task = await safe_create_task(self._validate_main(), task_name, self.validate_task)
+        if validate_mode == "sync":
+            print("[FullyAsyncRollouter][Public][Validate] sync")
+            await asyncio.gather(*[task], return_exceptions=True)
+            print("[FullyAsyncRollouter][Public][Validate] Validate end")
+        elif validate_mode == "async":
+            pass
+        else:
+            raise ValueError(f"Invalid validate_mode: {validate_mode}")
+
+        print("[FullyAsyncRollouter][Public][Validate] Validate completed")
+
+    def _create_continuous_iterator_validate(self):
+        """
+        Create a continuous data iterator across epoch
+        """
+        iterator = iter(self.val_dataloader)
+        for batch_dict in iterator:
+            yield 0, batch_dict
+
+    async def _feed_samples_validate(self):
+        for epoch, batch_dict in self._create_continuous_iterator_validate():
+            full_batch = prepare_single_generation_data(batch_dict, self.config, is_training=False)
+            sample_id = f"validate_sample_{epoch}_{self.global_steps_validate}"
+            rollout_sample = RolloutSample(
+                full_batch=full_batch,
+                agent_loop_output_list=[None] * self.config.actor_rollout_ref.rollout.val_kwargs.n,
+                sample_id=sample_id,
+                epoch=epoch,
+                param_version=0,
+                param_version_start=[],
+                param_version_end=[],
+                processing_times=[],
+                tool_calls=[],
+                rollout_status={},
+            )
+            await self.pending_queue_validate.put(rollout_sample)
+            self.global_steps_validate += 1
+
+        # End signal
+        await self.pending_queue_validate.put(None)
+        print(
+            f"[FullyAsyncRollouter][Validate][Feed] Sample addition is complete, {self.global_steps_validate} samples have been added"
+        )
+
+    async def _processor_worker_validate(self):
+        while True:
+            # Validate tasks only need to handle global pause, not conditional pause
+            if self.global_paused:
+                print(
+                    "[FullyAsyncRollouter][Validate][Processor] Received global pause signal, waiting for remaining tasks to return..."
+                )
+                while self.active_tasks_validate:
+                    async with self.lock:
+                        # After acquiring the lock, the number of active_tasks_validate may change, need to be verified again
+                        if self.active_tasks_validate:
+                            done_tasks, self.active_tasks_validate = await asyncio.wait(
+                                self.active_tasks_validate, return_when=asyncio.FIRST_COMPLETED
+                            )
+                            for task in done_tasks:
+                                await task
+
+                async with self.lock:
+                    while self.global_paused:
+                        await self.condition.wait()
+                continue
+
+            # Get sample from appropriate queue and immediately mark task as done
+            if not self.cancel_queue_validate.empty():
+                rollout_sample = await self.cancel_queue_validate.get()
+                self.cancel_queue_validate.task_done()
+            else:
+                rollout_sample = await self.pending_queue_validate.get()
+                self.pending_queue_validate.task_done()
+
+            if rollout_sample is None:
+                print(
+                    "[FullyAsyncRollouter][Validate][Processor] "
+                    "Received end signal, waiting for remaining tasks to complete..."
+                )
+                while self.active_tasks_validate:
+                    async with self.lock:
+                        if self.active_tasks_validate:
+                            done_tasks, self.active_tasks_validate = await asyncio.wait(
+                                self.active_tasks_validate, return_when=asyncio.FIRST_COMPLETED
+                            )
+                            for task in done_tasks:
+                                await task
+
+                # Check if there are cancelled samples to process
+                if not self.cancel_queue_validate.empty():
+                    print(
+                        f"[FullyAsyncRollouter][Validate][Processor] "
+                        f"Found {self.cancel_queue_validate.qsize()} cancelled samples, continuing processing..."
+                    )
+                    # Put None back to pending_queue to continue processing later
+                    await self.pending_queue_validate.put(None)
+                    await asyncio.sleep(1)
+                    continue  # Continue processing cancelled samples
+                else:
+                    # all task success
+                    await self.result_queue_validate.put(None)
+                    break
+
+            # Check whether the number of concurrent tasks exceeds the limit
+            while len(self.active_tasks_validate) + len(self.active_tasks) >= self.max_concurrent_samples:
+                async with self.lock:
+                    if self.active_tasks_validate:
+                        done_tasks, self.active_tasks_validate = await asyncio.wait(
+                            self.active_tasks_validate, return_when=asyncio.FIRST_COMPLETED
+                        )
+                        for task in done_tasks:
+                            await task
+
+            # Submit single sample processing
+            async with self.lock:
+                # After the pause is over, the lock is acquired and it is necessary
+                # to determine whether it is the pause phase, otherwise continue to wait
+                while self.global_paused:
+                    await self.condition.wait()
+                await safe_create_task(
+                    self._process_single_sample_streaming_validate(rollout_sample),
+                    name=rollout_sample.sample_id,
+                    task_set=self.active_tasks_validate,
+                )
+
+    async def _process_single_sample_streaming_validate(self, rollout_sample: RolloutSample):
+        """Process a single sample streamingly"""
+
+        # Calling asynchronous generation methods
+        rollout_sample.full_batch.non_tensor_batch["param_version"] = [self.current_param_version] * len(
+            rollout_sample.full_batch
+        )
+        ret, is_cancel = await self.async_rollout_manager.generate_single_sample_async(
+            rollout_sample.full_batch, rollout_sample.agent_loop_output_list
+        )
+
+        if not is_cancel:
+            rollout_sample.full_batch = ret
+            rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
+                [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
+            )
+            rollout_sample.param_version = self.current_param_version
+            rollout_sample.rollout_status = await self.get_statistics()
+            rollout_sample.agent_loop_output_list = []
+            await self.result_queue_validate.put(rollout_sample)
+        else:
+            rollout_sample.agent_loop_output_list = ret
+            await self.cancel_queue_validate.put(rollout_sample)
+
+    async def _consumer_worker_validate(self):
+        """
+        Get samples from message queue and compose gen_batch_output
+        Uses a loop to continuously collect samples until enough are gathered
+
+        Returns:
+            tuple: (epoch, batch_dict, gen_batch_output)
+        """
+        # Collect samples using a simple loop calling get_sample
+        consumer_start = time.time()
+        queue_samples = []
+
+        while True:
+            # Get a single sample and wait until there is a sample or None is received
+            sample = await self.result_queue_validate.get()
+            self.result_queue_validate.task_done()
+            if sample is None:
+                print(
+                    f"[FullyAsyncRollouter][Validate][Consumer] Detected termination signal (None), stopping sample collection. "
+                    f"Collected {len(queue_samples)} samples"
+                )
+                break
+            self.total_generated_samples_validate += 1
+            queue_samples.append(sample)
+
+            if len(queue_samples) % 32 == 0:
+                print(f"[FullyAsyncRollouter][Validate][Consumer] Collected {len(queue_samples)} samples. ")
+
+        consumer_end = time.time()
+        total_wait_time = consumer_end - consumer_start
+
+        print(
+            f"[FullyAsyncRollouter][Validate] Loop collection completed: {len(queue_samples)} samples, "
+            f"total wait time: {total_wait_time:.2f} seconds. "
+        )
+        # Assemble batch - now working directly with RolloutSample objects
+        test_batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
+
+        timing_raw = {}
+        val_metrics = await self._validate_metrics(test_batch)
+
+        print(f"[FullyAsyncRollouter][Validate] step: {self.current_param_version} {val_metrics}")
+        data = ValidateMetrics(
+            timing_raw=timing_raw,
+            metrics=val_metrics,
+            param_version=self.current_param_version,
+        )
+        await self.message_queue_client.put_validate(ray.cloudpickle.dumps(data))
+
+    async def _validate_metrics(self, test_batch: DataProto):
+        data_source_lst = []
+        reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+
+        # Lists to collect samples for the table
+        sample_inputs = []
+        sample_outputs = []
+        sample_gts = []
+        sample_scores = []
+        sample_turns = []
+        sample_uids = []
+
+        # we only do validation on rule-based rm
+        if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
+            return {}
+
+        input_ids = test_batch.batch["input_ids"]
+        input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+        sample_inputs.extend(input_texts)
+
+        sample_uids.extend(test_batch.non_tensor_batch["uid"])
+
+        output_ids = test_batch.batch["responses"]
+        output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+        sample_outputs.extend(output_texts)
+
+        ground_truths = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch]
+        sample_gts.extend(ground_truths)
+
+        # evaluate using reward_function
+        if self.val_reward_fn is None:
+            raise ValueError("val_reward_fn must be provided for validation.")
+        result = self.val_reward_fn(test_batch, return_dict=True)
+        reward_tensor = result["reward_tensor"]
+        scores = reward_tensor.sum(-1).cpu().tolist()
+        sample_scores.extend(scores)
+
+        reward_extra_infos_dict["reward"].extend(scores)
+        if "reward_extra_info" in result:
+            for key, lst in result["reward_extra_info"].items():
+                reward_extra_infos_dict[key].extend(lst)
+
+        # collect num_turns of each prompt
+        if "__num_turns__" in test_batch.non_tensor_batch:
+            sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
+
+        data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+
+        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+
+        # dump generations
+        val_data_dir = self.config.trainer.get("validation_data_dir", None)
+        if val_data_dir:
+            self._dump_generations(
+                inputs=sample_inputs,
+                outputs=sample_outputs,
+                gts=sample_gts,
+                scores=sample_scores,
+                reward_extra_infos_dict=reward_extra_infos_dict,
+                dump_path=val_data_dir,
+            )
+
+        for key_info, lst in reward_extra_infos_dict.items():
+            assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
+
+        data_sources = np.concatenate(data_source_lst, axis=0)
+
+        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
+        metric_dict = {}
+        for data_source, var2metric2val in data_src2var2metric2val.items():
+            core_var = "acc" if "acc" in var2metric2val else "reward"
+            for var_name, metric2val in var2metric2val.items():
+                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
+                for metric_name, metric_val in metric2val.items():
+                    if (
+                        (var_name == core_var)
+                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
+                        and (f"@{n_max}" in metric_name)
+                    ):
+                        metric_sec = "val-core"
+                    else:
+                        metric_sec = "val-aux"
+                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
+                    metric_dict[pfx] = metric_val
+
+        if len(sample_turns) > 0:
+            sample_turns = np.concatenate(sample_turns)
+            metric_dict["val-aux/num_turns/min"] = sample_turns.min()
+            metric_dict["val-aux/num_turns/max"] = sample_turns.max()
+            metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
+
+        return metric_dict
+
+    async def _validate_main(self):
+        # Only one validate task is allowed to execute at a time.
+        async with self.validate_lock:
+            print(
+                f"[FullyAsyncRollouter][Validate] Start async validate, "
+                f"current_param_version {self.current_param_version} "
+                f"current validate task {len(self.validate_task)} "
+                f"maximum concurrent samples: {self.max_concurrent_samples}"
+            )
+
+            self.global_steps_validate = 0
+
+            # Start sample feed coroutine, streaming process coroutine and consumer coroutine
+            self.feed_task_validate = await safe_create_task(
+                self._feed_samples_validate(), name=f"feed_task_validate_v{self.current_param_version}"
+            )
+            self.processor_task_validate = await safe_create_task(
+                self._processor_worker_validate(), name=f"processor_task_validate_v{self.current_param_version}"
+            )
+            self.consumer_task_validate = await safe_create_task(
+                self._consumer_worker_validate(), name=f"consumer_task_validate_v{self.current_param_version}"
+            )
+
+            exception_occurred = None
+            try:
+                # Wait for all tasks to complete
+                await self.feed_task_validate
+                print("[FullyAsyncRollouter][Validate] Sample feed completed")
+                await self.processor_task_validate
+                print("[FullyAsyncRollouter][Validate] Streaming process completed")
+                await self.consumer_task_validate
+                print("[FullyAsyncRollouter][Validate] Consumer process completed")
+                await self.result_queue_validate.join()
+                print("[FullyAsyncRollouter][Validate] result_queue is empty")
+                await self.cancel_queue_validate.join()
+                print("[FullyAsyncRollouter][Validate] cancel_queue is empty")
+
+            except Exception as e:
+                print(f"[FullyAsyncRollouter][Validate] Streaming process exception:{e}")
+                exception_occurred = e
+
+            finally:
+                print("[FullyAsyncRollouter][Validate] Clear Resource")
+                if self.feed_task_validate:
+                    self.feed_task_validate.cancel()
+                if self.processor_task_validate:
+                    self.processor_task_validate.cancel()
+                if self.consumer_task_validate:
+                    self.consumer_task_validate.cancel()
+
+                await asyncio.gather(
+                    self.feed_task_validate,
+                    self.processor_task_validate,
+                    self.consumer_task_validate,
+                    return_exceptions=True,
+                )
+
+                self.feed_task_validate = None
+                self.processor_task_validate = None
+                self.consumer_task_validate = None
+
+            # Re-raise the exception after cleanup
+            if exception_occurred is not None:
+                raise exception_occurred
