@@ -28,6 +28,18 @@ from .util import (
     preprocess_packed_seqs,
     preprocess_thd_no_padding,
 )
+from ...workers.config import MtpConfig
+
+import numpy as np  # 用于设置 np.inf
+import torch
+
+# 全局配置：打印全部元素，不截断、不省略
+torch.set_printoptions(
+    threshold=np.inf,  # 不限制元素数量阈值（关键）
+    edgeitems=None,    # 首尾显示所有元素（高维时不省略中间维度）
+    linewidth=200,     # 每行显示更多字符，减少换行
+    sci_mode=False     # 禁用科学计数法（可选，根据需求开启）
+)
 
 
 def model_forward_gen(vision_model: bool = False):
@@ -41,7 +53,21 @@ def model_forward_gen(vision_model: bool = False):
         logits_processor_args: dict = None,
         value_model=False,
         data_format: str = "thd",
+        mtp_config: MtpConfig =None
     ):
+        
+        # print(f"model {model}")
+        print(f"input_ids {input_ids}")
+        print(f"attention_mask {attention_mask}")
+        print(f"position_ids {position_ids}")
+        print(f"multi_modal_inputs {multi_modal_inputs}")
+        print(f"logits_processor {logits_processor}")
+        print(f"logits_processor_args {logits_processor_args}")
+        print(f"value_model {value_model}")
+        print(f"data_format {data_format}")
+        print(f"mtp_config {mtp_config}")
+
+
         """Forward pass for models with sequence packing."""
         assert data_format in ["thd", "bshd"], "data_format must be 'thd' or 'bshd'"
         pre_process = (
@@ -62,12 +88,36 @@ def model_forward_gen(vision_model: bool = False):
         if "video_grid_thw" in multi_modal_inputs:
             model_kwargs["video_grid_thw"] = multi_modal_inputs["video_grid_thw"].to(input_ids.device)
 
+        print(f"input_ids {input_ids.shape} \n"
+              f"attention_mask {attention_mask.shape} \n"
+              f"position_ids {position_ids.shape} \n"
+              )
+        
+        if post_process and logits_processor_args:
+            print(f"lables {logits_processor_args['label'].shape} \n"
+                  f"label_mask {logits_processor_args['label_mask'].shape} \n"
+              )
+        
+        # breakpoint()
+
+
         batch_size, seq_len = attention_mask.shape[:2]
         if data_format == "thd":
             input_ids_rmpad, packed_seq_params = preprocess_packed_seqs(
                 input_ids, attention_mask, pre_process=pre_process, use_fp8_padding=use_fp8_padding
             )
             input_ids_rmpad = input_ids_rmpad.contiguous()
+
+            print(f"input_ids {input_ids.shape} input_ids_rmpad: {input_ids_rmpad.shape}")
+
+            if mtp_config and mtp_config.enable_train:
+                args = {
+                    k: preprocess_packed_seqs(v, attention_mask, pre_process=True, use_fp8_padding=use_fp8_padding)[0]
+                    for k, v in logits_processor_args.items()
+                }
+                model_kwargs["labels"] = args["label"]
+                model_kwargs['loss_mask'] = args["label_mask"]
+                # breakpoint()
 
             input_args = dict(
                 input_ids=input_ids_rmpad,
@@ -85,7 +135,9 @@ def model_forward_gen(vision_model: bool = False):
                 input_args["input_ids"] = input_ids
                 input_args["attention_mask"] = attention_mask
 
+
             output_orig = model(**input_args)
+
             if post_process and logits_processor is not None:
                 args = {
                     k: preprocess_packed_seqs(v, attention_mask, pre_process=True, use_fp8_padding=use_fp8_padding)[0]

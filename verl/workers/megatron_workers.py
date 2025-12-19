@@ -112,6 +112,7 @@ class MegatronWorker(Worker):
         override_transformer_config,
         trust_remote_code=False,
         megatron_config=None,
+        enable_mtp=False,
     ):
         from transformers import AutoConfig
 
@@ -139,6 +140,7 @@ class MegatronWorker(Worker):
                 self.tokenizer.chat_template = self.config.model.custom_chat_template
 
         # Step 2: get the hf
+        print(f"hzg trust_remote_code: {trust_remote_code}")
         hf_config = AutoConfig.from_pretrained(self.local_path, trust_remote_code=trust_remote_code)
 
         # Step 3: override the hf config
@@ -149,6 +151,19 @@ class MegatronWorker(Worker):
         }
         override_config_kwargs.update(override_model_config.get("model_config", {}))
         self.share_embeddings_and_output_weights = getattr(hf_config, "tie_word_embeddings", False)
+
+        # only actor need enable mtp
+        if enable_mtp and self.config.model.mtp.enable:
+            assert hf_config.num_nextn_predict_layers > 0, "MTP requires at least one nextn_predict_layer"
+            assert megatron_config.use_mbridge, "MTP requires use_mbridge to be True"
+            assert megatron_config.vanilla_mbridge, "MTP requires vanilla_mbridge to be True"
+            override_transformer_config["mtp_loss_scaling_factor"] = self.config.model.mtp.mtp_loss_scaling_factor
+        else:
+            if hasattr(hf_config, "num_nextn_predict_layers"):
+                hf_config.num_nextn_predict_layers = 0
+
+        self.enable_mtp = enable_mtp
+
         update_model_config(hf_config, override_config_kwargs=override_config_kwargs)
         self.architectures = getattr(hf_config, "architectures", None)
         if self.rank == 0:
@@ -372,6 +387,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             override_transformer_config,
             self.config.model.get("trust_remote_code", False),
             self.config.actor.megatron if not self._is_ref else self.config.ref.megatron,
+            self.config.model.mtp.enable,
         )
         self.generation_config = get_generation_config(
             self.local_path,
@@ -598,6 +614,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 model_config=self.actor_model_config,
                 hf_config=self.hf_config,
                 tf_config=self.tf_config,
+                mtp_config=self.config.model.mtp,
                 actor_module=self.actor_module,
                 actor_optimizer=self.actor_optimizer,
             )
@@ -726,6 +743,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @GPUMemoryLogger(role="update_actor", logger=logger)
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
+
+        print("hzg update actor", "#" * 200)
+
+
         assert self._is_actor
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module)

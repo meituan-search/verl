@@ -24,7 +24,43 @@ from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import get_generation_config, update_model_config
 
-__all__ = ["HFModelConfig"]
+__all__ = ["HFModelConfig", "MtpConfig"]
+
+
+@dataclass
+class MtpConfig(BaseConfig):
+    """
+    Configuration for mtp model.
+
+    enable: 开启mtp参数的加载和保存，不进行使用
+
+    enable_train: 是否开启 train 使用 mtp 参数
+    enable_rollout: 是否开启 rollout 使用 mtp 参数
+
+    train 参数：
+        detach_encoder: 是否 mtp 训练期间 detach encoder的参数
+        mtp_loss_scaling_factor: mtp 训练期间 loss 缩放因子
+
+
+    rollout 参数：
+        speculative-algorithm EAGLE
+        speculative-num-steps 2
+        speculative-eagle-topk 2
+        speculative-num-draft-tokens
+
+    """
+
+    enable: bool = False
+    enable_train: bool = False
+    enable_rollout: bool = False
+
+    detach_encoder: bool = True
+    mtp_loss_scaling_factor: float = 0.1
+
+    speculative_algorithm: str = "EAGLE"
+    speculative_num_steps: int = 2
+    speculative_eagle_topk: int = 2
+    speculative_num_draft_tokens: int = 4
 
 
 @dataclass
@@ -93,6 +129,8 @@ class HFModelConfig(BaseConfig):
     fused_kernel_options: dict = field(default_factory=dict)
 
     architectures: Optional[list[str]] = None
+
+    mtp: MtpConfig = field(default_factory=MtpConfig)
 
     def __post_init__(self):
         import_external_libs(self.external_lib)
