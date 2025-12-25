@@ -776,6 +776,48 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
             },
         )
 
+    async def start_profile(
+        self,
+        output_dir: Optional[str] = None,
+        num_steps: int = 5,
+        activities: Optional[list[str]] = None,
+        profile_by_stage: bool = True,
+        profile_prefix: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Start profiling on SGLang server (async version).
+
+        Args:
+            output_dir: Directory to save profile traces. Defaults to /tmp.
+            num_steps: Number of forward steps to profile.
+            activities: List of activities to profile (e.g., ["CPU", "GPU"]).
+            profile_by_stage: Whether to profile prefill and decode separately.
+            profile_prefix: Prefix for profile file names.
+
+        Returns:
+            Dict[str, Any]: Server response indicating profile start status.
+        """
+        if activities is None:
+            activities = ["CPU", "GPU"]
+
+        payload = {
+            "output_dir": output_dir,
+            "num_steps": num_steps,
+            "activities": activities,
+            "profile_by_stage": profile_by_stage,
+        }
+        if profile_prefix:
+            payload["profile_prefix"] = profile_prefix
+
+        return await self._make_async_request("start_profile", payload, only_master=False)
+
+    async def stop_profile(self) -> dict[str, Any]:
+        """Stop profiling on SGLang server (async version).
+
+        Returns:
+            Dict[str, Any]: Server response indicating profile stop status.
+        """
+        return await self._make_async_request("stop_profile", {}, method="POST", only_master=False)
+
     async def flush_cache(self) -> dict[str, Any]:
         """Flush the cache of the server asynchronously.
 

@@ -28,6 +28,7 @@ __all__ = [
     "TraceConfig",
     "ServerConfig",
     "PrometheusConfig",
+    "SGLangProfilerConfig",
     "RolloutConfig",
 ]
 
@@ -114,6 +115,32 @@ class PrometheusConfig(BaseConfig):
 
 
 @dataclass
+class SGLangProfilerConfig(BaseConfig):
+    """Configuration for SGLang rollout profiler (independent from global_profiler)."""
+
+    # Steps to profile (list of step numbers)
+    steps: Optional[list[int]] = None
+
+    # Whether to combine continuous steps into one profile
+    profile_continuous_steps: bool = False
+
+    # Path to save profiling traces (if None, uses SGLANG_TORCH_PROFILER_DIR env var or /tmp)
+    save_path: Optional[str] = None
+
+    # Number of forward steps to profile per stage
+    num_steps: int = 5
+
+    # Activities to profile: ["CPU", "GPU", "MEM", "RPD"]
+    activities: list[str] = field(default_factory=lambda: ["CPU", "GPU"])
+
+    # Whether to profile prefill and decode separately
+    profile_by_stage: bool = True
+
+    # Prefix for profile file names (if None, uses step_{global_steps})
+    profile_prefix: Optional[str] = None
+
+
+@dataclass
 class RolloutConfig(BaseConfig):
     _mutable_fields = {"max_model_len", "load_format"}
 
@@ -178,6 +205,9 @@ class RolloutConfig(BaseConfig):
 
     # Use Prometheus to collect and monitor rollout statistics
     prometheus: PrometheusConfig = field(default_factory=PrometheusConfig)
+
+    # SGLang profiler configuration (independent from global_profiler)
+    sglang_profiler: SGLangProfilerConfig = field(default_factory=SGLangProfilerConfig)
 
     update_weights_bucket_megabytes: int = 512
 

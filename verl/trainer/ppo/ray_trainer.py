@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import logging
 import os
 import uuid
 from collections import defaultdict
@@ -59,6 +60,8 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -925,6 +928,9 @@ class RayPPOTrainer:
                 self.critic_wg.start_profile(profile_step=self.global_steps)
             if self.use_rm:
                 self.rm_wg.start_profile(profile_step=self.global_steps)
+        
+        # Independently handle SGLang rollout profiler
+        self._start_sglang_rollout_profiling()
 
     def _stop_profiling(self, do_profile: bool) -> None:
         """Stop profiling for all worker groups if profiling is enabled."""
@@ -936,6 +942,118 @@ class RayPPOTrainer:
                 self.critic_wg.stop_profile()
             if self.use_rm:
                 self.rm_wg.stop_profile()
+        
+        # Independently handle SGLang rollout profiler
+        self._stop_sglang_rollout_profiling()
+
+    def _start_sglang_rollout_profiling(self) -> None:
+        """Start SGLang rollout profiler if configured (independent from global_profiler)."""
+        try:
+            # Get SGLang profiler config
+            sglang_profiler_config = self.config.actor_rollout_ref.rollout.get("sglang_profiler", None)
+            if sglang_profiler_config is None:
+                return
+
+            steps = sglang_profiler_config.get("steps", None)
+            if steps is None:
+                return
+
+            # Check if current step is in the configured steps list
+            should_profile = self.global_steps in steps
+
+            # Handle continuous steps
+            if sglang_profiler_config.get("profile_continuous_steps", False):
+                # If previous step is not in list but current step is, start profiling
+                prev_step = self.global_steps - 1
+                prev_in_list = prev_step in steps if prev_step >= 0 else False
+                should_profile = not prev_in_list and should_profile
+
+            if not should_profile:
+                return
+
+            # Check if start_rollout_profile method exists (only for SGLang)
+            if not hasattr(self.actor_rollout_wg, "start_rollout_profile"):
+                return
+
+            import asyncio
+            import os
+
+            # Get configuration parameters
+            output_dir = (
+                sglang_profiler_config.get("save_path")
+                or os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+            )
+            num_steps = sglang_profiler_config.get("num_steps", 5)
+            activities = sglang_profiler_config.get("activities", ["CPU", "GPU"])
+            profile_by_stage = sglang_profiler_config.get("profile_by_stage", True)
+            profile_prefix = (
+                sglang_profiler_config.get("profile_prefix")
+                or f"step_{self.global_steps}"
+            )
+
+            # Async call
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(
+                    self.actor_rollout_wg.start_rollout_profile(
+                        output_dir=output_dir,
+                        num_steps=num_steps,
+                        activities=activities,
+                        profile_by_stage=profile_by_stage,
+                        profile_prefix=profile_prefix,
+                    )
+                )
+            else:
+                loop.run_until_complete(
+                    self.actor_rollout_wg.start_rollout_profile(
+                        output_dir=output_dir,
+                        num_steps=num_steps,
+                        activities=activities,
+                        profile_by_stage=profile_by_stage,
+                        profile_prefix=profile_prefix,
+                    )
+                )
+        except Exception as e:
+            # Silently ignore errors to avoid breaking training
+            logger.warning(f"Failed to start SGLang rollout profiler: {e}")
+
+    def _stop_sglang_rollout_profiling(self) -> None:
+        """Stop SGLang rollout profiler if it's running (independent from global_profiler)."""
+        try:
+            sglang_profiler_config = self.config.actor_rollout_ref.rollout.get("sglang_profiler", None)
+            if sglang_profiler_config is None:
+                return
+
+            steps = sglang_profiler_config.get("steps", None)
+            if steps is None:
+                return
+
+            # Check if current step is in the configured steps list
+            should_stop = self.global_steps in steps
+
+            # Handle continuous steps
+            if sglang_profiler_config.get("profile_continuous_steps", False):
+                # If next step is not in list but current step is, stop profiling
+                next_step = self.global_steps + 1
+                next_in_list = next_step in steps
+                should_stop = should_stop and not next_in_list
+
+            if not should_stop:
+                return
+
+            if not hasattr(self.actor_rollout_wg, "stop_rollout_profile"):
+                return
+
+            import asyncio
+
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(self.actor_rollout_wg.stop_rollout_profile())
+            else:
+                loop.run_until_complete(self.actor_rollout_wg.stop_rollout_profile())
+        except Exception as e:
+            # Silently ignore errors to avoid breaking training
+            logger.warning(f"Failed to stop SGLang rollout profiler: {e}")
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""

@@ -57,7 +57,9 @@ class DAPORewardManager(AbstractRewardManager):
             if self.num_examine > 0 and len(data) > 0:
                 try:
                     data_item = data[0]  # Get first item
-                    print(f"[DAPORewardManager] prompts in data_item.batch and responses in data_item.batch: {("prompts" in data_item.batch)} and {("responses" in data_item.batch)}", flush=True)
+                    has_prompts = "prompts" in data_item.batch
+                    has_responses = "responses" in data_item.batch
+                    print(f"[DAPORewardManager] prompts in data_item.batch and responses in data_item.batch: {has_prompts} and {has_responses}", flush=True)
                     print(f"return_dict exists?: {return_dict==None}", flush=True)
                     # Decode prompt and response if available
                     if "prompts" in data_item.batch and "responses" in data_item.batch:

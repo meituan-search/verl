@@ -650,6 +650,31 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         assert "actor" in self.role, "save_checkpoint only support actor role"
         self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    async def start_rollout_profile(
+        self,
+        output_dir: Optional[str] = None,
+        num_steps: int = 5,
+        activities: Optional[list[str]] = None,
+        profile_by_stage: bool = True,
+        profile_prefix: Optional[str] = None,
+    ) -> None:
+        """Start profiling for rollout stage (SGLang only)."""
+        if self.rollout is not None and hasattr(self.rollout, "start_profile"):
+            await self.rollout.start_profile(
+                output_dir=output_dir,
+                num_steps=num_steps,
+                activities=activities,
+                profile_by_stage=profile_by_stage,
+                profile_prefix=profile_prefix,
+            )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    async def stop_rollout_profile(self) -> None:
+        """Stop profiling for rollout stage (SGLang only)."""
+        if self.rollout is not None and hasattr(self.rollout, "stop_profile"):
+            await self.rollout.stop_profile()
+
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
     async def sleep(self):
         """Context switch from rollout mode to trainer mode."""

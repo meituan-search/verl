@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
-from typing import Generator
+from typing import Generator, Optional
 
 import ray
 import sglang.srt.entrypoints.engine
@@ -191,3 +191,28 @@ class ServerAdapter(BaseRollout):
 
         if self.device_mesh["infer_tp"].get_local_rank() == 0:
             await self._engine.flush_cache()
+
+    async def start_profile(
+        self,
+        output_dir: Optional[str] = None,
+        num_steps: int = 5,
+        activities: Optional[list[str]] = None,
+        profile_by_stage: bool = True,
+        profile_prefix: Optional[str] = None,
+    ) -> None:
+        """Start profiling on SGLang rollout server."""
+        if self.device_mesh["infer_tp"].get_local_rank() == 0:
+            await self._init_server_adapter()
+            await self._engine.start_profile(
+                output_dir=output_dir,
+                num_steps=num_steps,
+                activities=activities,
+                profile_by_stage=profile_by_stage,
+                profile_prefix=profile_prefix,
+            )
+
+    async def stop_profile(self) -> None:
+        """Stop profiling on SGLang rollout server."""
+        if self.device_mesh["infer_tp"].get_local_rank() == 0:
+            await self._init_server_adapter()
+            await self._engine.stop_profile()
