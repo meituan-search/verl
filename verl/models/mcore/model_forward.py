@@ -17,6 +17,7 @@
 import torch
 
 from verl.utils.megatron_utils import unwrap_model
+from verl.workers.config import MtpConfig
 
 from .util import (
     postprocess_bshd,
@@ -41,6 +42,7 @@ def model_forward_gen(vision_model: bool = False):
         logits_processor_args: dict = None,
         value_model=False,
         data_format: str = "thd",
+        mtp_config: MtpConfig = None,
     ):
         """Forward pass for models with sequence packing."""
         assert data_format in ["thd", "bshd"], "data_format must be 'thd' or 'bshd'"
@@ -69,6 +71,29 @@ def model_forward_gen(vision_model: bool = False):
             )
             input_ids_rmpad = input_ids_rmpad.contiguous()
 
+            # when pp > 1 and processor is not None, we need to pass the labels and loss_mask to the model
+            if mtp_config and mtp_config.enable_train and pre_process:
+                args = {
+                    k: preprocess_packed_seqs(
+                        v, attention_mask, pre_process=pre_process, use_fp8_padding=use_fp8_padding
+                    )[0]
+                    for k, v in logits_processor_args.items()
+                }
+                model_kwargs["labels"] = args["label"].contiguous()
+                model_kwargs["loss_mask"] = args["label_mask"].contiguous()
+
+                # print(
+                #     f"hzg model_forward\n"
+                #     f"\t pre_process {pre_process}\n"
+                #     f"\t input_ids: {input_ids.shape}\n"
+                #     f"\t input_ids_rmpad: {input_ids_rmpad.shape}\n"
+                #     f"\t position_ids: {position_ids.shape}\n"
+                #     f"\t labels {logits_processor_args['label'].shape}\n"
+                #     f"\t labels_rmpad {model_kwargs['labels'].shape}\n"
+                #     f"\t loss_mask {logits_processor_args['label_mask'].shape}\n"
+                #     f"\t loss_mask_rmpad {model_kwargs['loss_mask'].shape}\n"
+                # )
+
             input_args = dict(
                 input_ids=input_ids_rmpad,
                 attention_mask=None,
@@ -86,6 +111,7 @@ def model_forward_gen(vision_model: bool = False):
                 input_args["attention_mask"] = attention_mask
 
             output_orig = model(**input_args)
+
             if post_process and logits_processor is not None:
                 args = {
                     k: preprocess_packed_seqs(v, attention_mask, pre_process=True, use_fp8_padding=use_fp8_padding)[0]

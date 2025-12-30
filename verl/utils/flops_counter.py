@@ -336,6 +336,7 @@ ESTIMATE_FUNC = {
     "seed_oss": _estimate_qwen2_flops,
     "apertus": _estimate_apertus_flops,
     "glm4v": _estimate_qwen2_flops,
+    "mimo": _estimate_qwen2_flops,
 }
 
 
