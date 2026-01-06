@@ -256,6 +256,29 @@ class SGLangHttpServer:
         obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
         await self.tokenizer_manager.release_memory_occupation(obj, None)
 
+    async def get_all_model_weights(self, param_names: list[str] = None):
+        """Get all model weights and scales directly from model.
+        
+        Args:
+            param_names: Optional list of parameter names (ignored, kept for compatibility).
+        
+        Returns:
+            List of dicts with keys: name, weight, scale (if available)
+        """
+        if self.node_rank != 0:
+            return []
+        
+        try:
+            from sglang.srt.managers.io_struct import GetAllWeightsReqInput
+            
+            req = GetAllWeightsReqInput()
+            weights_data = await self.tokenizer_manager.get_all_model_weights(req, None)
+            
+            return weights_data if weights_data else []
+        except Exception as e:
+            logger.error(f"Failed to get model weights: {e}", exc_info=True)
+            return []
+
     async def generate(
         self,
         prompt_ids: torch.Tensor,

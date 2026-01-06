@@ -169,6 +169,10 @@ class ServerAdapter(BaseRollout):
             await self._init_server_adapter()
 
         update_weights_bucket_bytes = int(self.config.update_weights_bucket_megabytes) << 20
+        
+        # Check if flashrl mode for weight dumping
+        is_flashrl_mode = self.config.get("quantization", None) != "fp8" and self.config.get("load_format") == "flash_rl"
+        
         if self.config.get("quantization", None) == "fp8":
             from verl.utils.sglang.sglang_fp8_utils import quant_weights_by_name
 
@@ -191,3 +195,39 @@ class ServerAdapter(BaseRollout):
 
         if self.device_mesh["infer_tp"].get_local_rank() == 0:
             await self._engine.flush_cache()
+            
+            # Dump quantized weights for flashrl mode after all updates complete
+            if is_flashrl_mode:
+                await self._dump_flashrl_weights_after_update()
+    
+    async def _dump_flashrl_weights_after_update(self):
+        """Dump flashrl quantized weights from engine after update_weights completes."""
+        try:
+            print("[FLASH_RL DUMP] Starting quantized weights dump from engine...")
+            
+            # Get weights from server actor (batch get all weights in one call)
+            # Now returns stats dicts instead of tensors
+            weights_data = await self.server_actor.get_all_model_weights.remote()
+            
+            if weights_data:
+                from verl.utils.sglang.weight_dump_utils import dump_flash_rl_quantized_weights
+                
+                # Use default dump directory (no environment variable control)
+                base_dump_dir = "/workdir/quant-rollout/work_logs/weight_dumps"
+                dump_dir = os.path.join(base_dump_dir, "flashrl-quantized")
+                
+                # weights_data now contains pre-computed stats, not tensors
+                dump_path = dump_flash_rl_quantized_weights(
+                    quantized_weights_list=weights_data,
+                    quantized_scales=None,  # Not needed anymore
+                    dump_dir=dump_dir,
+                    prefix="quantized_weights_flash_rl",
+                )
+                print(f"[FLASH_RL DUMP] ✓ SUCCESS: Dumped {len(weights_data)} quantized weights to {dump_path}")
+                logger.info(f"Dumped flash_rl quantized weights to {dump_path}")
+            else:
+                print("[FLASH_RL DUMP] ⚠ WARNING: No weights data retrieved from engine")
+        except Exception as e:
+            print(f"[FLASH_RL DUMP] ✗ FAILED: Error during dump: {e}")
+            logger.error(f"Failed to dump flash_rl quantized weights: {e}", exc_info=True)
+            # Don't raise - allow training to continue even if dump fails
