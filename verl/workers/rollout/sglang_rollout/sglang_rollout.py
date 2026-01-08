@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
-from typing import Generator
+from typing import Generator, Optional
 
 import ray
 import sglang.srt.entrypoints.engine
@@ -170,10 +170,23 @@ class ServerAdapter(BaseRollout):
 
         update_weights_bucket_bytes = int(self.config.update_weights_bucket_megabytes) << 20
         
-        # Check if flashrl mode for weight dumping
-        is_flashrl_mode = self.config.get("quantization", None) != "fp8" and self.config.get("load_format") == "flash_rl"
+        # Get training step from kwargs if available
+        training_step = kwargs.get("global_step", kwargs.get("training_step", kwargs.get("step", None)))
+        # Determine quantization mode and whether to dump
+        quantization_mode = self.config.get("quantization", None)
+        load_format = self.config.get("load_format", None)
         
-        if self.config.get("quantization", None) == "fp8":
+        # Check if we should dump weights (for flash_rl or fp8)
+        # Check both config and environment variable
+        should_dump = self.config.get("dump_quantized_weights", False) or os.getenv("DUMP_QUANTIZED_WEIGHTS", "False").lower() == "true"
+        is_flashrl_mode = quantization_mode != "fp8" and load_format == "flash_rl"
+        is_fp8_mode = quantization_mode == "fp8"
+        
+        # Debug logging
+        if should_dump:
+            logger.info(f"[DUMP DEBUG] should_dump=True, quantization_mode={quantization_mode}, load_format={load_format}, is_flashrl_mode={is_flashrl_mode}, is_fp8_mode={is_fp8_mode}, training_step={training_step}")
+        
+        if quantization_mode == "fp8":
             from verl.utils.sglang.sglang_fp8_utils import quant_weights_by_name
 
             logger.info("Convert bf16 weights to fp8 format before loading")
@@ -196,38 +209,58 @@ class ServerAdapter(BaseRollout):
         if self.device_mesh["infer_tp"].get_local_rank() == 0:
             await self._engine.flush_cache()
             
-            # Dump quantized weights for flashrl mode after all updates complete
-            if is_flashrl_mode:
-                await self._dump_flashrl_weights_after_update()
+            # Dump quantized weights after all updates complete
+            if should_dump:
+                if is_flashrl_mode:
+                    await self._dump_quantized_weights_after_update("flashrl", training_step)
+                elif is_fp8_mode:
+                    await self._dump_quantized_weights_after_update("nvfp8", training_step)
     
-    async def _dump_flashrl_weights_after_update(self):
-        """Dump flashrl quantized weights from engine after update_weights completes."""
+    async def _dump_quantized_weights_after_update(self, quantization_type: str, training_step: Optional[int] = None):
+        """Dump quantized weights from engine after update_weights completes.
+        
+        Args:
+            quantization_type: Type of quantization ("flashrl" or "nvfp8")
+            training_step: Current training step (optional)
+        """
         try:
-            print("[FLASH_RL DUMP] Starting quantized weights dump from engine...")
+            step_str = f"_step{training_step}" if training_step is not None else ""
+            print(f"[QUANTIZED DUMP] Starting {quantization_type} quantized weights dump from engine{step_str}...")
             
             # Get weights from server actor (batch get all weights in one call)
             # Now returns stats dicts instead of tensors
             weights_data = await self.server_actor.get_all_model_weights.remote()
             
             if weights_data:
-                from verl.utils.sglang.weight_dump_utils import dump_flash_rl_quantized_weights
+                from verl.utils.sglang.weight_dump_utils import dump_quantized_weights
                 
-                # Use default dump directory (no environment variable control)
+                # Set base directory based on quantization type
                 base_dump_dir = "/workdir/quant-rollout/work_logs/weight_dumps"
-                dump_dir = os.path.join(base_dump_dir, "flashrl-quantized")
+                quantization_base_dir = os.path.join(base_dump_dir, quantization_type)
+                
+                # Create step subdirectory if step is provided
+                if training_step is not None:
+                    dump_dir = os.path.join(quantization_base_dir, f"step_{training_step}")
+                else:
+                    dump_dir = quantization_base_dir
+                
+                # Generate prefix with step info
+                prefix = f"quantized_weights_{quantization_type}"
+                if training_step is not None:
+                    prefix = f"{prefix}_step{training_step}"
                 
                 # weights_data now contains pre-computed stats, not tensors
-                dump_path = dump_flash_rl_quantized_weights(
+                dump_path = dump_quantized_weights(
                     quantized_weights_list=weights_data,
                     quantized_scales=None,  # Not needed anymore
                     dump_dir=dump_dir,
-                    prefix="quantized_weights_flash_rl",
+                    prefix=prefix,
                 )
-                print(f"[FLASH_RL DUMP] ✓ SUCCESS: Dumped {len(weights_data)} quantized weights to {dump_path}")
-                logger.info(f"Dumped flash_rl quantized weights to {dump_path}")
+                print(f"[QUANTIZED DUMP] ✓ SUCCESS: Dumped {len(weights_data)} {quantization_type} quantized weights to {dump_path}")
+                logger.info(f"Dumped {quantization_type} quantized weights to {dump_path} (step={training_step})")
             else:
-                print("[FLASH_RL DUMP] ⚠ WARNING: No weights data retrieved from engine")
+                print(f"[QUANTIZED DUMP] ⚠ WARNING: No weights data retrieved from engine")
         except Exception as e:
-            print(f"[FLASH_RL DUMP] ✗ FAILED: Error during dump: {e}")
-            logger.error(f"Failed to dump flash_rl quantized weights: {e}", exc_info=True)
+            print(f"[QUANTIZED DUMP] ✗ FAILED: Error during dump: {e}")
+            logger.error(f"Failed to dump {quantization_type} quantized weights: {e}", exc_info=True)
             # Don't raise - allow training to continue even if dump fails

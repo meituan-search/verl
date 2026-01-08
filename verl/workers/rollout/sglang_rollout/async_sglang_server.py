@@ -231,10 +231,15 @@ class SGLangHttpServer:
         self._server_port, self._server_task = await run_unvicorn(app, server_args, self._server_address)
         self.tokenizer_manager.server_status = ServerStatus.Up
 
-    async def wake_up(self):
+    async def wake_up(self, training_step=None):
+        """Wake up the SGLang server and switch to rollout mode.
+        
+        Args:
+            training_step: Optional training step number to pass to update_weights.
+        """
         if self.rollout_mode == RolloutMode.HYBRID:
             # Call all workers to switch between trainer mode and rollout mode.
-            await asyncio.gather(*[worker.wake_up.remote() for worker in self.workers])
+            await asyncio.gather(*[worker.wake_up.remote(training_step=training_step) for worker in self.workers])
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
             obj = ResumeMemoryOccupationReqInput(tags=["kv_cache", "weights"])

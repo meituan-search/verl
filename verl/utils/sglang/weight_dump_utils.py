@@ -26,13 +26,13 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-def dump_flash_rl_quantized_weights(
+def dump_quantized_weights(
     quantized_weights_list: List[Dict],
     quantized_scales: Optional[Dict] = None,
     dump_dir: Optional[str] = None,
-    prefix: str = "quantized_weights_flash_rl",
+    prefix: str = "quantized_weights",
 ) -> str:
-    """Dump flash_rl量化后的权重到JSON文件（与nvfp8格式一致）
+    """Dump quantized weights to JSON file (for nvfp8 rollout and sglang native fp8 rollout)
     
     Args:
         quantized_weights_list: List of dicts with keys: name, shape, dtype, max, min, mean, std, scale (optional stats dict)
@@ -43,17 +43,17 @@ def dump_flash_rl_quantized_weights(
     Returns:
         Path to the dumped file.
     """
-    # Use flashrl subdirectory as default
+    # Use default subdirectory
     if dump_dir is None:
         base_dump_dir = "/workdir/quant-rollout/work_logs/weight_dumps"
-        dump_dir = os.path.join(base_dump_dir, "flashrl")
+        dump_dir = os.path.join(base_dump_dir, "quantized")
     
     Path(dump_dir).mkdir(parents=True, exist_ok=True)
-    print(f"[FLASH_RL DUMP] Dump directory: {dump_dir}")
+    print(f"[QUANTIZED DUMP] Dump directory: {dump_dir}")
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     dump_path = os.path.join(dump_dir, f"{prefix}_{timestamp}.json")
-    print(f"[FLASH_RL DUMP] Dump file path: {dump_path}")
+    print(f"[QUANTIZED DUMP] Dump file path: {dump_path}")
     
     dump_data = []
     
@@ -136,10 +136,29 @@ def dump_flash_rl_quantized_weights(
     try:
         with open(dump_path, 'w') as f:
             json.dump(dump_data, f, indent=2)
-        print(f"[FLASH_RL DUMP] ✓ Successfully wrote {len(dump_data)} weights to {dump_path}")
-        logger.info(f"[QuantizedRL] Dumped {len(dump_data)} quantized weights to {dump_path}")
+        print(f"[QUANTIZED DUMP] ✓ Successfully wrote {len(dump_data)} weights to {dump_path}")
+        logger.info(f"[Quantized] Dumped {len(dump_data)} quantized weights to {dump_path}")
         return dump_path
     except Exception as e:
-        print(f"[FLASH_RL DUMP] ✗ Failed to write dump file: {e}")
+        print(f"[QUANTIZED DUMP] ✗ Failed to write dump file: {e}")
         raise
+
+
+# Keep backward compatibility
+def dump_flash_rl_quantized_weights(
+    quantized_weights_list: List[Dict],
+    quantized_scales: Optional[Dict] = None,
+    dump_dir: Optional[str] = None,
+    prefix: str = "quantized_weights_flash_rl",
+) -> str:
+    """Backward compatibility wrapper for dump_quantized_weights."""
+    if dump_dir is None:
+        base_dump_dir = "/workdir/quant-rollout/work_logs/weight_dumps"
+        dump_dir = os.path.join(base_dump_dir, "flashrl-quantized")
+    return dump_quantized_weights(
+        quantized_weights_list=quantized_weights_list,
+        quantized_scales=quantized_scales,
+        dump_dir=dump_dir,
+        prefix=prefix,
+    )
 

@@ -128,4 +128,6 @@ ENV/
 logs
 log
 outputs
-.historyverl/examples/sglang_multiturn/debug_tis/
+
+# debug directories
+**/debug_tis/

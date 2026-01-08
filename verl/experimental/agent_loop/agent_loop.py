@@ -823,7 +823,9 @@ class AgentLoopManager:
 
         # Fix for Issue #4147: Always call wake_up() to ensure weight sync
         # The wake_up()/sleep() methods internally check free_cache_engine
-        self.wake_up()
+        # Get training step from prompts meta_info if available
+        training_step = prompts.meta_info.get("global_steps", None)
+        self.wake_up(training_step=training_step)
         if self.reward_model_manager:
             self.reward_model_manager.wake_up()
 
@@ -869,9 +871,13 @@ class AgentLoopManager:
 
         return timing
 
-    def wake_up(self):
-        """Wake up all rollout replica instances."""
-        self._run_all([replica.wake_up() for replica in self.rollout_replicas])
+    def wake_up(self, training_step=None):
+        """Wake up all rollout replica instances.
+        
+        Args:
+            training_step: Optional training step number to pass to update_weights.
+        """
+        self._run_all([replica.wake_up(training_step=training_step) for replica in self.rollout_replicas])
 
     def sleep(self):
         """Sleep all rollout replica instances."""

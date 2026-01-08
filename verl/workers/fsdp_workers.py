@@ -141,6 +141,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         Worker.__init__(self)
 
         self.config = config
+        self.current_training_step = None  # Store training step for weight dumping
         import torch.distributed
 
         if not torch.distributed.is_initialized():
@@ -718,10 +719,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
                 for name, param in base_model_params.items()
             )
-            await self.rollout.update_weights(per_tensor_base_params, base_sync_done=False)
+            await self.rollout.update_weights(per_tensor_base_params, base_sync_done=False, training_step=self.current_training_step)
             del base_model_params, per_tensor_base_params
 
-        await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done)
+        await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done, training_step=self.current_training_step)
         log_gpu_memory_usage("After update_weights", logger=logger)
         del params, per_tensor_param
         aggressive_empty_cache(force_sync=True)
@@ -1930,7 +1931,13 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 # ================================= Async related workers =================================
 class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
-    async def wake_up(self):
+    async def wake_up(self, training_step=None):
+        """Wake up the actor and switch to rollout mode.
+        
+        Args:
+            training_step: Optional training step number to pass to update_weights.
+        """
+        self.current_training_step = training_step  # Store training step for weight dumping
         await self.rollout_mode()
         return True
 
