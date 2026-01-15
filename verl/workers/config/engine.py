@@ -123,6 +123,7 @@ class McoreEngineConfig(EngineConfig):
     override_mcore_model_config: dict[str, Any] = field(default_factory=dict)
     use_mbridge: bool = True
     vanilla_mbridge: bool = True
+    export_fp8_weights: bool = False
     strategy: str = "megatron"
 
     def __post_init__(self) -> None:
