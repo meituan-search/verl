@@ -24,6 +24,11 @@ import sglang
 import sglang.srt.entrypoints.engine
 import torch
 from ray.actor import ActorHandle
+from sglang.srt.entrypoints.engine import (
+    init_tokenizer_manager,
+    run_detokenizer_process,
+    run_scheduler_process,
+)
 from sglang.srt.entrypoints.http_server import (
     ServerArgs,
     _GlobalState,
@@ -198,7 +203,10 @@ class SGLangHttpServer:
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
         server_args = ServerArgs(**args)
         self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
-            server_args=server_args
+            server_args=server_args,
+            init_tokenizer_manager_func=init_tokenizer_manager,
+            run_scheduler_process_func=run_scheduler_process,
+            run_detokenizer_process_func=run_detokenizer_process,
         )
 
         # In multi-node cases, non-zero rank nodes should not launch http server.
@@ -214,11 +222,12 @@ class SGLangHttpServer:
         )
         app.is_single_tokenizer_mode = True
 
-        # Set warmup_thread_args to avoid AttributeError in lifespan function
-        app.warmup_thread_args = (
-            server_args,
-            None,
-            None,
+         # Set warmup_thread_kwargs to avoid AttributeError in lifespan function
+
+        app.warmup_thread_kwargs = dict(
+            server_args=server_args,
+            launch_callback=None,
+            execute_warmup_func=None,
         )
 
         # Manually add Prometheus middleware before starting server
