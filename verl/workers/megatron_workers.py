@@ -705,7 +705,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         per_tensor_param_cache = [(name, tensor.clone().detach().cpu()) for name, tensor in per_tensor_param]
         del per_tensor_param
-        torch.empty_cache()
+        torch.cuda.empty_cache()
 
         log_gpu_memory_usage("[MEMORY USAGE] [TAG3] per_tensor_param_cache", logger=logger)
 
@@ -728,7 +728,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         log_gpu_memory_usage("[MEMORY USAGE] [TAG7] After aggressive_empty_cache", logger=logger)
 
         del per_tensor_param_cache
-        torch.empty_cache()
+        torch.cuda.empty_cache()
         log_gpu_memory_usage("[MEMORY USAGE] [TAG7] delete per_tensor_param_cache", logger=logger)
 
         if self.config.rollout.free_cache_engine:
