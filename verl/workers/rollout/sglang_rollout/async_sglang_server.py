@@ -176,7 +176,7 @@ class SGLangHttpServer:
             "nnodes": self.nnodes,
             "trust_remote_code": self.model_config.trust_remote_code,
             "max_running_requests": self.config.get("max_num_seqs", None),
-            "log_level": "error",
+            "log_level": "info",
             "mm_attention_backend": "fa3",
             "attention_backend": attention_backend if attention_backend is not None else "fa3",
             "skip_tokenizer_init": self.config.skip_tokenizer_init,
@@ -210,18 +210,20 @@ class SGLangHttpServer:
 
         # mtp
         if self.config.mtp.enable and self.config.mtp.enable_rollout:
+            # Enable weights CPU backup for sglang >= 0.5.6
+            if sglang.__version__ < "0.5.6":
+                raise ValueError(f"sglang version {sglang.__version__} is not supported for MTP rollout")
+
             args["speculative_algorithm"] = self.config.mtp.speculative_algorithm
             args["speculative_num_steps"] = self.config.mtp.speculative_num_steps
             args["speculative_eagle_topk"] = self.config.mtp.speculative_eagle_topk
             args["speculative_num_draft_tokens"] = self.config.mtp.speculative_num_draft_tokens
 
             args["log_level"] = "info"
-            args["load_format"] = "auto"
+            # args["load_format"] = "auto"
 
-            # Enable weights CPU backup for sglang >= 0.5.6
-            if sglang.__version__ >= "0.5.6":
-                args["enable_weights_cpu_backup"] = True
-                args["enable_draft_weights_cpu_backup"] = True
+            args["enable_weights_cpu_backup"] = True
+            args["enable_draft_weights_cpu_backup"] = True
 
             # args['enable_memory_saver'] = False
             # enable_memory_saver = False MTP success but memory can't be release

@@ -681,12 +681,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
+        log_gpu_memory_usage("[MEMORY USAGE] [TAG1] async def rollout_mode", logger=logger)
         aggressive_empty_cache(force_sync=True)
         set_expandable_segments(False)
 
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor.actor_module, load_grad=False)
-            log_gpu_memory_usage("After load actor params during rollout_mode", logger=logger)
+            log_gpu_memory_usage("[MEMORY USAGE] [TAG2] After load actor params during rollout_mode", logger=logger)
 
         if self.bridge is not None:
             if self.vanilla_bridge:
@@ -702,14 +703,37 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 self.layer_name_mapping,
             )
 
+        per_tensor_param_cache = [(name, tensor.clone().detach().cpu()) for name, tensor in per_tensor_param]
+        del per_tensor_param
+        torch.empty_cache()
+
+        log_gpu_memory_usage("[MEMORY USAGE] [TAG3] per_tensor_param_cache", logger=logger)
+
+        def per_tensor_param_gen(cache):
+            for name, tensor in cache:
+                yield name, tensor
+
+        per_tensor_param = per_tensor_param_gen(per_tensor_param_cache)
+
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
+            log_gpu_memory_usage("[MEMORY USAGE] [TAG4] After resume sglang weights", logger=logger)
+
         await self.rollout.update_weights(per_tensor_param)
+        log_gpu_memory_usage("[MEMORY USAGE] [TAG5] After update_weights", logger=logger)
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor.actor_module)
+            log_gpu_memory_usage("[MEMORY USAGE] [TAG6] After offload_megatron_model_to_cpu", logger=logger)
         aggressive_empty_cache(force_sync=True)
+        log_gpu_memory_usage("[MEMORY USAGE] [TAG7] After aggressive_empty_cache", logger=logger)
+
+        del per_tensor_param_cache
+        torch.empty_cache()
+        log_gpu_memory_usage("[MEMORY USAGE] [TAG7] delete per_tensor_param_cache", logger=logger)
+
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["kv_cache"])
+            log_gpu_memory_usage("[MEMORY USAGE] [TAG8] After kv_cache", logger=logger)
 
         # important: need to manually set the random states of each tp to be identical.
         self.torch_random_states = get_torch_device().get_rng_state()

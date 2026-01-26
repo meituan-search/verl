@@ -2,6 +2,7 @@ working_dir: ./
 
 excludes:
   - ".git/"
+  - "sglang/"
 
 env_vars:
   VLLM_USE_V1: "1"
@@ -14,3 +15,6 @@ env_vars:
   CUDA_CACHE_PATH: "/tmp/cuda_cache"
   HF_HOME: "/tmp/hf_home_mimo"
   PYTHONPATH: "/tmp/hf_home_mimo/modules/"
+  TENSORBOARD_DIR: "/tmp/main/mimo-7b"
+  RAY_DEDUP_LOGS: "0"
+  VERL_LOGGING_LEVEL: "DEBUG"
