@@ -14,6 +14,7 @@
 """
 The main entry point to run the PPO algorithm
 """
+import asyncio
 import datetime
 import logging
 import os
@@ -704,38 +705,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 self.tf_config,
                 self.layer_name_mapping,
             )
-
-        # 检查缓存是否存在，如果存在则复用，否则创建新缓存
-        if self._cached_per_tensor_param is None:
-            # 第一次运行，创建并缓存
-            self._cached_per_tensor_param = [(name, tensor.clone()) for name, tensor in per_tensor_param]
-            logger.info(f"[MEMORY] [TAG3] Created new cache with {len(self._cached_per_tensor_param)} tensors")
-        else:
-            # 后续运行，复用缓存的 GPU tensor，但需要更新为最新的 actor 参数
-            # 缓存中的 tensor 已经是旧的，需要用新的 actor 参数覆盖
-            logger.info(f"[MEMORY] [TAG3] Updating cached tensors ({len(self._cached_per_tensor_param)} tensors) with fresh actor params")
-
-            # 用新的 actor 参数更新缓存的 tensor
-            for i, (name, new_tensor) in enumerate(per_tensor_param):
-                cached_name, cached_tensor = self._cached_per_tensor_param[i]
-                assert cached_name == name, f"Tensor name mismatch: {cached_name} vs {name}"
-                # 直接 copy 新参数到缓存的 tensor 中
-                cached_tensor.copy_(new_tensor)
-
-        # 计算缓存大小用于诊断
-        cache_size_gb = sum(t.element_size() * t.numel() for _, t in self._cached_per_tensor_param) / (1024 ** 3)
-        logger.info(f"[MEMORY] [TAG3] cache size: {cache_size_gb:.2f} GB, num tensors: {len(self._cached_per_tensor_param)}")
-        
-        del per_tensor_param
-        torch.cuda.empty_cache()
-
-        log_gpu_memory_usage("[MEMORY USAGE] [TAG3] self._cached_per_tensor_param", logger=logger)
-
-        def per_tensor_param_gen(cache):
-            for name, tensor in cache:
-                yield name, tensor
-
-        per_tensor_param = per_tensor_param_gen(self._cached_per_tensor_param)
 
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
