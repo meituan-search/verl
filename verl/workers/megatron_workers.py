@@ -699,6 +699,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self.bridge is not None:
             if self.vanilla_bridge:
                 per_tensor_param = self.bridge.export_weights(self.actor.actor_module)
+            elif not self.peft_merge and self.peft_cls is not None:
+                # Only export adapter weights
+                per_tensor_param = self.bridge.export_adapter_weights(self.actor.actor_module)
             else:
                 per_tensor_param = self.bridge.export_hf_weights(self.actor.actor_module)
         else:
@@ -1108,9 +1111,6 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
                     local_model_path = get_hf_model_path(self.config)
                     if self.vanilla_bridge:
                         self.bridge.load_weights(critic_module, local_model_path)
-                    elif not self.peft_merge and self.peft_cls is not None:
-                        # Only export adapter weights
-                        per_tensor_param = self.bridge.export_adapter_weights(self.actor.actor_module)
                     else:
                         self.bridge.load_hf_weights(
                             critic_module, local_model_path, allowed_mismatched_params=["output_layer.weight"]
