@@ -28,6 +28,7 @@ from verl.single_controller.ray.base import RayResourcePool
 from verl.trainer.ppo.reward import get_custom_reward_fn
 from verl.utils import hf_tokenizer
 from verl.utils.fs import copy_to_local
+from verl.utils.ray_utils import auto_await
 
 from .reward_manager import get_reward_manager_cls
 from .reward_model import RewardModelManager
@@ -218,6 +219,23 @@ class RewardLoopWorker:
             }
             output = await self._post_request(payloads, "v1/embeddings")
             rm_score = output["data"][-1]["embedding"][-1]
+        elif engine_name == "trtllm":
+            # TODO: remove this once TRT-LLM switches to TorchSampler
+            raise ValueError("TensorRT-LLM backend does not support reward models currently.")
+
+            payloads = {
+                "model": model_name,
+                "prompt": disrm_prompt,
+                "return_context_logits": True,
+            }
+            output = await self._post_request(payloads, "v1/completions")
+            rm_score = output["choices"][0]["context_logits"]
+            assert isinstance(rm_score, list) and len(rm_score) > 0, (
+                "TensorRT-LLM OpenAI server response for reward score is not in the expected format."
+            )
+
+            rm_score = float(rm_score[0][0])
+            logger.debug(f"rm score: {rm_score}")
         else:
             raise NotImplementedError(f"RewardLoopManager does not support {engine_name}")
 
@@ -233,14 +251,24 @@ class RewardLoopManager:
 
     def __init__(self, config: DictConfig, rm_resource_pool: RayResourcePool = None):
         self.config = config
-        if self.config.reward_model.enable:
-            self.reward_model_manager = RewardModelManager(config.reward_model, rm_resource_pool)
-            self.reward_router_address = self.reward_model_manager.get_router_address()
-        else:
-            self.reward_model_manager = None
-            self.reward_router_address = None
+        self.reward_model_manager = None
+        self.reward_router_address = None
 
-        self._init_reward_loop_workers()
+    @classmethod
+    @auto_await
+    async def create(
+        cls,
+        config: DictConfig,
+        rm_resource_pool: RayResourcePool = None,
+    ):
+        instance = cls(config, rm_resource_pool)
+
+        if config.reward_model.enable:
+            instance.reward_model_manager = await RewardModelManager.create(config.reward_model, rm_resource_pool)
+            instance.reward_router_address = instance.reward_model_manager.get_router_address()
+
+        instance._init_reward_loop_workers()
+        return instance
 
     def _init_reward_loop_workers(self):
         self.reward_loop_workers = []
@@ -296,9 +324,3 @@ class RewardLoopManager:
         return DataProto(
             batch=batch, non_tensor_batch=non_tensor_batch, meta_info={"reward_extra_keys": reward_extra_keys}
         )
-
-    def _run_all(self, tasks: list[asyncio.Task]):
-        async def run_all():
-            return await asyncio.gather(*tasks)
-
-        return asyncio.run(run_all())

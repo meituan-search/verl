@@ -16,31 +16,16 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Callable
 
 from omegaconf import DictConfig
-from pydantic import BaseModel
 from ray.actor import ActorHandle
 
-from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
-from verl.trainer.ppo.ray_trainer import RayResourcePool, ResourcePoolManager
+from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup, ResourcePoolManager
 from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config import HFModelConfig, RolloutConfig
 
 logger = logging.getLogger(__file__)
-
-
-class TokenOutput(BaseModel):
-    token_ids: list[int]
-    """response token ids"""
-    log_probs: Optional[list[float]] = None
-    """logprobs of response token ids"""
-    routed_experts: Optional[Any] = None
-    """routed experts of response token ids"""
-    stop_reason: Optional[str] = None
-    """stop reason: 'completed', 'aborted', or None for unknown"""
-    num_preempted: Optional[int] = None
-    """number of preempted times for metric calculation"""
 
 
 class RolloutMode(Enum):
@@ -229,9 +214,25 @@ class RolloutReplica(ABC):
         """Sleep each rollout server."""
         await asyncio.gather(*[server.sleep.remote() for server in self.servers])
 
+    async def abort_all_requests(self):
+        """Partial rollout: abort and save all unfinished requests in each rollout server."""
+        await asyncio.gather(*[server.abort_all_requests.remote() for server in self.servers])
+
+    async def resume_all_requests(self):
+        """Partial rollout: resume all unfinished requests in each rollout server."""
+        await asyncio.gather(*[server.resume_all_requests.remote() for server in self.servers])
+
     async def clear_kv_cache(self):
         """reset kv cache in each rollout server."""
         await asyncio.gather(*[server.clear_kv_cache.remote() for server in self.servers])
+
+    async def start_profile(self, **kwargs):
+        """Start profiling on the replica."""
+        await asyncio.gather(*[server.start_profile.remote(**kwargs) for server in self.servers])
+
+    async def stop_profile(self):
+        """Stop profiling on the replica."""
+        await asyncio.gather(*[server.stop_profile.remote() for server in self.servers])
 
 
 class RolloutReplicaRegistry:
