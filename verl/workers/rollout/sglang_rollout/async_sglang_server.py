@@ -273,7 +273,7 @@ class SGLangHttpServer(BaseRolloutServer):
             "nnodes": self.nnodes,
             "trust_remote_code": self.model_config.trust_remote_code,
             "max_running_requests": self.config.get("max_num_seqs", None),
-            "log_level": "info",
+            "log_level": "error",
             "mm_attention_backend": "fa3",
             "attention_backend": attention_backend if attention_backend is not None else "fa3",
             "skip_tokenizer_init": self.config.skip_tokenizer_init,
@@ -316,14 +316,8 @@ class SGLangHttpServer(BaseRolloutServer):
             args["speculative_eagle_topk"] = self.config.mtp.speculative_eagle_topk
             args["speculative_num_draft_tokens"] = self.config.mtp.speculative_num_draft_tokens
 
-            args["log_level"] = "info"
-            # args["load_format"] = "auto"
-
             args["enable_weights_cpu_backup"] = True
             args["enable_draft_weights_cpu_backup"] = True
-
-            # args['enable_memory_saver'] = False
-            # enable_memory_saver = False MTP success but memory can't be release
 
         # NOTE: We can't directly call SGLang's launch_server since it's not an async function.
         # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/http_server.py
