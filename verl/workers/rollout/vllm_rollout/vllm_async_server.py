@@ -18,7 +18,7 @@ import json
 import logging
 import os
 from pprint import pprint
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
 import ray
@@ -675,6 +675,79 @@ class vLLMHttpServer(BaseRolloutServer):
             logger.error(f"Error aborting request {request_id}: {e}")
             return {"aborted": False, "request_id": request_id, "error": str(e)}
 
+    async def _generate_step(
+        self,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        request_id: str,
+        image_data: Optional[list[Any]] = None,
+    ):
+        max_tokens = self.config.max_model_len - len(prompt_ids)
+        sampling_params["logprobs"] = 1
+        sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
+        sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
+        prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+        prompt = TokensPrompt(
+            prompt_token_ids=prompt_ids, multi_modal_data={"image": image_data} if image_data else None
+        )
+        generator = self.engine.generate(prompt=prompt, sampling_params=sampling_params, request_id=request_id)
+
+        # Get final response
+        async for output in generator:
+            self.req_output[request_id] = output
+        assert self.req_output[request_id] is not None
+
+    async def generate_for_partial(
+        self,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        request_id: str,
+        image_data: Optional[list[Any]] = None,
+    ) -> tuple[list[Any], list[Any], bool] | tuple[Sequence[int], list[float], Any]:
+        async with self.lock:
+            if self.paused:
+                # After cancel, all tasks will return directly and wait for the next submission
+                return [], [], True
+            self.req_output[request_id]: Optional[RequestOutput] = None
+            self.cancel_event[request_id] = asyncio.Event()
+            cancel_handle = asyncio.create_task(self.cancel_event[request_id].wait())
+            generation_handle = asyncio.create_task(
+                self._generate_step(prompt_ids, sampling_params, request_id, image_data)
+            )
+
+        done, pend = await asyncio.wait([generation_handle, cancel_handle], return_when=asyncio.FIRST_COMPLETED)
+
+        for task in done:
+            await task
+
+        for task in pend:
+            task.cancel()
+
+        async with self.lock:
+            if self.req_output[request_id] is None:
+                return [], [], True
+            token_ids = self.req_output[request_id].outputs[0].token_ids
+            log_probs: list[float] = []
+            for i, x in enumerate(self.req_output[request_id].outputs[0].logprobs):
+                # In sampling_params, logprobs is set to 1, which should return 1,
+                # but in practice there are multiple. Take the log_prob corresponding to token_id
+                token_id = self.req_output[request_id].outputs[0].token_ids[i]
+                log_probs.append(x[token_id].logprob)
+            is_cancel = generation_handle not in done
+            self.cancel_event.pop(request_id, None)
+            self.req_output.pop(request_id, None)
+        return token_ids, log_probs, is_cancel
+
+    async def cancel(self):
+        async with self.lock:
+            self.paused = True
+            for request_id in self.cancel_event:
+                self.cancel_event[request_id].set()
+
+    async def resume(self):
+        async with self.lock:
+            self.paused = False
+
 
 _rollout_worker_actor_cls = ray.remote(ServerAdapter)
 
@@ -824,6 +897,14 @@ class vLLMReplica(RolloutReplica):
                 return r
 
         return {"aborted": False, "request_id": request_id, "error": "Request not found on any server"}
+
+    async def cancel(self):
+        """Cancel each rollout server."""
+        await asyncio.gather(*[server.cancel.remote() for server in self.servers])
+
+    async def resume(self):
+        """Resume each rollout server."""
+        await asyncio.gather(*[server.resume.remote() for server in self.servers])
 
 
 def _qwen2_5_vl_dedup_image_tokens(prompt_ids: list[int], processor):

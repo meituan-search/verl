@@ -218,6 +218,12 @@ class BaseRolloutServer(ABC):
         self.resume_event.set()
         self.model_version = model_version
 
+        # for cancel LLMServer
+        self.paused = False
+        self.lock = asyncio.Lock()
+        self.cancel_event: dict[str, asyncio.Event] = {}
+        self.req_output: dict[str, Optional[Any]] = {}
+
     @resume_on_abort
     async def generate(
         self,

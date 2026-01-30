@@ -17,7 +17,7 @@ import logging
 import os
 import random
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 from uuid import uuid4
 
 import hydra
@@ -119,6 +119,38 @@ class AsyncLLMServerManager:
             sampling_params=sampling_params,
             image_data=image_data,
             video_data=video_data,
+        )
+        return output
+
+    @rollout_trace_op
+    async def generate_for_partial(
+        self,
+        request_id,
+        *,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        image_data: Optional[list[Any]] = None,
+    ) -> tuple[list[Any], list[Any], Any] | tuple[Sequence[int], list[float], bool]:
+        """Generate tokens from prompt ids, used for async partial.
+
+        Args:
+            request_id (str): request id for sticky session.
+            prompt_ids (List[int]): List of prompt token ids.
+            sampling_params (Dict[str, Any]): Sampling parameters for the chat completion.
+            image_data (Optional[List[Any]]): Image data for multi-modal tools.
+
+        Returns:
+            output: A tuple representing the generation output.
+            - Element 0 (Sequence[int]): Generated response token IDs.
+            - Element 1 (list[float]): Log probabilities for the response token IDs.
+            - Element 2 (bool): A flag or status indicating cancellation.
+        """
+        server = self._choose_server(request_id)
+        output = await server.generate_for_partial.remote(
+            request_id=request_id,
+            prompt_ids=prompt_ids,
+            sampling_params=sampling_params,
+            image_data=image_data,
         )
         return output
 
@@ -402,6 +434,9 @@ class AgentLoopWorker:
             trace_config.get("token2text", False),
             trace_config.get("max_samples_per_step_per_worker", None),
         )
+
+        # A shared cancellation event for all agent loops running on this worker.
+        self.cancellation_event = asyncio.Event()
 
     @tqbridge()
     async def generate_sequences(self, batch: DataProto) -> DataProto:
@@ -820,6 +855,129 @@ class AgentLoopWorker:
             config=self.config.transfer_queue,
         )
 
+    async def generate_sequences_no_post(
+        self, batch: DataProto, partial_output_list: Optional[list[AgentLoopOutput]]
+    ) -> tuple[list[AgentLoopOutput], bool] | tuple[DataProto, bool]:
+        """Generate sequences from agent loop.
+
+        Args:
+            batch (DataProto): Input batch.
+            partial_output_list: Optional[List[AgentLoopOutput]]: already rollout result.
+
+        Returns:
+            list[AgentLoopOutput]: List of agent loop outputs, one per sample in the batch.
+        """
+        config = self.config.actor_rollout_ref.rollout
+        sampling_params = dict(
+            temperature=config.temperature,
+            top_p=config.top_p,
+            repetition_penalty=1.0,
+            logprobs=config.calculate_log_probs,
+        )
+
+        # override sampling params for validation
+        if batch.meta_info.get("validate", False):
+            sampling_params["top_p"] = config.val_kwargs.top_p
+            sampling_params["temperature"] = config.val_kwargs.temperature
+
+        if "agent_name" not in batch.non_tensor_batch:
+            default_agent_loop = config.agent.default_agent_loop
+            batch.non_tensor_batch["agent_name"] = np.array([default_agent_loop] * len(batch), dtype=object)
+
+        if "index" in batch.non_tensor_batch:
+            index = batch.non_tensor_batch["index"]
+        else:
+            index = np.arange(len(batch))
+
+        trajectory_info = await get_trajectory_info(
+            batch.meta_info.get("global_steps", -1), index, batch.meta_info.get("validate", False)
+        )
+
+        if not partial_output_list:
+            partial_output_list = [None] * len(batch)
+        try:
+            tasks = []
+            for i in range(len(batch)):
+                kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+                kwargs["output"] = partial_output_list[i]
+                tasks.append(
+                    asyncio.create_task(self._partial_run_agent_loop(sampling_params, trajectory_info[i], **kwargs))
+                )
+            outputs = await asyncio.gather(*tasks)
+        except Exception:
+            logger.exception("_partial_run_agent_loop failed")
+            raise
+
+        is_cancel = any(output.extra_fields.get("is_cancel", False) for output in outputs)
+        if not is_cancel:
+            output = self._postprocess(outputs)
+            output = self._addition_process(output)
+            return output, is_cancel
+        return outputs, is_cancel
+
+    def _addition_process(self, output: DataProto):
+        """collect metirics"""
+        metrics = output.meta_info.pop("metrics")  # List[Dict[str, str]]
+        processing_times_list = [item["generate_sequences"] for item in metrics]
+        tool_calls_times_list = [item["tool_calls"] for item in metrics]
+        output.non_tensor_batch["processing_times"] = processing_times_list
+        output.non_tensor_batch["tool_calls_times"] = tool_calls_times_list
+        return output
+
+    async def _partial_run_agent_loop(
+        self,
+        sampling_params: dict[str, Any],
+        trajectory: dict[str, Any],
+        *,
+        agent_name: str,
+        **kwargs,
+    ) -> AgentLoopOutput:
+        # Completed, return directly
+        if kwargs["output"] is not None and not kwargs["output"].extra_fields.get("is_cancel", False):
+            logger.info("In _partial_run_agent_loop, already completed, return derictly!")
+            return kwargs["output"]
+        try:
+            with rollout_trace_attr(
+                step=trajectory["step"],
+                sample_index=trajectory["sample_index"],
+                rollout_n=trajectory["rollout_n"],
+                validate=trajectory["validate"],
+                name="agent_loop",
+            ):
+                assert agent_name in _agent_loop_registry, (
+                    f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
+                )
+
+                agent_loop_config = _agent_loop_registry[agent_name]
+                agent_loop = hydra.utils.instantiate(
+                    config=agent_loop_config,
+                    trainer_config=DictConfigWrap(config=self.config),
+                    server_manager=self.server_manager,
+                    tokenizer=self.tokenizer,
+                    processor=self.processor,
+                    dataset_cls=self.dataset_cls,
+                    dataset_config=DictConfigWrap(config=self.config.data),
+                )
+                output: AgentLoopOutput = await agent_loop.run(
+                    sampling_params, cancellation_event=self.cancellation_event, **kwargs
+                )
+                if not output.extra_fields.get("is_cancel", False):
+                    kwargs.pop("output", None)
+                    output = await self._agent_loop_postprocess(output, **kwargs)
+
+                return output
+        except Exception:
+            logger.exception("Agent_loop run failed")
+            raise
+
+    async def cancel_agent_loops(self):
+        """Set the shared cancellation event to stop all agent loops."""
+        self.cancellation_event.set()
+
+    async def resume_agent_loops(self):
+        """Clear the shared cancellation event."""
+        self.cancellation_event.clear()
+
 
 async def get_trajectory_info(step, index, validate):
     """Get trajectory info.
@@ -1034,3 +1192,70 @@ class AgentLoopManager:
     async def stop_profile(self):
         """Stop profiling on all rollout replicas."""
         await asyncio.gather(*[replica.stop_profile() for replica in self.rollout_replicas])
+
+    async def generate_single_sample_async(
+        self,
+        sample: DataProto,
+        partial_output_list: Optional[list[AgentLoopOutput]],
+    ) -> tuple[list[AgentLoopOutput], bool] | tuple[DataProto, bool]:
+        """
+        Asynchronously process a single sample
+
+        Args:
+            sample: Single sample data
+            partial_output_list: Optional[List[AgentLoopOutput]]: already rollout result.
+
+        Returns:
+            list[AgentLoopOutput]: Processing results
+        """
+
+        def select_worker():
+            """Select the best worker, simple round-robin load balancing"""
+            if not hasattr(self, "_worker_index"):
+                self._worker_index = 0
+
+            _worker = self.agent_loop_workers[self._worker_index]
+            self._worker_index = (self._worker_index + 1) % len(self.agent_loop_workers)
+            return _worker
+
+        worker = select_worker()
+        output_future = worker.generate_sequences_no_post.remote(sample, partial_output_list)
+        return await asyncio.wrap_future(output_future.future())
+
+    async def cancel(self):
+        worker_cancel_tasks = [worker.cancel_agent_loops.remote() for worker in self.agent_loop_workers]
+        rollout_cancel_tasks = [replica.cancel() for replica in self.rollout_replicas]
+        await asyncio.gather(*rollout_cancel_tasks, *worker_cancel_tasks)
+
+    async def resume(self):
+        rollout_resume_tasks = [replica.resume() for replica in self.rollout_replicas]
+        worker_resume_tasks = [worker.resume_agent_loops.remote() for worker in self.agent_loop_workers]
+        await asyncio.gather(*rollout_resume_tasks, *worker_resume_tasks)
+
+    async def wake_up(self):
+        await asyncio.gather(*[replica.wake_up() for replica in self.rollout_replicas])
+
+    async def sleep(self):
+        await asyncio.gather(*[replica.sleep() for replica in self.rollout_replicas])
+
+    async def reset_prefix_cache(self):
+        print("[FullyAsyncAgentLoopManager] Reset prefix cache ...")
+        # await asyncio.gather(*[replica.reset_prefix_cache() for replica in self.rollout_replicas])
+        # Note: debug
+        timeout = 5.0
+
+        async def reset_one(idx, replica):
+            print(f"[reset_prefix_cache] start replica={idx}")
+            try:
+                await asyncio.wait_for(replica.reset_prefix_cache(), timeout=timeout)
+            except asyncio.TimeoutError:
+                print(f"[reset_prefix_cache] TIMEOUT replica={idx} after {timeout}s")
+                return
+            except Exception as e:
+                print(f"[reset_prefix_cache] ERROR replica={idx}: {e!r}")
+                return
+            print(f"[reset_prefix_cache] done  replica={idx}")
+
+        tasks = [reset_one(i, replica) for i, replica in enumerate(self.rollout_replicas)]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        print("[FullyAsyncAgentLoopManager] Reset prefix cache finished")

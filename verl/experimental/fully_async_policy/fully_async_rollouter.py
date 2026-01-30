@@ -441,10 +441,10 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
     async def _init_async_rollout_manager(self):
         # create async rollout manager and request scheduler
         assert self.config.actor_rollout_ref.rollout.mode == "async"
-        from verl.experimental.fully_async_policy.agent_loop import FullyAsyncAgentLoopManager
+        from verl.experimental.agent_loop import AgentLoopManager
 
         self.async_rollout_mode = True
-        self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
+        self.async_rollout_manager = await AgentLoopManager.create(
             config=self.config,
             worker_group=self.rollout_wg,
         )

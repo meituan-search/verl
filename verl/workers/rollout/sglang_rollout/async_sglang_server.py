@@ -512,6 +512,108 @@ class SGLangHttpServer(BaseRolloutServer):
                 break
             await asyncio.sleep(1.0)
 
+    async def _generate_step(
+        self,
+        prompt_ids: torch.Tensor,
+        sampling_params: dict[str, Any],
+        request_id: str,
+        image_data: Optional[list[Any]] = None,
+    ) -> None:
+        sampling_params = dict(sampling_params)
+
+        max_new_tokens = min(
+            self.config.response_length,
+            self.config.max_model_len - len(prompt_ids) - 1,
+        )
+        sampling_params["max_new_tokens"] = max_new_tokens
+
+        sampling_params.setdefault(
+            "repetition_penalty",
+            self.config.get("repetition_penalty", 1.0),
+        )
+
+        sampling_params.pop("logprobs", None)
+        return_logprob = True
+        from sglang.srt.managers.io_struct import GenerateReqInput
+
+        request = GenerateReqInput(
+            rid=request_id,
+            input_ids=prompt_ids,
+            sampling_params=sampling_params,
+            return_logprob=return_logprob,
+            image_data=image_data,
+        )
+        generator = self.tokenizer_manager.generate_request(request, None)
+        async for output in generator:
+            self.req_output[request_id] = output
+
+        assert self.req_output[request_id] is not None
+
+    async def generate_for_partial(
+        self,
+        prompt_ids: torch.Tensor,
+        sampling_params: dict[str, Any],
+        request_id: str,
+        image_data: Optional[list[Any]] = None,
+    ) -> tuple[list[int], list[float], bool]:
+        async with self.lock:
+            if self.paused:
+                return [], [], True
+            self.req_output[request_id] = None
+            self.cancel_event[request_id] = asyncio.Event()
+            cancel_handle = asyncio.create_task(self.cancel_event[request_id].wait())
+            generation_handle = asyncio.create_task(
+                self._generate_step(prompt_ids, sampling_params, request_id, image_data)
+            )
+        done, pending = await asyncio.wait(
+            [generation_handle, cancel_handle],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in done:
+            await task
+
+        for task in pending:
+            task.cancel()
+        async with self.lock:
+            output = self.req_output.get(request_id)
+            if output is None:
+                self.cancel_event.pop(request_id, None)
+                self.req_output.pop(request_id, None)
+                return [], [], True
+            meta_info = output.get("meta_info", {})
+            output_token_logprobs = meta_info.get("output_token_logprobs")
+
+            token_ids: list[int] = []
+            log_probs: list[float] = []
+
+            if output_token_logprobs is not None:
+                for log_prob, token_id, _ in output_token_logprobs:
+                    token_ids.append(int(token_id))
+                    log_probs.append(float(log_prob))
+            else:
+                token_ids = list(output["output_ids"])
+                log_probs = []
+            is_cancel = generation_handle not in done
+            self.cancel_event.pop(request_id, None)
+            self.req_output.pop(request_id, None)
+
+        return token_ids, log_probs, is_cancel
+
+    async def cancel(self):
+        async with self.lock:
+            self.paused = True
+            for request_id in self.cancel_event:
+                self.cancel_event[request_id].set()
+
+    async def resume(self):
+        async with self.lock:
+            self.paused = False
+
+    async def reset_prefix_cache(self):
+        async with self.lock:
+            print("Reset prefix cache ...")
+            await self.tokenizer_manager.flush_cache()
+
 
 _rollout_worker_actor_cls = ray.remote(ServerAdapter)
 
@@ -626,3 +728,15 @@ class SGLangReplica(RolloutReplica):
             if is_valid_ipv6_address(server_address)
             else f"{server_address}:{server_port}"
         )
+
+    async def cancel(self):
+        """Cancel each rollout server."""
+        await asyncio.gather(*[server.cancel.remote() for server in self.servers])
+
+    async def resume(self):
+        """Resume each rollout server."""
+        await asyncio.gather(*[server.resume.remote() for server in self.servers])
+
+    async def reset_prefix_cache(self):
+        """reset kv cache in each rollout server."""
+        await asyncio.gather(*[server.reset_prefix_cache.remote() for server in self.servers])
