@@ -23,16 +23,18 @@ import torch.distributed
 from omegaconf import DictConfig
 
 from verl.experimental.fully_async_policy.base_detach_sync import BaseDetachNcclSync
-from verl.experimental.fully_async_policy.megatron_utils import (
-    copy_megatron_model_to_cpu,
-    restore_megatron_model_from_cpu,
-)
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import (
     get_device_name,
     get_torch_device,
 )
-from verl.utils.megatron_utils import load_megatron_model_to_gpu, offload_megatron_model_to_cpu, per_tensor_generator
+from verl.utils.megatron_utils import (
+    copy_megatron_model_to_cpu,
+    load_megatron_model_to_gpu,
+    offload_megatron_model_to_cpu,
+    per_tensor_generator,
+    restore_megatron_model_from_cpu,
+)
 from verl.workers.megatron_workers import AsyncActorRolloutRefWorker, CriticWorker
 
 logger = logging.getLogger(__file__)
@@ -82,7 +84,23 @@ class DetachNcclSync(BaseDetachNcclSync, AsyncActorRolloutRefWorker):
                         return self.rollout._engine
 
                     inference_model = self._run_async_safely(init_engine())
-                    if inference_model is None:
+                    # For ServerAdapter, only TP rank 0 initializes the engine
+                    # TP rank != 0 can safely have inference_model as None
+                    from verl.workers.rollout.sglang_rollout.sglang_rollout import ServerAdapter
+
+                    is_server_adapter = isinstance(self.rollout, ServerAdapter)
+                    is_non_tp_rank = False
+                    if (
+                        is_server_adapter
+                        and hasattr(self.rollout, "device_mesh")
+                        and self.rollout.device_mesh is not None
+                    ):
+                        try:
+                            is_non_tp_rank = self.rollout.device_mesh["infer_tp"].get_local_rank() != 0
+                        except Exception:
+                            pass
+
+                    if inference_model is None and not (is_server_adapter and is_non_tp_rank):
                         raise RuntimeError(
                             f"Failed to initialize rollout engine. "
                             f"rollout type: {type(self.rollout)}, "
@@ -179,7 +197,23 @@ class DetachNcclSync(BaseDetachNcclSync, AsyncActorRolloutRefWorker):
                         return self.rollout._engine
 
                     inference_model = self._run_async_safely(init_engine())
-                    if inference_model is None:
+                    # For ServerAdapter, only TP rank 0 initializes the engine
+                    # TP rank != 0 can safely have inference_model as None
+                    from verl.workers.rollout.sglang_rollout.sglang_rollout import ServerAdapter
+
+                    is_server_adapter = isinstance(self.rollout, ServerAdapter)
+                    is_non_tp_rank = False
+                    if (
+                        is_server_adapter
+                        and hasattr(self.rollout, "device_mesh")
+                        and self.rollout.device_mesh is not None
+                    ):
+                        try:
+                            is_non_tp_rank = self.rollout.device_mesh["infer_tp"].get_local_rank() != 0
+                        except Exception:
+                            pass
+
+                    if inference_model is None and not (is_server_adapter and is_non_tp_rank):
                         raise RuntimeError(
                             f"Failed to initialize rollout engine. "
                             f"rollout type: {type(self.rollout)}, "

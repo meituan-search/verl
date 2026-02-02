@@ -272,7 +272,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     timing_raw=timing_raw, metrics=None, global_steps=global_steps, param_version=version
                 )
             elif need_validate and not self.parallel_validate_and_rollout:
-                data = self._validate_wrapper(timing_raw, version, global_steps, use_trainer_do_validate)
+                data = await self._validate_wrapper(timing_raw, version, global_steps, use_trainer_do_validate)
 
             if not need_validate or not self.parallel_validate_and_rollout:
                 await self.message_queue_client.put_validate(ray.cloudpickle.dumps(data))
@@ -287,12 +287,12 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 self.do_validate_async(timing_raw, version, global_steps, use_trainer_do_validate)
             )
 
-    def _validate_wrapper(
+    async def _validate_wrapper(
         self, timing_raw: dict, version: int, global_steps: int = 0, use_trainer_do_validate: bool = False
     ):
         val_metrics = None
         with marked_timer("rollouter/validate_time", timing_raw, color="green"):
-            val_metrics: dict = self._validate(use_trainer_do_validate)
+            val_metrics: dict = await self._validate(use_trainer_do_validate)
         data = ValidateMetrics(
             timing_raw=timing_raw, metrics=val_metrics, global_steps=global_steps, param_version=version
         )
@@ -441,10 +441,10 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
     async def _init_async_rollout_manager(self):
         # create async rollout manager and request scheduler
         assert self.config.actor_rollout_ref.rollout.mode == "async"
-        from verl.experimental.fully_async_policy.agent_loop import FullyAsyncAgentLoopManager
+        from verl.experimental.agent_loop import AgentLoopManager
 
         self.async_rollout_mode = True
-        self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
+        self.async_rollout_manager = await AgentLoopManager.create(
             config=self.config,
             worker_group=self.rollout_wg,
         )

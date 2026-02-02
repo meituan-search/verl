@@ -31,6 +31,7 @@ from torch.utils.data import Dataset, Sampler
 from tqdm import tqdm
 
 from verl import DataProto
+from verl.experimental.agent_loop import AgentLoopManager
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.experimental.one_step_off_policy.utils import need_critic
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
@@ -287,7 +288,6 @@ class OneStepOffRayTrainer(RayPPOTrainer):
     def _init_async_rollout_manager(self):
         # create async rollout manager and request scheduler
         assert self.config.actor_rollout_ref.rollout.mode == "async"
-        from verl.experimental.one_step_off_policy.agent_loop import OneStepOffAgentLoopManager
 
         self.async_rollout_mode = True
 
@@ -296,7 +296,7 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         else:
             rm_resource_pool = None
 
-        self.async_rollout_manager = OneStepOffAgentLoopManager(
+        self.async_rollout_manager = AgentLoopManager.create(
             config=self.config, worker_group=self.rollout_wg, rm_resource_pool=rm_resource_pool
         )
 
