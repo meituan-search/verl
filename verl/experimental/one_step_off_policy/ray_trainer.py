@@ -132,6 +132,126 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         self.actor_rollout_wg = self.actor_wg
         return ret
 
+    # =========================================================================
+    # 模板方法重写：复用 RayPPOTrainer 的公共逻辑
+    # =========================================================================
+
+    def _fit_generate(self, gen_batch: DataProto, is_last_step: bool) -> DataProto:
+        """异步生成序列"""
+        gen_batch.meta_info["global_steps"] = self.global_steps
+        gen_batch_output = gen_batch.repeat(
+            repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+        )
+        gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+        return gen_batch_output
+
+    def _fit_compute_log_prob(self, batch: DataProto, metrics: dict, timing_raw: dict) -> DataProto:
+        """计算 log probability - 使用 actor_wg"""
+        rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+        bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+
+        with marked_timer("old_log_prob", timing_raw, color="blue"):
+            if bypass_recomputing_logprobs:
+                from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
+
+                apply_bypass_mode(
+                    batch=batch,
+                    rollout_corr_config=rollout_corr_config,
+                    policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
+                )
+            else:
+                old_log_prob = self.actor_wg.compute_log_prob(batch)
+                entropys = old_log_prob.batch["entropys"]
+                response_masks = batch.batch["response_mask"]
+                actor_config = self.config.actor_rollout_ref.actor
+                entropy_agg = agg_loss(
+                    loss_mat=entropys,
+                    loss_mask=response_masks,
+                    loss_agg_mode=actor_config.loss_agg_mode,
+                    loss_scale_factor=actor_config.loss_scale_factor,
+                )
+                metrics["actor/entropy"] = entropy_agg.detach().item()
+                old_log_prob.batch.pop("entropys")
+                batch = batch.union(old_log_prob)
+
+                if "rollout_log_probs" in batch.batch.keys():
+                    from verl.utils.debug.metrics import calculate_debug_metrics
+
+                    metrics.update(calculate_debug_metrics(batch))
+
+        return batch
+
+    def _fit_compute_values(self, batch: DataProto, metrics: dict, timing_raw: dict) -> DataProto:
+        """计算 values - 使用 critic_wg"""
+        if self.use_critic:
+            with marked_timer("values", timing_raw, color="cyan"):
+                values = self.critic_wg.compute_values(batch)
+                batch = batch.union(values)
+        return batch
+
+    def _fit_update_critic(self, batch: DataProto, metrics: dict, timing_raw: dict) -> tuple[DataProto, dict]:
+        """更新 critic"""
+        if self.use_critic:
+            with marked_timer("update_critic", timing_raw, color="pink"):
+                critic_output = self.critic_wg.update_critic(batch)
+            critic_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+            metrics.update(critic_metrics)
+        return batch, metrics
+
+    def _fit_update_actor(self, batch: DataProto, metrics: dict, timing_raw: dict) -> tuple[DataProto, dict]:
+        """更新 actor - 使用 actor_wg"""
+        if self.config.trainer.critic_warmup <= self.global_steps:
+            with marked_timer("update_actor", timing_raw, color="red"):
+                rollout_config = self.config.actor_rollout_ref.rollout
+                batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
+                batch.meta_info["temperature"] = rollout_config.temperature
+                actor_output = self.actor_wg.update_actor(batch)
+            actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+            metrics.update(actor_metrics)
+        return batch, metrics
+
+    def _fit_after_step(
+        self,
+        batch: DataProto,
+        metrics: dict,
+        timing_raw: dict,
+        is_last_step: bool,
+        reward_extra_infos_dict: dict,
+    ):
+        """步骤后处理 - 添加 sync_rollout_weights"""
+        # Log rollout generations
+        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+        if rollout_data_dir:
+            self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+
+        # Validate
+        if (
+            self.val_reward_fn is not None
+            and self.config.trainer.test_freq > 0
+            and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+        ):
+            with marked_timer("testing", timing_raw, color="green"):
+                val_metrics = self._validate()
+            metrics.update(val_metrics)
+
+        # Save checkpoint
+        esi_close_to_expiration = should_save_ckpt_esi(
+            max_steps_duration=self.max_steps_duration,
+            redundant_time=self.config.trainer.esi_redundant_time,
+        )
+        if self.config.trainer.save_freq > 0 and (
+            is_last_step or self.global_steps % self.config.trainer.save_freq == 0 or esi_close_to_expiration
+        ):
+            if esi_close_to_expiration:
+                print("Force saving checkpoint: ESI instance expiration approaching.")
+            with marked_timer("save_checkpoint", timing_raw, color="green"):
+                self._save_checkpoint()
+
+    def sync_rollout_weights(self):
+        """同步 actor 和 rollout 的权重"""
+        self.actor_wg.sync_rollout_weights()
+        ray.get(self.rollout_wg.sync_rollout_weights())
+
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
 

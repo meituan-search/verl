@@ -85,22 +85,16 @@ def create_role_worker_mapping(config):
     # Select worker class based on strategy
     if config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
         assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
-        from verl.experimental.one_step_off_policy.fsdp_workers import (
-            CriticWorker,
-            DetachActorWorker,
-            DetachAsyncRolloutWorker,
-        )
+        from verl.workers.engine_workers import DetachActorWorker, DetachAsyncRolloutWorker
+        from verl.workers.fsdp_workers import CriticWorker
         from verl.single_controller.ray import RayWorkerGroup
 
         ray_worker_group_cls = RayWorkerGroup
 
     elif config.actor_rollout_ref.actor.strategy == "megatron":
         assert config.critic.strategy == "megatron"
-        from verl.experimental.one_step_off_policy.megatron_workers import (
-            CriticWorker,
-            DetachActorWorker,
-            DetachAsyncRolloutWorker,
-        )
+        from verl.workers.engine_workers import DetachActorWorker, DetachAsyncRolloutWorker
+        from verl.workers.megatron_workers import CriticWorker
         from verl.single_controller.ray import RayWorkerGroup
 
         ray_worker_group_cls = RayWorkerGroup
