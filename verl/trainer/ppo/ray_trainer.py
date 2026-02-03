@@ -56,7 +56,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
-from verl.utils.import_utils import load_class_from_fqn
+from verl.utils.import_utils import load_class_from_fqn, deprecated
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
@@ -1308,6 +1308,7 @@ class RayPPOTrainer:
             critic_output = self.critic_wg.update_critic(batch)
         return critic_output
 
+    @deprecated
     def fit(self):
         """
         The training loop of PPO.
@@ -1319,6 +1320,7 @@ class RayPPOTrainer:
         The logic of fit is consistent with that of fit_refactor;
         if any modifications are made, apply them to both methods simultaneously.
 
+        In the future, we will migrate all relevant logic to the fit_refactor function.
         """
         from omegaconf import OmegaConf
 
@@ -1345,7 +1347,7 @@ class RayPPOTrainer:
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
-            self.logger.log(data=val_metrics, step=self.global_steps)
+            logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
 
