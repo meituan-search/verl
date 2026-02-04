@@ -39,7 +39,7 @@ from verl.trainer.ppo.ray_trainer import (
     ResourcePoolManager,
     compute_response_mask,
 )
-from verl.trainer.ppo.ray_trainer_for_separate import SeparateRayPPOTrainer
+from verl.trainer.ppo.ray_trainer_for_separation import SeparationRayPPOTrainer
 from verl.trainer.ppo.reward import compute_reward_async
 from verl.trainer.ppo.utils import Role, WorkerType, need_reference_policy, need_reward_model
 from verl.utils.debug import marked_timer
@@ -47,7 +47,7 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.tracking import ValidationGenerationsLogger
 
 
-class OneStepOffRayTrainer(SeparateRayPPOTrainer):
+class OneStepOffRayTrainer(SeparationRayPPOTrainer):
     def __init__(
         self,
         config,
@@ -352,7 +352,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
-        self.checkpoint_manager.update_weights()
+        self._fit_update_weights()
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
@@ -478,3 +478,10 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             await asyncio.sleep(0)
 
         return batch, batch_data_future
+
+
+    def _fit_update_weights(self):
+        # TODO: use checkpoint engine to update weight
+        self.sync_rollout_weights()
+
+

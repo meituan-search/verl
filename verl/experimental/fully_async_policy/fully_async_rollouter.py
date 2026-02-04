@@ -23,6 +23,7 @@ from pprint import pformat
 import numpy as np
 import ray
 import torch
+from modelscope.trainers.audio.separation_trainer import SeparationTrainer
 from ray import ObjectRef
 
 from verl.experimental.fully_async_policy.detach_utils import (
@@ -31,10 +32,9 @@ from verl.experimental.fully_async_policy.detach_utils import (
     prepare_single_generation_data,
 )
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
-from verl.experimental.fully_async_policy.ray_trainer import FullyAsyncRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
-from verl.trainer.ppo.ray_trainer_for_separate import SeparateRayPPOTrainer
+from verl.trainer.ppo.ray_trainer_for_separation import SeparationRayPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import Role, WorkerType
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
@@ -43,7 +43,7 @@ from verl.utils.tracking import ValidationGenerationsLogger
 
 
 @ray.remote(num_cpus=10, max_concurrency=100)
-class FullyAsyncRollouter(SeparateRayPPOTrainer):
+class FullyAsyncRollouter(SeparationRayPPOTrainer):
     """
     Asynchronous sample generator, responsible for continuously generating training samples
     and putting them into MessageQueue
