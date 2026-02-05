@@ -437,7 +437,8 @@ class FullyAsyncTrainer(SeparationRayPPOTrainer):
 
     def _compute_old_log_prob(self, batch: DataProto):
         """
-        如果 algorithm.rollout_correction.bypass_mode 为 False，则计算 old_log_prob
+        If algorithm.rollout_correction.bypass_mode is False,
+        use model engine and first version model params to re-calculate old_log_prob.
         """
         # If local_triger_step == 1, load the training engine's parameters to the CPU
         #  and save a copy for subsequent MIS use.

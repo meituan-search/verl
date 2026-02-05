@@ -708,8 +708,8 @@ class FullyAsyncRollouter(SeparationRayPPOTrainer):
         Function 2: Trigger rollout recovery
         """
         last_stats_time = time.time()
-        stats_interval = 10.0
-        check_interval = 5.0
+        stats_interval = 60.0
+        check_interval = 10.0
 
         while True:
             async with self.lock:
