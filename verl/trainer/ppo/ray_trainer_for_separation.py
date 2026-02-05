@@ -19,7 +19,6 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
-import sys
 import uuid
 from copy import deepcopy
 from pprint import pprint
@@ -453,7 +452,6 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
         return batch
 
     def _fit_compute_reward(self, batch: DataProto) -> DataProto:
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         timing_raw = self.timing_raw
         with marked_timer("reward", timing_raw, color="yellow"):
             # compute reward model score
@@ -478,7 +476,6 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
         return batch
 
     def _fit_compute_log_prob(self, batch: DataProto) -> DataProto:
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         metrics = self.metrics
         timing_raw = self.timing_raw
         # Operating Mode Selection:
@@ -530,7 +527,6 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
         return batch
 
     def _fit_compute_ref_log_prob(self, batch: DataProto) -> DataProto:
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         timing_raw = self.timing_raw
         if self.use_reference_policy:
             with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
@@ -539,7 +535,6 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
         return batch
 
     def _fit_compute_critic(self, batch: DataProto) -> DataProto:
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         timing_raw = self.timing_raw
         if self.use_critic:
             with marked_timer("values", timing_raw, color="cyan"):
@@ -548,7 +543,6 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
         return batch
 
     def _fit_compute_advantage(self, batch) -> DataProto:
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         metrics = self.metrics
         timing_raw = self.timing_raw
         future_reward = self.future_reward
@@ -608,7 +602,6 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
         return batch
 
     def _fit_update_critic(self, batch: DataProto) -> DataProto:
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         metrics = self.metrics
         timing_raw = self.timing_raw
         if self.use_critic:
@@ -619,7 +612,6 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
         return batch
 
     def _fit_update_actor(self, batch: DataProto) -> DataProto:
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         metrics = self.metrics
         timing_raw = self.timing_raw
         # implement critic warmup
@@ -633,7 +625,6 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
         return batch
 
     def _fit_update_weights(self):
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         timing_raw = self.timing_raw
         if self.config.trainer.critic_warmup <= self.global_steps:
             # update weights from trainer to rollout
@@ -641,7 +632,6 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
                 self.checkpoint_manager.update_weights()
 
     def _fit_dump_data(self, batch: DataProto):
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         timing_raw = self.timing_raw
         reward_extra_infos_dict = self.reward_extra_infos_dict
         # Log rollout generations if enabled
@@ -650,7 +640,6 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
             self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
     def _fit_validate(self):
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         metrics = self.metrics
         timing_raw = self.timing_raw
         if self.config.trainer.test_freq > 0 and (
@@ -663,7 +652,6 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
             metrics.update(val_metrics)
 
     def _fit_save_checkpoint(self):
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         timing_raw = self.timing_raw
         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
         esi_close_to_expiration = should_save_ckpt_esi(
@@ -691,7 +679,6 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
                 # self.checkpoint_manager.update_weights()
 
     def _fit_stop_profile(self):
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         timing_raw = self.timing_raw
         with marked_timer("stop_profile", timing_raw):
             self.next_step_profile = (
@@ -708,7 +695,6 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
             self.curr_step_profile = self.next_step_profile
 
     def _fit_collect_metrics(self, batch):
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         metrics = self.metrics
         timing_raw = self.timing_raw
 
@@ -723,7 +709,6 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
         metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
 
     def _fit_torch_memory(self):
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         if (
             hasattr(self.config.actor_rollout_ref.actor, "profiler")
             and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"
@@ -733,7 +718,6 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
             )
 
     def _fit_experimental(self, batch):
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         # this is experimental and may be changed/removed in the future in favor of a general-purpose one
         if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
             self.train_dataloader.sampler.update(batch=batch)
@@ -745,7 +729,6 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
             self.train_dataset.on_batch_end(batch=batch)
 
     def _fit_postprocess_step(self):
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         metrics = self.metrics
         timing_raw = self.timing_raw
 

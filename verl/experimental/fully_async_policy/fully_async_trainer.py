@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import os
-import sys
 import time
 from datetime import datetime
 from pprint import pprint
@@ -427,7 +426,6 @@ class FullyAsyncTrainer(SeparationRayPPOTrainer):
         self._fit_postprocess_step()
 
     def _fit_generate(self, batch: DataProto = None) -> DataProto:
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         metrics = self.metrics
         timing_raw = self.timing_raw
         with marked_timer("gen", timing_raw, color="red"):
@@ -441,7 +439,6 @@ class FullyAsyncTrainer(SeparationRayPPOTrainer):
         """
         如果 algorithm.rollout_correction.bypass_mode 为 False，则计算 old_log_prob
         """
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         # If local_triger_step == 1, load the training engine's parameters to the CPU
         #  and save a copy for subsequent MIS use.
         # If local_trigger_step == 2, 3, ..., restore the parameters of version 1 to calculate the old_log_prob,
@@ -460,7 +457,6 @@ class FullyAsyncTrainer(SeparationRayPPOTrainer):
         return old_log_prob, old_log_prob_mfu
 
     def _fit_collect_metrics(self, batch):
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         super()._fit_collect_metrics(batch)
         self.metrics_aggregator.add_step_metrics(
             metrics=self.metrics, sample_count=self.required_samples, timestamp=time.time()
@@ -468,7 +464,6 @@ class FullyAsyncTrainer(SeparationRayPPOTrainer):
         self._log_validation_data()
 
     async def _fit_update_weights(self):
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         # with marked_timer("update_weights", self.timing_raw, color="red"):
         #     self.checkpoint_manager.update_weights()
 
@@ -483,7 +478,6 @@ class FullyAsyncTrainer(SeparationRayPPOTrainer):
         await self._trigger_parameter_sync_after_step()
 
     def _fit_save_checkpoint(self):
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         timing_raw = self.timing_raw
         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
         esi_close_to_expiration = should_save_ckpt_esi(
@@ -510,11 +504,9 @@ class FullyAsyncTrainer(SeparationRayPPOTrainer):
                 # self.checkpoint_manager.update_weights()
 
     def _fit_postprocess_step(self):
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         self.global_steps += 1
 
     def _save_checkpoint(self):
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         # Warning: Currently, to align the training process and metrics of colocate,
         # we use current_param_version instead of global step.
         # This can be logically aligned with the original self.global_steps of colocate
@@ -578,7 +570,6 @@ class FullyAsyncTrainer(SeparationRayPPOTrainer):
             f.write(str(self.current_param_version))
 
     def load_checkpoint(self):
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         if self.config.trainer.resume_mode == "disable":
             # NOTE: while there is no checkpoint to load, we still need to offload the model and optimizer to CPU
             self.actor_rollout_wg.load_checkpoint(None)
@@ -638,7 +629,6 @@ class FullyAsyncTrainer(SeparationRayPPOTrainer):
         """
         Collect metrics from samples
         """
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         if hasattr(batch, "meta_info") and batch.meta_info:
             samples_param_versions = batch.meta_info["rollout_param_versions"]
             stale_count = sum(1 for v in samples_param_versions if self.current_param_version - v >= 1)
@@ -662,7 +652,6 @@ class FullyAsyncTrainer(SeparationRayPPOTrainer):
         Trigger parameter synchronization after training step
         This ensures rollouter always uses the latest trained parameters
         """
-        print(f"[FullyAsyncTrainer] {sys._getframe().f_code.co_name}")
         if self.local_trigger_step < self.trigger_parameter_sync_step and not validate:
             self.local_trigger_step += 1
             return

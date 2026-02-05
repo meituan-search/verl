@@ -185,7 +185,7 @@ class SGLangHttpServer:
             "dp_size": self.config.data_parallel_size,
             "ep_size": self.config.expert_parallel_size,
             "node_rank": self.node_rank,
-            "load_format": "auto",
+            "load_format": self.config.load_format,
             "dist_init_addr": dist_init_addr,
             "nnodes": self.nnodes,
             "trust_remote_code": self.model_config.trust_remote_code,
