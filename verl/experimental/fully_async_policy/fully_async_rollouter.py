@@ -128,7 +128,6 @@ class FullyAsyncRollouter(SeparationRayPPOTrainer):
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
-
         self.total_rollout_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
         if self.config.rollout.total_rollout_steps is not None:
             self.total_rollout_steps = min(self.config.rollout.total_rollout_steps, self.total_rollout_steps)
@@ -271,7 +270,7 @@ class FullyAsyncRollouter(SeparationRayPPOTrainer):
                 or (validate and self.val_reward_fn is not None)
             )
             print(
-                f"[FullyAsyncRollouter] need_validate: {need_validate},"
+                f"[FullyAsyncRollouter] need_validate: {need_validate}, "
                 f"parallel_validate_and_rollout: {self.parallel_validate_and_rollout}"
             )
             if not need_validate:
@@ -495,7 +494,7 @@ class FullyAsyncRollouter(SeparationRayPPOTrainer):
             if self.global_steps >= self.total_rollout_steps:
                 print(
                     f"[FullyAsyncRollouter][Feed] "
-                    f"Maximum count has been reached, stop adding new samples"
+                    f"Maximum count has been reached, stop adding new samples: "
                     f"{self.global_steps} >= {self.total_rollout_steps}"
                 )
                 break
@@ -709,8 +708,8 @@ class FullyAsyncRollouter(SeparationRayPPOTrainer):
         Function 2: Trigger rollout recovery
         """
         last_stats_time = time.time()
-        stats_interval = 60.0
-        check_interval = 10.0
+        stats_interval = 10.0
+        check_interval = 5.0
 
         while True:
             async with self.lock:
