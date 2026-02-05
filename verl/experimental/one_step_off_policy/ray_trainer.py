@@ -182,12 +182,27 @@ class OneStepOffRayTrainer(SeparationRayPPOTrainer):
         self._create_weight_sync_group()
 
     def _init_async_rollout_manager(self):
+
+        # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
+        # agent_reward_loop: streaming reward computation with actor rollout
+        # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
+        enable_agent_reward_loop = self.use_reward_loop and (
+                not self.use_rm or self.config.reward_model.enable_resource_pool
+        )
+        # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
+        # to stream reward computation with actor rollout
+        self.reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
+        reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
+
+
         # create async rollout manager and request scheduler
         assert self.config.actor_rollout_ref.rollout.mode == "async"
         from verl.experimental.one_step_off_policy.agent_loop import OneStepOffAgentLoopManager
 
         self.async_rollout_mode = True
-        self.async_rollout_manager = OneStepOffAgentLoopManager(config=self.config, worker_group=self.rollout_wg)
+        self.async_rollout_manager = OneStepOffAgentLoopManager(config=self.config,
+                                                                worker_group=self.rollout_wg,
+                                                                reward_loop_worker_handles=reward_loop_worker_handles)
 
     def _create_weight_sync_group(self):
         from verl.utils.device import get_nccl_backend
@@ -356,7 +371,7 @@ class OneStepOffRayTrainer(SeparationRayPPOTrainer):
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+        if self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
@@ -390,6 +405,8 @@ class OneStepOffRayTrainer(SeparationRayPPOTrainer):
         batch_data_future = asyncio.create_task(self._async_gen_next_batch(continuous_iterator))
         while batch_data_future is not None:
             batch_data_future = await self.fit_step(batch_data_future, continuous_iterator)
+            if self.is_last_step:
+                return
 
     async def fit_step(self, batch_data_future, continuous_iterator):
         """
@@ -469,19 +486,20 @@ class OneStepOffRayTrainer(SeparationRayPPOTrainer):
 
         # sync weights from actor to rollout
         with marked_timer("sync_rollout_weights", timing_raw, color="purple"):
-            self.sync_rollout_weights()
+            self._fit_update_weights()
             await self.async_rollout_manager.clear_kv_cache()
 
         # async next generation
         if not self.is_last_step:
             batch_data_future = asyncio.create_task(self._async_gen_next_batch(continuous_iterator))
             await asyncio.sleep(0)
+        else:
+            batch_data_future = None
 
         return batch, batch_data_future
 
 
     def _fit_update_weights(self):
         # TODO: use checkpoint engine to update weight
-        self.sync_rollout_weights()
-
-
+        # self.sync_rollout_weights()
+        pass

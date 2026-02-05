@@ -32,6 +32,7 @@ from torch.utils.data import Dataset, Sampler
 from tqdm import tqdm
 
 from verl import DataProto
+from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
@@ -118,7 +119,15 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
         self._create_worker_classes()
         self._init_worker_groups()
         self._init_models()
+        self._init_reward_loop()
         self._init_async_rollout_manager()
+
+        self.checkpoint_manager = CheckpointEngineManager(
+            backend=self.config.actor_rollout_ref.rollout.checkpoint_engine.backend,
+            trainer=self.actor_rollout_wg,
+            replicas=self.async_rollout_manager.rollout_replicas,
+        )
+
 
     def _init_resource_pools(self):
         self.resource_pool_manager.create_resource_pool()
@@ -212,6 +221,21 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
         self.actor_rollout_wg = self.all_wg[str(Role.ActorRollout)]
         self.actor_rollout_wg.init_model()
 
+    def _init_reward_loop(self):
+        if self.use_reward_loop:
+            # create reward loop manager
+            if self.use_reward_loop:
+                from verl.experimental.reward_loop import RewardLoopManager
+
+                # initalize reward loop manager
+                # reward model (colocate or standalone): get resource_pool
+                # no reward model: resource_pool = None
+                resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel) if self.use_rm else None
+                self.reward_loop_manager = RewardLoopManager(
+                    config=self.config,
+                    rm_resource_pool=resource_pool,
+                )
+
     def _init_async_rollout_manager(self):
         pass
 
@@ -247,7 +271,7 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+        if self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
@@ -279,6 +303,8 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
             for batch_dict in self.train_dataloader:
                 self.epoch = epoch
                 self.fit_step(batch_dict)
+                if self.is_last_step:
+                    return
 
     def fit_step(self, batch_dict: Any = None):
         """
@@ -367,9 +393,6 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
             gen_batch_output.meta_info.pop("timing", None)
 
         if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-            if self.reward_fn is None:
-                raise ValueError("A reward_fn is required for REMAX advantage estimation.")
-
             with marked_timer("gen_max", timing_raw, color="purple"):
                 gen_baseline_batch = deepcopy(gen_batch)
                 gen_baseline_batch.meta_info["do_sample"] = False
@@ -386,17 +409,16 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
                 # compute reward model score on batch
                 rm_scores = None
                 if self.use_rm and "rm_scores" not in batch.batch.keys():
-                    if not self.use_reward_loop:
-                        rm_scores = self.rm_wg.compute_rm_score(batch)
-                    else:
-                        assert self.reward_loop_manager is not None, "RewardLoopManager is None"
-                        rm_scores = self.reward_loop_manager.compute_rm_score(batch)
-                    batch = batch.union(rm_scores)
+                    batch_reward = self._compute_reward_colocate(batch)
+                    batch = batch.union(batch_reward)
 
                 # Compute or extract reward for REMAX baseline
-                reward_baseline_tensor = self._compute_or_extract_reward(
-                    batch, reward_fn=self.reward_fn, sum_reward=True
-                )
+                if not self.use_reward_loop:
+                    reward_baseline_tensor = self._compute_reward_legacy(
+                        batch, reward_fn=self.reward_fn, sum_reward=True
+                    )
+                else:
+                    reward_baseline_tensor = batch.batch["rm_scores"].sum(dim=-1)
 
                 keys_to_pop = set(gen_baseline_output.batch.keys())
                 if rm_scores is not None:
@@ -435,22 +457,23 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
         with marked_timer("reward", timing_raw, color="yellow"):
             # compute reward model score
             if self.use_rm and "rm_scores" not in batch.batch.keys():
-                if not self.use_reward_loop:
-                    self.reward_tensor = self.rm_wg.compute_rm_score(batch)
-                else:
-                    assert self.reward_loop_manager is not None
-                    self.reward_tensor = self.reward_loop_manager.compute_rm_score(batch)
-                batch = batch.union(self.reward_tensor)
+                batch_reward = self._compute_reward_colocate(batch)
+                batch = batch.union(batch_reward)
 
-            # Compute or extract reward for training
-            if self.config.reward_model.launch_reward_fn_async:
-                self.future_reward = compute_reward_async.remote(
-                    data=batch, config=self.config, tokenizer=self.tokenizer
-                )
+            # Compute or extract reward_tensor and reward_extra_infos_dict for training
+            if not self.use_reward_loop:
+                if self.config.reward_model.launch_reward_fn_async:
+                    self.future_reward = compute_reward_async.remote(
+                        data=batch, config=self.config, tokenizer=self.tokenizer
+                    )
+                else:
+                    self.reward_tensor, self.reward_extra_infos_dict = self._compute_reward_legacy(
+                        batch, reward_fn=self.reward_fn, reward_for_val=False
+                    )
             else:
-                self.reward_tensor, self.reward_extra_infos_dict = self._compute_or_extract_reward(
-                    batch, reward_fn=self.reward_fn, reward_for_val=False
-                )
+                self.reward_tensor = batch.batch["rm_scores"]
+                reward_extra_keys = batch.meta_info.get("reward_extra_keys", [])
+                self.reward_extra_infos_dict = {key: batch.non_tensor_batch[key] for key in reward_extra_keys}
         return batch
 
     def _fit_compute_log_prob(self, batch: DataProto) -> DataProto:
@@ -620,11 +643,8 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
     def _fit_validate(self):
         metrics = self.metrics
         timing_raw = self.timing_raw
-        if (
-            self.val_reward_fn is not None
-            and self.config.trainer.test_freq > 0
-            and (self.is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
-        ):
+        if self.config.trainer.test_freq > 0 and (
+                self.is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
             with marked_timer("testing", timing_raw, color="green"):
                 val_metrics: dict = self._validate()
                 if self.is_last_step:
@@ -652,10 +672,11 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
                 print("Force saving checkpoint: ESI instance expiration approaching.")
             with marked_timer("save_checkpoint", timing_raw, color="green"):
                 # sleep replicas to avoid OOM during checkpoint saving
-                self.checkpoint_manager.sleep_replicas()
+                # self.checkpoint_manager.sleep_replicas()
                 self._save_checkpoint()
                 # wake replicas to avoid OOM during checkpoint saving
-                self.checkpoint_manager.update_weights()
+                # TODO: Check separation is needed.
+                # self.checkpoint_manager.update_weights()
 
     def _fit_stop_profile(self):
         timing_raw = self.timing_raw
@@ -727,4 +748,3 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
                 self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
             pprint(f"Final validation metrics: {self.last_val_metrics}")
             self.progress_bar.close()
-            return

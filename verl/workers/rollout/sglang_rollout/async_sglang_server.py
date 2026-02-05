@@ -266,7 +266,7 @@ class SGLangHttpServer:
             "dp_size": self.config.data_parallel_size,
             "ep_size": self.config.expert_parallel_size,
             "node_rank": self.node_rank,
-            "load_format": self.config.load_format,
+            "load_format": "auto",
             "dist_init_addr": dist_init_addr,
             "nnodes": self.nnodes,
             "trust_remote_code": self.model_config.trust_remote_code,
@@ -391,8 +391,8 @@ class SGLangHttpServer:
             logger.info("skip sleep in standalone mode")
 
     async def clear_kv_cache(self):
-        obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
-        await self.tokenizer_manager.release_memory_occupation(obj, None)
+        if self.node_rank == 0:
+            await self.tokenizer_manager.flush_cache()
 
     async def generate(
         self,
