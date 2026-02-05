@@ -30,7 +30,7 @@ from verl.experimental.fully_async_policy.detach_utils import (
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo import core_algos
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer, ResourcePoolManager
+from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.ray_trainer_for_separation import SeparationRayPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
@@ -40,10 +40,9 @@ from verl.utils.debug import marked_timer
 
 class TrainingStopException(Exception):
     """Exception raised to signal training should stop"""
-
     pass
 
-
+@ray.remote(num_cpus=10)
 class FullyAsyncTrainer(SeparationRayPPOTrainer):
     """
     A fully asynchronous PPO trainer that obtains samples from a MessageQueue for training.
@@ -83,7 +82,8 @@ class FullyAsyncTrainer(SeparationRayPPOTrainer):
         self.use_reference_policy = need_reference_policy(self.config)
 
         self.use_rm = need_reward_model(self.role_worker_mapping)
-        # self.use_reward_loop = self.config.reward_model.use_reward_loop
+        self.use_reward_loop = self.config.reward_model.use_reward_loop
+
         self.use_critic = need_critic(self.config)
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
@@ -101,8 +101,6 @@ class FullyAsyncTrainer(SeparationRayPPOTrainer):
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
-
-        # self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         # ==================== SeparateRayPPOTrainer config ====================
         self.global_steps = 0
@@ -303,14 +301,31 @@ class FullyAsyncTrainer(SeparationRayPPOTrainer):
         # use async rollout do validate
         print(f"[FullyAsyncTrainer] use_trainer_do_validate: {self.config.async_training.use_trainer_do_validate}")
         if self.config.async_training.use_trainer_do_validate:
-            assert self.config.actor_rollout_ref.rollout.mode == "async"
-            self.async_rollout_mode = True
             print("[FullyAsyncTrainer] Init async rollout manager")
+
+            # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
+            # agent_reward_loop: streaming reward computation with actor rollout
+            # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
+            enable_agent_reward_loop = self.use_reward_loop and (
+                not self.use_rm or self.config.reward_model.enable_resource_pool
+            )
+            # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
+            # to stream reward computation with actor rollout
+            reward_loop_worker_handles = (
+                self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
+            )
+
+            # create async rollout manager and request scheduler
+            assert self.config.actor_rollout_ref.rollout.mode == "async"
             from verl.experimental.fully_async_policy.agent_loop import FullyAsyncAgentLoopManager
 
+            self.async_rollout_mode = True
             self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
-                config=self.config, worker_group=self.actor_rollout_wg
+                config=self.config,
+                worker_group=self.actor_rollout_wg,
+                reward_loop_worker_handles=reward_loop_worker_handles,
             )
+
             print("[FullyAsyncTrainer] async_rollout_manager sleep")
             await self.async_rollout_manager.sleep()
         else:
@@ -364,7 +379,7 @@ class FullyAsyncTrainer(SeparationRayPPOTrainer):
             ray.get(self.param_synchronizer.wait_last_valid.remote())
             self._log_validation_data()
         self.progress_bar.close()
-        self._check_save_checkpoint(self.timing_raw)
+        self._fit_save_checkpoint()
 
     async def fit_step(self, batch_dict: dict = None):
         """
@@ -405,8 +420,11 @@ class FullyAsyncTrainer(SeparationRayPPOTrainer):
         self._fit_stop_profile()
         self._fit_collect_metrics(batch)
         self._fit_torch_memory()
-        self._fit_experimental(batch)
+        # self._fit_experimental(batch)
         self._fit_postprocess_step()
+
+    def _fit_prepare_step(self):
+        pass
 
     def _fit_generate(self, batch: DataProto = None) -> DataProto:
         metrics = self.metrics
@@ -427,11 +445,11 @@ class FullyAsyncTrainer(SeparationRayPPOTrainer):
         old_log_prob_mfu = 0
         if self.local_trigger_step == 1:
             self.actor_rollout_wg.save_model_to_cpu(1)
-            old_log_prob, old_log_prob_mfu = RayPPOTrainer._compute_old_log_prob(batch)
+            old_log_prob, old_log_prob_mfu = super()._compute_old_log_prob(batch)
         elif self.local_trigger_step is not None:
             self.actor_rollout_wg.save_model_to_cpu(self.local_trigger_step)
             self.actor_rollout_wg.restore_model_from_cpu(1)
-            old_log_prob, old_log_prob_mfu = RayPPOTrainer._compute_old_log_prob(batch)
+            old_log_prob, old_log_prob_mfu = super()._compute_old_log_prob(batch)
             self.actor_rollout_wg.restore_model_from_cpu(self.local_trigger_step)
             self.actor_rollout_wg.clear_cpu_model(self.local_trigger_step)
         return old_log_prob, old_log_prob_mfu
@@ -444,8 +462,8 @@ class FullyAsyncTrainer(SeparationRayPPOTrainer):
         self._log_validation_data()
 
     async def _fit_update_weights(self):
-        with marked_timer("update_weights", self.timing_raw, color="red"):
-            self.checkpoint_manager.update_weights()
+        # with marked_timer("update_weights", self.timing_raw, color="red"):
+        #     self.checkpoint_manager.update_weights()
 
         # Trigger parameter synchronization after training step
         time_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -455,7 +473,7 @@ class FullyAsyncTrainer(SeparationRayPPOTrainer):
             f"trigger_parameter_sync_step: {self.trigger_parameter_sync_step} "
             f"{time_str}"
         )
-        await self._trigger_parameter_sync_after_step(global_steps=self.global_steps)
+        await self._trigger_parameter_sync_after_step()
 
     def _fit_save_checkpoint(self):
         timing_raw = self.timing_raw
@@ -478,10 +496,13 @@ class FullyAsyncTrainer(SeparationRayPPOTrainer):
                 print("Force saving checkpoint: ESI instance expiration approaching.")
             with marked_timer("save_checkpoint", timing_raw, color="green"):
                 # sleep replicas to avoid OOM during checkpoint saving
-                self.checkpoint_manager.sleep_replicas()
+                # self.checkpoint_manager.sleep_replicas()
                 self._save_checkpoint()
                 # wake replicas to avoid OOM during checkpoint saving
-                self.checkpoint_manager.update_weights()
+                # self.checkpoint_manager.update_weights()
+
+    def _fit_postprocess_step(self):
+        self.global_steps += 1
 
     def _save_checkpoint(self):
         # Warning: Currently, to align the training process and metrics of colocate,
@@ -624,7 +645,7 @@ class FullyAsyncTrainer(SeparationRayPPOTrainer):
                 if key.startswith("fully_async") or key.startswith("timing_s"):
                     metrics[key] = value
 
-    async def _trigger_parameter_sync_after_step(self, validate: bool = False, global_steps: int = None):
+    async def _trigger_parameter_sync_after_step(self, validate: bool = False):
         """
         Trigger parameter synchronization after training step
         This ensures rollouter always uses the latest trained parameters
@@ -649,7 +670,7 @@ class FullyAsyncTrainer(SeparationRayPPOTrainer):
                 self.param_synchronizer.sync_weights.remote(
                     self.current_param_version,
                     validate=validate,
-                    global_steps=global_steps,
+                    global_steps=self.global_steps,
                     use_trainer_do_validate=self.config.async_training.use_trainer_do_validate,
                 )
             )

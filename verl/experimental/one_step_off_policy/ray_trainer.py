@@ -125,6 +125,8 @@ class OneStepOffRayTrainer(SeparationRayPPOTrainer):
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
+        # ==================== SeparateRayPPOTrainer config ====================
+
         self.global_steps = 0
         self.epoch = 0
         self.max_steps_duration = 0
@@ -182,27 +184,24 @@ class OneStepOffRayTrainer(SeparationRayPPOTrainer):
         self._create_weight_sync_group()
 
     def _init_async_rollout_manager(self):
-
         # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
         # agent_reward_loop: streaming reward computation with actor rollout
         # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
         enable_agent_reward_loop = self.use_reward_loop and (
-                not self.use_rm or self.config.reward_model.enable_resource_pool
+            not self.use_rm or self.config.reward_model.enable_resource_pool
         )
         # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
         # to stream reward computation with actor rollout
-        self.reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
         reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
-
 
         # create async rollout manager and request scheduler
         assert self.config.actor_rollout_ref.rollout.mode == "async"
         from verl.experimental.one_step_off_policy.agent_loop import OneStepOffAgentLoopManager
 
         self.async_rollout_mode = True
-        self.async_rollout_manager = OneStepOffAgentLoopManager(config=self.config,
-                                                                worker_group=self.rollout_wg,
-                                                                reward_loop_worker_handles=reward_loop_worker_handles)
+        self.async_rollout_manager = OneStepOffAgentLoopManager(
+            config=self.config, worker_group=self.rollout_wg, reward_loop_worker_handles=reward_loop_worker_handles
+        )
 
     def _create_weight_sync_group(self):
         from verl.utils.device import get_nccl_backend
@@ -497,7 +496,6 @@ class OneStepOffRayTrainer(SeparationRayPPOTrainer):
             batch_data_future = None
 
         return batch, batch_data_future
-
 
     def _fit_update_weights(self):
         # TODO: use checkpoint engine to update weight

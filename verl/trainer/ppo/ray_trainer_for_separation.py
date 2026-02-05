@@ -128,7 +128,6 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
             replicas=self.async_rollout_manager.rollout_replicas,
         )
 
-
     def _init_resource_pools(self):
         self.resource_pool_manager.create_resource_pool()
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
@@ -644,7 +643,8 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
         metrics = self.metrics
         timing_raw = self.timing_raw
         if self.config.trainer.test_freq > 0 and (
-                self.is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
+            self.is_last_step or self.global_steps % self.config.trainer.test_freq == 0
+        ):
             with marked_timer("testing", timing_raw, color="green"):
                 val_metrics: dict = self._validate()
                 if self.is_last_step:
@@ -707,10 +707,6 @@ class SeparationRayPPOTrainer(RayPPOTrainer):
         # compute variance proxy metrics
         gradient_norm = metrics.get("actor/grad_norm", None)
         metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
-
-        # this is experimental and may be changed/removed in the future in favor of a general-purpose one
-        if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
-            self.train_dataloader.sampler.update(batch=batch)
 
     def _fit_torch_memory(self):
         if (

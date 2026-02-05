@@ -23,7 +23,6 @@ from pprint import pformat
 import numpy as np
 import ray
 import torch
-from modelscope.trainers.audio.separation_trainer import SeparationTrainer
 from ray import ObjectRef
 
 from verl.experimental.fully_async_policy.detach_utils import (
@@ -84,6 +83,12 @@ class FullyAsyncRollouter(SeparationRayPPOTrainer):
 
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
+        self.use_reference_policy = False
+
+        self.use_rm = False
+        self.use_reward_loop = self.config.reward_model.use_reward_loop
+
+        self.use_critic = False
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
         self.validation_generations_logger = ValidationGenerationsLogger(
@@ -93,9 +98,11 @@ class FullyAsyncRollouter(SeparationRayPPOTrainer):
 
         self.ref_in_actor = False
         self.kl_ctrl_in_reward = False
-        self.use_critic = False
-        self.use_reference_policy = False
-        self.use_rm = False
+
+        self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
+        self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+
+        # ==================== fully async config ====================
 
         print("[FullyAsyncRollouter] Creating datasets...")
         from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
@@ -121,7 +128,6 @@ class FullyAsyncRollouter(SeparationRayPPOTrainer):
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
-        # ==================== fully async config ====================
 
         self.total_rollout_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
         if self.config.rollout.total_rollout_steps is not None:
@@ -412,6 +418,7 @@ class FullyAsyncRollouter(SeparationRayPPOTrainer):
         self._create_worker_classes()
         self._init_worker_groups()
         self._init_models()
+        self._init_reward_loop()
         await self._init_async_rollout_manager()
 
     def _create_actor_rollout_classes(self):
@@ -440,14 +447,23 @@ class FullyAsyncRollouter(SeparationRayPPOTrainer):
                 yield epoch, batch_dict
 
     async def _init_async_rollout_manager(self):
+        # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
+        # agent_reward_loop: streaming reward computation with actor rollout
+        # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
+        enable_agent_reward_loop = self.use_reward_loop and (
+            not self.use_rm or self.config.reward_model.enable_resource_pool
+        )
+        # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
+        # to stream reward computation with actor rollout
+        reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
+
         # create async rollout manager and request scheduler
         assert self.config.actor_rollout_ref.rollout.mode == "async"
         from verl.experimental.fully_async_policy.agent_loop import FullyAsyncAgentLoopManager
 
         self.async_rollout_mode = True
         self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
-            config=self.config,
-            worker_group=self.rollout_wg,
+            config=self.config, worker_group=self.rollout_wg, reward_loop_worker_handles=reward_loop_worker_handles
         )
 
     # Add samples to the pending_queue
@@ -752,10 +768,12 @@ class FullyAsyncRollouter(SeparationRayPPOTrainer):
                 await asyncio.gather(*self.active_tasks, return_exceptions=True)
                 self.active_tasks.clear()
                 print("[FullyAsyncRollouter][Public][Pause] All active tasks completed")
-            print("[FullyAsyncRollouter][Public][Pause] Prefix cache reset")
-            # Always clear KV cache to release GPU memory during weight synchronization,
-            # regardless of partial_rollout setting.
-            await self.async_rollout_manager.clear_kv_cache()
+
+            # TODO use checkpoint engine for rollout clear_kv_cache
+            # print("[FullyAsyncRollouter][Public][Pause] clear kv cache")
+            # # Always clear KV cache to release GPU memory during weight synchronization,
+            # # regardless of partial_rollout setting.
+            # await self.async_rollout_manager.clear_kv_cache()
             self.monitor_loop_trigger = False
 
     async def resume(self, dependency_ref: ObjectRef = None):
