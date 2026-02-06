@@ -439,17 +439,17 @@ class FullyAsyncTrainer(SeparationRayPPOTrainer):
         """
         If algorithm.rollout_correction.bypass_mode is False,
         use model engine and first version model params to re-calculate old_log_prob.
+
+        If local_trigger_step == 1, load the training engine's parameters to the CPU
+          and save a copy for subsequent MIS use.
+
+        If local_trigger_step == 2, 3, ..., restore the parameters of version 1 to calculate the old_log_prob,
+        then restore the parameters of the current version.
         """
-        # If local_triger_step == 1, load the training engine's parameters to the CPU
-        #  and save a copy for subsequent MIS use.
-        # If local_trigger_step == 2, 3, ..., restore the parameters of version 1 to calculate the old_log_prob,
-        # then restore the parameters of the current version.
-        old_log_prob = None
-        old_log_prob_mfu = 0
         if self.local_trigger_step == 1:
             self.actor_rollout_wg.save_model_to_cpu(1)
             old_log_prob, old_log_prob_mfu = super()._compute_old_log_prob(batch)
-        elif self.local_trigger_step is not None:
+        else:
             self.actor_rollout_wg.save_model_to_cpu(self.local_trigger_step)
             self.actor_rollout_wg.restore_model_from_cpu(1)
             old_log_prob, old_log_prob_mfu = super()._compute_old_log_prob(batch)

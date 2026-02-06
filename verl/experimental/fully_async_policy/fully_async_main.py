@@ -175,9 +175,11 @@ class FullyAsyncTaskRunner:
         print("[ASYNC MAIN] Creating FullyAsyncRollouter and FullyAsyncTrainer in parallel...")
         with ThreadPoolExecutor(max_workers=2) as executor:
             rollouter_future = executor.submit(self._create_rollouter, config)
+            rollouter_future.result()
+
+            # TODO: keep _create_rollouter and _create_trainer parallel
             trainer_future = executor.submit(self._create_trainer, config)
             # Wait for both to complete
-            rollouter_future.result()
             trainer_future.result()
 
         # sync total_train_steps between rollouter and trainer
