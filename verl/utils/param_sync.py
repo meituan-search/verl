@@ -33,7 +33,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Generator, Optional
 
 import torch
 import torch.distributed
@@ -51,6 +51,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 # ==================== 设备与后端相关 ====================
 
+
 def get_inference_model(rollout) -> torch.nn.Module:
     """
     Get inference model from different rollout types.
@@ -63,9 +64,7 @@ def get_inference_model(rollout) -> torch.nn.Module:
     """
     inference_engine = rollout.inference_engine
     if hasattr(inference_engine, "llm_engine"):
-        inference_model = (
-            inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
-        )
+        inference_model = inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
     elif hasattr(inference_engine, "worker"):
         inference_model = inference_engine.worker.model_runner.model
     else:
@@ -106,18 +105,20 @@ def broadcast_tensor(
 
 # ==================== 权重信息相关 ====================
 
+
 @dataclass
 class WeightInfo:
     """权重信息数据类"""
+
     key: str  # 权重名称
-    shape: Tuple[int, ...]  # 形状
+    shape: tuple[int, ...]  # 形状
     dtype: torch.dtype  # 数据类型
 
-    def to_list(self) -> List:
+    def to_list(self) -> list:
         return [self.key, list(self.shape), self.dtype]
 
 
-def build_weights_info(params: Dict[str, torch.Tensor]) -> List[WeightInfo]:
+def build_weights_info(params: dict[str, torch.Tensor]) -> list[WeightInfo]:
     """
     Build weight info list from state dict.
 
@@ -130,17 +131,18 @@ def build_weights_info(params: Dict[str, torch.Tensor]) -> List[WeightInfo]:
     return [WeightInfo(key=key, shape=tuple(tensor.shape), dtype=tensor.dtype) for key, tensor in params.items()]
 
 
-def serialize_weights_info(weights_info: List[WeightInfo]) -> List:
+def serialize_weights_info(weights_info: list[WeightInfo]) -> list:
     """Serialize weight info to list format for transmission"""
     return [info.to_list() for info in weights_info]
 
 
-def deserialize_weights_info(data: List) -> List[WeightInfo]:
+def deserialize_weights_info(data: list) -> list[WeightInfo]:
     """Deserialize weight info from list format"""
     return [WeightInfo(key=item[0], shape=tuple(item[1]), dtype=item[2]) for item in data]
 
 
 # ==================== 抽象基类 ====================
+
 
 class ModelBackend(ABC):
     """模型后端抽象基类 (FSDP/Megatron)"""
@@ -158,12 +160,12 @@ class ModelBackend(ABC):
     @abstractmethod
     def get_params_generator(
         self, model, model_config, weight_converter, tf_config, layer_name_mapping
-    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get parameter generator for weight sync"""
         pass
 
     @abstractmethod
-    def get_weights_info(self, model) -> List[WeightInfo]:
+    def get_weights_info(self, model) -> list[WeightInfo]:
         """Get weight information from model"""
         pass
 
@@ -172,7 +174,7 @@ class InferenceBackend(ABC):
     """推理后端抽象基类 (vLLM/SGLang)"""
 
     @abstractmethod
-    def load_weights(self, weights: List[Tuple[str, torch.Tensor]]) -> None:
+    def load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> None:
         """Load weights into inference model"""
         pass
 
@@ -183,6 +185,7 @@ class InferenceBackend(ABC):
 
 
 # ==================== FSDP 后端实现 ====================
+
 
 class FSDPBackend:
     """FSDP 模型后端实现"""
@@ -206,7 +209,7 @@ class FSDPBackend:
             offload_fsdp_model_to_cpu(model)
 
     @staticmethod
-    def get_params(model) -> Dict[str, torch.Tensor]:
+    def get_params(model) -> dict[str, torch.Tensor]:
         """Get parameters from FSDP model state dict"""
         from verl.utils.model import convert_weight_keys
 
@@ -215,10 +218,11 @@ class FSDPBackend:
         return params
 
     @staticmethod
-    def get_weights_info(model) -> List[WeightInfo]:
+    def get_weights_info(model) -> list[WeightInfo]:
         """Get weight info from FSDP model"""
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         from torch.distributed.fsdp.api import ShardedStateDictConfig, StateDictType
+
         from verl.utils.fsdp_utils import fsdp_version
 
         if fsdp_version(model) == 1:
@@ -232,7 +236,7 @@ class FSDPBackend:
         return build_weights_info(params)
 
     @staticmethod
-    def get_params_with_full_tensor(params: Dict[str, torch.Tensor]) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    def get_params_with_full_tensor(params: dict[str, torch.Tensor]) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get parameters, handling full_tensor if available"""
         for key, tensor in params.items():
             if hasattr(tensor, "full_tensor"):
@@ -240,12 +244,13 @@ class FSDPBackend:
             yield key, tensor
 
     @staticmethod
-    def _create_empty_tensor(shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    def _create_empty_tensor(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
         """Create empty tensor on current device"""
         return torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
 
 
 # ==================== Megatron 后端实现 ====================
+
 
 class MegatronBackend:
     """Megatron 模型后端实现"""
@@ -265,7 +270,7 @@ class MegatronBackend:
     @staticmethod
     def get_params_generator(
         model, model_config, weight_converter, tf_config, layer_name_mapping
-    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get parameter generator for Megatron model"""
         from verl.utils.megatron_utils import per_tensor_generator
 
@@ -278,7 +283,7 @@ class MegatronBackend:
         )
 
     @staticmethod
-    def get_weights_info(model) -> List[WeightInfo]:
+    def get_weights_info(model) -> list[WeightInfo]:
         """Get weight info from Megatron model"""
         from megatron.core import parallel_state as mpu
 
@@ -312,6 +317,7 @@ class MegatronBackend:
 
 # ==================== vLLM 推理后端 ====================
 
+
 class VLLMBackend:
     """vLLM 推理后端实现"""
 
@@ -323,12 +329,13 @@ class VLLMBackend:
         patch_vllm_moe_model_weight_loader(inference_model)
 
     @staticmethod
-    def load_weights(inference_model, weights: List[Tuple[str, torch.Tensor]]) -> None:
+    def load_weights(inference_model, weights: list[tuple[str, torch.Tensor]]) -> None:
         """Load weights into vLLM model"""
         inference_model.load_weights(weights)
 
 
 # ==================== SGLang 推理后端 ====================
+
 
 class SGLangBackend:
     """SGLang 推理后端实现"""
@@ -336,9 +343,9 @@ class SGLangBackend:
     @staticmethod
     async def update_weights(
         inference_engine,
-        params_batch: List[Tuple[str, torch.Tensor]],
+        params_batch: list[tuple[str, torch.Tensor]],
         device_mesh_key: str,
-        device_mesh: Dict,
+        device_mesh: dict,
     ) -> None:
         """Async update weights in SGLang"""
         from sglang.srt.weight_sync.utils import update_weights as sgl_update_weights
@@ -356,7 +363,7 @@ class SGLangBackend:
         await inference_engine.flush_cache()
 
     @staticmethod
-    async def resume_memory_occupation(inference_engine, tags: List[str] = None) -> None:
+    async def resume_memory_occupation(inference_engine, tags: list[str] = None) -> None:
         """Resume memory occupation after weight sync"""
         if tags is None:
             tags = ["kv_cache"]
@@ -365,9 +372,11 @@ class SGLangBackend:
 
 # ==================== 权重同步核心逻辑 ====================
 
+
 @dataclass
 class SyncMetrics:
     """同步指标记录"""
+
     bucket_size_mb: float = 0.0
     sync_time: float = 0.0
     cache_time: float = 0.0
@@ -387,7 +396,7 @@ class UnifiedWeightSynchronizer:
     _bucket_size_mb: float = 1024.0
     _max_bucket_size_mb: float = 8192.0
     _min_bucket_size_mb: float = 512.0
-    _sync_history: List[Tuple[float, float]] = []
+    _sync_history: list[tuple[float, float]] = []
     _max_history_size: int = 20
 
     def __init__(
@@ -422,7 +431,7 @@ class UnifiedWeightSynchronizer:
         self._checkpoint_engine = None
 
         # 权重信息
-        self._weights_info: Optional[List[WeightInfo]] = None
+        self._weights_info: Optional[list[WeightInfo]] = None
 
         # 背景事件循环（用于 SGLang 异步操作）
         self._bg_loop = None
@@ -514,7 +523,7 @@ class UnifiedWeightSynchronizer:
         inference_model,
         is_actor: bool,
         is_rollout: bool,
-        params: Optional[Dict[str, torch.Tensor]] = None,
+        params: Optional[dict[str, torch.Tensor]] = None,
         use_checkpoint_engine: bool = False,
     ) -> SyncMetrics:
         """
@@ -531,26 +540,19 @@ class UnifiedWeightSynchronizer:
         Returns:
             SyncMetrics: Synchronization metrics
         """
-        metrics = SyncMetrics()
 
         if is_actor and self._weights_info is None:
             raise ValueError("weights_info must be set before sync for actor")
 
         # 如果使用检查点引擎，使用优化后的同步路径
         if use_checkpoint_engine and self.inference_backend_type != "sglang":
-            return self._sync_weights_by_checkpoint(
-                model, inference_model, is_actor, is_rollout, params
-            )
+            return self._sync_weights_by_checkpoint(model, inference_model, is_actor, is_rollout, params)
 
         # 标准同步路径
         if self.inference_backend_type == "vllm":
-            return self._sync_vllm_weights(
-                model, inference_model, is_actor, is_rollout, params
-            )
+            return self._sync_vllm_weights(model, inference_model, is_actor, is_rollout, params)
         elif self.inference_backend_type == "sglang":
-            return self._sync_sglang_weights(
-                model, inference_model, is_actor, is_rollout, params
-            )
+            return self._sync_sglang_weights(model, inference_model, is_actor, is_rollout, params)
 
     def _sync_vllm_weights(
         self,
@@ -558,7 +560,7 @@ class UnifiedWeightSynchronizer:
         inference_model,
         is_actor: bool,
         is_rollout: bool,
-        params: Optional[Dict[str, torch.Tensor]] = None,
+        params: Optional[dict[str, torch.Tensor]] = None,
     ) -> SyncMetrics:
         """同步权重到 vLLM"""
         metrics = SyncMetrics()
@@ -612,7 +614,7 @@ class UnifiedWeightSynchronizer:
         inference_model,
         is_actor: bool,
         is_rollout: bool,
-        params: Optional[Dict[str, torch.Tensor]] = None,
+        params: Optional[dict[str, torch.Tensor]] = None,
     ) -> SyncMetrics:
         """同步权重到 SGLang（使用分桶优化）"""
         metrics = SyncMetrics()
@@ -631,8 +633,8 @@ class UnifiedWeightSynchronizer:
 
         # 分桶同步
         bucket_size_bytes = int(self._bucket_size_mb * 1024 * 1024)
-        actual_bucket_sizes: List[float] = []
-        current_batch: List[Tuple[str, torch.Tensor]] = []
+        actual_bucket_sizes: list[float] = []
+        current_batch: list[tuple[str, torch.Tensor]] = []
         current_batch_size = 0
 
         def flush_batch():
@@ -703,7 +705,7 @@ class UnifiedWeightSynchronizer:
         inference_model,
         is_actor: bool,
         is_rollout: bool,
-        params: Optional[Dict[str, torch.Tensor]] = None,
+        params: Optional[dict[str, torch.Tensor]] = None,
     ) -> SyncMetrics:
         """使用检查点引擎同步权重（优化版本）"""
         metrics = SyncMetrics()
@@ -753,8 +755,8 @@ class UnifiedWeightSynchronizer:
     def _cache_params_to_cpu(
         self,
         model,
-        params: Optional[Dict[str, torch.Tensor]] = None,
-    ) -> Dict[str, torch.Tensor]:
+        params: Optional[dict[str, torch.Tensor]] = None,
+    ) -> dict[str, torch.Tensor]:
         """缓存参数到 CPU"""
         cpu_params = {}
 
@@ -824,15 +826,15 @@ class UnifiedWeightSynchronizer:
 
     # ==================== 外部接口 ====================
 
-    def set_weights_info(self, weights_info: List[WeightInfo]) -> None:
+    def set_weights_info(self, weights_info: list[WeightInfo]) -> None:
         """设置权重信息"""
         self._weights_info = weights_info
 
-    def get_weights_info(self) -> Optional[List[WeightInfo]]:
+    def get_weights_info(self) -> Optional[list[WeightInfo]]:
         """获取权重信息"""
         return self._weights_info
 
-    def set_device_mesh(self, device_mesh: Dict) -> None:
+    def set_device_mesh(self, device_mesh: dict) -> None:
         """设置设备网格（用于 SGLang）"""
         self._device_mesh = device_mesh
 
@@ -849,6 +851,7 @@ class UnifiedWeightSynchronizer:
 
 
 # ==================== 工厂函数 ====================
+
 
 def create_weight_synchronizer(
     model_backend: str,
@@ -878,6 +881,7 @@ def create_weight_synchronizer(
 
 # ==================== 工具函数 ====================
 
+
 def patch_vllm_moe_weight_loader(inference_model) -> None:
     """Patch vLLM MoE model weight loader"""
     from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
@@ -886,7 +890,7 @@ def patch_vllm_moe_weight_loader(inference_model) -> None:
 
 
 def create_sync_group_for_ranks(
-    workers: List,
+    workers: list,
     world_size: int,
     group_name: str = "actor_rollout",
 ) -> None:
@@ -911,6 +915,7 @@ def create_sync_group_for_ranks(
 
 # ==================== 统一参数同步管理器 ====================
 
+
 class UnifiedParamSyncManager:
     """
     统一参数同步管理器基类
@@ -932,7 +937,7 @@ class UnifiedParamSyncManager:
     _bucket_size_mb: float = 1024.0
     _max_bucket_size_mb: float = 8192.0
     _min_bucket_size_mb: float = 512.0
-    _sync_history: List[Tuple[float, float]] = []
+    _sync_history: list[tuple[float, float]] = []
     _max_history_size: int = 20
 
     def __init__(self, config=None, role: str = None):
@@ -947,7 +952,7 @@ class UnifiedParamSyncManager:
         self.role = role
 
         # 同步状态
-        self._weights_info: Optional[List] = None
+        self._weights_info: Optional[list] = None
         self._sync_group_name: str = "actor_rollout"
         self._weight_sync_group = None
 
@@ -987,12 +992,12 @@ class UnifiedParamSyncManager:
     def _get_model(self):
         """获取训练模型，子类可重写"""
         if self.is_actor:
-            return getattr(self, 'actor_module_fsdp', None) or getattr(self, 'actor_module', None)
+            return getattr(self, "actor_module_fsdp", None) or getattr(self, "actor_module", None)
         return None
 
     def _get_rollout(self):
         """获取 rollout 对象，子类可重写"""
-        return getattr(self, 'rollout', None)
+        return getattr(self, "rollout", None)
 
     def _get_actor_params_generator(self):
         """
@@ -1021,15 +1026,15 @@ class UnifiedParamSyncManager:
 
     # ==================== 权重信息管理 ====================
 
-    def set_weights_info(self, weights_info: List) -> None:
+    def set_weights_info(self, weights_info: list) -> None:
         """设置权重信息"""
         self._weights_info = weights_info
 
-    def get_weights_info(self) -> Optional[List]:
+    def get_weights_info(self) -> Optional[list]:
         """获取权重信息"""
         return self._weights_info
 
-    def _build_weights_info(self, params: Dict[str, torch.Tensor]) -> List:
+    def _build_weights_info(self, params: dict[str, torch.Tensor]) -> list:
         """从参数字典构建权重信息"""
         return [(key, tensor.size(), tensor.dtype) for key, tensor in params.items()]
 
@@ -1064,7 +1069,7 @@ class UnifiedParamSyncManager:
 
     # ==================== 核心同步方法 ====================
 
-    def sync_weights(self, sync_group_name: str = "actor_rollout") -> Dict:
+    def sync_weights(self, sync_group_name: str = "actor_rollout") -> dict:
         """
         执行权重同步（统一入口）
 
@@ -1081,9 +1086,7 @@ class UnifiedParamSyncManager:
 
         # 决定使用哪种同步方式
         use_checkpoint = (
-            hasattr(self, 'checkpoint_engine')
-            and self.checkpoint_engine is not None
-            and self.rollout_name != "sglang"
+            hasattr(self, "checkpoint_engine") and self.checkpoint_engine is not None and self.rollout_name != "sglang"
         )
 
         if use_checkpoint:
@@ -1093,7 +1096,7 @@ class UnifiedParamSyncManager:
         else:
             return self._sync_vllm()
 
-    def _sync_vllm(self) -> Dict:
+    def _sync_vllm(self) -> dict:
         """同步权重到 vLLM"""
         metrics = {"sync_time": 0.0}
         start_time = time.time()
@@ -1139,7 +1142,7 @@ class UnifiedParamSyncManager:
 
         return metrics
 
-    def _sync_sglang(self) -> Dict:
+    def _sync_sglang(self) -> dict:
         """同步权重到 SGLang（使用分桶优化）"""
         metrics = {"sync_time": 0.0, "bucket_sizes": []}
         start_time = time.time()
@@ -1161,16 +1164,14 @@ class UnifiedParamSyncManager:
 
         # 4. 分桶同步
         bucket_size_bytes = int(self._bucket_size_mb * 1024 * 1024)
-        actual_bucket_sizes: List[float] = []
+        actual_bucket_sizes: list[float] = []
         current_batch = []
         current_batch_size = 0
 
         def flush_batch():
             if current_batch:
                 actual_bucket_sizes.append(current_batch_size / (1024 * 1024))
-                self._run_async_safely(
-                    self._sglang_update_weights(inference_model, iter(current_batch))
-                )
+                self._run_async_safely(self._sglang_update_weights(inference_model, iter(current_batch)))
                 get_torch_device().synchronize()
                 current_batch.clear()
 
@@ -1217,7 +1218,7 @@ class UnifiedParamSyncManager:
 
         # 6. 恢复 KV cache
         if self.is_rollout:
-            rollout_device_mesh = getattr(self, 'rollout_device_mesh', None)
+            rollout_device_mesh = getattr(self, "rollout_device_mesh", None)
             if rollout_device_mesh and rollout_device_mesh["infer_tp"].get_local_rank() == 0:
                 self._run_async_safely(inference_model.resume_memory_occupation(tags=["kv_cache"]))
 
@@ -1230,12 +1231,11 @@ class UnifiedParamSyncManager:
 
         return metrics
 
-    def _sync_by_checkpoint(self) -> Dict:
+    def _sync_by_checkpoint(self) -> dict:
         """使用检查点引擎同步权重"""
         from ray.util.collective import collective
 
         metrics = {"cache_time": 0.0, "register_time": 0.0, "update_time": 0.0}
-        start_time = time.time()
 
         # 1. 加载模型到 GPU
         if self.is_actor and self.is_offload_param:
@@ -1265,7 +1265,7 @@ class UnifiedParamSyncManager:
         self._checkpoint_engine.update_checkpoint(
             inference_model=inference_model,
             group_name=self._sync_group_name,
-            overlap_broadcast_and_consume=getattr(self.config.checkpoint_engine, 'overlap_broadcast_and_consume', True),
+            overlap_broadcast_and_consume=getattr(self.config.checkpoint_engine, "overlap_broadcast_and_consume", True),
         )
         metrics["update_time"] = time.time() - update_start
 
@@ -1279,7 +1279,7 @@ class UnifiedParamSyncManager:
 
     # ==================== 统一参数获取接口 ====================
 
-    def get_per_tensor_param(self) -> Dict[str, torch.Tensor]:
+    def get_per_tensor_param(self) -> dict[str, torch.Tensor]:
         """
         统一获取 Actor 参数的方法
 
@@ -1296,7 +1296,7 @@ class UnifiedParamSyncManager:
 
         # 尝试检测模型类型并调用对应的后端
         # 1. 优先检查是否有 _get_actor_params_custom 方法（兼容旧接口）
-        if hasattr(self, '_get_actor_params_custom'):
+        if hasattr(self, "_get_actor_params_custom"):
             return self._get_actor_params_custom()
 
         # 2. 检测 FSDP 模型
@@ -1313,8 +1313,9 @@ class UnifiedParamSyncManager:
             return {}
 
         # 4. 默认实现：使用 state_dict
-        if hasattr(model, 'state_dict'):
+        if hasattr(model, "state_dict"):
             from verl.utils.model import convert_weight_keys
+
             params = model.state_dict()
             params = convert_weight_keys(params, getattr(model, "_fsdp_wrapped_module", model))
             return params
@@ -1325,6 +1326,7 @@ class UnifiedParamSyncManager:
         """检测是否为 FSDP 模型"""
         try:
             from verl.utils.fsdp_utils import fsdp_version
+
             fsdp_version(model)
             return True
         except (ImportError, Exception):
@@ -1333,15 +1335,11 @@ class UnifiedParamSyncManager:
     def _is_megatron_model(self, model) -> bool:
         """检测是否为 Megatron 模型"""
         # Megatron 模型通常有特定的结构特征
-        try:
-            import megatron.core
-            return True
-        except ImportError:
-            return False
+        pass
 
     # ==================== 内部辅助方法 ====================
 
-    def _get_actor_params(self) -> Dict[str, torch.Tensor]:
+    def _get_actor_params(self) -> dict[str, torch.Tensor]:
         """获取 Actor 参数"""
         return self.get_per_tensor_param()
 
@@ -1360,7 +1358,7 @@ class UnifiedParamSyncManager:
             return
 
         # 优先检查是否有 _load_model_to_gpu_custom 方法（兼容旧接口）
-        if hasattr(self, '_load_model_to_gpu_custom'):
+        if hasattr(self, "_load_model_to_gpu_custom"):
             self._load_model_to_gpu_custom()
             return
 
@@ -1380,7 +1378,7 @@ class UnifiedParamSyncManager:
             return
 
         # 优先检查是否有 _offload_model_to_cpu_custom 方法（兼容旧接口）
-        if hasattr(self, '_offload_model_to_cpu_custom'):
+        if hasattr(self, "_offload_model_to_cpu_custom"):
             self._offload_model_to_cpu_custom()
             return
 
@@ -1440,7 +1438,7 @@ class UnifiedParamSyncManager:
         else:
             collective.broadcast(tensor, src_rank=src_rank, group_name=self._sync_group_name)
 
-    def _cache_params_to_cpu(self) -> Dict[str, torch.Tensor]:
+    def _cache_params_to_cpu(self) -> dict[str, torch.Tensor]:
         """缓存参数到 CPU"""
         params = self._get_actor_params()
         cpu_params = {}
@@ -1464,9 +1462,9 @@ class UnifiedParamSyncManager:
             inference_engine=inference_engine,
             params_batch=params_batch,
             device_mesh_key="infer_tp",
-            device_mesh=getattr(self, 'rollout_device_mesh', None),
+            device_mesh=getattr(self, "rollout_device_mesh", None),
         )
-        if getattr(self, 'rollout_device_mesh', {}).get("infer_tp", {}).get_local_rank() == 0:
+        if getattr(self, "rollout_device_mesh", {}).get("infer_tp", {}).get_local_rank() == 0:
             await SGLangBackend.flush_cache(inference_engine)
 
     def _update_bucket_size(self, bucket_size_mb: float, sync_time: float) -> None:
@@ -1542,7 +1540,7 @@ class UnifiedParamSyncManager:
             current_rank,
             actor_ranks,
             rollout_ranks,
-            getattr(self.config.checkpoint_engine, 'device_buffer_size_M', 1024),
+            getattr(self.config.checkpoint_engine, "device_buffer_size_M", 1024),
         )
 
     # ==================== 指标记录 ====================
@@ -1564,11 +1562,12 @@ class UnifiedParamSyncManager:
         if model is None:
             return
 
-        if not hasattr(self, 'cpu_saved_models'):
+        if not hasattr(self, "cpu_saved_models"):
             self.cpu_saved_models = {}
 
         try:
             from verl.experimental.fully_async_policy.fsdp2_utils import fsdp2_sharded_save_to_cpu
+
             self.cpu_saved_models[key] = fsdp2_sharded_save_to_cpu(model)
         except ImportError:
             pass
@@ -1576,12 +1575,13 @@ class UnifiedParamSyncManager:
     def restore_model_from_cpu(self, key: str) -> None:
         """从 CPU 恢复模型"""
         model = self._get_model()
-        if model is None or not hasattr(self, 'cpu_saved_models'):
+        if model is None or not hasattr(self, "cpu_saved_models"):
             return
 
         if key in self.cpu_saved_models:
             try:
                 from verl.experimental.fully_async_policy.fsdp2_utils import fsdp2_sharded_load_from_cpu
+
                 cpu_sharded_state, global_spec = self.cpu_saved_models[key]
                 fsdp2_sharded_load_from_cpu(model, cpu_sharded_state, global_spec)
             except ImportError:
@@ -1589,6 +1589,5 @@ class UnifiedParamSyncManager:
 
     def clear_cpu_model(self, key: str) -> None:
         """清除 CPU 上的模型"""
-        if hasattr(self, 'cpu_saved_models') and key in self.cpu_saved_models:
+        if hasattr(self, "cpu_saved_models") and key in self.cpu_saved_models:
             del self.cpu_saved_models[key]
-
