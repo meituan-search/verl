@@ -36,23 +36,24 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-@ray.remote
 class RewardLoopWorker:
+    """
+    RewardLoopWork can tackle reward computation:
+    (1) rule-based reward computation
+    (2) reward model-based reward computation (both disrm and genrm)
+    (3) high-flexible user-customized reward function (can access rm by posting requests to reward_model_router)
+
+    Reward Computation Logic:
+    - if user-customized reward function is provided:
+        -> directly use user-customized reward function
+    - if user-customized reward function is not provided:
+        -> rm is not enabled: use default rule-based reward function
+        -> rm is disrm: compute reward score using disrm
+        -> rm is genrm: raise error (user-costomized reward func must be provided)
+    """
+
     def __init__(self, config: DictConfig, reward_router_address: str = None):
         """
-        RewardLoopWork can tackle reward computation:
-        (1) rule-based reward computation
-        (2) reward model-based reward computation (both disrm and genrm)
-        (3) high-flexible user-customized reward function (can access rm by posting requests to reward_model_router)
-
-        Reward Computation Logic:
-        - if user-customized reward function is provided:
-            -> directly use user-customized reward function
-        - if user-customized reward function is not provided:
-            -> rm is not enabled: use default rule-based reward function
-            -> rm is disrm: compute reward score using disrm
-            -> rm is genrm: raise error (user-costomized reward func must be provided)
-
         Args:
             config: DictConfig, the config for reward loop worker.
             reward_router_address: str, the address of reward router.
@@ -218,6 +219,23 @@ class RewardLoopWorker:
             }
             output = await self._post_request(payloads, "v1/embeddings")
             rm_score = output["data"][-1]["embedding"][-1]
+        elif engine_name == "trtllm":
+            # TODO: remove this once TRT-LLM switches to TorchSampler
+            raise ValueError("TensorRT-LLM backend does not support reward models currently.")
+
+            payloads = {
+                "model": model_name,
+                "prompt": disrm_prompt,
+                "return_context_logits": True,
+            }
+            output = await self._post_request(payloads, "v1/completions")
+            rm_score = output["choices"][0]["context_logits"]
+            assert isinstance(rm_score, list) and len(rm_score) > 0, (
+                "TensorRT-LLM OpenAI server response for reward score is not in the expected format."
+            )
+
+            rm_score = float(rm_score[0][0])
+            logger.debug(f"rm score: {rm_score}")
         else:
             raise NotImplementedError(f"RewardLoopManager does not support {engine_name}")
 
@@ -240,6 +258,7 @@ class RewardLoopManager:
             self.reward_model_manager = None
             self.reward_router_address = None
 
+        self.reward_loop_workers_class = ray.remote(RewardLoopWorker)
         self._init_reward_loop_workers()
 
     def _init_reward_loop_workers(self):
@@ -251,7 +270,7 @@ class RewardLoopManager:
             # Round-robin scheduling over the all nodes
             node_id = node_ids[i % len(node_ids)]
             self.reward_loop_workers.append(
-                RewardLoopWorker.options(
+                self.reward_loop_workers_class.options(
                     name=f"reward_loop_worker_{i}",
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                         node_id=node_id,
@@ -260,7 +279,6 @@ class RewardLoopManager:
                 ).remote(self.config, self.reward_router_address)
             )
 
-    # this func is used to replace the legacy fsdp/megatron RewardModelWorker.compute_rm_score
     def compute_rm_score(self, data: DataProto) -> DataProto:
         if self.reward_model_manager is not None:
             self.reward_model_manager.wake_up()

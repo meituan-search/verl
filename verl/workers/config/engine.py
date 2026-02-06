@@ -14,7 +14,7 @@
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 
 from verl.base_config import BaseConfig
 from verl.trainer.config import CheckpointConfig
@@ -23,7 +23,44 @@ from ...utils.profiler import ProfilerConfig
 from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
-__all__ = ["FSDPEngineConfig", "McoreEngineConfig", "TrainingWorkerConfig", "VeOmniEngineConfig"]
+__all__ = [
+    "FSDPEngineConfig",
+    "McoreEngineConfig",
+    "TrainingWorkerConfig",
+    "VeOmniEngineConfig",
+    "EngineConfig",
+    "EngineRouterReplayConfig",
+]
+
+
+# TODO: rename to RouterReplayConfig after removing the legacy implementation
+@dataclass
+class EngineRouterReplayConfig(BaseConfig):
+    """Configuration for router replay in MoE models.
+
+    This configuration controls the routing behavior for Mixture of Experts (MoE) models,
+    allowing for deterministic training through route recording and replay.
+
+    Args:
+        mode (str): Router replay mode. Options: 'disabled', 'R2', 'R3'.
+            - 'disabled': No router replay functionality
+            - 'R2': Use Router Replay routing strategy
+            - 'R3': Use Rollout Router Replay routing strategy
+        record_file (Optional[str]): File path to save recorded routing decisions.
+            Required when mode is 'record', 'R2', or 'R3'.
+        replay_file (Optional[str]): File path to load recorded routing decisions for replay.
+            Required when mode is 'replay'.
+    """
+
+    mode: str = "disabled"
+    record_file: Optional[str] = None
+    replay_file: Optional[str] = None
+
+    def __post_init__(self):
+        """Validate router replay configuration."""
+        valid_modes = ["disabled", "R2", "R3"]
+        if self.mode not in valid_modes:
+            raise ValueError(f"Invalid router_replay mode: {self.mode}. Must be one of {valid_modes}")
 
 
 @dataclass
@@ -37,7 +74,6 @@ class EngineConfig(BaseConfig):
         "use_fused_kernels",
         "use_remove_padding",
     }
-
     # whether to offload param
     param_offload: bool = False
     # whether to offload optimizer
@@ -66,6 +102,7 @@ class EngineConfig(BaseConfig):
     seed: int = 42
 
     full_determinism: bool = False
+    router_replay: EngineRouterReplayConfig = field(default_factory=EngineRouterReplayConfig)
 
     def __post_init__(self):
         pass
@@ -97,6 +134,8 @@ class McoreEngineConfig(EngineConfig):
         use_distributed_optimizer (bool): Whether to use distributed optimizer.
         use_dist_checkpointing (bool): Whether to use distributed checkpointing.
         dist_checkpointing_path (Optional[str]): Path for distributed checkpointing.
+        dist_ckpt_optim_fully_reshardable (bool): Use fully reshardable optimizer checkpoints.
+        distrib_optim_fully_reshardable_mem_efficient (bool): Use memory-efficient fully reshardable format.
         seed (int): Random seed for reproducibility.
         override_ddp_config (dict[str, Any]): Override configuration for DDP.
         override_transformer_config (dict[str, Any]): Override configuration for transformer.
@@ -118,6 +157,8 @@ class McoreEngineConfig(EngineConfig):
     use_dist_checkpointing: bool = False
     dist_checkpointing_path: Optional[str] = None
     dist_checkpointing_prefix: str = ""
+    dist_ckpt_optim_fully_reshardable: bool = False
+    distrib_optim_fully_reshardable_mem_efficient: bool = False
     override_ddp_config: dict[str, Any] = field(default_factory=dict)
     override_transformer_config: dict[str, Any] = field(default_factory=dict)
     override_mcore_model_config: dict[str, Any] = field(default_factory=dict)
@@ -213,8 +254,21 @@ class VeOmniEngineConfig(EngineConfig):
         enable_full_shard (bool): Enable fully shard for FSDP training (ZeRO-3), default False
         enable_fsdp_offload (bool): Enable CPU offload for FSDP1, default False
         enable_reentrant (bool): Use reentrant gradient checkpointing, default False
-        attn_implementation (str): Attention implementation to use, default "flash-attn"
-        moe_implementation (str): MoE implementation to use, default "eager"
+        attn_implementation (str): Attention implementation to use.
+            1. `eager`
+            2. `sdpa`
+            3. `flash_attention_2`
+            4. `flash_attention_3`
+            5. `veomni_flash_attention_2_with_sp`
+            6. `veomni_flash_attention_3_with_sp`
+            7. `native-sparse`
+            default "flash_attention_2"
+            Note: In case VeOmni add more attn_implementation, please check https://github.com/ByteDance-Seed/VeOmni/
+        moe_implementation (str): MoE implementation to use.
+            1. `eager`
+            2. `fused`
+            default "fused"
+            Note: In case VeOmni add more moe_implementation, please check https://github.com/ByteDance-Seed/VeOmni/
         force_use_huggingface (bool): Force loading model from huggingface, default False
         activation_gpu_limit (float): When enabling activation offload, `activation_gpu_limit` GB
             activations are allowed to reserve on GPU, default 0.0
@@ -257,8 +311,8 @@ class VeOmniEngineConfig(EngineConfig):
     load_checkpoint_path: Optional[str] = None
     enable_fsdp_offload: bool = False
     enable_reentrant: bool = False
-    attn_implementation: Optional[Literal["eager", "sdpa", "flash_attention_2", "native-sparse"]] = "flash_attention_2"
-    moe_implementation: Optional[Literal[None, "eager", "fused"]] = "eager"
+    attn_implementation: str = "flash_attention_2"
+    moe_implementation: str = "fused"
     force_use_huggingface: bool = False
     activation_gpu_limit: float = 0.0
     basic_modules: Optional[list[str]] = field(default_factory=list)
@@ -276,3 +330,7 @@ class TrainingWorkerConfig(BaseConfig):
     optimizer_config: OptimizerConfig = None
     checkpoint_config: CheckpointConfig = None
     profiler_config: ProfilerConfig = None
+    # automatically select engine and optimizer function.
+    # This function takes model config and the device name as parameter.
+    # Users can pass in a higher-order function to take more parameters
+    auto_select_engine_optim_fn: Callable[["HFModelConfig", str], tuple["EngineConfig", "OptimizerConfig"]] = None

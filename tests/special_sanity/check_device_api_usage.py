@@ -25,7 +25,10 @@ from pathlib import Path
 # directory or file path must contain keyword ".cuda" or "cuda"
 CUDA_KEYWORD_CHECK_WHITELIST = [
     "verl/utils/device.py",
+    "verl/utils/torch_functional.py",  # import flash_attn only on cuda
     "verl/utils/profiler/nvtx_profile.py",  # appear in NsightSystemsProfiler
+    "verl/utils/profiler/torch_profile.py",  # appear in TorchProfiler
+    "verl/utils/profiler/config.py",  # appear in TorchProfilerToolConfig
     "verl/utils/kernel/linear_cross_entropy.py",  # appear in nvidia nvtx
     "verl/utils/rendezvous/ray_backend.py",  # appear in cupy importance
     "verl/single_controller/ray/base.py",  # appear in default device_name
@@ -42,6 +45,8 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "verl/workers/engine/veomni/transformer_impl.py",  # appear in default device_name
     "verl/workers/rollout/vllm_rollout/vllm_async_server.py",  # appear in config.cudagraph_capture_sizes
     "verl/workers/rollout/sglang_rollout/async_sglang_server.py",  # manually set CUDA_VISIBLE_DEVICES
+    "verl/workers/rollout/trtllm_rollout/trtllm_async_server.py",  # appear in config.cudagraph_capture_sizes
+    "verl/workers/rollout/replica.py",  # appear in default device_name
     "verl/checkpoint_engine",  # checkpoint engine backend are device specific
 ]
 
