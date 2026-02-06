@@ -33,13 +33,13 @@ from tqdm import tqdm
 
 from verl import DataProto
 from verl.experimental.one_step_off_policy.utils import need_critic
+from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.ray_trainer import (
     ResourcePoolManager,
     compute_response_mask,
 )
-from verl.trainer.ppo.ray_trainer_for_separation import SeparationRayPPOTrainer
 from verl.trainer.ppo.reward import compute_reward_async
 from verl.trainer.ppo.utils import Role, WorkerType, need_reference_policy, need_reward_model
 from verl.utils.debug import marked_timer
@@ -47,7 +47,7 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.tracking import ValidationGenerationsLogger
 
 
-class OneStepOffRayTrainer(SeparationRayPPOTrainer):
+class OneStepOffRayTrainer(SeparateRayPPOTrainer):
     def __init__(
         self,
         config,

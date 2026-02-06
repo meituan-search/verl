@@ -53,7 +53,7 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
 
 
-class SeparationRayPPOTrainer(RayPPOTrainer):
+class SeparateRayPPOTrainer(RayPPOTrainer):
     """
     Support for the initialization and fit process of Ray Trainer in the resource-separated scenario:
         - Fully async policy
