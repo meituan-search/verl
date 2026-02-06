@@ -21,7 +21,7 @@ import signal
 import threading
 from multiprocessing import shared_memory
 from types import MethodType
-from typing import Any, Callable, TypedDict, get_args
+from typing import Any, Callable, Literal, TypedDict, get_args
 
 import torch
 import zmq
@@ -74,7 +74,11 @@ def get_vllm_max_lora_rank(lora_rank: int):
     """
     assert lora_rank > 0, f"lora_rank must be greater than 0, get {lora_rank}"
 
-    from vllm.config.lora import MaxLoRARanks
+    try:
+        from vllm.config.lora import MaxLoRARanks
+    except Exception:
+        # FIXME: migrate vllm version https://github.com/vllm-project/vllm/blob/main/vllm/config/lora.py#L25
+        MaxLoRARanks = Literal[1, 8, 16, 32, 64, 128, 256, 320, 512]
 
     vllm_max_lora_ranks = sorted(get_args(MaxLoRARanks))
     if lora_rank > vllm_max_lora_ranks[-1]:
@@ -209,7 +213,7 @@ class vLLMColocateWorkerExtension:
         # receive bucket and update weights
         while True:
             metadata = socket.recv_pyobj()
-            weights = []
+            weights, tensor = [], None
             for name, meta in metadata["bucket_meta"].items():
                 shape, dtype, offset = meta["shape"], meta["dtype"], meta["offset"]
                 size = dtype.itemsize * shape.numel()
@@ -225,7 +229,7 @@ class vLLMColocateWorkerExtension:
             get_torch_device().synchronize()
             socket.send(b"")
             self._update_weights(weights, peft_config=peft_config, base_sync_done=base_sync_done)
-            del weights
+            del weights, tensor
             if metadata["is_last"]:
                 break
 
@@ -235,6 +239,7 @@ class vLLMColocateWorkerExtension:
         if shm is not None:
             shm.close()
             del shm
+        get_torch_device().synchronize()
         gc.collect()
         get_torch_device().ipc_collect()
         get_torch_device().empty_cache()

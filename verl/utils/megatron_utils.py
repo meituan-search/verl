@@ -31,6 +31,7 @@ from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import ChainedOptimizer
+from megatron.core.parallel_state import get_global_memory_buffer
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
@@ -598,7 +599,7 @@ def offload_megatron_optimizer(optimizers):
             pass
 
         # Free Megatron-LM's global memory buffer
-        # get_global_memory_buffer().buffer.clear()
+        get_global_memory_buffer().buffer.clear()
 
         gc.collect()
         get_torch_device().empty_cache()
@@ -1346,7 +1347,6 @@ def patch_engine_mtp(module, model_config):
         patch_postprocess(module)
         if model_config.mtp.detach_encoder:
             patch_mtp_layer_get_embeddings(module)
-
 
 
 @torch.no_grad()
