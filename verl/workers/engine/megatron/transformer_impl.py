@@ -618,23 +618,6 @@ class MegatronEngine(BaseEngine):
     def disable_adapter(self) -> ContextManager:
         return self.peft_cls.disable_adapter(self.module)
 
-    # ==================== 模型加载/卸载（用于参数同步） ====================
-
-    def load_model_to_gpu(self, load_grad: bool = False):
-        """
-        将 Megatron 模型加载到 GPU（用于参数同步）
-
-        Args:
-            load_grad: 是否同时加载梯度
-        """
-        load_megatron_model_to_gpu(self.module, load_grad=load_grad)
-
-    def offload_model_to_cpu(self):
-        """
-        将 Megatron 模型卸载到 CPU（用于参数同步）
-        """
-        offload_megatron_model_to_cpu(self.module)
-
     def forward_step(self, batch_iter, model, postprocess_micro_batch_func):
         raise NotImplementedError("forward_step must be implemented in subclass")
 

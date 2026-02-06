@@ -15,20 +15,6 @@
 from . import config, tokenizer
 from .config import omega_conf_to_dataclass, validate_config
 from .groupwise import as_torch_index, group_mean_std
-from .param_sync import (
-    FSDPBackend,
-    MegatronBackend,
-    SGLangBackend,
-    UnifiedParamSyncManager,
-    UnifiedWeightSynchronizer,
-    VLLMBackend,
-    WeightInfo,
-    broadcast_tensor,
-    build_weights_info,
-    create_weight_synchronizer,
-    get_inference_model,
-    patch_vllm_moe_weight_loader,
-)
 from .tokenizer import hf_processor, hf_tokenizer
 
 __all__ = (
