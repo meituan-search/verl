@@ -227,19 +227,27 @@ class MegatronWorker(Worker):
                 tf_config = None  # Will be set after model creation
             self.bridge = bridge
             
-            # Validate and set export_fp8_weights configuration
-            export_fp8_weights = megatron_config.get("export_fp8_weights", False)
-            if export_fp8_weights:
+            # Validate and set export_weight_dtype configuration
+            export_weight_dtype = megatron_config.get("export_weight_dtype", "bf16")
+            if isinstance(export_weight_dtype, str):
+                export_weight_dtype = export_weight_dtype.lower()
+            if export_weight_dtype not in ("bf16", "fp16", "fp8"):
+                raise ValueError(
+                    f"Invalid export_weight_dtype: {export_weight_dtype}. "
+                    f"Must be one of: bf16, fp16, fp8"
+                )
+            
+            if export_weight_dtype == "fp8":
                 fp8_param = override_transformer_config.get("fp8_param", False)
                 fp8_recipe = override_transformer_config.get("fp8_recipe", None)
                 # Validate fp8_param is enabled
                 if not (fp8_param and fp8_recipe == "blockwise" and not self.vanilla_bridge):
                     raise ValueError(
-                        "export_fp8_weights=True requires: fp8_param=True, fp8_recipe='blockwise', vanilla_mbridge=False\n"
+                        "export_weight_dtype=FP8 requires: fp8_param=True, fp8_recipe='blockwise', vanilla_mbridge=False\n"
                     )
-                # Set the configuration on bridge
-                if self.bridge is not None:
-                    self.bridge.export_fp8_weights = True
+            # Set the configuration on bridge
+            if self.bridge is not None:
+                self.bridge.export_weight_dtype = export_weight_dtype
         else:
             tf_config = hf_to_mcore_config(hf_config, dtype, **override_transformer_config)
             self.bridge = None
@@ -510,7 +518,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
             # When using fp8_param=True, we should initialize main params from original HF weights
             # (not from quantized model params dequantized) to avoid initalization accumulation.
-            if self.config.actor.megatron.get("export_fp8_weights", False):
+            export_weight_dtype = self.config.actor.megatron.get("export_weight_dtype", "bf16")
+            if isinstance(export_weight_dtype, str):
+                export_weight_dtype = export_weight_dtype.lower()
+            if export_weight_dtype not in ("bf16", "fp16", "fp8"):
+                export_weight_dtype = "bf16"  # Default to bf16 if invalid
+            # for debug
+            if export_weight_dtype == "fp8":
                 initial_state_dict = getattr(self.bridge, "unquantized_state_dict", None)
                 if initial_state_dict is not None:
                     actor_optimizer.reload_model_params(state_dict={"model": initial_state_dict})
