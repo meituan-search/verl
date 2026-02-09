@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name='DAPO'
-exp_name='dapo_qwen2-7B-math_28k_fsdp2_fully-async_16-16'
+exp_name='fully-async_16-16_dapo_filter'
 
 # Ray
 # RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -56,6 +56,9 @@ top_p=1.0
 top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_top_p=0.7
 
+enable_filter_groups=True
+filter_groups_metric=acc
+
 # Performance Related Parameter
 use_dynamic_bsz=True
 actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
@@ -75,7 +78,7 @@ train_prompt_bsz=0
 gen_prompt_bsz=1
 n_resp_per_prompt=16
 train_prompt_mini_bsz=32
-total_rollout_steps=$(((512*400)))
+total_rollout_steps=null
 test_freq=20
 staleness_threshold=0.5
 trigger_parameter_sync_step=4
@@ -165,4 +168,12 @@ python -X faulthandler -m verl.experimental.fully_async_policy.fully_async_main 
     async_training.trigger_parameter_sync_step="${trigger_parameter_sync_step}" \
     async_training.require_batches="${require_batches}" \
     async_training.partial_rollout="${partial_rollout}" \
-    async_training.use_rollout_log_probs=True
+    async_training.use_rollout_log_probs=True \
+    async_training.compute_advantage_in_rollout=True \
+    filter.filter_function_path='verl/experimental/fully_async_policy/utils/filter/dapo_filter.py' \
+    filter.filter_function_name='filter_dapo' \
+   +algorithm.filter_groups.enable=${enable_filter_groups} \
+   +algorithm.filter_groups.metric=${filter_groups_metric} \
+    # async_training.compute_prox_log_prob=True
+    # actor_rollout_ref.rollout.dtype=${dtype} \
+    # actor_rollout_ref.actor.fsdp_config.dtype=${dtype} \

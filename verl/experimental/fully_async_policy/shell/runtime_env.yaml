@@ -1,4 +1,18 @@
 env_vars:
-  VLLM_USE_V1: "1"
-  NCCL_DEBUG: "INFO"
   HYDRA_FULL_ERROR: "1"
+  NCCL_NVLS_ENABLE: "0"
+  NCCL_SOCKET_IFNAME: "eth0"
+  CUDA_CACHE_PATH: "/tmp/cuda_cache"
+  TMPDIR: "/tmp"
+  CUDA_TMPDIR: "/tmp"
+  CUDA_CACHE_PATH: "/tmp/cuda_cache"
+  # TENSORBOARD_DIR: "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/tensorboard/dapo_filter/fully-async_64-64_dapo_filter_verl_fix1"
+  TENSORBOARD_DIR: "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/tensorboard/dapo_filter/fully-async_16-16_traj_control_0.5_test2"
+  # TENSORBOARD_DIR: "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/tensorboard/dapo_filter/fully-async_64-64_dapo_filter_verl_wo_stale_drop"
+  # TENSORBOARD_DIR: "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/tensorboard/dapo_filter/colocate128_dapo_filter_retry3"
+  # TENSORBOARD_DIR: "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/tensorboard/tmp/test_filter"
+
+working_dir: ./
+
+excludes:
+  - ".git/"

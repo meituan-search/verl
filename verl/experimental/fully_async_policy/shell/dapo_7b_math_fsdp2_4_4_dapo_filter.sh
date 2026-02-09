@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name='DAPO'
-exp_name='dapo_qwen2-7B-math_28k_fsdp2_fully-async_16-16'
+exp_name='DAPO-Qwen2.5-7b-MATH-0527a1-fsdp2-fully-async-4-4'
 
 # Ray
 # RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -42,7 +42,7 @@ clip_ratio_high=0.28
 
 # Response length parameters
 max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 28))
+max_response_length=$((1024 * 8))
 enable_overlong_buffer=True
 overlong_buffer_len=$((1024 * 4))
 overlong_penalty_factor=1.0
@@ -56,30 +56,35 @@ top_p=1.0
 top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_top_p=0.7
 
+enable_filter_groups=True
+filter_groups_metric=acc
+
 # Performance Related Parameter
 use_dynamic_bsz=True
 actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
 infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3))
 ref_offload=True
 actor_offload=False
-gen_tp=4
-sp_size=4
-fsdp_size=8
+gen_tp=1
+sp_size=1
+fsdp_size=2
 
 # Fully async specific parameters
-NNODES_ROLLOUT=${NNODES_ROLLOUT:-2}
-NNODES_TRAIN=${NNODES_TRAIN:-2}
+NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
+
+n_gpus_rollout=4
+n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
 
 train_prompt_bsz=0
 gen_prompt_bsz=1
-n_resp_per_prompt=16
-train_prompt_mini_bsz=32
-total_rollout_steps=$(((512*400)))
-test_freq=20
-staleness_threshold=0.5
+n_resp_per_prompt=8
+train_prompt_mini_bsz=8
+total_rollout_steps=$(((32*1000)))
+test_freq=10
+staleness_threshold=5
 trigger_parameter_sync_step=4
-require_batches=4
+require_batches=1
 partial_rollout=True
 
 python -X faulthandler -m verl.experimental.fully_async_policy.fully_async_main \
@@ -135,12 +140,12 @@ python -X faulthandler -m verl.experimental.fully_async_policy.fully_async_main 
     actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
+    actor_rollout_ref.rollout.calculate_log_probs=True \
     actor_rollout_ref.ref.fsdp_config.param_offload=${ref_offload} \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
     actor_rollout_ref.rollout.name=${rollout_name} \
     actor_rollout_ref.rollout.mode=${rollout_mode} \
-    actor_rollout_ref.rollout.calculate_log_probs=True \
     reward_model.reward_manager=dapo \
     +reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
@@ -150,14 +155,14 @@ python -X faulthandler -m verl.experimental.fully_async_policy.fully_async_main 
     trainer.logger=['console','tensorboard'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.save_freq=-1 \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.resume_mode=auto \
-    trainer.nnodes="${NNODES_TRAIN}" \
-    trainer.n_gpus_per_node="${NGPUS_PER_NODE}" \
-    rollout.nnodes="${NNODES_ROLLOUT}" \
-    rollout.n_gpus_per_node="${NGPUS_PER_NODE}" \
+    trainer.nnodes="${NNODES}" \
+    trainer.n_gpus_per_node="${n_gpus_training}" \
+    rollout.nnodes="${NNODES}" \
+    rollout.n_gpus_per_node="${n_gpus_rollout}" \
     rollout.total_rollout_steps="${total_rollout_steps}" \
     trainer.total_epochs=10 \
     rollout.test_freq="${test_freq}" \
@@ -166,3 +171,8 @@ python -X faulthandler -m verl.experimental.fully_async_policy.fully_async_main 
     async_training.require_batches="${require_batches}" \
     async_training.partial_rollout="${partial_rollout}" \
     async_training.use_rollout_log_probs=True
+#     async_training.compute_advantage_in_rollout=True \
+#     filter.filter_function_path='verl/experimental/fully_async_policy/utils/filter/random_filter.py' \
+#     filter.filter_function_name='random_filter' \
+#    +algorithm.filter_groups.enable=${enable_filter_groups} \
+#    +algorithm.filter_groups.metric=${filter_groups_metric}
