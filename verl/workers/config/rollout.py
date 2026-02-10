@@ -232,6 +232,8 @@ class RolloutConfig(BaseConfig):
 
     quantization_config_file: Optional[str] = None
 
+    skip_mid_quantization: bool = False
+
     enable_rollout_routing_replay: bool = False
 
     enable_sleep_mode: bool = True
