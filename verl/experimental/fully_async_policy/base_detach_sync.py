@@ -212,6 +212,19 @@ class BaseDetachNcclSync:
     async def update_weights(self, inference_engine, params):
         from sglang.srt.weight_sync.utils import update_weights as sgl_update_weights
 
+        quantization = self.config.rollout.get("quantization", None) if hasattr(self, "config") else None
+        if quantization == "fp8":
+            from verl.utils.sglang.sglang_fp8_utils import quant_weights_by_name
+
+            FP8_BLOCK_QUANT_KWARGS = {
+                "activation_scheme": "dynamic",
+                "fmt": "e4m3",
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128],
+            }
+            logger.info("Convert bf16 weights to fp8 format before loading")
+            params = quant_weights_by_name(params, FP8_BLOCK_QUANT_KWARGS)
+
         await sgl_update_weights(
             engine=inference_engine,
             params_batch=params,

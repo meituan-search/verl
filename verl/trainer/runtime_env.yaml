@@ -1,5 +1,12 @@
 working_dir: ./
-excludes: ["/.git/"]
+excludes:
+  - ".git/"
+
 env_vars:
-  TORCH_NCCL_AVOID_RECORD_STREAMS: "1"
-  CUDA_DEVICE_MAX_CONNECTIONS: "1"
+  VLLM_USE_V1: "1"
+  HYDRA_FULL_ERROR: "1"
+  NCCL_NVLS_ENABLE: "0"
+  NCCL_SOCKET_IFNAME: "eth0"
+  CUDA_CACHE_PATH: "/tmp/cuda_cache"
+  VLLM_USE_FLASHINFER_SAMPLER: "0"
+  TMPDIR: "/workdir/tmp"
