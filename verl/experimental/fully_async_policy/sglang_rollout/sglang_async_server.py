@@ -153,6 +153,7 @@ class SGLangHttpServerForPartial(SGLangHttpServer):
             self.paused = True
             for request_id in self.cancel_event:
                 self.cancel_event[request_id].set()
+            self.tokenizer_manager.abort_request(abort_all=True)
 
     async def resume(self):
         async with self.lock:
