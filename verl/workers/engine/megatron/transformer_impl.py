@@ -590,7 +590,12 @@ class MegatronEngine(BaseEngine):
                 RouterReplay.clear_global_indices()
                 RouterReplay.clear_global_router_replay_action()
 
-        if self.model_config.mtp.enable and self.is_mp_src_rank_with_outputs():
+        # MTP loss is gathered across dp and cp
+        if (
+            self.model_config.mtp.enable
+            and mpu.get_tensor_model_parallel_rank() == 0
+            and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
+        ):
             # add mtp_losses
             metrics = get_megatron_mtp_loss(n_micro_batch)
             if "metrics" not in losses_reduced[0]:
@@ -762,7 +767,6 @@ class MegatronEngineWithLMHead(MegatronEngine):
             temperature = temperature.to(torch.float32)
             assert temperature.shape[0] == input_ids.shape[0]
             temperature = verl_F.expand_as_nested(temperature, input_ids)  # (bsz, j1)
-
             forward_fn = get_mcore_forward_no_padding_fn(self.model_config.hf_config)
 
             def logits_processor(logits, label, temperature):
@@ -802,6 +806,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 pad_token_id=self.model_config.tokenizer.pad_token_id,
                 data_format="thd" if self.engine_config.use_remove_padding else "bshd",
                 enable_mtp=self.model_config.mtp.enable_train,
+                position_ids=batch["position_ids"],
             )
 
         # Router replay: switch to backward replay mode for next backward pass
@@ -861,6 +866,7 @@ class MegatronEngineWithValueHead(MegatronEngineWithLMHead):
             vision_model=hasattr(self.model_config.hf_config, "vision_config"),
             pad_token_id=self.model_config.tokenizer.pad_token_id,
             enable_mtp=self.model_config.mtp.enable_train,
+            position_ids=batch["position_ids"],
         )
 
         return output, partial(postprocess_micro_batch_func, data=batch)

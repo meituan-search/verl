@@ -169,6 +169,7 @@ def gptmodel_forward_no_padding(
     pad_token_id=None,
     data_format: str = "thd",
     enable_mtp: bool = False,
+    position_ids=None,
 ):
     """Default forward pass for GPT models with optional sequence packing."""
 
@@ -190,7 +191,9 @@ def gptmodel_forward_no_padding(
     if data_format == "thd":
         input_ids_rmpad, packed_seq_params = preprocess_thd_no_padding(input_ids, pre_process=pre_process)
         input_ids_rmpad = input_ids_rmpad.contiguous()
+        position_ids_rmpad = None
 
+        # Add label and loss for MTP layer
         if enable_mtp and post_process:
             args = {
                 k: preprocess_thd_no_padding(v, pre_process=True, need_roll=(k == "label" or k == "loss_mask"))[0]
@@ -198,6 +201,14 @@ def gptmodel_forward_no_padding(
             }
             model_kwargs["labels"] = args["label"].contiguous()
             model_kwargs["loss_mask"] = args["loss_mask"].contiguous()
+
+            # processed input_ids, i.e. Normal tensor
+            input_ids_rmpad, _ = preprocess_thd_no_padding(input_ids, pre_process=True)
+            input_ids_rmpad = input_ids_rmpad.contiguous()
+
+            position_ids_rmpad, _ = preprocess_thd_no_padding(position_ids, pre_process=True)
+            position_ids_rmpad = position_ids_rmpad.contiguous()
+
         if logits_processor_args and "loss_mask" in logits_processor_args:
             logits_processor_args.pop("loss_mask")
 
@@ -213,7 +224,7 @@ def gptmodel_forward_no_padding(
         output_orig = model(
             input_ids=input_ids_rmpad,
             attention_mask=attention_mask,
-            position_ids=None,
+            position_ids=position_ids_rmpad,
             packed_seq_params=packed_seq_params,
             **model_kwargs,
         )
@@ -252,6 +263,7 @@ def gptmodel_forward_no_padding(
             }
             model_kwargs["labels"] = args["label"].contiguous()
             model_kwargs["loss_mask"] = args["loss_mask"].contiguous()
+
         if logits_processor_args and "loss_mask" in logits_processor_args:
             logits_processor_args.pop("loss_mask")
 

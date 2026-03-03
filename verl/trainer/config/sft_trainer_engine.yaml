@@ -84,4 +84,4 @@ trainer:
   nnodes: 1
   n_gpus_per_node: 1
 
-  profile_interval: [-1, -1]
+  profile_interral: [-1, -1]
