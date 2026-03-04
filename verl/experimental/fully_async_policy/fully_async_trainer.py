@@ -122,7 +122,6 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.global_steps = 1
         self.local_trigger_step = 1
         self.processed_samples = 0
-        self.stale_samples_processed = 0
         self.stale_trajectory_processed = 0
         self.current_param_version = 0
         self.total_train_steps = None
@@ -363,9 +362,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # 1. waiting remaining validate task
         ray.get(self.param_synchronizer.wait_last_valid.remote())
         self._log_validation_data()
-        # 2. perform addtional parameter_sync and validate if trainer already updated
+        # 2. perform additional parameter_sync and validate if trainer already updated
         if self.current_param_version % self.config.rollout.test_freq != 0 or self.local_trigger_step > 1:
-            await self._trigger_parameter_sync_after_step(validate=True, global_steps=self.global_steps)
+            await self._trigger_parameter_sync_after_step(validate=True)
             ray.get(self.param_synchronizer.wait_last_valid.remote())
             self._log_validation_data()
         self.progress_bar.close()
@@ -649,15 +648,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                'fully_async/total_wait_time': 0.09598183631896973}
         """
         if hasattr(batch, "meta_info") and batch.meta_info:
-            samples_param_versions = batch.meta_info["rollout_param_versions"]
-            stale_count = sum(1 for v in samples_param_versions if self.current_param_version - v >= 1)
-            self.stale_samples_processed += stale_count
             trajectory_param_versions = batch.meta_info["trajectory_param_versions"]
             stale_traj_count = sum(1 for v in trajectory_param_versions if self.current_param_version - v >= 1)
             self.stale_trajectory_processed += stale_traj_count
             metrics.update(
                 {
-                    "fully_async/count/stale_samples_processed": self.stale_samples_processed,
                     "fully_async/count/stale_trajectory_processed": self.stale_trajectory_processed,
                     "fully_async/count/current_param_version": self.current_param_version,
                 }

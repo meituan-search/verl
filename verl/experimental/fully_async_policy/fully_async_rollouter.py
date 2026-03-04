@@ -471,11 +471,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 full_batch=full_batch,
                 sample_id=sample_id,
                 epoch=epoch,
-                param_version=0,
-                param_version_start=[],
-                param_version_end=[],
-                processing_times=[],
-                tool_calls=[],
                 rollout_status={},
             )
 
@@ -566,20 +561,15 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
         # Calling asynchronous generation methods
-        rollout_sample.full_batch.non_tensor_batch["param_version"] = [self.current_param_version] * len(
-            rollout_sample.full_batch
-        )
         ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
         rollout_sample.full_batch = ret
         rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
         )
-        rollout_sample.param_version = self.current_param_version
         rollout_sample.rollout_status = await self.get_statistics()
 
         success = await self.message_queue_client.put_sample(
             sample=ray.cloudpickle.dumps(rollout_sample),
-            param_version=self.current_param_version,
         )
         if success:
             self.total_generated_samples += 1
@@ -641,10 +631,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self.processor_task = None
 
             # Send a finish signal
-            await self.message_queue_client.put_sample(
-                sample=None,
-                param_version=self.current_param_version,
-            )
+            await self.message_queue_client.put_sample(sample=None)
 
         async with self.lock:
             self.running = False

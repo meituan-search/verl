@@ -64,7 +64,7 @@ class MessageQueue:
             f"staleness_threshold={self.staleness_threshold}"
         )
 
-    async def put_sample(self, sample: Any, param_version: int) -> bool:
+    async def put_sample(self, sample: Any) -> bool:
         """
         Put a batch sample into the queue
 
@@ -205,9 +205,9 @@ class MessageQueueClient:
     def __init__(self, queue_actor: Any):
         self.queue_actor = queue_actor
 
-    async def put_sample(self, sample: Any, param_version: int) -> bool:
+    async def put_sample(self, sample: Any) -> bool:
         """Put batch into queue (async)"""
-        future = self.queue_actor.put_sample.remote(sample, param_version)
+        future = self.queue_actor.put_sample.remote(sample)
         return await asyncio.wrap_future(future.future())
 
     async def put_validate(self, data: Any) -> bool:

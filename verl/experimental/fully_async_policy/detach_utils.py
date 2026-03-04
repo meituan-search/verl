@@ -36,11 +36,6 @@ class RolloutSample:
     epoch: int
 
     # Processing metadata
-    processing_times: list[float]
-    tool_calls: list[float]
-    param_version: int
-    param_version_start: list[int]
-    param_version_end: list[int]
     rollout_status: dict[str, Any]
 
 
@@ -125,8 +120,6 @@ def assemble_batch_from_rollout_samples(
     print(f"[BatchUtils] Assembling batch from {len(rollout_samples)} RolloutSample objects")
 
     rollout_samples_batch = []
-    processing_times = []
-    tool_calls = []
     rollout_status = rollout_samples[0].rollout_status
     # Add a prefix to all rollout_status keys
     rollout_status = {f"fully_async/{key}": value for key, value in rollout_status.items()}
@@ -177,14 +170,12 @@ def assemble_batch_from_rollout_samples(
         "fully_async/partial/max_partial_span": max(param_version_diff),
     }
     # add meta_info
-    param_versions = [rs.param_version for rs in rollout_samples]
-    trajectorys_param_versions = final_batch.non_tensor_batch["max_global_steps"]
+    trajectory_param_versions = final_batch.non_tensor_batch["max_global_steps"]
 
     final_batch.meta_info.update(
         {
-            "rollout_param_versions": param_versions,
-            "param_version_diversity": len(set(param_versions)) if param_versions else 0,
-            "trajectory_param_versions": trajectorys_param_versions,
+            "param_version_diversity": len(set(trajectory_param_versions)),
+            "trajectory_param_versions": trajectory_param_versions,
             **processing_time_stats,
             **rollout_status,
             **partial_stats,
