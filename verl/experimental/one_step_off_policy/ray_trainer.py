@@ -179,10 +179,10 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
 
         # create async rollout manager and request scheduler
         assert self.config.actor_rollout_ref.rollout.mode == "async"
-        from verl.experimental.one_step_off_policy.agent_loop import OneStepOffAgentLoopManager
+        from verl.experimental.agent_loop import AgentLoopManager
 
         self.async_rollout_mode = True
-        self.async_rollout_manager = OneStepOffAgentLoopManager.create(
+        self.async_rollout_manager = AgentLoopManager.create(
             config=self.config, reward_loop_worker_handles=reward_loop_worker_handles
         )
 

@@ -103,10 +103,7 @@ class ParameterSynchronizer:
     def sync_weights(self, version, validate=False, global_steps=0, use_trainer_do_validate=False):
         """Sync weights between trainer and rollouter, and update parameter version"""
         start_time = time.time()
-
         self.current_version = version
-        ray.get(self.rollouter.pause.remote())
-
         print(f"[ParameterSynchronizer] rollout paused. cost {time.time() - start_time:.2f} seconds")
         # Update MQ version
         self.mq_client.update_param_version_sync(version)
@@ -133,15 +130,12 @@ class ParameterSynchronizer:
         self.wait_last_update = self.rollouter.update_param_version.remote(
             version, validate, global_steps, use_trainer_do_validate
         )
-        self.wait_last_resume = self.rollouter.resume.remote(self.wait_last_update)
 
     def wait_last_valid(self):
         print("[ParameterSynchronizer] Waiting last sync and validate...")
         start_time = time.time()
         if self.wait_last_update:
             ray.get(self.wait_last_update)
-        if self.wait_last_resume:
-            ray.get(self.wait_last_resume)
         if self.validate_task:
             ray.get(self.validate_task)
         print(f"[ParameterSynchronizer] Wait last validate cost: {time.time() - start_time:.2f} seconds")
