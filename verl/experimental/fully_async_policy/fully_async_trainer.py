@@ -382,7 +382,6 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         Args:
             batch_dict: Raw data dictionary
         """
-        print("[FullyAsyncTrainer] fit_step")
         self.metrics = {"training/global_step": self.global_steps, "training/epoch": self.epoch}
         self.timing_raw = {}
         # reward message
@@ -613,39 +612,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
     def _collect_metrics_from_samples(self, batch, metrics):
         """
-               Collect metrics from samples
-
-        [FullyAsyncTrainer] _collect_metrics_from_samples batch
-         {'reward_extra_keys': ['acc'],
-          'global_token_num': [141, 221, 235, 254, 264, 271, 286, 300, 305, 31, ....],
-          'rollout_param_versions': [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-          'param_version_diversity': 1,
-          'trajectory_param_versions': array([0, 0, 0, 0, 0, 0, ...], dtype=object),
-               'fully_async/processing_time/avg': np.float64(2.0293464065762237),
-               'fully_async/processing_time/max': np.float64(3.307145457714796),
-               'fully_async/processing_time/min': np.float64(0.483974352478981),
-               'fully_async/processing_time/tp50': np.float64(2.038824511691928),
-               'fully_async/processing_time/tp99': np.float64(3.1464134970679867),
-               'fully_async/processing_time/tp95': np.float64(2.9516119929030538),
-               'fully_async/monitor/active_tasks_size': 54,
-               'fully_async/monitor/queue/pending_queue_size': 59,
-               'fully_async/monitor/queue/mq_queue_size': 0,
-               'fully_async/count/current_param_version': 0,
-               'fully_async/count/total_generated_samples': 16,
-               'fully_async/count/staleness_samples': 70,
-               'fully_async/count/dropped_stale_samples': 0,
-               'fully_async/static/max_required_samples': 70,
-               'fully_async/static/required_samples': 16,
-               'fully_async/static/staleness_threshold': 0.1,
-               'fully_async/static/max_queue_size': 70,
-               'fully_async/static/max_concurrent_samples': 64,
-               'fully_async/partial/total_partial_num': 0,
-               'fully_async/partial/partial_ratio': 0.0,
-               'fully_async/partial/max_partial_span': 0,
-               'timing_s/agent_loop/tool_calls/max': np.float64(0.0),
-               'timing_s/agent_loop/tool_calls/min': np.float64(0.0),
-               'timing_s/agent_loop/tool_calls/mean': np.float64(0.0),
-               'fully_async/total_wait_time': 0.09598183631896973}
+        Collect metrics from samples
         """
         if hasattr(batch, "meta_info") and batch.meta_info:
             trajectory_param_versions = batch.meta_info["trajectory_param_versions"]
