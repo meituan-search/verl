@@ -93,17 +93,6 @@ global_profiler:
       # controller Nvidia Nsight Systems Options. Must set when profile_steps is not None.
       ## reference https://docs.nvidia.com/nsight-systems/UserGuide/index.html
       ## reference https://docs.ray.io/en/latest/ray-observability/user-guides/profiling.html
-      controller_nsight_options:
-        # Select the API(s) to be traced.
-        trace: "cuda,nvtx,cublas,ucx"
-
-        # Track the GPU memory usage by CUDA kernels. Must be string type "true" or "false".
-        cuda-memory-usage: "true"
-
-        # CUDA graphs will be traced as a whole
-        cuda-graph-trace: "graph"
-
-      # worker Nvidia Nsight Systems Options. Must set when profile_steps is not None.
       worker_nsight_options:
         # Select the API(s) to be traced.
         trace: "cuda,nvtx,cublas,ucx"

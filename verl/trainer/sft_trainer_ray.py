@@ -311,7 +311,6 @@ class SFTTrainer:
 
                 # start profile in SPMD mode
                 if global_step == self.start_profile_step:
-                    print(f"Start profile, current step: {global_step}", flush=True)
                     self.training_client.start_profile()
 
                 # train for on batch
@@ -319,7 +318,6 @@ class SFTTrainer:
                 output = output.get()
 
                 if global_step == self.end_profile_step:
-                    print(f"stop profile, current step: {global_step}", flush=True)
                     self.training_client.stop_profile()
 
                 metrics = tu.get(output, "metrics")
