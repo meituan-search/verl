@@ -410,7 +410,7 @@ class SGLangHttpServer:
             log_probs=log_probs,
             routed_experts=routed_experts,
             stop_reason=finish_reason,
-            extra_info={"global_steps": self.global_steps},
+            extra_fields={"global_steps": self.global_steps},
         )
 
     async def set_global_steps(self, global_steps: int):
@@ -418,9 +418,11 @@ class SGLangHttpServer:
         self.global_steps = global_steps
 
     async def abort_all_requests(self):
+        print(f"hzg: abort_all_requests in replica {self.replica_rank}")
         await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="abort"))
 
     async def resume_generation(self):
+        print(f"hzg: resume_generation in replica {self.replica_rank}")
         await self.tokenizer_manager.continue_generation(ContinueGenerationReqInput())
 
     async def start_profile(self, **kwargs):

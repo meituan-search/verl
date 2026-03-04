@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -20,7 +21,6 @@ import numpy as np
 import torch
 
 from verl import DataProto
-from verl.experimental.agent_loop.agent_loop import AgentLoopOutput
 from verl.trainer.ppo.ray_trainer import compute_response_mask
 
 
@@ -30,9 +30,6 @@ class RolloutSample:
 
     # Original batch information
     full_batch: Any
-
-    # AgentLoopOutput from generation
-    agent_loop_output_list: list[AgentLoopOutput]
 
     # Metadata
     sample_id: str
@@ -82,17 +79,23 @@ def prepare_single_generation_data(batch_dict, config) -> DataProto:
 
     # Setting selected agent, that supports partial
     if config.actor_rollout_ref.rollout.multi_turn.enable:
-        full_batch.non_tensor_batch["agent_name"] = np.array(
-            ["async_partial_tool_agent"] * len(full_batch), dtype=object
-        )
+        full_batch.non_tensor_batch["agent_name"] = np.array(["tool_agent"] * len(full_batch), dtype=object)
     else:
-        full_batch.non_tensor_batch["agent_name"] = np.array(
-            ["partial_single_turn_agent"] * len(full_batch), dtype=object
-        )
+        full_batch.non_tensor_batch["agent_name"] = np.array(["single_turn_agent"] * len(full_batch), dtype=object)
 
     # Add global step count to generated data
     full_batch = full_batch.repeat(repeat_times=config.actor_rollout_ref.rollout.n, interleave=True)
     return full_batch
+
+
+def addition_process(output: DataProto):
+    """collect metirics"""
+    metrics = output.meta_info.pop("metrics")  # List[Dict[str, str]]
+    processing_times_list = [item["generate_sequences"] for item in metrics]
+    tool_calls_times_list = [item["tool_calls"] for item in metrics]
+    output.non_tensor_batch["processing_times"] = processing_times_list
+    output.non_tensor_batch["tool_calls_times"] = tool_calls_times_list
+    return output
 
 
 def assemble_batch_from_rollout_samples(
@@ -129,7 +132,8 @@ def assemble_batch_from_rollout_samples(
     rollout_status = {f"fully_async/{key}": value for key, value in rollout_status.items()}
 
     for rs in rollout_samples:
-        rollout_samples_batch.append(rs.full_batch)
+        batch = addition_process(rs.full_batch)
+        rollout_samples_batch.append(batch)
     final_batch = DataProto.concat(rollout_samples_batch)
 
     # Calculate response_mask (if not present)
@@ -146,7 +150,6 @@ def assemble_batch_from_rollout_samples(
     processing_times = final_batch.non_tensor_batch["processing_times"]
     tool_calls = final_batch.non_tensor_batch["tool_calls_times"]
     # Collect statistics
-
     processing_time_stats = {
         "processing_time/avg": np.mean(processing_times),
         "processing_time/max": np.max(processing_times),
@@ -164,8 +167,8 @@ def assemble_batch_from_rollout_samples(
         }
     processing_time_stats = {f"fully_async/{key}": value for key, value in processing_time_stats.items()}
 
-    param_version_start = final_batch.non_tensor_batch["param_version_start"]
-    param_version_end = final_batch.non_tensor_batch["param_version_end"]
+    param_version_start = final_batch.non_tensor_batch["min_global_steps"]
+    param_version_end = final_batch.non_tensor_batch["max_global_steps"]
     param_version_diff = [abs(a - b) for a, b in zip(param_version_end, param_version_start, strict=False)]
     num_diff0 = param_version_diff.count(0)
     partial_stats = {
@@ -175,7 +178,7 @@ def assemble_batch_from_rollout_samples(
     }
     # add meta_info
     param_versions = [rs.param_version for rs in rollout_samples]
-    trajectorys_param_versions = final_batch.non_tensor_batch["param_version_end"]
+    trajectorys_param_versions = final_batch.non_tensor_batch["max_global_steps"]
 
     final_batch.meta_info.update(
         {
@@ -322,7 +325,7 @@ class MetricsAggregator:
         # Aggregate special metrics
         aggregated = self._special_metrics_aggergate(aggregated)
 
-        print(f"aggregated metrics done. cost {time.time() - t}")
+        print(f"aggregated metrics done. cost {time.time() - t:.4f} seconds.")
 
         return aggregated
 
@@ -361,3 +364,32 @@ class MetricsAggregator:
             "total_samples": sum(self.sample_counts),
             "metric_names": list(self.metric_values.keys()),
         }
+
+
+def task_exception_handler(task: asyncio.Task):
+    """Handle task exceptions and log them"""
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass  # Task was cancelled, this is expected
+    except Exception as e:
+        print(f"Task {task.get_name()} failed with exception: {e}")
+        raise e
+
+
+def safe_create_task(coro, name: str, task_set: set = None):
+    """Safely create a task with exception handling
+
+    Args:
+        coro: The coroutine to run
+        name: Name for the task
+        task_set: Optional set to add the task to
+
+    Returns:
+        The created asyncio.Task
+    """
+    task = asyncio.create_task(coro, name=name)
+    task.add_done_callback(task_exception_handler)
+    if task_set is not None:
+        task_set.add(task)
+    return task

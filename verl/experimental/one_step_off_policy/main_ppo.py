@@ -24,10 +24,9 @@ import hydra
 import ray
 
 from verl.experimental.one_step_off_policy.ray_trainer import OneStepOffRayTrainer
-from verl.experimental.one_step_off_policy.utils import need_critic
 from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
-from verl.trainer.ppo.utils import Role, need_reference_policy
+from verl.trainer.ppo.utils import Role, need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device
 
