@@ -23,7 +23,6 @@ from pprint import pformat
 import numpy as np
 import ray
 import torch
-from ray import ObjectRef
 
 from verl.experimental.fully_async_policy.detach_utils import (
     RolloutSample,
@@ -170,7 +169,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Modified by self.pause() or self._should_pause_generation()
         self.paused = False
         self.running = True
-        self.monitor_loop_trigger = True
 
         # Add dataloader lock
         self.dataloader_lock = asyncio.Lock()
@@ -244,6 +242,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     ):
         """Update current parameter version"""
         async with self.lock:
+            self.paused = False
             old_version = self.current_param_version
             self.current_param_version = version
             # every time param change, reset staleness_samples
@@ -695,11 +694,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 last_stats_time = current_time
 
             # Trigger rollout recovery
-            if self.monitor_loop_trigger:
-                if not await self._should_pause_generation():
-                    async with self.lock:
-                        self.paused = False
-                        self.condition.notify_all()
+            if self.paused and not await self._should_pause_generation():
+                async with self.lock:
+                    self.paused = False
+                    print("[FullyAsyncRollouter][ShouldPause] notify all wait tasks.")
+                    self.condition.notify_all()
 
     async def _should_pause_generation(self) -> bool:
         """Determine whether the build should be paused"""
@@ -724,36 +723,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             return True
 
         return False
-
-    async def pause(self):
-        """pause rollout"""
-        print("[FullyAsyncRollouter][Public][Pause] partial rollout:", self.config.async_training.partial_rollout)
-        async with self.lock:
-            self.paused = True
-            # Cancel all rollout tasks
-            if self.config.async_training.partial_rollout:
-                await self.async_rollout_manager.cancel()
-                print("[FullyAsyncRollouter][Public][Pause] Unfinished rollout tasks canceled")
-            if self.active_tasks:
-                await asyncio.gather(*self.active_tasks, return_exceptions=True)
-                self.active_tasks.clear()
-                print("[FullyAsyncRollouter][Public][Pause] All active tasks completed")
-            print("[FullyAsyncRollouter][Public][Pause] Prefix cache reset")
-            # Always clear KV cache to release GPU memory during weight synchronization,
-            # regardless of partial_rollout setting.
-            await self.async_rollout_manager.clear_kv_cache()
-            self.monitor_loop_trigger = False
-
-    async def resume(self, dependency_ref: ObjectRef = None):
-        if dependency_ref is not None:
-            ray.get(dependency_ref)
-        print("[FullyAsyncRollouter][Public][Resume]")
-        async with self.lock:
-            if self.config.async_training.partial_rollout:
-                await self.async_rollout_manager.resume()
-            self.paused = False
-            self.monitor_loop_trigger = True
-            self.condition.notify_all()
 
     async def get_statistics(self) -> dict:
         queue_stats = self.message_queue_client.get_statistics_sync()

@@ -21,12 +21,9 @@ async_training:
   # The number of ppo_mini_batches that the FullyAsyncTrainer obtains once
   require_batches: 1
 
-  # When synchronizing parameters, whether to interrupt rollouter and perform partial rollout
+  # When synchronizing parameters, Whether to resume generation when rollout is interrupted.
+  # If True, AsyncLLMServerManager auto resume generation, making rollout interruption invisible to the AgentLoop.
   partial_rollout: True
-
-  # Whether to resume generation when rollout is interrupted. If True, AsyncLLMServerManager
-  # auto resume generation, making rollout interruption invisible to the AgentLoop.
-  partial_rollout_resume: True
 
   # whether to use trainer do_validate
   use_trainer_do_validate: False

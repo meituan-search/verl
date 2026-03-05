@@ -115,7 +115,7 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
                     break
 
             # 4. check stop reason
-            if output.stop_reason not in ("aborted", "abort") or not self.config.async_training.partial_rollout_resume:
+            if output.stop_reason not in ("aborted", "abort") or not self.config.async_training.partial_rollout:
                 break
         final_output.extra_fields["global_steps"] = global_steps
         final_output.extra_fields["min_global_steps"] = min_global_steps
