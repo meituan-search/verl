@@ -16,11 +16,9 @@ import logging
 import time
 
 import ray
-from ray.util.collective import collective
 
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_nccl_backend
 
 logger = logging.getLogger(__name__)
 
@@ -42,9 +40,6 @@ class ParameterSynchronizer:
         self.rollout_wg = ray.get(rollouter.get_rollout_wg.remote())
 
         # Basic attributes
-        self.weights_info = None
-        self.sync_group_initialized = False
-        self.sync_group_name = "actor_rollout"
         self.wait_last_update = None
         self.wait_last_resume = None
         self.validate_task = None
@@ -58,67 +53,13 @@ class ParameterSynchronizer:
             config=checkpoint_engine_config, trainer=self.actor_wg, replicas=replicas
         )
 
-    def get_current_param_version(self) -> int:
-        """Get current parameter version number"""
-        return self.current_version
-
-    def get_weights_info(self):
-        """Get weights info"""
-        return self.weights_info
-
-    def _init_weights_info(self):
-        self.weights_info = self.actor_wg.get_actor_weights_info()[0]
-        self.rollout_wg.set_actor_weights_info(self.weights_info)
-
-    def _init_sync_group(self):
-        print("[ParameterSynchronizer] Initializing parameter synchronization group...")
-        actor_rollout_workers = self.actor_wg.workers + self.rollout_wg.workers
-        n_workers = len(self.actor_wg.workers + self.rollout_wg.workers)
-        if self.config.trainer.device == "npu":
-            master_address = ray.get(self.actor_wg.workers[0]._get_node_ip.remote()).strip("[]")
-            master_port = ray.get(self.actor_wg.workers[0]._get_free_port.remote())
-            self.actor_wg.create_weight_sync_group(
-                master_address,
-                master_port,
-                0,
-                n_workers,
-            )
-            ray.get(
-                self.rollout_wg.create_weight_sync_group(
-                    master_address,
-                    master_port,
-                    len(self.actor_wg.workers),
-                    n_workers,
-                )
-            )
-        else:
-            collective.create_collective_group(
-                actor_rollout_workers,
-                n_workers,
-                list(range(0, n_workers)),
-                backend=get_nccl_backend(),
-                group_name=self.sync_group_name,
-            )
-
     def sync_weights(self, version, validate=False, global_steps=0, use_trainer_do_validate=False):
         """Sync weights between trainer and rollouter, and update parameter version"""
         start_time = time.time()
         self.current_version = version
-        print(f"[ParameterSynchronizer] rollout paused. cost {time.time() - start_time:.2f} seconds")
-        # Update MQ version
-        self.mq_client.update_param_version_sync(version)
-
-        pause_time = time.time()
-
-        # sync weights
-        # For sglang, always use sync_rollout_weights instead of sync_rollout_weights_by_checkpoint
-
         self.checkpoint_manager.update_weights(global_steps)
         end_time = time.time()
-        print(
-            f"[ParameterSynchronizer] sync_weights success. cost {end_time - start_time:.2f} seconds, "
-            f"pause:{pause_time - start_time:.2f}s, sync:{end_time - pause_time:.2f}s"
-        )
+        print(f"[ParameterSynchronizer] sync_weights success. cost {end_time - start_time:.2f} seconds")
         # async train do validate
         print(f"[ParameterSynchronizer] validate: {validate}, use_trainer_do_validate: {use_trainer_do_validate}")
         if validate and use_trainer_do_validate:
