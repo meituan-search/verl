@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import asyncio
-import functools
 import multiprocessing
 import os
 import time
@@ -155,15 +154,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.max_queue_size = None
 
         # Statistics
-        self.current_param_version = 0
         self.total_generated_samples = 0
         self.staleness_samples = 0
         self.dropped_stale_samples = 0
         self.processed_sample_count = 0
         # we start from step 1
         self.global_steps = 1
-        self.idle_start_time = None
-        self.version_start_time = None
+        self.idle_start_time = time.time()
+        self.step_start_time = time.time()
 
         # Concurrency control
         # Modified by self.pause() or self._should_pause_generation()
@@ -180,7 +178,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         cpu_cores = multiprocessing.cpu_count()
         # cpu case use cpu_cores; io case use cpu_cores*2
         self.validate_executor = ThreadPoolExecutor(max_workers=cpu_cores)
-        self.parallel_validate_and_rollout = config.async_training.get("parallel_validate_and_rollout", False)
         self.validate_task = None
 
     def _init_async_objects(self):
@@ -237,95 +234,37 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     def get_total_train_steps(self):
         return self.total_train_steps
 
-    async def update_param_version(
-        self, version: int, validate: bool = False, global_steps: int = 0, use_trainer_do_validate: bool = False
-    ):
-        """Update current parameter version"""
+    async def reset_staleness(self):
+        """
+        Reset staleness samples after parameter update.
+        Returns timing_raw dictionary for metrics.
+        """
         async with self.lock:
             self.paused = False
-            old_version = self.current_param_version
-            self.current_param_version = version
             # every time param change, reset staleness_samples
             self.staleness_samples = len(self.active_tasks) + await self.message_queue_client.get_queue_size()
             timing_raw = {}
-            idle_ratio = None
-            if self.idle_start_time is not None and self.version_start_time is not None:
-                rollout_active_time = self.idle_start_time - self.version_start_time
-                rollout_version_time = time.time() - self.version_start_time
-                idle_ratio = 1 - rollout_active_time / rollout_version_time
-                timing_raw["rollouter/active_time"] = rollout_active_time
-                timing_raw["rollouter/version_time"] = rollout_version_time
-                timing_raw["rollouter/idle_ratio"] = idle_ratio
-                self.idle_start_time = None
+            rollout_active_time = self.idle_start_time - self.step_start_time
+            rollout_version_time = time.time() - self.step_start_time
+            idle_ratio = 1 - rollout_active_time / rollout_version_time
+            timing_raw["rollouter/active_time"] = rollout_active_time
+            timing_raw["rollouter/version_time"] = rollout_version_time
+            timing_raw["rollouter/idle_ratio"] = idle_ratio
+
             print(
                 f"[FullyAsyncRollouter][Public][update_param_version] "
-                f"Parameter version updated from {old_version} to {version} "
-                f",reset staleness_samples to: {self.staleness_samples}"
-                f",idle_ratio: {idle_ratio}"
+                f"reset staleness_samples to: {self.staleness_samples} "
+                f"idle_ratio: {timing_raw['rollouter/idle_ratio']}"
             )
-            need_validate = (
-                (
-                    self.config.rollout.test_freq > 0
-                    and self.current_param_version % self.config.rollout.test_freq == 0
-                    and self.current_param_version > 0
-                )  # don't test here in the initial parameter sync
-                or validate
-            )
-            print(
-                f"[FullyAsyncRollouter] need_validate: {need_validate}, "
-                f"parallel_validate_and_rollout: {self.parallel_validate_and_rollout}"
-            )
-            if not need_validate:
-                data = ValidateMetrics(
-                    timing_raw=timing_raw, metrics=None, global_steps=global_steps, param_version=version
-                )
-            elif need_validate and not self.parallel_validate_and_rollout:
-                data = self._validate_wrapper(timing_raw, version, global_steps, use_trainer_do_validate)
+            self.step_start_time = time.time()
+        return timing_raw
 
-            if not need_validate or not self.parallel_validate_and_rollout:
-                await self.message_queue_client.put_validate(ray.cloudpickle.dumps(data))
-
-            self.version_start_time = time.time()
-
-        if need_validate and self.parallel_validate_and_rollout:
-            if self.validate_task and not self.validate_task.done():
-                print("[FullyAsyncRollouter] validate_task is running, wait last validate_task to finish")
-                self.validate_task.get()
-            self.validate_task = safe_create_task(
-                self.do_validate_async(timing_raw, version, global_steps, use_trainer_do_validate), name="validate_task"
-            )
-
-    def _validate_wrapper(
-        self, timing_raw: dict, version: int, global_steps: int = 0, use_trainer_do_validate: bool = False
-    ):
-        val_metrics = None
+    def do_validate(self) -> ValidateMetrics:
+        """Run validation and return metrics"""
+        timing_raw = {}
         with marked_timer("rollouter/validate_time", timing_raw, color="green"):
-            val_metrics: dict = self._validate(use_trainer_do_validate)
-        data = ValidateMetrics(
-            timing_raw=timing_raw, metrics=val_metrics, global_steps=global_steps, param_version=version
-        )
-        return data
-
-    async def do_validate_async(
-        self,
-        timing_raw: dict,
-        version: int,
-        global_steps: int = 0,
-        use_trainer_do_validate: bool = False,
-    ):
-        loop = asyncio.get_running_loop()
-
-        data = await loop.run_in_executor(
-            self.validate_executor,
-            functools.partial(
-                self._validate_wrapper,
-                timing_raw=timing_raw,
-                version=version,
-                global_steps=global_steps,
-                use_trainer_do_validate=use_trainer_do_validate,
-            ),
-        )
-        await self.message_queue_client.put_validate(ray.cloudpickle.dumps(data))
+            val_metrics: dict = self._validate()
+        return ValidateMetrics(timing_raw=timing_raw, metrics=val_metrics)
 
     async def save_checkpoint(self, local_global_step_folder: str):
         # WARNING!: Due to the asynchronous nature, there are some in-flight samples
@@ -733,7 +672,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             "monitor/queue/pending_queue_size": self.pending_queue.qsize(),
             "monitor/queue/mq_queue_size": queue_stats["queue_size"],
             # counting stats
-            "count/current_param_version": self.current_param_version,
             "count/total_generated_samples": self.total_generated_samples,
             "count/staleness_samples": self.staleness_samples,
             "count/dropped_stale_samples": self.dropped_stale_samples,

@@ -548,7 +548,9 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                 batch = batch.union(values)
         return batch
 
-    def _fit_compute_advantage(self, batch) -> DataProto:
+    def _fit_compute_advantage(self, batch) -> DataProto | None:
+        if batch is None:
+            return batch
         metrics = self.metrics
         timing_raw = self.timing_raw
         reward_tensor = self.reward_tensor

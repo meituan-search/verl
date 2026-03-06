@@ -100,32 +100,19 @@ class FullyAsyncTaskRunner:
         ray.get(self.components["rollouter"].set_message_queue_client.remote(self.components["message_queue_client"]))
         ray.get(self.components["trainer"].set_message_queue_client.remote(self.components["message_queue_client"]))
 
-        print("[ASYNC MAIN] Setting up parameter synchronization...")
-        from verl.experimental.fully_async_policy.param_sync import ParameterSynchronizer
-
-        param_synchronizer = ParameterSynchronizer.remote(
-            config=config,
-            trainer=self.components["trainer"],
-            rollouter=self.components["rollouter"],
-            mq=self.components["message_queue_client"],
-        )
-        ray.get(self.components["trainer"].set_parameter_synchronizer.remote(param_synchronizer))
-
-        # load checkpoint and sync parameter before doing anything
-        val_before_train = config.trainer.get("val_before_train", True)
         # param_version resume from ckpt or default 0
-        param_version = ray.get(self.components["trainer"].load_checkpoint.remote())
+        ray.get(self.components["trainer"].load_checkpoint.remote())
         ray.get(self.components["rollouter"].load_checkpoint.remote())
-        ray.get(
-            param_synchronizer.sync_weights.remote(
-                version=param_version,
-                validate=val_before_train,
-                use_trainer_do_validate=config.async_training.use_trainer_do_validate,
-            )
-        )
-        ray.get(param_synchronizer.wait_last_valid.remote())
 
-        self.components["param_synchronizer"] = param_synchronizer
+        print("[ASYNC MAIN] Setting up parameter synchronization...")
+        ray.get(self.components["trainer"].set_rollouter.remote(self.components["rollouter"]))
+
+        print("[ASYNC MAIN] Param sync before fit..")
+        ray.get(self.components["trainer"]._fit_update_weights.remote())
+
+        if config.trainer.get("val_before_train", True):
+            ray.get(self.components["trainer"]._fit_validate.remote(True))
+
         print("[ASYNC MAIN] All components initialized successfully")
 
     def _create_rollouter(self, config) -> None:
