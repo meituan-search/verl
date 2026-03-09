@@ -128,11 +128,12 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
     def __init__(
         self,
         config: DictConfig,
-        server_handles: list[ray.actor.ActorHandle],
+        servers: list[tuple[str, ray.actor.ActorHandle]],
+        load_balancer_handle: ray.actor.ActorHandle,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
     ):
-        self.server_manager = FullyAsyncLLMServerManager(config, server_handles)
-        super().__init__(config, server_handles, reward_loop_worker_handles)
+        self.server_manager = FullyAsyncLLMServerManager(config, servers, load_balancer_handle)
+        super().__init__(config, servers, load_balancer_handle, reward_loop_worker_handles)
 
 
 class FullyAsyncAgentLoopManager(AgentLoopManager):

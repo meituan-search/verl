@@ -27,7 +27,6 @@ from verl.single_controller.ray import (
     RayResourcePool,
 )
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_device_name
 from verl.workers.config import CheckpointEngineConfig, HFModelConfig
 
 
@@ -47,7 +46,7 @@ def init_config() -> DictConfig:
     config.actor_rollout_ref.rollout.name = os.environ["ROLLOUT_NAME"]
     config.actor_rollout_ref.rollout.max_num_seqs = 256
     config.actor_rollout_ref.rollout.response_length = 4096
-    config.actor_rollout_ref.rollout.checkpoint_engine.backend = "nccl" if get_device_name() == "cuda" else "hccl"
+    config.actor_rollout_ref.rollout.checkpoint_engine.backend = "nccl"
     config.actor_rollout_ref.rollout.nnodes = 1
     config.trainer.n_gpus_per_node = 4
     config.trainer.nnodes = 1
@@ -197,7 +196,14 @@ async def test_server_adapter(init_config):
 
     # 2. create standalone rollout with AgentLoopManager
     agent_loop_manager = await AgentLoopManager.create(config=init_config)
-    server_handles = [server._server_handle for server in agent_loop_manager.rollout_replicas]
+    servers = list(
+        zip(
+            agent_loop_manager.server_addresses,
+            [server._server_handle for server in agent_loop_manager.rollout_replicas],
+            strict=True,
+        )
+    )
+    load_balancer_handle = agent_loop_manager.global_load_balancer
 
     # 3. create checkpoint engine manager
     checkpoint_manager = CheckpointEngineManager(
@@ -212,7 +218,9 @@ async def test_server_adapter(init_config):
         [{"role": "user", "content": "Please write an article about the geography of America, at least 1000 words."}],
     ] * n
 
-    server_manager = AsyncLLMServerManager(config=init_config, server_handles=server_handles)
+    server_manager = AsyncLLMServerManager(
+        config=init_config, servers=servers, load_balancer_handle=load_balancer_handle
+    )
 
     # 4. test update_weights with global_steps=None
     await _run_update_weights_with_global_steps_none(
@@ -233,7 +241,9 @@ async def test_server_adapter(init_config):
     )
 
     # 6. test FullyAsyncLLMServerManager with partial rollout resume
-    server_manager = FullyAsyncLLMServerManager(config=init_config, server_handles=server_handles)
+    server_manager = FullyAsyncLLMServerManager(
+        config=init_config, servers=servers, load_balancer_handle=load_balancer_handle
+    )
     await _run_server_manager_with_resume(
         initial_steps=4,
         train_steps=3,

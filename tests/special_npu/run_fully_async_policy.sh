@@ -135,7 +135,6 @@ common_params=(
     async_training.trigger_parameter_sync_step="${trigger_parameter_sync_step}"
     # NPU specific configurations
     trainer.device='npu'
-    actor_rollout_ref.rollout.checkpoint_engine.backend='hccl'
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=1024
 )
 
