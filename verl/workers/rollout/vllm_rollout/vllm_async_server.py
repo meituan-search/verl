@@ -17,7 +17,6 @@ import inspect
 import json
 import logging
 import os
-import time
 from pprint import pprint
 from typing import Any, Callable, Optional
 
@@ -838,16 +837,6 @@ class vLLMReplica(RolloutReplica):
                 if not self.is_reward_model
                 else f"vllm_server_reward_{self.replica_rank}_{node_rank}"
             )
-
-            # Check if actor with this name already exists
-            try:
-                ray.get_actor(name)
-                # Actor exists, use a unique name with timestamp
-                name = f"{name}_{int(time.time() * 1000)}"
-                logging.warning(f"Actor {name} already exists, using new name: {name}")
-            except ValueError:
-                # Actor does not exist, use original name
-                pass
 
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(

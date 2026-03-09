@@ -39,7 +39,6 @@ from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
-from verl.utils.profiler import log_gpu_memory_usage
 from verl.utils.tracking import Tracking
 
 logger = logging.getLogger(__name__)
@@ -349,10 +348,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
             # create async rollout manager and request scheduler
             assert self.config.actor_rollout_ref.rollout.mode == "async"
-            from verl.experimental.fully_async_policy.agent_loop import FullyAsyncAgentLoopManager
 
             self.async_rollout_mode = True
-            self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
+            from verl.experimental.agent_loop import AgentLoopManager
+
+            self.async_rollout_manager = await AgentLoopManager.create(
                 config=self.config,
                 worker_group=self.actor_rollout_wg,
                 reward_loop_worker_handles=reward_loop_worker_handles,
@@ -375,9 +375,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             )
 
             # sleep all replicas to load checkpoint
-            log_gpu_memory_usage("Before colocate_checkpoint_manager sleep_replicas", logger=None)
             await self.colocate_checkpoint_manager.sleep_replicas()
-            log_gpu_memory_usage("After colocate_checkpoint_manager sleep_replicas", logger=None)
 
             # Restore original backend value
             with open_dict(checkpoint_engine_cfg):
@@ -455,7 +453,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self._fit_dump_data(batch)
 
         await self._fit_validate()
-        self._fit_save_checkpoint()
+        await self._fit_save_checkpoint()
         self._fit_stop_profile()
         self._fit_collect_metrics(batch)
         self._fit_torch_memory()
@@ -538,14 +536,14 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
             # Wake up rollouter replicas and sync weights
             print("[FullyAsyncTrainer] wake up replicas before validation")
-            await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
+            await self.colocate_checkpoint_manager.update_weights(global_steps=self.current_param_version)
 
             with marked_timer("trainer/validate_time", self.timing_raw):
                 train_val_metrics = self._validate(True)
 
             # Sleep rollouter replicas to free GPU memory for validation
             print("[FullyAsyncTrainer] sleep replicas after validation")
-            await self.checkpoint_manager.sleep_replicas()
+            await self.colocate_checkpoint_manager.sleep_replicas()
 
             print(f"[FullyAsyncTrainer] validate timing: {self.timing_raw['trainer/validate_time']}")
             return train_val_metrics
@@ -594,7 +592,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 )
         self.logger.log(data=val_metrics.timing_raw, step=self.current_param_version)
 
-    def _fit_save_checkpoint(self):
+    async def _fit_save_checkpoint(self):
         if self.current_param_version == self.last_ckpt_version:
             return
 
@@ -618,10 +616,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 print("Force saving checkpoint: ESI instance expiration approaching.")
             with marked_timer("save_checkpoint", timing_raw, color="green"):
                 # sleep replicas to avoid OOM during checkpoint saving
-                # self.checkpoint_manager.sleep_replicas()
                 self._save_checkpoint()
-                # wake replicas to avoid OOM during checkpoint saving
-                # self.checkpoint_manager.update_weights()
 
     def _fit_postprocess_step(self):
         self.global_steps += 1

@@ -115,6 +115,7 @@ class FullyAsyncTaskRunner:
         print("[ASYNC MAIN] All components initialized successfully")
 
     def _create_rollouter(self, config) -> None:
+        print("[ASYNC MAIN] Starting create rollouter...")
         rollouter = FullyAsyncRollouter.remote(
             config=config,
             tokenizer=self.components["tokenizer"],
@@ -132,6 +133,7 @@ class FullyAsyncTaskRunner:
         print("[ASYNC MAIN] Rollouter created and initialized successfully")
 
     def _create_trainer(self, config) -> None:
+        print("[ASYNC MAIN] Starting create trainer...")
         trainer_role_mapping = {
             role: worker_cls
             for role, worker_cls in self.components["role_worker_mapping"].items()
@@ -195,6 +197,9 @@ def main(config):
     # Ensure async training config exists
     if not hasattr(config, "async_training"):
         raise RuntimeError("must set async_training config")
+
+    assert config.async_training.use_trainer_do_validate is False, "use_trainer_do_validate is not ready to use."
+
     from time import time
 
     start_time = time()
