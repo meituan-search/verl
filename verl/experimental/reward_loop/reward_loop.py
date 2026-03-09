@@ -295,12 +295,9 @@ class RewardLoopManager:
             # Round-robin scheduling over the all nodes
             node_id = node_ids[i % len(node_ids)]
 
-            # Check if actor with this name already exists
-            actor_name = f"reward_loop_worker_{i}"
-
             self.reward_loop_workers.append(
                 self.reward_loop_workers_class.options(
-                    name=actor_name,
+                    name=f"reward_loop_worker_{i}",
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                         node_id=node_id,
                         soft=True,
