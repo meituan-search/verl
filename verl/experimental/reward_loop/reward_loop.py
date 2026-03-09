@@ -15,6 +15,7 @@
 import asyncio
 import logging
 import os
+import time
 
 import aiohttp
 import numpy as np
@@ -294,9 +295,21 @@ class RewardLoopManager:
         for i in range(num_workers):
             # Round-robin scheduling over the all nodes
             node_id = node_ids[i % len(node_ids)]
+
+            # Check if actor with this name already exists
+            actor_name = f"reward_loop_worker_{i}"
+            try:
+                ray.get_actor(actor_name)
+                # Actor exists, use a unique name with timestamp
+                actor_name = f"reward_loop_worker_{i}_{int(time.time() * 1000)}"
+                logger.warning(f"Actor {actor_name} already exists, using new name: {actor_name}")
+            except ValueError:
+                # Actor does not exist, use original name
+                pass
+
             self.reward_loop_workers.append(
                 self.reward_loop_workers_class.options(
-                    name=f"reward_loop_worker_{i}",
+                    name=actor_name,
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                         node_id=node_id,
                         soft=True,

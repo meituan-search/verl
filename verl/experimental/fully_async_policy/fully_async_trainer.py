@@ -39,6 +39,7 @@ from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
+from verl.utils.profiler import log_gpu_memory_usage
 from verl.utils.tracking import Tracking
 
 logger = logging.getLogger(__name__)
@@ -183,6 +184,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.rollouter = None
         self.checkpoint_manager = None
 
+        # when use_trainer_do_validate == Ture, use colocate_checkpoint_manager to sync params
+        self.colocate_checkpoint_manager = None
+
     def _setup_checkpoint_manager(self, rollouter):
         """Setup checkpoint manager after rollouter is initialized"""
         replicas = ray.get(rollouter.get_replicas.remote())
@@ -221,7 +225,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         """Get actor worker group"""
         return self.actor_wg
 
-    def _get_samples_from_queue(self) -> tuple[None, None] | tuple[int, Any]:
+    async def _get_samples_from_queue(self) -> tuple[None, None] | tuple[int, Any]:
         """
         Get samples from message queue and compose gen_batch_output
         Uses a loop to continuously collect samples until enough are gathered
@@ -266,7 +270,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         print(
             f"[FullyAsyncTrainer] Loop collection completed: {len(queue_samples)}/{self.required_samples} samples, "
-            f"total wait time: {total_wait_time:.2f} seconds."
+            f"total wait time: {total_wait_time:.2f} seconds. "
             f"mq_len: {queue_len}"
         )
 
@@ -318,7 +322,13 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._create_worker_classes()
         self._init_worker_groups()
         self._init_models()
+        self._init_reward_loop()
         await self._init_async_rollout_manager()
+
+    def _init_reward_loop(self):
+        if self.config.async_training.use_trainer_do_validate:
+            print("[FullyAsyncTrainer] Init reward loop")
+            super()._init_reward_loop()
 
     async def _init_async_rollout_manager(self):
         # use async rollout do validate
@@ -347,9 +357,34 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 worker_group=self.actor_rollout_wg,
                 reward_loop_worker_handles=reward_loop_worker_handles,
             )
+            print("[FullyAsyncTrainer] async_rollout_manager initialized")
 
-            print("[FullyAsyncTrainer] async_rollout_manager sleep")
-            await self.async_rollout_manager.sleep()
+            # Modify checkpoint_engine config to use naive backend
+            checkpoint_engine_cfg = self.config.actor_rollout_ref.rollout.checkpoint_engine
+            original_backend = checkpoint_engine_cfg.backend
+            with open_dict(checkpoint_engine_cfg):
+                checkpoint_engine_cfg.backend = "naive"
+            checkpoint_engine_config = omega_conf_to_dataclass(checkpoint_engine_cfg)
+
+            print(f"[FullyAsyncTrainer] checkpoint_engine_config: {checkpoint_engine_config}")
+
+            self.colocate_checkpoint_manager = CheckpointEngineManager(
+                config=checkpoint_engine_config,
+                trainer=self.actor_rollout_wg,
+                replicas=self.async_rollout_manager.rollout_replicas,
+            )
+
+            # sleep all replicas to load checkpoint
+            log_gpu_memory_usage("Before colocate_checkpoint_manager sleep_replicas", logger=None)
+            await self.colocate_checkpoint_manager.sleep_replicas()
+            log_gpu_memory_usage("After colocate_checkpoint_manager sleep_replicas", logger=None)
+
+            # Restore original backend value
+            with open_dict(checkpoint_engine_cfg):
+                checkpoint_engine_cfg.backend = original_backend
+
+            print("[FullyAsyncTrainer] colocate_checkpoint_manager initialized")
+
         else:
             print("[FullyAsyncTrainer] Skip async rollout manager (use_trainer_do_validate=False)")
 
@@ -407,7 +442,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._fit_start_profile()
 
         with marked_timer("step", self.timing_raw):
-            batch = self._fit_generate(None)
+            batch = await self._fit_generate(None)
             batch = self._fit_compute_reward(batch)
             batch = self._fit_compute_log_prob(batch)
             batch = self._fit_compute_ref_log_prob(batch)
@@ -426,11 +461,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._fit_torch_memory()
         self._fit_postprocess_step()
 
-    def _fit_generate(self, batch: DataProto = None) -> DataProto | None:
+    async def _fit_generate(self, batch: DataProto = None) -> DataProto | None:
         metrics = self.metrics
         timing_raw = self.timing_raw
         with marked_timer("gen", timing_raw, color="red"):
-            epoch, batch = self._get_samples_from_queue()
+            epoch, batch = await self._get_samples_from_queue()
             if batch is None:
                 raise TrainingStopException("Training terminated: queue returned None")
             self._collect_metrics_from_samples(batch, metrics)
@@ -501,10 +536,17 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             print("[FullyAsyncTrainer] _validate_process")
             from verl.utils.profiler import marked_timer
 
-            await self.async_rollout_manager.wake_up()
+            # Wake up rollouter replicas and sync weights
+            print("[FullyAsyncTrainer] wake up replicas before validation")
+            await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
+
             with marked_timer("trainer/validate_time", self.timing_raw):
                 train_val_metrics = self._validate(True)
-            await self.async_rollout_manager.sleep()
+
+            # Sleep rollouter replicas to free GPU memory for validation
+            print("[FullyAsyncTrainer] sleep replicas after validation")
+            await self.checkpoint_manager.sleep_replicas()
+
             print(f"[FullyAsyncTrainer] validate timing: {self.timing_raw['trainer/validate_time']}")
             return train_val_metrics
         else:
@@ -654,7 +696,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.current_param_version))
 
-    def load_checkpoint(self):
+    async def load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
             return 0
 
@@ -704,6 +746,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self.critic_wg.load_checkpoint(
                 critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
             )
+
+        if self.colocate_checkpoint_manager:
+            await self.colocate_checkpoint_manager.update_weights(self.current_param_version)
+            await self.colocate_checkpoint_manager.sleep_replicas()
+
         return self.current_param_version
 
     def _collect_metrics_from_samples(self, batch, metrics):

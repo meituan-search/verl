@@ -76,7 +76,6 @@ class FullyAsyncTaskRunner:
 
         print("[ASYNC MAIN] Creating FullyAsyncRollouter and FullyAsyncTrainer in parallel...")
         with ThreadPoolExecutor(max_workers=2) as executor:
-            # TODO: keep _create_rollouter and _create_trainer parallel
             # Rollouter does not permit continuous allocation, so we allocate trainer first.
             trainer_future = executor.submit(self._create_trainer, config)
             trainer_future.result()

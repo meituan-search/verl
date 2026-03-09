@@ -241,6 +241,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         """
         async with self.lock:
             self.paused = False
+            self.condition.notify_all()
             # every time param change, reset staleness_samples
             self.staleness_samples = len(self.active_tasks) + await self.message_queue_client.get_queue_size()
             timing_raw = {}
@@ -252,9 +253,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             timing_raw["rollouter/idle_ratio"] = idle_ratio
 
             print(
-                f"[FullyAsyncRollouter][Public][update_param_version] "
+                f"[FullyAsyncRollouter][Public][reset_staleness] "
                 f"reset staleness_samples to: {self.staleness_samples} "
-                f"idle_ratio: {timing_raw['rollouter/idle_ratio']}"
+                f"idle_ratio: {timing_raw['rollouter/idle_ratio']:.4f}"
             )
             self.step_start_time = time.time()
         return timing_raw
