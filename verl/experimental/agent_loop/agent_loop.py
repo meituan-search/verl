@@ -839,9 +839,8 @@ class AgentLoopWorker:
         default_extra_keys = {
             "turn_scores",
             "tool_rewards",
-            "is_cancel",
-            "param_version_start",
-            "param_version_end",
+            "min_global_steps",
+            "max_global_steps",
             "extras",
         }
         all_keys = set(key for input_item in inputs for key in input_item.extra_fields) | default_extra_keys
