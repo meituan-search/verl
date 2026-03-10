@@ -519,7 +519,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         )
 
         # Reset staleness in rollouter
-        self.rollouter.reset_staleness.remote()
+        timing_raw = self.rollouter.reset_staleness.remote()
+        self.logger.log(
+            data=timing_raw,
+            step=self.current_param_version,
+        )
 
         # Log aggregated training metrics
         self.logger.log(
