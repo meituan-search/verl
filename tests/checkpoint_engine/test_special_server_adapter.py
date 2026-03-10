@@ -73,8 +73,8 @@ async def _run_update_weights_with_global_steps_none(
     assert output.stop_reason not in ("aborted", "abort"), (
         f"output.stop_reason is {output.stop_reason}, expected not abort"
     )
-    assert output.extra_info["global_steps"] is None, (
-        f"output.extra_info['global_steps'] is {output.extra_info['global_steps']}, expected None"
+    assert output.extra_fields["global_steps"] is None, (
+        f"output.extra_fields['global_steps'] is {output.extra_fields['global_steps']}, expected None"
     )
     print("========== [update_weights with global_steps=None] ==========")
     print("[RESPONSE]", tokenizer.decode(output.token_ids, skip_special_tokens=True))
