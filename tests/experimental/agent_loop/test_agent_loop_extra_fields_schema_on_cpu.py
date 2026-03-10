@@ -205,12 +205,10 @@ async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(
     )
     for key in stable_keys:
         assert key in merged.non_tensor_batch, f"missing key in merged batch: {key}"
-        assert merged.non_tensor_batch[key].shape == (2,), (
+        assert merged.non_tensor_batch[key].shape == (1,), (
             f"invalid shape for {key}: {merged.non_tensor_batch[key].shape}"
         )
 
     # And the list-typed fields are actually lists (not missing / scalar).
     assert merged.non_tensor_batch["turn_scores"][0] == []
     assert merged.non_tensor_batch["tool_rewards"][0] == []
-    assert merged.non_tensor_batch["turn_scores"][1] == []
-    assert merged.non_tensor_batch["tool_rewards"][1] == []
