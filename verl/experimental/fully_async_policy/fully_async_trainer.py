@@ -416,7 +416,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         if self.current_param_version % self.config.rollout.test_freq != 0 or self.local_trigger_step > 1:
             await self._fit_update_weights()
             await self._fit_validate()
-        self._fit_save_checkpoint()
+        self._fit_save_checkpoint(force=True)
 
     async def fit_step(self, batch_dict: dict = None):
         """
@@ -453,7 +453,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self._fit_dump_data(batch)
 
         await self._fit_validate()
-        await self._fit_save_checkpoint()
+        self._fit_save_checkpoint()
         self._fit_stop_profile()
         self._fit_collect_metrics(batch)
         self._fit_torch_memory()
@@ -596,7 +596,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 )
         self.logger.log(data=val_metrics.timing_raw, step=self.current_param_version)
 
-    async def _fit_save_checkpoint(self):
+    def _fit_save_checkpoint(self, force=False):
         if self.current_param_version == self.last_ckpt_version:
             return
 
@@ -614,13 +614,14 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # 3. The current step number is a multiple of the save frequency.
         # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
         if self.config.trainer.save_freq > 0 and (
-            self.current_param_version % self.config.trainer.save_freq == 0 or esi_close_to_expiration
+            force and self.current_param_version % self.config.trainer.save_freq == 0 or esi_close_to_expiration
         ):
             if esi_close_to_expiration:
                 print("Force saving checkpoint: ESI instance expiration approaching.")
             with marked_timer("save_checkpoint", timing_raw, color="green"):
                 # sleep replicas to avoid OOM during checkpoint saving
                 self._save_checkpoint()
+                self.last_ckpt_version = self.current_param_version
 
     def _fit_postprocess_step(self):
         self.global_steps += 1
