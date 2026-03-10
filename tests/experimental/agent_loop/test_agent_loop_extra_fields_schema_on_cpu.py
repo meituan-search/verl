@@ -29,8 +29,6 @@ from verl.experimental.agent_loop.agent_loop import (
     _InternalAgentLoopOutput,
 )
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
-from verl.experimental.fully_async_policy.agent_loop.partial_single_turn_agent_loop import PartialSingleTurnAgentLoop
-from verl.protocol import DataProto
 from verl.utils.dataset.rl_dataset import RLHFDataset
 
 
@@ -173,54 +171,30 @@ async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(
         dataset_cls=RLHFDataset,
         data_config=data_config,
     )
-    partial_single_turn = PartialSingleTurnAgentLoop(
-        trainer_config=trainer_config,
-        server_manager=server_manager,
-        tokenizer=tokenizer,
-        processor=processor,
-        dataset_cls=RLHFDataset,
-        data_config=data_config,
-    )
 
     raw_prompt = [{"role": "user", "content": "hi"}]
     sampling_params: dict[str, Any] = {}
 
-    out_a = await single_turn.run(sampling_params=sampling_params, raw_prompt=raw_prompt)
-    out_b = await partial_single_turn.run(sampling_params=sampling_params, raw_prompt=raw_prompt, param_version=0)
+    out = await single_turn.run(sampling_params=sampling_params, raw_prompt=raw_prompt)
 
     # Agent loop outputs should always contain these fields with consistent types.
-    assert out_a.extra_fields["turn_scores"] == []
-    assert out_a.extra_fields["tool_rewards"] == []
-    assert out_b.extra_fields["turn_scores"] == []
-    assert out_b.extra_fields["tool_rewards"] == []
-
-    prompt_len = max(len(out_a.prompt_ids), len(out_b.prompt_ids))
-    response_len = max(len(out_a.response_ids), len(out_b.response_ids))
+    assert out.extra_fields["turn_scores"] == []
+    assert out.extra_fields["tool_rewards"] == []
 
     internal_a = _to_internal(
-        output_prompt_ids=out_a.prompt_ids,
-        output_response_ids=out_a.response_ids,
-        output_response_mask=out_a.response_mask,
-        metrics=out_a.metrics,
-        extra_fields=out_a.extra_fields,
-        num_turns=out_a.num_turns,
-        prompt_len=prompt_len,
-        response_len=response_len,
-    )
-    internal_b = _to_internal(
-        output_prompt_ids=out_b.prompt_ids,
-        output_response_ids=out_b.response_ids,
-        output_response_mask=out_b.response_mask,
-        metrics=out_b.metrics,
-        extra_fields=out_b.extra_fields,
-        num_turns=out_b.num_turns,
-        prompt_len=prompt_len,
-        response_len=response_len,
+        output_prompt_ids=out.prompt_ids,
+        output_response_ids=out.response_ids,
+        output_response_mask=out.response_mask,
+        metrics=out.metrics,
+        extra_fields=out.extra_fields,
+        num_turns=out.num_turns,
+        prompt_len=len(out.prompt_ids),
+        response_len=len(out.response_ids),
     )
 
     # Mimic two "worker chunks" and concatenate as in training.
     dummy_worker = type("_DummyWorker", (), {"reward_loop_worker_handles": None})()
-    chunk_a = AgentLoopWorker._postprocess(
+    merged = AgentLoopWorker._postprocess(
         dummy_worker,
         inputs=[internal_a],
         input_non_tensor_batch={
@@ -228,23 +202,13 @@ async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(
             "agent_name": np.array(["single_turn_agent"], dtype=object),
         },
     )
-    chunk_b = AgentLoopWorker._postprocess(
-        dummy_worker,
-        inputs=[internal_b],
-        input_non_tensor_batch={
-            "index": np.array([1], dtype=object),
-            "agent_name": np.array(["partial_single_turn_agent"], dtype=object),
-        },
-    )
-    merged: DataProto = DataProto.concat([chunk_a, chunk_b])
 
     # Stable schema: present regardless of which loop produced a sample.
     stable_keys = (
         "turn_scores",
         "tool_rewards",
-        "is_cancel",
-        "param_version_start",
-        "param_version_end",
+        "min_global_steps",
+        "max_global_steps",
         "extras",
     )
     for key in stable_keys:

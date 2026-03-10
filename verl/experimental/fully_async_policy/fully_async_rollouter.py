@@ -255,7 +255,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             print(
                 f"[FullyAsyncRollouter][Public][reset_staleness] "
                 f"reset staleness_samples to: {self.staleness_samples} "
-                f"idle_ratio: {timing_raw['rollouter/idle_ratio']:.4f}"
+                f"idle_ratio: {timing_raw['fully_async/rollouter/idle_ratio']:.4f}"
             )
             self.step_start_time = time.time()
         return timing_raw
