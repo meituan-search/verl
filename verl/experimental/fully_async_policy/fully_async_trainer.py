@@ -413,7 +413,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 break
 
         self.progress_bar.close()
-        if self.current_param_version % self.config.rollout.test_freq != 0 or self.local_trigger_step > 1:
+        if self.current_param_version % self.config.trainer.test_freq != 0 or self.local_trigger_step > 1:
             await self._fit_update_weights()
             await self._fit_validate()
         self._fit_save_checkpoint(force=True)
@@ -561,8 +561,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         # Check if validation is needed
         need_validate = (
-            self.config.rollout.test_freq > 0
-            and self.current_param_version % self.config.rollout.test_freq == 0
+            self.config.trainer.test_freq > 0
+            and self.current_param_version % self.config.trainer.test_freq == 0
             and self.current_param_version > 0
         )
         # Skip validation if not needed and not validation before training

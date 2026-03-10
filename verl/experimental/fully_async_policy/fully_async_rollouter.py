@@ -372,7 +372,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         """
         Create a continuous data iterator across epoch
         """
-        for epoch in range(self.config.rollout.total_epochs):
+        for epoch in range(self.config.trainer.total_epochs):
             iterator = iter(self.train_dataloader)
             for batch_dict in iterator:
                 yield epoch, batch_dict

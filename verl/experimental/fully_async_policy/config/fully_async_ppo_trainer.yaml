@@ -43,12 +43,6 @@ rollout:
   # total rollout samples # TODO rename to total_rollout_samples
   total_rollout_steps: 100
 
-  # Number of epochs in training 
-  total_epochs: 10
-
-  # Test frequency, how many times a parameter update triggers a validation
-  test_freq: 1
-
 data:
   # Number of samples generated, currently only support 1
   gen_batch_size: 1
