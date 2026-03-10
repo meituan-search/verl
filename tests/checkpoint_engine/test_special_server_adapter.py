@@ -38,7 +38,7 @@ def init_config() -> DictConfig:
         config = compose(
             config_name="ppo_trainer",
             overrides=[
-                "+async_training.partial_rollout_resume=True",
+                "+async_training.partial_rollout=True",
             ],
         )
 
