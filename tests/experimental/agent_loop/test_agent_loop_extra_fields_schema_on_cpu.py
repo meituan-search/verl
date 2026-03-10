@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Optional
 
 import numpy as np
@@ -30,14 +29,7 @@ from verl.experimental.agent_loop.agent_loop import (
 )
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
 from verl.utils.dataset.rl_dataset import RLHFDataset
-
-
-@dataclass
-class _FakeTokenOutput:
-    token_ids: list[int]
-    log_probs: Optional[list[float]] = None
-    routed_experts: Any = None
-    num_preempted: Optional[int] = None
+from verl.workers.rollout.replica import TokenOutput
 
 
 class _FakeServerManager:
@@ -49,10 +41,10 @@ class _FakeServerManager:
         sampling_params: dict[str, Any],
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
-    ) -> _FakeTokenOutput:
+    ) -> TokenOutput:
         del request_id, sampling_params, image_data, video_data
         # Return a short, deterministic "generation" for testing.
-        return _FakeTokenOutput(token_ids=prompt_ids[-1:] + [11, 12, 13], log_probs=[0.0, 0.0, 0.0, 0.0])
+        return TokenOutput(token_ids=prompt_ids[-1:] + [11, 12, 13], log_probs=[0.0, 0.0, 0.0, 0.0])
 
     async def generate_for_partial(
         self,
