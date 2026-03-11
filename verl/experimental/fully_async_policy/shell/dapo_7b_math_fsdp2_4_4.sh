@@ -17,7 +17,7 @@ TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
 
 rollout_mode="async"
-rollout_name="vllm" # sglang or vllm
+rollout_name="sglang" # sglang or vllm
 if [ "$rollout_mode" = "async" ]; then
     export VLLM_USE_V1=1
     return_raw_chat="True"
