@@ -236,7 +236,7 @@ def gptmodel_forward_no_padding(
 
         args = {}
         if mtp_enable_train and post_process:
-            # 使用 input_ids 的序列长度来确保 label 和 loss_mask 对齐
+            # Use input_ids sequence length to ensure label and loss_mask alignment
             input_ids_offsets = input_ids.offsets()
             input_ids_lengths = input_ids_offsets.diff().tolist()
 
@@ -302,7 +302,7 @@ def gptmodel_forward_no_padding(
 
         if mtp_enable_train and post_process:
             args = {}
-            # 使用 input_ids 的序列长度来确保 label 和 loss_mask 对齐
+            # Use input_ids sequence length to ensure label and loss_mask alignment
             input_ids_offsets = input_ids.offsets()
             input_ids_lengths = input_ids_offsets.diff().tolist()
 
