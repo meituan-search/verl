@@ -53,7 +53,7 @@ train_tp=1
 train_pp=1
 train_cp=1
 
-
+train_prompt_bsz=128
 n_resp_per_prompt=16
 train_prompt_mini_bsz=32
 
