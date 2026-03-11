@@ -1,0 +1,16 @@
+working_dir: ./
+
+excludes:
+  - ".git/"
+
+env_vars:
+  VLLM_USE_V1: "1"
+  HYDRA_FULL_ERROR: "1"
+  NCCL_NVLS_ENABLE: "0"
+  NCCL_SOCKET_IFNAME: "eth0"
+  TMPDIR: "/tmp"
+  CUDA_HOME: "/usr/local/cuda"
+  CUDA_TMPDIR: "/tmp"
+  RAY_DATA_HOME: "/home/hadoop-djst-algoplat"
+  TENSORBOARD_DIR: "/home/hadoop-djst-algoplat/data/tensorboard/qwen2.5-7b-math/4-4-gsm8k-sglang"
+  VERL_LOGGING_LEVEL: "DEBUG"
