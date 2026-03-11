@@ -15,6 +15,7 @@ import functools
 import logging
 import os
 from contextlib import nullcontext
+from copy import deepcopy
 from functools import partial
 from itertools import chain
 
@@ -481,7 +482,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.config.ref.use_dynamic_bsz = self.config.ref.pop("log_prob_use_dynamic_bsz", False)
                 self.config.ref.ppo_max_token_len_per_gpu = self.config.ref.pop("log_prob_max_token_len_per_gpu", None)
             ref_config: ActorConfig = omega_conf_to_dataclass(self.config.ref)
-            ref_config.model_config = model_config
+
+            # The ref model does not need to enable MTP; force it to false.
+            ref_config.model_config = deepcopy(model_config)
+            ref_config.model_config.mtp.enable = False
 
             # construct TrainingWorkerConfig
             ref_training_config = TrainingWorkerConfig(
