@@ -53,9 +53,9 @@ train_tp=1
 train_pp=1
 train_cp=1
 
-train_prompt_bsz=16
-n_resp_per_prompt=8
-train_prompt_mini_bsz=16
+
+n_resp_per_prompt=16
+train_prompt_mini_bsz=32
 
 mtp_params=(
   actor_rollout_ref.actor.megatron.use_mbridge=True
@@ -93,7 +93,6 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     data.truncation='left' \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
-    data.train_batch_size=${train_prompt_bsz} \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
