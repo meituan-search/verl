@@ -240,8 +240,6 @@ def gptmodel_forward_no_padding(
             input_ids_offsets = input_ids.offsets()
             input_ids_lengths = input_ids_offsets.diff().tolist()
 
-            print(f"hzg input_ids_lengths={input_ids_lengths}")
-
             for k in ["label", "loss_mask"]:
                 v = logits_processor_args[k]
                 v = _convert_to_nested_tensor(v, input_ids_lengths)
