@@ -16,9 +16,9 @@ clip_ratio_low=0.2
 clip_ratio_high=0.28
 
 max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 1))
+max_response_length=$((1024 * 8))
 enable_overlong_buffer=True
-overlong_buffer_len=$((1024 * 1))
+overlong_buffer_len=$((1024 * 4))
 overlong_penalty_factor=1.0
 
 loss_agg_mode="token-mean"
@@ -49,7 +49,7 @@ actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
 infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3))
 offload=False
 gen_tp=2
-train_tp=1
+train_tp=2
 train_pp=1
 train_cp=1
 
