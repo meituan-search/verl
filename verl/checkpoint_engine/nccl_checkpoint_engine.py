@@ -16,7 +16,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import AsyncGenerator, Generator
+from typing import AsyncGenerator, Generator, Optional
 from unittest.mock import patch
 
 with patch("importlib.metadata.distributions", return_value=[]):
@@ -151,18 +151,40 @@ class NCCLCheckpointEngine(CheckpointEngine):
         torch.cuda.empty_cache()
 
     @classmethod
-    def build_topology(cls, trainer_world_size: int, rollout_world_size: int, metadata: list[dict]):
+    def build_topology(
+        cls,
+        trainer_world_size: int,
+        rollout_world_size: int,
+        metadata: list[dict],
+        extra_groups_world_size_list: Optional[list[int]] = None,
+    ):
+        # Build a unified NCCL broadcast group: trainer rank 0 → rollout + extra_groups
+        extra_total = sum(extra_groups_world_size_list) if extra_groups_world_size_list else 0
+        total_world_size = 1 + rollout_world_size + extra_total
+
         trainer_kwargs = {
             "rank": [0] + [-1] * (trainer_world_size - 1),
-            "world_size": [rollout_world_size + 1] * trainer_world_size,
+            "world_size": [total_world_size] * trainer_world_size,
             "master_metadata": [metadata[0]] * trainer_world_size,
         }
         rollout_kwargs = {
             "rank": list(range(1, rollout_world_size + 1)),
-            "world_size": [rollout_world_size + 1] * rollout_world_size,
+            "world_size": [total_world_size] * rollout_world_size,
             "master_metadata": [metadata[0]] * rollout_world_size,
         }
-        return trainer_kwargs, rollout_kwargs
+        extra_groups_kwargs_list = []
+        if extra_groups_world_size_list is not None:
+            offset = rollout_world_size + 1
+            for world_size in extra_groups_world_size_list:
+                extra_groups_kwargs_list.append(
+                    {
+                        "rank": list(range(offset, offset + world_size)),
+                        "world_size": [total_world_size] * world_size,
+                        "master_metadata": [metadata[0]] * world_size,
+                    }
+                )
+                offset += world_size
+        return trainer_kwargs, rollout_kwargs, extra_groups_kwargs_list
 
     def _start_zmq_server(self):
         self.ip = ray.util.get_node_ip_address().strip("[]")
