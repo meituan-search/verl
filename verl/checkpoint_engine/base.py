@@ -423,11 +423,11 @@ class CheckpointEngineManager:
         rollout = RayWorkerGroup(worker_handles=workers, ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls))
         trainer = self.trainer
 
-        # 3. build process group
-        self.build_process_group(rollout)
-
-        # 4. sleep replicas to free kv_cache before weight sync (if free_cache_engine is enabled)
+        # 3. sleep replicas to free kv_cache before weight sync (if free_cache_engine is enabled)
         await self.sleep_replicas()
+
+        # 4. build process group
+        self.build_process_group(rollout)
 
         # 5. update weights of all workers
         ray.get(trainer.update_weights(global_steps=global_steps) + rollout.update_weights(global_steps=global_steps))
