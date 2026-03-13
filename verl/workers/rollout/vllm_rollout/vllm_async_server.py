@@ -483,6 +483,7 @@ class vLLMHttpServer:
 
     async def run_headless(self, args: argparse.Namespace):
         """Run headless server in a separate thread."""
+        args.api_server_count = 0
 
         def run_headless_wrapper():
             with SuppressSignalInThread():
@@ -851,6 +852,11 @@ class vLLMReplica(RolloutReplica):
                     "env_vars": {
                         "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
                         "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
+                        # To prevent hanging or crash during synchronization of weights between actor and rollout
+                        # in disaggregated mode. See:
+                        # https://docs.vllm.ai/en/latest/usage/troubleshooting.html?h=nccl_cumem_enable#known-issues
+                        # https://github.com/vllm-project/vllm/blob/c6b0a7d3ba03ca414be1174e9bd86a97191b7090/vllm/worker/worker_base.py#L445
+                        "NCCL_CUMEM_ENABLE": "0",
                     }
                 },
                 name=name,

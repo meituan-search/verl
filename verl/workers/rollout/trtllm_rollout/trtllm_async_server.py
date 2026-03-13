@@ -395,7 +395,12 @@ class TRTLLMReplica(RolloutReplica):
                 node_id=node_id,
                 soft=False,
             ),
-            runtime_env={"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}},
+            runtime_env={
+                "env_vars": {
+                    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+                    "NCCL_CUMEM_ENABLE": "0",
+                }
+            },
             name=name,
             max_concurrency=self.max_concurrency,
         ).remote(
