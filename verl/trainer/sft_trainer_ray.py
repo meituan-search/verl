@@ -316,19 +316,6 @@ class SFTTrainer:
                     global_partition_lst = get_seqlen_balanced_partitions(
                         global_seqlen_lst, k_partitions=dp_size, equal_size=True
                     )
-
-                    # ✅ Print workload sum per DP rank after reorder
-                    reordered_seqlen = torch.Tensor([item.size()[0] for item in data["input_ids"]])
-                    reordered_workload = calculate_workload(reordered_seqlen)
-                    total_samples = len(reordered_workload)
-                    samples_per_dp = total_samples // dp_size  # evenly distributed
-                    for dp_rank in range(dp_size):
-                        start = dp_rank * samples_per_dp
-                        end = start + samples_per_dp
-                        dp_workload_sum = reordered_workload[start:end].sum().item()
-                        print(f"DP rank {dp_rank} workload sum: {dp_workload_sum:.0f}  (samples [{start}:{end}])")
-                    print(f"Total workload sum: {reordered_workload.sum().item():.0f}")
-
                     # Place smaller micro-batches at both ends to reduce the bubbles in pipeline parallel.
                     # Skip reordering within partitions for PrefixGrouper to maintain uid grouping
                     for idx, partition in enumerate(global_partition_lst):
@@ -339,19 +326,6 @@ class SFTTrainer:
                     global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
 
                     data = tu.reorder_tensordict(data, global_idx)
-
-                    # ✅ Print workload sum per DP rank after reorder
-                    print("length sorted:", torch.Tensor([item.size()[0] for item in data["input_ids"]]))
-                    reordered_seqlen = torch.Tensor([item.size()[0] for item in data["input_ids"]])
-                    reordered_workload = calculate_workload(reordered_seqlen)
-                    total_samples = len(reordered_workload)
-                    samples_per_dp = total_samples // dp_size  # evenly distributed
-                    for dp_rank in range(dp_size):
-                        start = dp_rank * samples_per_dp
-                        end = start + samples_per_dp
-                        dp_workload_sum = reordered_workload[start:end].sum().item()
-                        print(f"DP rank {dp_rank} workload sum: {dp_workload_sum:.0f}  (samples [{start}:{end}])")
-                    print(f"Total workload sum: {reordered_workload.sum().item():.0f}")
 
                 # start profile in SPMD mode
                 if global_step == self.start_profile_step:
