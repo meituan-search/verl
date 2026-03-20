@@ -35,7 +35,14 @@ from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
-from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
+from verl.trainer.ppo.utils import (
+    Role,
+    WorkerType,
+    need_critic,
+    need_old_log_prob_server,
+    need_reference_policy,
+    need_reward_model,
+)
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
@@ -186,12 +193,18 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # when use_trainer_do_validate == Ture, use colocate_checkpoint_manager to sync params
         self.colocate_checkpoint_manager = None
 
+        self.use_old_log_prob_server = need_old_log_prob_server(self.config)
+        self.old_log_prob_server = None
+
     def _setup_checkpoint_manager(self, rollouter):
         """Setup checkpoint manager after rollouter is initialized"""
         replicas = ray.get(rollouter.get_replicas.remote())
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
+        extra_groups = []
+        if self.use_old_log_prob_server:
+            extra_groups.append(self.old_log_prob_server_wg)
         self.checkpoint_manager = CheckpointEngineManager(
-            config=checkpoint_engine_config, trainer=self.actor_wg, replicas=replicas
+            config=checkpoint_engine_config, trainer=self.actor_wg, replicas=replicas, extra_groups=extra_groups
         )
         print("[FullyAsyncTrainer] Checkpoint manager initialized")
 
@@ -307,6 +320,22 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self.rm_wg = self.all_wg[str(Role.RewardModel)]
             self.rm_wg.init_model()
 
+        if self.use_old_log_prob_server:
+            self.old_log_prob_server_wg = self.all_wg[str(Role.OldLogProb)]
+            self.old_log_prob_server_wg.init_model()
+
+            # Create OldLogProbServer Ray actor for batched inference + deferred weight loading
+            from verl.workers.old_log_prob import OldLogProbServer
+
+            old_log_prob_cfg = self.config.old_log_prob
+            self.old_log_prob_server = OldLogProbServer.remote(
+                old_log_prob_worker_group=self.old_log_prob_server_wg,
+                batch_size=old_log_prob_cfg.get("batch_size", 8),
+                timeout=old_log_prob_cfg.get("timeout", 10.0),
+            )
+        else:
+            self.old_log_prob_server = None
+
         self.actor_wg = self.all_wg[str(self.train_role)]
         self.actor_wg.init_model()
         self.actor_rollout_wg = self.actor_wg  # to be compatible with the functions that not be modified
@@ -328,6 +357,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         if self.config.async_training.use_trainer_do_validate:
             print("[FullyAsyncTrainer] Init reward loop")
             super()._init_reward_loop()
+
+    def get_old_log_prob_server_handle(self):
+        return self.old_log_prob_server
 
     async def _init_async_rollout_manager(self):
         # use async rollout do validate
@@ -356,6 +388,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 config=self.config,
                 worker_group=self.actor_rollout_wg,
                 reward_loop_worker_handles=reward_loop_worker_handles,
+                old_log_prob_server_handle=None,
             )
             print("[FullyAsyncTrainer] async_rollout_manager initialized")
 
@@ -512,6 +545,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         with marked_timer("timing_s/param_sync", self.timing_raw):
             await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
+            if self.old_log_prob_server is not None:
+                ray.get(self.old_log_prob_server.drain_and_load_weights.remote())
         print(
             f"[FullyAsyncTrainer] _fit_update_weights, "
             f"timing_s/param_sync: {self.timing_raw['timing_s/param_sync']:.4f} seconds "

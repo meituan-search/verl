@@ -157,6 +157,16 @@ class BaseEngine:
         """
         raise NotImplementedError
 
+    def set_param(self, state_dict: dict[str, torch.Tensor]):
+        """
+        Load full state_dict into the (possibly sharded) model.
+        This is the inverse of get_per_tensor_param.
+
+        Args:
+            state_dict: A dictionary mapping parameter names and tensors.
+        """
+        raise NotImplementedError
+
     def get_data_parallel_size(self):
         raise NotImplementedError
 

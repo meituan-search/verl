@@ -44,7 +44,7 @@ from verl.trainer.ppo.metric_utils import (
 )
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, apply_kl_penalty, compute_advantage, compute_response_mask
 from verl.trainer.ppo.reward import extract_reward
-from verl.trainer.ppo.utils import Role, WorkerType
+from verl.trainer.ppo.utils import Role, WorkerType, need_old_log_prob_server
 from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
@@ -104,6 +104,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         self.reward_tensor = None
         self.reward_extra_infos_dict = {}
         self.checkpoint_manager = None
+        self.use_old_log_prob_server = need_old_log_prob_server(self.config)
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -134,6 +135,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         self._create_critic_class()
         self._create_reference_policy_class()
         self._create_reward_model_class()
+        self._create_old_log_prob_class()
 
     def _create_actor_rollout_classes(self):
         raise NotImplementedError
@@ -167,6 +169,21 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
 
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
             self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
+
+    def _create_old_log_prob_class(self):
+        # create old_log_prob if needed
+        if self.use_old_log_prob_server and Role.OldLogProb in self.role_worker_mapping:
+            if self.use_legacy_worker_impl == "disable":
+                resource_pool = self.resource_pool_manager.get_resource_pool(Role.OldLogProb)
+
+                old_log_prob_cls = RayClassWithInitArgs(
+                    self.role_worker_mapping[Role.OldLogProb],
+                    config=self.config,
+                    role=str(Role.OldLogProb),
+                )
+                self.resource_pool_to_cls[resource_pool][str(Role.OldLogProb)] = old_log_prob_cls
+            else:
+                raise NotImplementedError("Old log prob server is only supported in model engine")
 
     def _create_reference_policy_class(self):
         # create reference policy if needed
@@ -242,6 +259,22 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         if self.use_reference_policy and not self.ref_in_actor:
             self.ref_policy_wg = self.all_wg[str(Role.RefPolicy)]
             self.ref_policy_wg.init_model()
+
+        if self.use_old_log_prob_server:
+            self.old_log_prob_server_wg = self.all_wg[str(Role.OldLogProb)]
+            self.old_log_prob_server_wg.init_model()
+
+            # Create OldLogProbServer Ray actor for batched inference + deferred weight loading
+            from verl.workers.old_log_prob import OldLogProbServer
+
+            old_log_prob_cfg = self.config.old_log_prob
+            self.old_log_prob_server = OldLogProbServer.remote(
+                old_log_prob_worker_group=self.old_log_prob_server_wg,
+                batch_size=old_log_prob_cfg.get("batch_size", 8),
+                timeout=old_log_prob_cfg.get("timeout", 10.0),
+            )
+        else:
+            self.old_log_prob_server = None
 
         if self.use_rm:
             self.rm_wg = self.all_wg[str(Role.RewardModel)]
@@ -489,7 +522,8 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
         #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
         rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
-        bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+        # bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+        bypass_recomputing_logprobs = False
         if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
             from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
 
@@ -498,7 +532,10 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                 rollout_corr_config=rollout_corr_config,
                 policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
             )
+        elif False:
+            assert "old_log_probs" in batch.batch, f'"old_log_probs" not in {batch.batch.keys()=}'
         else:  # Recompute old_log_probs
+            # assert "old_log_probs_server" in batch.batch, f'"old_log_probs_server" not in {batch.batch.keys()=}'
             with marked_timer("old_log_prob", timing_raw, color="blue"):
                 old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                 entropys = old_log_prob.batch["entropys"]
@@ -530,6 +567,16 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                     metrics.update(calculate_debug_metrics(batch))
 
         assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+        # import numpy as np
+        torch.set_printoptions(threshold=np.inf)
+        # print(f"{batch.batch["old_log_probs"]=}")
+        print("\n")
+        # print(f"{batch.batch["old_log_probs_server"]=}")
+        # log_prob_diff = batch.batch["old_log_probs"] - batch.batch["old_log_probs_server"]
+        # tr_log_probs = batch.batch["old_log_probs"] - batch.batch["rollout_log_probs"]
+        # print(f"log_prob_diff: {log_prob_diff.abs().sum()}")
+        # print(f"tr_log_probs: {tr_log_probs.abs().sum()}")
+
         return batch
 
     def _fit_compute_ref_log_prob(self, batch: DataProto) -> DataProto:

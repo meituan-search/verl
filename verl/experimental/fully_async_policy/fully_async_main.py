@@ -88,6 +88,12 @@ class FullyAsyncTaskRunner:
         print(f"total_train_steps {total_train_steps}")
         ray.get(self.components["trainer"].set_total_train_steps.remote(total_train_steps))
 
+        ray.get(self.components["trainer"].init_workers.remote())
+        old_log_prob_server_handle = ray.get(self.components["trainer"].get_old_log_prob_server_handle.remote())
+        ray.get(self.components["rollouter"].set_old_log_prob_server.remote(old_log_prob_server_handle))
+        ray.get(self.components["rollouter"].init_workers.remote())
+        ray.get(self.components["rollouter"].set_max_required_samples.remote())
+
         # max_queue_size
         max_queue_size = ray.get(self.components["rollouter"].get_max_queue_size.remote())
         print(f"[ASYNC MAIN] Creating MessageQueue... max_queue_size {max_queue_size}")
@@ -125,10 +131,6 @@ class FullyAsyncTaskRunner:
             processor=self.components["processor"],
             device_name=config.trainer.device,
         )
-
-        ray.get(rollouter.init_workers.remote())
-        ray.get(rollouter.set_max_required_samples.remote())
-
         self.components["rollouter"] = rollouter
         print("[ASYNC MAIN] Rollouter created and initialized successfully")
 
@@ -150,7 +152,6 @@ class FullyAsyncTaskRunner:
             device_name=config.trainer.device,
         )
 
-        ray.get(trainer.init_workers.remote())
         self.components["trainer"] = trainer
         print("[ASYNC MAIN] FullyAsyncTrainer created and initialized successfully")
 

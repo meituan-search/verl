@@ -9,6 +9,8 @@ defaults:
   # Reference model config.
   # Reference model will be enabled when actor.use_kl_loss or/and algorithm.use_kl_in_reward is/are True.
   - ref@actor_rollout_ref.ref: megatron_ref
+  # old_log_prob model config
+  - old_log_prob@old_log_prob: megatron_old_log_prob
   # Rollout model config.
   - rollout@actor_rollout_ref.rollout: rollout
   # Model config.

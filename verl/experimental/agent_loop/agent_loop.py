@@ -108,6 +108,7 @@ class AsyncLLMServerManager:
         config: DictConfig,
         servers: list[tuple[str, ray.actor.ActorHandle]],
         load_balancer_handle: ray.actor.ActorHandle,
+        old_log_prob_server_handle: ray.actor.ActorHandle,
     ):
         """Initialize the AsyncLLMServerManager.
 
@@ -118,6 +119,7 @@ class AsyncLLMServerManager:
         """
         self.config = config
         self._load_balancer = load_balancer_handle
+        self.old_log_prob_server_handle = old_log_prob_server_handle
         self._server_id_to_handle: dict[str, ray.actor.ActorHandle] = dict(servers)
 
     async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
@@ -185,6 +187,8 @@ class AgentLoopOutput(BaseModel):
     """Response mask, 1 for LLM generated token, 0 for tool response token."""
     response_logprobs: Optional[list[float]] = None
     """Log probabilities for the response tokens."""
+    response_oldlogprobs: Optional[list[float]] = None
+    """Log probabilities calculated by standalone server for the response tokens."""
     routed_experts: Optional[Any] = None
     """Routed experts for the total tokens."""
     multi_modal_data: Optional[dict[str, Any]] = None
@@ -218,6 +222,8 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded attention mask."""
     response_logprobs: Optional[torch.Tensor] = None
     """Padded log probabilities for the response tokens."""
+    response_oldlogprobs: Optional[torch.Tensor] = None
+    """Padded old log probabilities for the response tokens."""
     routed_experts: Optional[torch.Tensor] = None
     """Padded routed experts for the total tokens."""
     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
@@ -402,6 +408,7 @@ class AgentLoopWorker:
         servers: list[tuple[str, ray.actor.ActorHandle]],
         load_balancer_handle: ray.actor.ActorHandle,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
+        old_log_prob_server_handle: ray.actor.ActorHandle = None,
     ):
         """Initialize agent loop manager.
         Args:
@@ -421,6 +428,7 @@ class AgentLoopWorker:
                 config,
                 servers,
                 load_balancer_handle=load_balancer_handle,
+                old_log_prob_server_handle=old_log_prob_server_handle,
             )
 
         self.dataset_cls = get_dataset_class(config.data)
@@ -627,6 +635,10 @@ class AgentLoopWorker:
         if output.response_logprobs is not None:
             pad_size = self.rollout_config.response_length - len(output.response_logprobs)
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
+        response_oldlogprobs = None
+        if output.response_oldlogprobs is not None:
+            pad_size = self.rollout_config.response_length - len(output.response_oldlogprobs)
+            response_oldlogprobs = torch.tensor(output.response_oldlogprobs + [0.0] * pad_size).unsqueeze(0)
 
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
@@ -676,6 +688,7 @@ class AgentLoopWorker:
             response_mask=response_mask,
             attention_mask=attention_mask,
             response_logprobs=response_logprobs,
+            response_oldlogprobs=response_oldlogprobs,
             routed_experts=routed_experts,
             multi_modal_inputs=multi_modal_inputs,
             multi_modal_data=output.multi_modal_data,
@@ -790,6 +803,10 @@ class AgentLoopWorker:
         optional_outputs = {}
         if inputs[0].response_logprobs is not None:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
+        if inputs[0].response_oldlogprobs is not None:
+            optional_outputs["old_log_probs_server"] = torch.cat(
+                [input.response_oldlogprobs for input in inputs], dim=0
+            )
         if inputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
 
@@ -906,12 +923,14 @@ class AgentLoopManager:
         worker_group: RayWorkerGroup = None,
         rollout_resource_pool: RayResourcePool = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
+        old_log_prob_server_handle: ray.actor.ActorHandle = None,
     ):
         self.config = config
         self.rollout_config, self.model_config = _get_rollout_and_model_config(config)
         self.worker_group = worker_group
         self.rollout_resource_pool = rollout_resource_pool
         self.reward_loop_worker_handles = reward_loop_worker_handles
+        self.old_log_prob_server_handle = old_log_prob_server_handle
 
         assert worker_group is not None or self.rollout_config.nnodes > 0, "nnodes must be > 0 in standalone mode"
 
@@ -929,9 +948,12 @@ class AgentLoopManager:
         worker_group: RayWorkerGroup = None,
         rollout_resource_pool: RayResourcePool = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
+        old_log_prob_server_handle: ray.actor.ActorHandle = None,
     ):
         """Create agent loop manager."""
-        instance = cls(config, worker_group, rollout_resource_pool, reward_loop_worker_handles)
+        instance = cls(
+            config, worker_group, rollout_resource_pool, reward_loop_worker_handles, old_log_prob_server_handle
+        )
         await instance._initialize_llm_servers()
         await instance._init_global_load_balancer()
         await instance._init_agent_loop_workers()
@@ -1005,6 +1027,7 @@ class AgentLoopManager:
                     servers,
                     load_balancer_handle,
                     self.reward_loop_worker_handles,
+                    self.old_log_prob_server_handle,
                 )
             )
 
