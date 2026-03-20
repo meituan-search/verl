@@ -345,6 +345,51 @@ def chunk_tensordict(td: TensorDict, chunks: int) -> list[TensorDict]:
     return tds
 
 
+def reorder_tensordict(data: TensorDict, index: list[int]) -> TensorDict:
+    """Reorder a TensorDict along dimension zero according to given indices.
+
+    Reorders the elements of a TensorDict based on the provided index list.
+    Handles nested tensors specially since they don't support standard
+    tensor indexing operations.
+
+    Args:
+        data: The TensorDict to reorder.
+        index: A list of integers representing the new order. Must contain
+            values from 0 to n-1 (or 1 to n), where n is len(data).
+
+    Returns:
+        A new TensorDict with elements reordered according to index.
+
+    Raises:
+        AssertionError: If the length of index does not match len(data).
+
+    Note:
+        - Nested tensors are handled specially via unbind and rebind
+        - Regular tensors use standard tensor indexing
+    """
+    assert len(index) == len(data), f"index length {len(index)} must match data length {len(data)}"
+
+    # Normalize index to 0-based if it's 1-based
+    min_idx = min(index)
+    if min_idx == 1:
+        index = [i - 1 for i in index]
+
+    # Find nested tensor keys
+    nested_tensor_keys = {key for key, value in data.items() if isinstance(value, torch.Tensor) and value.is_nested}
+
+    # Build a new TensorDict for non-nested tensors using index-based selection
+    regular_items = {k: v[index] for k, v in data.items() if k not in nested_tensor_keys}
+    output = TensorDict(regular_items, batch_size=data.batch_size, device=data.device)
+
+    # Handle nested tensors by unbinding, reordering, and rebinding
+    for key in nested_tensor_keys:
+        unbound = data[key].unbind(dim=0)
+        reordered = [unbound[i] for i in index]
+        output[key] = torch.nested.as_nested_tensor(reordered, layout=torch.jagged)
+
+    return output
+
+
 def get_tensordict(tensor_dict: dict[str, torch.Tensor | list], non_tensor_dict: dict = None) -> TensorDict:
     """Create a TensorDict from tensors and non-tensor data.
 

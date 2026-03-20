@@ -38,6 +38,7 @@ from verl.utils.dataset.dataset_utils import SFTTensorCollator
 from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
 from verl.utils.device import auto_set_device, get_device_name
 from verl.utils.logger import log_with_rank
+from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions
 from verl.utils.tracking import Tracking
 from verl.workers.engine_workers import TrainingWorker
 
@@ -306,6 +307,51 @@ class SFTTrainer:
                 batch_seqlens_ntd = NonTensorData(batch_seqlens)
 
                 tu.assign_non_tensor(data, update_lr_scheduler=True, global_token_num=batch_seqlens_ntd)
+
+                if self.config.trainer.balance_batch:
+                    global_seqlen_lst = torch.Tensor([item.size()[0] for item in data["input_ids"]])
+                    global_seqlen_lst = calculate_workload(global_seqlen_lst)
+                    dp_size = max(self.training_client._query_dispatch_info("train")) + 1
+
+                    global_partition_lst = get_seqlen_balanced_partitions(
+                        global_seqlen_lst, k_partitions=dp_size, equal_size=True
+                    )
+
+                    # ✅ Print workload sum per DP rank after reorder
+                    reordered_seqlen = torch.Tensor([item.size()[0] for item in data["input_ids"]])
+                    reordered_workload = calculate_workload(reordered_seqlen)
+                    total_samples = len(reordered_workload)
+                    samples_per_dp = total_samples // dp_size  # evenly distributed
+                    for dp_rank in range(dp_size):
+                        start = dp_rank * samples_per_dp
+                        end = start + samples_per_dp
+                        dp_workload_sum = reordered_workload[start:end].sum().item()
+                        print(f"DP rank {dp_rank} workload sum: {dp_workload_sum:.0f}  (samples [{start}:{end}])")
+                    print(f"Total workload sum: {reordered_workload.sum().item():.0f}")
+
+                    # Place smaller micro-batches at both ends to reduce the bubbles in pipeline parallel.
+                    # Skip reordering within partitions for PrefixGrouper to maintain uid grouping
+                    for idx, partition in enumerate(global_partition_lst):
+                        partition.sort(key=lambda x: (global_seqlen_lst[x], x))
+                        ordered_partition = partition[::2] + partition[1::2][::-1]
+                        global_partition_lst[idx] = ordered_partition
+
+                    global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
+
+                    data = tu.reorder_tensordict(data, global_idx)
+
+                    # ✅ Print workload sum per DP rank after reorder
+                    print("length sorted:", torch.Tensor([item.size()[0] for item in data["input_ids"]]))
+                    reordered_seqlen = torch.Tensor([item.size()[0] for item in data["input_ids"]])
+                    reordered_workload = calculate_workload(reordered_seqlen)
+                    total_samples = len(reordered_workload)
+                    samples_per_dp = total_samples // dp_size  # evenly distributed
+                    for dp_rank in range(dp_size):
+                        start = dp_rank * samples_per_dp
+                        end = start + samples_per_dp
+                        dp_workload_sum = reordered_workload[start:end].sum().item()
+                        print(f"DP rank {dp_rank} workload sum: {dp_workload_sum:.0f}  (samples [{start}:{end}])")
+                    print(f"Total workload sum: {reordered_workload.sum().item():.0f}")
 
                 # start profile in SPMD mode
                 if global_step == self.start_profile_step:
