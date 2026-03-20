@@ -317,7 +317,6 @@ class SFTTrainer:
                         global_seqlen_lst, k_partitions=dp_size, equal_size=True
                     )
                     # Place smaller micro-batches at both ends to reduce the bubbles in pipeline parallel.
-                    # Skip reordering within partitions for PrefixGrouper to maintain uid grouping
                     for idx, partition in enumerate(global_partition_lst):
                         partition.sort(key=lambda x: (global_seqlen_lst[x], x))
                         ordered_partition = partition[::2] + partition[1::2][::-1]
