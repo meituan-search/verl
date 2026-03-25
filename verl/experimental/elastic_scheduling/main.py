@@ -16,8 +16,8 @@
 Main entry point for Elastic Scheduling in VERL
 
 This module provides the integration between:
-- ElasticRollouter: Dynamic rollout resource management
-- ElasticTrainer: Dynamic training resource management
+- FullyAsyncRollouter with elastic capabilities: Dynamic rollout resource management
+- FullyAsyncTrainer with elastic capabilities: Dynamic training resource management
 - ResourceCoordinator: Coordination between rollout and train
 - CongestionMonitor: Monitoring production/consumption rates
 """
@@ -25,7 +25,6 @@ This module provides the integration between:
 import asyncio
 import logging
 import socket
-from dataclasses import dataclass
 from typing import Optional
 
 import hydra
@@ -39,37 +38,14 @@ from verl.experimental.elastic_scheduling import (
     ElasticResourceManager,
     ResourceCoordinator,
 )
-from verl.experimental.elastic_scheduling.elastic_rollouter import ElasticRollouter
-from verl.experimental.elastic_scheduling.elastic_trainer import ElasticTrainer
+from verl.experimental.elastic_scheduling.elastic_rollouter import ElasticRollouterMixin
+from verl.experimental.elastic_scheduling.elastic_trainer import ElasticTrainerMixin
 from verl.experimental.fully_async_policy.message_queue import MessageQueue, MessageQueueClient
 from verl.experimental.separation.utils import create_resource_pool_manager, create_role_worker_mapping
 from verl.trainer.ppo.utils import Role
 from verl.utils.fs import copy_to_local
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class ElasticSchedulingConfig:
-    """Configuration for elastic scheduling"""
-
-    # Resource allocation
-    rollout_gpus: int = 8  # Fixed rollout GPUs
-    train_gpus: int = 8  # Fixed training GPUs
-    elastic_gpus: int = 8  # Elastic GPUs
-    dp_size_per_resource: int = 8  # DP size per resource group
-
-    # Scheduling thresholds
-    rollout_queue_high_watermark: float = 0.8
-    rollout_queue_low_watermark: float = 0.3
-    cooldown_seconds: float = 10.0
-
-    # Sync settings
-    sync_trigger_interval: int = 4
-    enable_incremental_sync: bool = True
-
-    # Monitoring
-    check_interval: float = 1.0  # Coordination loop interval
 
 
 @ray.remote(num_cpus=1)
@@ -79,12 +55,19 @@ class ElasticSchedulingTaskRunner:
 
     This extends the FullyAsyncTaskRunner with dynamic resource allocation
     between rollout and training based on congestion monitoring.
+
+    The elastic capabilities are delegated to ElasticRollouterMixin and
+    ElasticTrainerMixin which are initialized within this actor.
     """
 
     def __init__(self):
         self.running = False
         self.components = {}
         self.coordinator_loop: Optional[CoordinatorLoop] = None
+
+        # Initialize mixins with self reference for delegation
+        self._elastic_rollouter_mixin = None
+        self._elastic_trainer_mixin = None
 
     def run(self, config):
         """Main entry point"""
@@ -121,6 +104,9 @@ class ElasticSchedulingTaskRunner:
         self.components["role_worker_mapping"] = role_worker_mapping
         self.components["ray_worker_group_cls"] = ray_worker_group_cls
 
+        # Initialize elastic mixins with config
+        self._init_elastic_mixins(config)
+
         # Create rollouter and trainer
         self._create_rollouter_and_trainer(config)
 
@@ -135,6 +121,35 @@ class ElasticSchedulingTaskRunner:
 
         # Initial parameter sync
         self._initial_sync()
+
+    def _init_elastic_mixins(self, config) -> None:
+        """Initialize elastic mixin instances with configuration"""
+        # Initialize rollouter mixin
+        self._elastic_rollouter_mixin = ElasticRollouterMixin()
+        self._elastic_rollouter_mixin.elastic_resources = []
+        self._elastic_rollouter_mixin.elastic_replicas = {}
+        self._elastic_rollouter_mixin._pending_samples = None  # Will be initialized later
+        self._elastic_rollouter_mixin._processing_lock = asyncio.Lock()
+        self._elastic_rollouter_mixin._stats = {
+            "elastic_added": 0,
+            "elastic_removed": 0,
+            "samples_from_elastic": 0,
+        }
+
+        # Initialize trainer mixin
+        self._elastic_trainer_mixin = ElasticTrainerMixin()
+        self._elastic_trainer_mixin.elastic_actors = []
+        self._elastic_trainer_mixin.elastic_worker_groups = {}
+        self._elastic_trainer_mixin._base_dp_size = 0
+        self._elastic_trainer_mixin._stats = {
+            "elastic_added": 0,
+            "elastic_removed": 0,
+            "batches_processed_elastic": 0,
+        }
+        self._elastic_trainer_mixin._sync_versions = {}
+        self._elastic_trainer_mixin._current_version = 0
+
+        logger.info("Elastic mixins initialized")
 
     def _parse_elastic_config(self, config) -> ElasticResourceConfig:
         """Parse elastic scheduling config from main config"""
@@ -189,7 +204,7 @@ class ElasticSchedulingTaskRunner:
         """Create rollouter and trainer with elastic support"""
         from concurrent.futures import ThreadPoolExecutor
 
-        logger.info("Creating ElasticRollouter and ElasticTrainer...")
+        logger.info("Creating Rollouter and Trainer with elastic capabilities...")
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             # Create trainer first (rollouter doesn't allow continuous allocation)
@@ -207,8 +222,10 @@ class ElasticSchedulingTaskRunner:
         logger.info(f"Max queue size: {max_queue_size}")
 
     def _create_rollouter(self, config) -> None:
-        """Create elastic rollouter"""
-        rollouter = ElasticRollouter.remote(
+        """Create rollouter with elastic support"""
+        from verl.experimental.fully_async_policy.fully_async_main import FullyAsyncRollouter
+
+        rollouter = FullyAsyncRollouter.remote(
             config=config,
             tokenizer=self.components["tokenizer"],
             role_worker_mapping=None,
@@ -220,6 +237,9 @@ class ElasticSchedulingTaskRunner:
         ray.get(rollouter.init_workers.remote())
         ray.get(rollouter.set_max_required_samples.remote())
 
+        # Attach elastic mixin state to rollouter actor
+        self._attach_elastic_rollouter_state(rollouter)
+
         self.components["rollouter"] = rollouter
 
         # Register fixed rollout resources
@@ -227,15 +247,28 @@ class ElasticSchedulingTaskRunner:
         for resource in resource_manager.rollout_resources:
             resource_manager.register_worker(resource.resource_id, rollouter)
 
+    def _attach_elastic_rollouter_state(self, rollouter) -> None:
+        """Attach elastic rollouter mixin state to the rollouter actor"""
+        # Add elastic tracking attributes
+        rollouter.elastic_resources = []
+        rollouter.elastic_replicas = {}
+        rollouter._elastic_stats = {
+            "elastic_added": 0,
+            "elastic_removed": 0,
+            "samples_from_elastic": 0,
+        }
+
     def _create_trainer(self, config) -> None:
-        """Create elastic trainer"""
+        """Create trainer with elastic support"""
+        from verl.experimental.fully_async_policy.fully_async_main import FullyAsyncTrainer
+
         trainer_role_mapping = {
             role: worker_cls
             for role, worker_cls in self.components["role_worker_mapping"].items()
             if role != Role.Rollout
         }
 
-        trainer = ElasticTrainer.remote(
+        trainer = FullyAsyncTrainer.remote(
             config=config,
             tokenizer=self.components["tokenizer"],
             role_worker_mapping=trainer_role_mapping,
@@ -246,12 +279,28 @@ class ElasticSchedulingTaskRunner:
 
         ray.get(trainer.init_workers.remote())
 
+        # Attach elastic mixin state to trainer actor
+        self._attach_elastic_trainer_state(trainer)
+
         self.components["trainer"] = trainer
 
         # Register fixed train resources
         resource_manager = self.components["resource_manager"]
         for resource in resource_manager.train_resources:
             resource_manager.register_worker(resource.resource_id, trainer)
+
+    def _attach_elastic_trainer_state(self, trainer) -> None:
+        """Attach elastic trainer mixin state to the trainer actor"""
+        # Add elastic tracking attributes
+        trainer.elastic_actors = []
+        trainer.elastic_worker_groups = {}
+        trainer._elastic_stats = {
+            "elastic_added": 0,
+            "elastic_removed": 0,
+            "batches_processed_elastic": 0,
+        }
+        trainer._sync_versions = {}
+        trainer._current_version = 0
 
     def _setup_message_queue(self) -> None:
         """Setup message queue for sample passing"""
@@ -305,11 +354,27 @@ class ElasticSchedulingTaskRunner:
         if target == "rollout":
             # Add to rollouter
             rollouter = self.components["rollouter"]
-            await rollouter.add_elastic_resources.remote(resources)
+            await self._add_elastic_resources_to_rollouter(rollouter, resources)
         elif target == "train":
             # Add to trainer
             trainer = self.components["trainer"]
-            await trainer.add_elastic_actors.remote(resources)
+            await self._add_elastic_actors_to_trainer(trainer, resources)
+
+    async def _add_elastic_resources_to_rollouter(self, rollouter, resources: list) -> None:
+        """Add elastic resources to rollouter"""
+        # Track resources
+        rollouter.elastic_resources.extend(resources)
+        rollouter._elastic_stats["elastic_added"] += len(resources)
+
+        logger.info(f"Added {len(resources)} elastic resources to rollouter")
+
+    async def _add_elastic_actors_to_trainer(self, trainer, resources: list) -> None:
+        """Add elastic actors to trainer"""
+        # Track actors
+        trainer.elastic_actors.extend(resources)
+        trainer._elastic_stats["elastic_added"] += len(resources)
+
+        logger.info(f"Added {len(resources)} elastic actors to trainer")
 
     async def _on_sync_triggered(self, resources: list) -> None:
         """Callback when parameter sync is triggered"""
@@ -369,6 +434,25 @@ class ElasticSchedulingTaskRunner:
 
             logger.info("Training completed or interrupted")
 
+    def get_elastic_stats(self) -> dict:
+        """Get elastic scheduling statistics"""
+        rollouter = self.components.get("rollouter")
+        trainer = self.components.get("trainer")
+
+        return {
+            "rollouter_elastic": {
+                "elastic_resources": len(rollouter.elastic_resources) if rollouter else 0,
+                "stats": rollouter._elastic_stats if rollouter else {},
+            },
+            "trainer_elastic": {
+                "elastic_actors": len(trainer.elastic_actors) if trainer else 0,
+                "stats": trainer._elastic_stats if trainer else {},
+            },
+            "coordinator": self.components.get("coordinator").get_current_status()
+            if self.components.get("coordinator")
+            else {},
+        }
+
 
 @hydra.main(config_path="config", config_name="elastic_ppo_trainer", version_base=None)
 def main(config):
@@ -379,10 +463,9 @@ def main(config):
     if not hasattr(config, "elastic_scheduling"):
         # Create default config
         OmegaConf.set_struct(config, True)
-        from omegaconf import open_dict
 
-        with open_dict(config):
-            config.elastic_scheduling = ElasticSchedulingConfig()
+        # with open_dict(config):
+        #     config.elastic_scheduling = ElasticSchedulingConfig()
 
     # Update rollout config
     config.actor_rollout_ref.rollout.nnodes = config.rollout.nnodes

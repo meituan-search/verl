@@ -24,6 +24,7 @@ This module provides elastic rollout and training scheduling capabilities:
 from .coordinator import (
     CongestionMetrics,
     CongestionMonitor,
+    CoordinatorLoop,
     ResourceCoordinator,
 )
 from .elastic_rollouter import ElasticRollouterMixin
@@ -46,6 +47,7 @@ __all__ = [
     "CongestionMetrics",
     "CongestionMonitor",
     "ResourceCoordinator",
+    "CoordinatorLoop",
     # Mixins (for composing with FullyAsyncRollouter/Trainer)
     "ElasticRollouterMixin",
     "ElasticTrainerMixin",

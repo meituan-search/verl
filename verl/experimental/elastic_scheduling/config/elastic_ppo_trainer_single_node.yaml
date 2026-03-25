@@ -52,6 +52,7 @@ actor_rollout_ref:
     path: null
     use_remove_padding: true
     use_fused_kernels: true
+    trust_remote_code: true
     hf_config:
       architectures:
         - Qwen2ForCausalLM
@@ -86,6 +87,7 @@ actor_rollout_ref:
     name: vllm
     nnodes: 1
     n_gpus_per_node: 4  # Rollout uses 4 GPUs
+    n: 16  # Number of responses per prompt
     tensor_model_parallel_size: 1
     pipeline_model_parallel_size: 1
     data_parallel_size: -1
@@ -96,6 +98,7 @@ actor_rollout_ref:
     max_model_len: 8192
     free_cache_engine: true
     gpu_memory_utilization: 0.6
+    enable_chunked_prefill: true
     checkpoint_engine:
       backend: naive
       update_weights_bucket_megabytes: 1000
@@ -125,6 +128,10 @@ actor_rollout_ref:
 data:
   train_files: []
   val_files: []
+  prompt_key: prompt
+  truncation: left
+  max_prompt_length: 2048
+  max_response_length: 8192
   max_seq_len: 8192
   train_batch_size: 0  # Disabled for async
   gen_batch_size: 1   # Async mode
@@ -132,6 +139,7 @@ data:
   num_workers: 8
   num_train_workers: 1
   num_val_workers: 1
+  trust_remote_code: true
 
 # PPO Algorithm Configuration
 algorithm:
@@ -217,4 +225,11 @@ trainer:
   nnodes: 1
   n_gpus_per_node: 2  # Train uses 2 GPUs
   logger: ['console']
+  project_name: 'ElasticPPO'
+  experiment_name: 'elastic-ppo-single-node-8g'
+  default_local_dir: null
+  total_epochs: 10
+  val_before_train: true
+  resume_mode: auto
+  test_freq: 10
 
