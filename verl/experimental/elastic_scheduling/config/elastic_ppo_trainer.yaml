@@ -12,52 +12,154 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# ============================================================================
 # Elastic Scheduling PPO Trainer Configuration
-# This extends the standard PPO trainer with dynamic resource allocation
+# ============================================================================
+# This config extends the standard async PPO trainer with dynamic resource
+# allocation between rollout and training via elastic scheduling.
+#
+# Resource topology:
+#   Fixed rollout: Always in rollout mode (inference only, lower latency)
+#   Fixed train:   Always in training mode (optimizer, gradients)
+#   Elastic:       Can switch between rollout and train modes based on queue pressure
+#
+# Typical deployment (32 GPUs total):
+#   Fixed rollout:  8 GPUs  (1 node, rollout server)
+#   Fixed train:   16 GPUs  (2 nodes, training workers)
+#   Elastic:        8 GPUs  (1 node, switches based on queue congestion)
+# ============================================================================
 
+# ============================================================================
 # Elastic Scheduling Configuration
+# ============================================================================
 elastic_scheduling:
-  # Resource allocation (number of GPUs per role)
-  rollout_gpus: 8           # Fixed rollout GPUs
-  train_gpus: 8              # Fixed training GPUs
-  elastic_gpus: 8            # Elastic GPUs that can switch
-  dp_size_per_resource: 8    # DP size per resource group
+  # ---- Resource topology ----
+  # Number of elastic resource groups (each group = dp_size_per_resource GPUs)
+  n_elastic_resources: 1
 
-  # Scheduling thresholds
-  rollout_queue_high_watermark: 0.8   # Trigger rollout scale-up
-  rollout_queue_low_watermark: 0.3    # Trigger train scale-up
-  cooldown_seconds: 10.0             # Cooldown between switches
+  # Initial mode for elastic resources: "rollout" or "train"
+  elastic_initial_mode: rollout
 
-  # Sync settings
-  sync_trigger_interval: 4     # Sync every N training steps
+  # Number of GPUs per elastic resource group (typically equals TP*DP per group)
+  # Must be divisible by tensor_model_parallel_size
+  dp_size_per_resource: 8
+
+  # ---- Scheduling thresholds ----
+  # Queue utilization above this threshold → scale up rollout (add elastic to rollout)
+  rollout_queue_high_watermark: 0.8
+
+  # Queue utilization below this threshold → scale up train (add elastic to train)
+  rollout_queue_low_watermark: 0.3
+
+  # Minimum time between consecutive switches for the same resource (seconds)
+  cooldown_seconds: 30.0
+
+  # ---- Rate monitoring ----
+  # Coordinator polling interval (seconds)
+  check_interval: 2.0
+
+  # EMA smoothing factor for production/consumption rate estimation
+  ema_alpha: 0.3
+
+  # Minimum confidence required to trigger a switch (0-1)
+  confidence_threshold: 0.6
+
+  # ---- Safety constraints ----
+  # Always keep at least this many elastic resources in rollout mode
+  min_rollout_resources: 0
+
+  # Always keep at least this many elastic resources in train mode
+  min_train_resources: 0
+
+  # Maximum number of concurrent role switches
+  max_concurrent_switches: 1
+
+  # ---- Parameter sync ----
+  # Sync every N training steps (also used by ElasticParameterSyncManager)
+  sync_trigger_interval: 4
+
+  # Enable incremental sync for elastic replicas (only changed params)
   enable_incremental_sync: true
 
-  # Monitoring
-  check_interval: 1.0         # Coordination loop interval (seconds)
-  congestion_window_size: 20   # Sliding window for rate calculation
+  # ---- Legacy congestion monitor settings (for backward compatibility) ----
+  congestion_window_size: 20
 
+
+# ============================================================================
 # Standard PPO Training Configuration
+# ============================================================================
+
+# ---- Trainer node configuration ----
+trainer:
+  # Total training nodes
+  nnodes: 2
+  n_gpus_per_node: 8
+  total_epochs: 100
+  # Logging and validation
+  project_name: verl_elastic
+  experiment_name: elastic_ppo_default
+  logger: console
+  val_interval: 50
+  default_hdfs_dir: null
+  default_local_dir: /tmp/verl_elastic
+  balance_batch: true
+  device: cuda
+  log_interval: 1
+  seed: null
+
+# ---- Rollout node configuration ----
+rollout:
+  # Fixed rollout nodes
+  nnodes: 1
+  n_gpus_per_node: 8
+
+# ---- Async training configuration ----
+async_training:
+  # Steps between parameter synchronizations
+  trigger_parameter_sync_step: 4
+
+  # Staleness threshold: discard samples older than this many sync cycles
+  staleness_threshold: 2
+
+  # Minimum batches required per training step
+  require_batches: 2
+
+  # Whether trainer also does validation (requires extra dataset split)
+  use_trainer_do_validate: false
+
+
+# ============================================================================
+# Model and Worker Configuration
+# ============================================================================
+
 actor_rollout_ref:
-  # Model configuration
+  # ---- Hybrid engine settings ----
+  hybrid_engine: false
+
+  # ---- Model configuration ----
   model:
-    path: null
+    path: null  # Path to HuggingFace model (required)
     use_remove_padding: true
     use_fused_kernels: true
+    use_shm: false
     hf_config:
       architectures:
         - Qwen2ForCausalLM
       torch_dtype: bfloat16
       use_flash_attention_2: true
 
-  # Actor configuration
+  # ---- Actor (training) configuration ----
   actor:
-    config:
-      strategy: fsdp2
-      tensor_model_parallel_size: 1
-      pipeline_model_parallel_size: 1
-      use_dynamic_bsz: true
-      ppo_max_token_len_per_gpu: 8192
-      ppo_micro_batch_size_per_gpu: 2
+    strategy: fsdp2  # "fsdp2" or "megatron"
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    use_dynamic_bsz: true
+    ppo_max_token_len_per_gpu: 16384
+    ppo_micro_batch_size_per_gpu: 2
+    ppo_mini_batch_size: 256
+    use_prefix_grouper: false
+
+    # Optimizer
     optim:
       lr: 1.0e-6
       weight_decay: 0.01
@@ -66,29 +168,53 @@ actor_rollout_ref:
       adam_beta1: 0.9
       adam_beta2: 0.999
       adam_eps: 1.0e-8
+      warmup_steps: 0
+      lr_scheduler_type: cosine
+
+    # Checkpoint / parameter sync
     checkpoint:
       save_algorithm: generic
       checkpoint_type: ddp
       save_freq: -1
-      load_format: fake
+      load_format: auto
 
-  # Rollout configuration
+    # FSDP2-specific
+    fsdp:
+      sharding_strategy: FULL_SHARD
+      mixed_precision:
+        param: bf16
+        reduce: fp32
+        buffer: bf16
+      cpu_offload: false
+
+    # Megatron-specific (used when strategy=megatron)
+    megatron:
+      sequence_parallel: false
+      use_distributed_optimizer: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+
+  # ---- Rollout configuration ----
   rollout:
-    name: vllm
+    name: vllm  # "vllm" or "sglang"
+    mode: async  # Must be "async" for elastic scheduling
     nnodes: 1
     n_gpus_per_node: 8
     tensor_model_parallel_size: 1
     pipeline_model_parallel_size: 1
     data_parallel_size: -1
     data_parallel_size_rollout: -1
+    # Token length limits
     log_prob_micro_batch_size_per_gpu: 2
     log_prob_use_dynamic_bsz: true
-    log_prob_max_token_len_per_gpu: 8192
-    max_model_len: 8192
+    log_prob_max_token_len_per_gpu: 16384
+    max_model_len: 16384
+    # Memory management
     free_cache_engine: true
     gpu_memory_utilization: 0.6
+    # Parameter sync engine
     checkpoint_engine:
-      backend: naive
+      backend: naive  # "naive", "nccl", "nixl", "mooncake"
       update_weights_bucket_megabytes: 1000
       engine_kwargs:
         naive: {}
@@ -96,72 +222,111 @@ actor_rollout_ref:
         raycollective: {}
     profiler: null
 
-  # Reference model configuration
+  # ---- Reference policy configuration ----
   ref:
-    config:
-      strategy: fsdp2
-      tensor_model_parallel_size: 1
-      pipeline_model_parallel_size: 1
+    strategy: fsdp2
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    use_dynamic_bsz: true
+    log_prob_micro_batch_size_per_gpu: 2
+    log_prob_max_token_len_per_gpu: 16384
     checkpoint:
       save_algorithm: generic
       checkpoint_type: ddp
       save_freq: -1
-      load_format: fake
-    use_dynamic_bsz: true
-    log_prob_micro_batch_size_per_gpu: 2
-    log_prob_max_token_len_per_gpu: 8192
+      load_format: auto
+    fsdp:
+      sharding_strategy: FULL_SHARD
+      mixed_precision:
+        param: bf16
+        reduce: fp32
+        buffer: bf16
+      cpu_offload: false
 
-# Training Data Configuration
+
+# ============================================================================
+# Data Configuration
+# ============================================================================
+
 data:
-  train_files: []
-  val_files: []
-  max_seq_len: 8192
-  train_batch_size: 1024
+  train_files: []     # Path(s) to training data (required)
+  val_files: []       # Path(s) to validation data
+  max_seq_len: 16384
+  # train_batch_size: 0 means generate indefinitely (for async)
+  train_batch_size: 0
+  # gen_batch_size: 1 means generate one prompt at a time
+  gen_batch_size: 1
   val_batch_size: null
   num_workers: 8
   num_train_workers: 1
   num_val_workers: 1
+  dataloader_num_workers: 4
+  validation_shuffle: true
 
+  # Prompt format
+  max_prompt_length: 1024
+  max_response_length: 15360
+  filter_overlong_prompts: true
+
+  # Packing / batching
+  return_raw_chat: false
+  pack_seq: false
+
+
+# ============================================================================
 # PPO Algorithm Configuration
-algorithm:
-  ppo:
-    gradient_accumulation_steps: 1
-    mini_batch_size: 512
-    epochs: 1
-    clip_ratio: 0.2
-    clip_ratio_value: 0.2
-    gamma: 1.0
-    lam: 0.95
-    Adv_estimator:gae
-    gae_tau: 1.0
-    adaptive_clip: false
-    adaptive_clip_ratio: 0.2
-    use_rloo: false
-    rloo_beta: 0.0
-    kl_ctrl:
-      type: fixed
-      kl_coef: 0.0
+# ============================================================================
 
-# Custom Loss Configuration
+algorithm:
+  # KL divergence control
+  use_kl_in_reward: false
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.0
+    target_kl: 0.01
+    horizon: 10000
+
+  # PPO hyperparameters
+  gamma: 1.0
+  lam: 1.0
+  adv_estimator: gae
+  norm_adv_by_std_in_grp: false
+
+  # Value function clipping
+  vf_clip: null
+
+
+# ============================================================================
+# Loss Configuration
+# ============================================================================
+
 loss:
-  entropy:
-    coefficient: 0.0
-    cache_per_sample: false
-  mask:
-    decoder_margin_loss_weight: 0.0
+  clip_ratio: 0.2
+  clip_ratio_value: 0.2
+  entropy_coeff: 0.0
   mask_padding: true
 
+
+# ============================================================================
 # Reward Configuration
+# ============================================================================
+
 reward:
   reward_function: null
   reward_norm_by_device: false
   reward_scale: -1
   reward_shift: 0
   mixed_precision: false
+  reward_model:
+    enable_resource_pool: false
 
-# Wandb Configuration
+
+# ============================================================================
+# Logging & Tracking
+# ============================================================================
+
 wandb:
-  project: verl_async
+  project: verl_elastic
   experiment: elastic_ppo
   entity: null
   name: null
@@ -172,24 +337,15 @@ wandb:
   project_dir: null
   enable: false
 
+
+# ============================================================================
 # Checkpoint Configuration
+# ============================================================================
+
 checkpoint:
-  save_freq: 10
-  max_checkpoints_to_keep: 3
-  save_per_n_iterations: 100
-  checkpoint_dir: null
-
-# Training Configuration
-training:
-  total_epochs: 100
-  val_interval: 5
-  save_freq: 10
-  logging_interval: 1
-  seed: null
-  device: cuda
-
-# Rollout Worker Configuration
-rollout:
-  nnodes: 1
-  n_gpus_per_node: 8
+  save_freq: 100          # Save checkpoint every N steps
+  max_to_keep: 3          # Keep at most N checkpoints
+  checkpoint_dir: null    # Local directory for checkpoints
+  hdfs_dir: null          # HDFS directory for checkpoints
+  resume_from: null       # Resume from specific checkpoint path
 
