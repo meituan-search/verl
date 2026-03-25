@@ -1,0 +1,396 @@
+# Copyright 2025 Meituan Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Main entry point for Elastic Scheduling in VERL
+
+This module provides the integration between:
+- ElasticRollouter: Dynamic rollout resource management
+- ElasticTrainer: Dynamic training resource management
+- ResourceCoordinator: Coordination between rollout and train
+- CongestionMonitor: Monitoring production/consumption rates
+"""
+
+import asyncio
+import logging
+import socket
+from dataclasses import dataclass
+from typing import Optional
+
+import hydra
+import ray
+from omegaconf import OmegaConf
+
+from verl.experimental.elastic_scheduling import (
+    CongestionMonitor,
+    CoordinatorLoop,
+    ElasticResourceConfig,
+    ElasticResourceManager,
+    ResourceCoordinator,
+)
+from verl.experimental.elastic_scheduling.elastic_rollouter import ElasticRollouter
+from verl.experimental.elastic_scheduling.elastic_trainer import ElasticTrainer
+from verl.experimental.fully_async_policy.message_queue import MessageQueue, MessageQueueClient
+from verl.experimental.separation.utils import create_resource_pool_manager, create_role_worker_mapping
+from verl.trainer.ppo.utils import Role
+from verl.utils.fs import copy_to_local
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ElasticSchedulingConfig:
+    """Configuration for elastic scheduling"""
+
+    # Resource allocation
+    rollout_gpus: int = 8  # Fixed rollout GPUs
+    train_gpus: int = 8  # Fixed training GPUs
+    elastic_gpus: int = 8  # Elastic GPUs
+    dp_size_per_resource: int = 8  # DP size per resource group
+
+    # Scheduling thresholds
+    rollout_queue_high_watermark: float = 0.8
+    rollout_queue_low_watermark: float = 0.3
+    cooldown_seconds: float = 10.0
+
+    # Sync settings
+    sync_trigger_interval: int = 4
+    enable_incremental_sync: bool = True
+
+    # Monitoring
+    check_interval: float = 1.0  # Coordination loop interval
+
+
+@ray.remote(num_cpus=1)
+class ElasticSchedulingTaskRunner:
+    """
+    Ray remote class for elastic scheduling PPO training.
+
+    This extends the FullyAsyncTaskRunner with dynamic resource allocation
+    between rollout and training based on congestion monitoring.
+    """
+
+    def __init__(self):
+        self.running = False
+        self.components = {}
+        self.coordinator_loop: Optional[CoordinatorLoop] = None
+
+    def run(self, config):
+        """Main entry point"""
+        logger.info("Starting Elastic Scheduling PPO training...")
+        self._initialize_components(config)
+        self._run_training_loop()
+
+    def _initialize_components(self, config) -> None:
+        """Initialize all components"""
+        logger.info(f"TaskRunner hostname: {socket.gethostname()}")
+
+        # Parse elastic config
+        elastic_config = self._parse_elastic_config(config)
+
+        # Initialize model and tokenizer
+        local_path = copy_to_local(
+            config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
+        )
+        from verl.utils import hf_processor, hf_tokenizer
+
+        tokenizer = hf_tokenizer(local_path)
+        processor = hf_processor(local_path)
+
+        self.components["tokenizer"] = tokenizer
+        self.components["processor"] = processor
+        self.components["config"] = config
+        self.components["elastic_config"] = elastic_config
+
+        # Create resource manager
+        self._init_resource_manager(elastic_config, config)
+
+        # Create worker mapping
+        role_worker_mapping, ray_worker_group_cls = create_role_worker_mapping(config)
+        self.components["role_worker_mapping"] = role_worker_mapping
+        self.components["ray_worker_group_cls"] = ray_worker_group_cls
+
+        # Create rollouter and trainer
+        self._create_rollouter_and_trainer(config)
+
+        # Setup message queue
+        self._setup_message_queue()
+
+        # Setup coordinator
+        self._setup_coordinator()
+
+        # Load checkpoints
+        self._load_checkpoints()
+
+        # Initial parameter sync
+        self._initial_sync()
+
+    def _parse_elastic_config(self, config) -> ElasticResourceConfig:
+        """Parse elastic scheduling config from main config"""
+        es_config = getattr(config, "elastic_scheduling", None)
+
+        if es_config:
+            return ElasticResourceConfig(
+                rollout_gpus=es_config.get("rollout_gpus", 8),
+                train_gpus=es_config.get("train_gpus", 8),
+                elastic_gpus=es_config.get("elastic_gpus", 8),
+                dp_size_per_resource=es_config.get("dp_size_per_resource", 8),
+                rollout_queue_high_watermark=es_config.get("rollout_queue_high_watermark", 0.8),
+                rollout_queue_low_watermark=es_config.get("rollout_queue_low_watermark", 0.3),
+                cooldown_seconds=es_config.get("cooldown_seconds", 10.0),
+                sync_trigger_interval=es_config.get("sync_trigger_interval", 4),
+            )
+        else:
+            # Default config
+            return ElasticResourceConfig(
+                rollout_gpus=8,
+                train_gpus=8,
+                elastic_gpus=8,
+                dp_size_per_resource=8,
+            )
+
+    def _init_resource_manager(
+        self,
+        elastic_config: ElasticResourceConfig,
+        config,
+    ) -> None:
+        """Initialize elastic resource manager"""
+        # Calculate GPU allocation
+        total_gpus = elastic_config.rollout_gpus + elastic_config.train_gpus + elastic_config.elastic_gpus
+
+        # Assuming GPUs are numbered 0 to total_gpus-1
+        rollout_spec = list(range(elastic_config.rollout_gpus))
+        train_spec = list(range(elastic_config.rollout_gpus, elastic_config.rollout_gpus + elastic_config.train_gpus))
+        elastic_spec = list(range(elastic_config.rollout_gpus + elastic_config.train_gpus, total_gpus))
+
+        # Create resource manager
+        resource_manager = ElasticResourceManager(
+            config=elastic_config,
+            rollout_resource_spec=rollout_spec,
+            train_resource_spec=train_spec,
+            elastic_resource_spec=elastic_spec,
+        )
+
+        self.components["resource_manager"] = resource_manager
+        logger.info(f"Resource manager initialized: {resource_manager.get_status_summary()}")
+
+    def _create_rollouter_and_trainer(self, config) -> None:
+        """Create rollouter and trainer with elastic support"""
+        from concurrent.futures import ThreadPoolExecutor
+
+        logger.info("Creating ElasticRollouter and ElasticTrainer...")
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            # Create trainer first (rollouter doesn't allow continuous allocation)
+            trainer_future = executor.submit(self._create_trainer, config)
+            trainer_future.result()
+
+            rollouter_future = executor.submit(self._create_rollouter, config)
+            rollouter_future.result()
+
+        # Get shared info
+        total_train_steps = ray.get(self.components["rollouter"].get_total_train_steps.remote())
+        ray.get(self.components["trainer"].set_total_train_steps.remote(total_train_steps))
+
+        max_queue_size = ray.get(self.components["rollouter"].get_max_queue_size.remote())
+        logger.info(f"Max queue size: {max_queue_size}")
+
+    def _create_rollouter(self, config) -> None:
+        """Create elastic rollouter"""
+        rollouter = ElasticRollouter.remote(
+            config=config,
+            tokenizer=self.components["tokenizer"],
+            role_worker_mapping=None,
+            resource_pool_manager=create_resource_pool_manager(config, roles=[Role.Rollout]),
+            ray_worker_group_cls=self.components["ray_worker_group_cls"],
+            processor=self.components["processor"],
+        )
+
+        ray.get(rollouter.init_workers.remote())
+        ray.get(rollouter.set_max_required_samples.remote())
+
+        self.components["rollouter"] = rollouter
+
+        # Register fixed rollout resources
+        resource_manager = self.components["resource_manager"]
+        for resource in resource_manager.rollout_resources:
+            resource_manager.register_worker(resource.resource_id, rollouter)
+
+    def _create_trainer(self, config) -> None:
+        """Create elastic trainer"""
+        trainer_role_mapping = {
+            role: worker_cls
+            for role, worker_cls in self.components["role_worker_mapping"].items()
+            if role != Role.Rollout
+        }
+
+        trainer = ElasticTrainer.remote(
+            config=config,
+            tokenizer=self.components["tokenizer"],
+            role_worker_mapping=trainer_role_mapping,
+            resource_pool_manager=create_resource_pool_manager(config, roles=list(trainer_role_mapping.keys())),
+            ray_worker_group_cls=self.components["ray_worker_group_cls"],
+            processor=self.components["processor"],
+        )
+
+        ray.get(trainer.init_workers.remote())
+
+        self.components["trainer"] = trainer
+
+        # Register fixed train resources
+        resource_manager = self.components["resource_manager"]
+        for resource in resource_manager.train_resources:
+            resource_manager.register_worker(resource.resource_id, trainer)
+
+    def _setup_message_queue(self) -> None:
+        """Setup message queue for sample passing"""
+        max_queue_size = ray.get(self.components["rollouter"].get_max_queue_size.remote())
+        message_queue = MessageQueue.remote(self.components["config"], max_queue_size)
+        message_queue_client = MessageQueueClient(message_queue)
+
+        self.components["message_queue"] = message_queue
+        self.components["message_queue_client"] = message_queue_client
+
+        # Connect to rollouter and trainer
+        ray.get(self.components["rollouter"].set_message_queue_client.remote(message_queue_client))
+        ray.get(self.components["trainer"].set_message_queue_client.remote(message_queue_client))
+
+    def _setup_coordinator(self) -> None:
+        """Setup the resource coordinator"""
+        elastic_config = self.components["elastic_config"]
+        resource_manager = self.components["resource_manager"]
+
+        # Create congestion monitor
+        congestion_monitor = CongestionMonitor(
+            window_size=20,
+            high_watermark=elastic_config.rollout_queue_high_watermark,
+            low_watermark=elastic_config.rollout_queue_low_watermark,
+        )
+
+        # Create coordinator
+        coordinator = ResourceCoordinator(
+            resource_manager=resource_manager,
+            congestion_monitor=congestion_monitor,
+            sync_trigger_interval=elastic_config.sync_trigger_interval,
+        )
+
+        # Setup callbacks
+        coordinator.on_switch_complete = self._on_switch_complete
+        coordinator.on_sync_triggered = self._on_sync_triggered
+
+        # Create coordinator loop
+        self.coordinator_loop = CoordinatorLoop(
+            coordinator=coordinator,
+            check_interval=elastic_config.check_interval,
+        )
+
+        self.components["coordinator"] = coordinator
+        self.components["congestion_monitor"] = congestion_monitor
+
+    async def _on_switch_complete(self, target: str, resources: list) -> None:
+        """Callback when resource switch completes"""
+        logger.info(f"Switched {len(resources)} resources to {target}")
+
+        if target == "rollout":
+            # Add to rollouter
+            rollouter = self.components["rollouter"]
+            await rollouter.add_elastic_resources.remote(resources)
+        elif target == "train":
+            # Add to trainer
+            trainer = self.components["trainer"]
+            await trainer.add_elastic_actors.remote(resources)
+
+    async def _on_sync_triggered(self, resources: list) -> None:
+        """Callback when parameter sync is triggered"""
+        logger.debug(f"Triggering sync to {len(resources)} resources")
+        # The actual sync is handled by the checkpoint manager
+
+    def _load_checkpoints(self) -> None:
+        """Load checkpoints for resume"""
+        ray.get(self.components["trainer"].load_checkpoint.remote())
+        ray.get(self.components["rollouter"].load_checkpoint.remote())
+
+    def _initial_sync(self) -> None:
+        """Perform initial parameter sync"""
+        ray.get(self.components["trainer"].set_rollouter.remote(self.components["rollouter"]))
+        ray.get(self.components["trainer"]._fit_update_weights.remote())
+
+    def _run_training_loop(self):
+        """Run the training loop with coordination"""
+        self.running = True
+
+        logger.info("Starting Rollouter and Trainer...")
+        rollouter_future = self.components["rollouter"].fit.remote()
+        trainer_future = self.components["trainer"].fit.remote()
+
+        # Start coordinator loop
+        if self.coordinator_loop:
+            asyncio.run(self.coordinator_loop.start())
+
+        try:
+            futures = [rollouter_future, trainer_future]
+
+            while futures:
+                done_futures, remaining_futures = ray.wait(futures, num_returns=1, timeout=None)
+
+                for future in done_futures:
+                    try:
+                        ray.get(future)
+                        logger.info("Component completed successfully")
+                    except Exception as e:
+                        logger.error(f"Component failed: {e}")
+                        for remaining in remaining_futures:
+                            ray.cancel(remaining)
+                        raise
+
+                futures = remaining_futures
+
+        except Exception as e:
+            logger.error(f"Training failed: {e}")
+            raise
+        finally:
+            # Stop coordinator
+            if self.coordinator_loop:
+                asyncio.run(self.coordinator_loop.stop())
+
+            # Clear queue
+            asyncio.run(self.components["message_queue_client"].clear_queue())
+
+            logger.info("Training completed or interrupted")
+
+
+@hydra.main(config_path="config", config_name="elastic_ppo_trainer", version_base=None)
+def main(config):
+    """Main entry point"""
+    from verl.trainer.main_ppo import run_ppo
+
+    # Ensure elastic scheduling config exists
+    if not hasattr(config, "elastic_scheduling"):
+        # Create default config
+        OmegaConf.set_struct(config, True)
+        from omegaconf import open_dict
+
+        with open_dict(config):
+            config.elastic_scheduling = ElasticSchedulingConfig()
+
+    # Update rollout config
+    config.actor_rollout_ref.rollout.nnodes = config.rollout.nnodes
+    config.actor_rollout_ref.rollout.n_gpus_per_node = config.rollout.n_gpus_per_node
+
+    # Run with elastic scheduling task runner
+    run_ppo(config, task_runner_class=ElasticSchedulingTaskRunner)
+
+
+if __name__ == "__main__":
+    main()
