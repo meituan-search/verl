@@ -124,7 +124,6 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         return final_output
 
 
-@ray.remote
 class FullyAsyncAgentLoopWorker(AgentLoopWorker):
     def __init__(
         self,
@@ -155,7 +154,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         teacher_model_manager: TeacherModelManager = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
     ):
-        self.agent_loop_workers_class = FullyAsyncAgentLoopWorker
+        self.agent_loop_workers_class = ray.remote(FullyAsyncAgentLoopWorker)
         super().__init__(config, worker_group, rollout_resource_pool, teacher_model_manager, reward_loop_worker_handles)
         if self.distillation_enabled:
             raise NotImplementedError("Distillation is not implemented in FullyAsyncAgentLoopManager yet.")

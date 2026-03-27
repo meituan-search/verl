@@ -1,0 +1,309 @@
+# Copyright 2025 Meituan Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ============================================================================
+# Elastic Scheduling PPO Trainer - Single Node Configuration
+# ============================================================================
+# Designed for single-node development and testing of elastic scheduling.
+# Simulates elastic behavior with fewer GPUs.
+#
+# Resource topology (8 GPUs total on 1 node):
+#   Fixed rollout: 2 GPUs  (vLLM inference server)
+#   Fixed train:   4 GPUs  (FSDP2 training)
+#   Elastic:       2 GPUs  (switches between rollout and train based on congestion)
+#
+# Note: For production deployment, use elastic_ppo_trainer.yaml
+# ============================================================================
+
+# ============================================================================
+# Elastic Scheduling Configuration
+# ============================================================================
+elastic_scheduling:
+  # ---- Resource topology ----
+  # 1 elastic resource group with 2 GPUs (single node dev)
+  n_elastic_resources: 1
+
+  # Initial mode for elastic resources
+  elastic_initial_mode: rollout
+
+  # Number of GPUs per elastic resource group
+  dp_size_per_resource: 2
+
+  # ---- Scheduling thresholds ----
+  # Queue utilization above this → scale up rollout
+  rollout_queue_high_watermark: 0.75
+
+  # Queue utilization below this → scale up train
+  rollout_queue_low_watermark: 0.25
+
+  # Minimum time between consecutive switches (seconds)
+  # Shorter cooldown for development testing
+  cooldown_seconds: 15.0
+
+  # ---- Rate monitoring ----
+  # Coordinator polling interval (seconds)
+  check_interval: 1.0
+
+  # EMA smoothing factor
+  ema_alpha: 0.4
+
+  # Minimum confidence for switch (lower for faster testing)
+  confidence_threshold: 0.5
+
+  # ---- Safety constraints ----
+  min_rollout_resources: 0
+  min_train_resources: 0
+  max_concurrent_switches: 1
+
+  # ---- Parameter sync ----
+  sync_trigger_interval: 2
+  enable_incremental_sync: true
+  congestion_window_size: 10
+
+
+# ============================================================================
+# Standard PPO Training Configuration - Single Node
+# ============================================================================
+
+# ---- Trainer node configuration ----
+trainer:
+  nnodes: 1
+  n_gpus_per_node: 4  # 4 GPUs dedicated to training
+  total_epochs: 10    # Fewer epochs for dev/test
+  project_name: verl_elastic_dev
+  experiment_name: elastic_ppo_single_node
+  logger: console
+  val_interval: 5
+  default_hdfs_dir: null
+  default_local_dir: /tmp/verl_elastic_dev
+  balance_batch: true
+  device: cuda
+  log_interval: 1
+  seed: 42
+
+# ---- Rollout node configuration ----
+rollout:
+  nnodes: 1
+  n_gpus_per_node: 2  # 2 GPUs for fixed rollout
+
+# ---- Async training configuration ----
+async_training:
+  trigger_parameter_sync_step: 2  # More frequent sync for dev
+  staleness_threshold: 2
+  require_batches: 1   # 1 batch minimum for dev
+  use_trainer_do_validate: false
+
+
+# ============================================================================
+# Model and Worker Configuration
+# ============================================================================
+
+actor_rollout_ref:
+  hybrid_engine: false
+
+  # ---- Model configuration ----
+  model:
+    path: null  # Required: path to HuggingFace model
+    use_remove_padding: true
+    use_fused_kernels: false  # Disable for compatibility on dev machines
+    use_shm: false
+    hf_config:
+      architectures:
+        - Qwen2ForCausalLM
+      torch_dtype: bfloat16
+      use_flash_attention_2: false  # May not be available on dev
+
+  # ---- Actor (training) configuration ----
+  actor:
+    strategy: fsdp2
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    use_dynamic_bsz: true
+    ppo_max_token_len_per_gpu: 4096   # Smaller for dev
+    ppo_micro_batch_size_per_gpu: 1
+    ppo_mini_batch_size: 32           # Smaller batch for dev
+    use_prefix_grouper: false
+
+    optim:
+      lr: 1.0e-6
+      weight_decay: 0.01
+      clip_grad: 1.0
+      type: adamw
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1.0e-8
+      warmup_steps: 0
+      lr_scheduler_type: cosine
+
+    checkpoint:
+      save_algorithm: generic
+      checkpoint_type: ddp
+      save_freq: -1
+      load_format: auto
+
+    fsdp:
+      sharding_strategy: FULL_SHARD
+      mixed_precision:
+        param: bf16
+        reduce: fp32
+        buffer: bf16
+      cpu_offload: false
+
+    megatron:
+      sequence_parallel: false
+      use_distributed_optimizer: false
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+
+  # ---- Rollout configuration ----
+  rollout:
+    name: vllm
+    mode: async
+    nnodes: 1
+    n_gpus_per_node: 2
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    data_parallel_size: -1
+    data_parallel_size_rollout: -1
+    log_prob_micro_batch_size_per_gpu: 1
+    log_prob_use_dynamic_bsz: true
+    log_prob_max_token_len_per_gpu: 4096
+    max_model_len: 4096
+    free_cache_engine: true
+    gpu_memory_utilization: 0.7
+    checkpoint_engine:
+      backend: naive
+      update_weights_bucket_megabytes: 500
+      engine_kwargs:
+        naive: {}
+        nixl: {}
+        raycollective: {}
+    profiler: null
+
+  # ---- Reference policy configuration ----
+  ref:
+    strategy: fsdp2
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    use_dynamic_bsz: true
+    log_prob_micro_batch_size_per_gpu: 1
+    log_prob_max_token_len_per_gpu: 4096
+    checkpoint:
+      save_algorithm: generic
+      checkpoint_type: ddp
+      save_freq: -1
+      load_format: auto
+    fsdp:
+      sharding_strategy: FULL_SHARD
+      mixed_precision:
+        param: bf16
+        reduce: fp32
+        buffer: bf16
+      cpu_offload: false
+
+
+# ============================================================================
+# Data Configuration
+# ============================================================================
+
+data:
+  train_files: []     # Required: path(s) to training data
+  val_files: []
+  max_seq_len: 4096
+  train_batch_size: 0
+  gen_batch_size: 1
+  val_batch_size: null
+  num_workers: 4
+  num_train_workers: 1
+  num_val_workers: 1
+  dataloader_num_workers: 2
+  validation_shuffle: true
+  max_prompt_length: 512
+  max_response_length: 3584
+  filter_overlong_prompts: true
+  return_raw_chat: false
+  pack_seq: false
+
+
+# ============================================================================
+# PPO Algorithm Configuration
+# ============================================================================
+
+algorithm:
+  use_kl_in_reward: false
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.0
+    target_kl: 0.01
+    horizon: 10000
+  gamma: 1.0
+  lam: 1.0
+  adv_estimator: gae
+  norm_adv_by_std_in_grp: false
+  vf_clip: null
+
+
+# ============================================================================
+# Loss Configuration
+# ============================================================================
+
+loss:
+  clip_ratio: 0.2
+  clip_ratio_value: 0.2
+  entropy_coeff: 0.0
+  mask_padding: true
+
+
+# ============================================================================
+# Reward Configuration
+# ============================================================================
+
+reward:
+  reward_function: null
+  reward_norm_by_device: false
+  reward_scale: -1
+  reward_shift: 0
+  mixed_precision: false
+  reward_model:
+    enable_resource_pool: false
+
+
+# ============================================================================
+# Logging & Tracking
+# ============================================================================
+
+wandb:
+  project: verl_elastic_dev
+  experiment: elastic_ppo_single_node
+  entity: null
+  name: null
+  resume: false
+  notes: "Single-node elastic scheduling test"
+  tags: [elastic, dev, single-node]
+  log_interval: 1
+  project_dir: null
+  enable: false
+
+
+# ============================================================================
+# Checkpoint Configuration
+# ============================================================================
+
+checkpoint:
+  save_freq: 10
+  max_to_keep: 2
+  checkpoint_dir: /tmp/verl_elastic_dev/checkpoints
+  hdfs_dir: null
+  resume_from: null
+

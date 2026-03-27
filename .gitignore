@@ -1,3 +1,5 @@
+examples/mtp_trainer/runtime_env.yaml
+
 **/*.pt
 **/checkpoints
 **/wget-log
@@ -130,3 +132,13 @@ logs
 log
 outputs
 .history
+
+Megatron-LM
+pytorch
+
+examples/mtp_trainer/*
+
+
+./pyproject.toml
+.gitignore
+.rayignore

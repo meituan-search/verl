@@ -117,7 +117,7 @@ class FullyAsyncTaskRunner:
 
     def _create_rollouter(self, config) -> None:
         print("[ASYNC MAIN] Starting create rollouter...")
-        rollouter = FullyAsyncRollouter.remote(
+        rollouter = ray.remote(FullyAsyncRollouter).remote(
             config=config,
             tokenizer=self.components["tokenizer"],
             role_worker_mapping=None,
