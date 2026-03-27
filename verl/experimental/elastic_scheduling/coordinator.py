@@ -1142,7 +1142,6 @@ class ElasticCoordinator:
             success = await asyncio.wrap_future(
                 self.rollouter.remove_elastic_replica.remote(
                     resource_id=resource_id,
-                    graceful=True,
                 ).future()
             )
             if not success:

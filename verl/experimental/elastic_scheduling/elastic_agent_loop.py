@@ -15,11 +15,14 @@
 """
 Elastic Agent Loop Manager for VERL
 
-Extends AgentLoopManager with dynamic server management:
+Extends FullyAsyncAgentLoopManager with dynamic server management:
 - Add new rollout servers (when elastic resources switch to rollout mode)
 - Remove rollout servers (when elastic resources switch to training mode)
 - Update GlobalRequestLoadBalancer when server pool changes
 - Coordinate parameter synchronization for newly added servers
+
+All elastic replica lifecycle management (tracking, versioning, statistics)
+is centralized here; ElasticRollouter only delegates to this class.
 """
 
 import asyncio
@@ -46,7 +49,8 @@ class ElasticGlobalRequestLoadBalancer:
 
     Adds:
     - add_server(): add a new server to the pool
-    - remove_server(): remove a server from the pool (no new requests)
+    - remove_server(): mark a server for removal (no new requests)
+    - cleanup_removed_server(): fully remove a drained server
     - get_inflight_count(): get the number of in-flight requests for a server
     """
 
@@ -62,15 +66,13 @@ class ElasticGlobalRequestLoadBalancer:
 
     def acquire_server(self, request_id: str) -> str:
         """Acquire a server for the given request (sticky + least-loaded)."""
-        # Sticky session: reuse same server for multi-turn conversations
         if request_id in self._request_id_to_server:
             server_id = self._request_id_to_server[request_id]
             if server_id not in self._removed_servers:
                 self._inflight_requests[server_id] += 1
                 return server_id
 
-        # Route to least loaded server (exclude servers being drained)
-        available = {sid: count for sid, count in self._inflight_requests.items() if sid not in self._removed_servers}
+        available = {sid: cnt for sid, cnt in self._inflight_requests.items() if sid not in self._removed_servers}
         if not available:
             raise RuntimeError("No available servers in load balancer")
 
@@ -82,28 +84,21 @@ class ElasticGlobalRequestLoadBalancer:
     def release_server(self, server_id: str) -> None:
         """Release a server after a request completes."""
         if server_id not in self._inflight_requests:
-            return  # Server was removed, ignore
+            return
         if self._inflight_requests[server_id] > 0:
             self._inflight_requests[server_id] -= 1
 
     def add_server(self, server_id: str) -> None:
         """Add a new server to the load balancer pool."""
         if server_id in self._inflight_requests:
-            # Re-enable if it was being drained
             self._removed_servers.discard(server_id)
             return
-
         self._inflight_requests[server_id] = 0
         self._removed_servers.discard(server_id)
         logger.info(f"[ElasticLB] Added server: {server_id}")
 
     def remove_server(self, server_id: str) -> None:
-        """
-        Mark server for removal (no new requests routed to it).
-
-        Existing in-flight requests continue until complete.
-        Server is fully removed when get_inflight_count returns 0.
-        """
+        """Mark server for removal (no new requests routed to it)."""
         if server_id in self._inflight_requests:
             self._removed_servers.add(server_id)
         logger.info(f"[ElasticLB] Marked server for removal: {server_id}")
@@ -128,12 +123,15 @@ class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
     Elastic Agent Loop Manager with dynamic server management.
 
     Extends FullyAsyncAgentLoopManager to support:
-    1. Adding new rollout servers when elastic resources switch to rollout mode
-    2. Removing rollout servers when elastic resources switch to training mode
-    3. Coordinating parameter sync for newly added servers
+    1. Adding elastic rollout replicas when resources switch to rollout mode
+    2. Removing elastic rollout replicas when resources switch to training mode
+    3. Centralised tracking of replica lifecycle, param versions, and statistics
 
-    The load balancer is extended to support add_server/remove_server operations.
-    AgentLoopWorkers are updated via remote calls when the server pool changes.
+    All state for elastic replicas lives here; ElasticRollouter is a thin
+    delegation layer that calls add_elastic_replica / remove_elastic_replica.
+
+    Ordering guarantee for partial-rollout auto-resume on removal:
+      LB mark-removing → workers remove handle → abort_all_requests → LB cleanup
     """
 
     def __init__(
@@ -151,228 +149,201 @@ class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
             teacher_model_manager=teacher_model_manager,
             reward_loop_worker_handles=reward_loop_worker_handles,
         )
-        # Elastic server tracking
-        self._elastic_replicas: dict[str, RolloutReplica] = {}  # address -> replica
+        # resource_id -> RolloutReplica
+        self._elastic_replicas: dict[str, RolloutReplica] = {}
+        # resource_id -> server_address (for LB / worker notification)
+        self._elastic_addresses: dict[str, str] = {}
+        # resource_id -> param_version
+        self._elastic_versions: dict[str, int] = {}
+
+        # Timing / counters
+        self._total_elastic_adds: int = 0
+        self._total_elastic_removes: int = 0
+        self._last_elastic_add_time: float = 0.0
+        self._last_elastic_remove_time: float = 0.0
+
+    # -------------------------------------------------------------------------
+    # Override: use ElasticGlobalRequestLoadBalancer
+    # -------------------------------------------------------------------------
 
     async def _init_global_load_balancer(self) -> None:
-        """
-        Override to use ElasticGlobalRequestLoadBalancer.
-
-        The elastic load balancer supports dynamic add/remove operations.
-        """
+        """Override to use ElasticGlobalRequestLoadBalancer (supports add/remove)."""
         self.global_load_balancer = ElasticGlobalRequestLoadBalancer.remote(
             server_actor_ids=self.server_addresses,
             max_cache_size=10000,
         )
         logger.info(
-            f"[ElasticAgentLoopManager] Elastic load balancer initialized with {len(self.server_addresses)} servers"
+            f"[ElasticAgentLoopManager] Elastic load balancer initialised with {len(self.server_addresses)} servers"
         )
 
-    async def add_rollout_server(self, replica: "RolloutReplica") -> bool:
-        """
-        Dynamically add a new rollout server to the pool.
+    # -------------------------------------------------------------------------
+    # Public API – called by ElasticRollouter (and ElasticCoordinator)
+    # -------------------------------------------------------------------------
 
-        Steps:
-        1. Initialize replica if not already initialized
-        2. Register server with elastic load balancer
-        3. Notify all AgentLoopWorkers of the new server
-        4. Track the replica for future management
+    async def add_elastic_replica(
+        self,
+        resource_id: str,
+        replica: "RolloutReplica",
+        param_version: int,
+    ) -> bool:
+        """
+        Add an elastic rollout replica to the production pool.
+
+        Initialises the replica if needed, registers it with the load balancer,
+        notifies all AgentLoopWorkers, and records tracking state.
 
         Args:
-            replica: The RolloutReplica to add (should be in rollout mode)
+            resource_id: Unique identifier for the elastic resource.
+            replica: RolloutReplica already switched to rollout mode.
+            param_version: Parameter version the replica was synced to.
 
         Returns:
-            True if successfully added, False otherwise
+            True on success, False on failure.
         """
+        if resource_id in self._elastic_replicas:
+            logger.warning(f"[ElasticAgentLoopManager] Replica {resource_id} already registered, skipping")
+            return False
+
+        logger.info(f"[ElasticAgentLoopManager] Adding elastic replica {resource_id} (param_version={param_version})")
         try:
-            # Get or initialize server handle and address
+            # Ensure replica is initialised
             server_address = getattr(replica, "_server_address", None)
             server_handle = getattr(replica, "_server_handle", None)
-
             if server_address is None or server_handle is None:
-                logger.info("[ElasticAgentLoopManager] Initializing new elastic replica...")
+                logger.info(f"[ElasticAgentLoopManager] Initialising replica {resource_id}...")
                 await replica.init_standalone()
                 server_address = replica._server_address
                 server_handle = replica._server_handle
 
-            logger.info(f"[ElasticAgentLoopManager] Adding server at {server_address}")
-
-            # Update load balancer
+            # 1. Register with load balancer
             await self.global_load_balancer.add_server.remote(server_id=server_address)
 
-            # Update AgentLoopWorkers
+            # 2. Notify AgentLoopWorkers
             await self._notify_workers_server_added(server_address, server_handle)
 
-            # Track replica
-            self._elastic_replicas[server_address] = replica
+            # 3. Record state
+            self._elastic_replicas[resource_id] = replica
+            self._elastic_addresses[resource_id] = server_address
+            self._elastic_versions[resource_id] = param_version
+            self._total_elastic_adds += 1
+            self._last_elastic_add_time = time.time()
 
-            # Track in server handle map
-            if not hasattr(self, "_server_id_to_handle"):
-                self._server_id_to_handle = {}
-
-            logger.info(f"[ElasticAgentLoopManager] Server {server_address} added successfully")
+            logger.info(
+                f"[ElasticAgentLoopManager] Replica {resource_id} added at {server_address}. "
+                f"Total elastic: {len(self._elastic_replicas)}"
+            )
             return True
 
         except Exception as e:
-            logger.error(f"[ElasticAgentLoopManager] Failed to add server: {e}")
+            logger.error(f"[ElasticAgentLoopManager] Failed to add replica {resource_id}: {e}")
             return False
 
-    async def remove_rollout_server(
-        self,
-        server_address: str,
-        graceful: bool = True,
-        drain_timeout: float = 30.0,
-    ) -> bool:
+    async def remove_elastic_replica(self, resource_id: str) -> bool:
         """
-        Remove a rollout server from the pool, with correct partial-rollout resume ordering.
+        Remove an elastic rollout replica from the production pool.
 
-        The ordering here is critical for partial rollout auto-resume to work correctly:
-
-        1. Mark server in LB as "removing" → stops NEW requests being routed to it.
-        2. Notify AgentLoopWorkers to remove server from their _server_id_to_handle.
-           → This must happen BEFORE abort so that when FullyAsyncLLMServerManager
-             retries after receiving stop_reason="aborted", the LB can only route
-             the resume request to remaining healthy servers (old handle is gone).
-        3. abort_all_requests() → triggers stop_reason="aborted" on all in-flight
-             requests; FullyAsyncLLMServerManager catches this and automatically
-             re-submits with already-generated tokens (partial rollout resume).
-        4. Cleanup LB entry fully.
+        Ordering is critical for partial-rollout auto-resume:
+          1. LB: mark server as removing (no NEW requests)
+          2. Workers: remove server handle BEFORE abort
+          3. abort_all_requests() → FullyAsyncLLMServerManager catches
+             stop_reason="aborted" and re-submits with already-generated
+             tokens → auto-resume on a healthy server
+          4. LB: full cleanup
 
         Args:
-            server_address: Address of server to remove
-            graceful: Unused in elastic mode. We always abort immediately to unblock
-                rollout workers via partial-rollout resume. Kept for API compatibility.
-            drain_timeout: Unused (same reason). Kept for API compatibility.
+            resource_id: Unique identifier of the elastic resource to remove.
 
         Returns:
-            True if successfully removed, False otherwise
+            True on success, False if resource_id not found.
         """
-        try:
-            logger.info(f"[ElasticAgentLoopManager] Removing server {server_address} (partial-rollout resume ordering)")
+        if resource_id not in self._elastic_replicas:
+            logger.warning(f"[ElasticAgentLoopManager] Replica {resource_id} not found, skipping")
+            return False
 
-            # Step 1: Mark for removal in LB (no new requests routed here)
+        server_address = self._elastic_addresses[resource_id]
+        replica = self._elastic_replicas[resource_id]
+
+        logger.info(f"[ElasticAgentLoopManager] Removing elastic replica {resource_id} at {server_address}")
+        try:
+            # Step 1: Stop new routing to this server
             await self.global_load_balancer.remove_server.remote(server_id=server_address)
 
-            # Step 2: Notify workers to remove the server handle BEFORE aborting.
-            # This ensures that when FullyAsyncLLMServerManager resumes after abort,
-            # its _server_id_to_handle no longer contains the dead server, and the
-            # LB will correctly route the resume to a healthy server.
+            # Step 2: Remove handle from workers BEFORE aborting
             await self._notify_workers_server_removed(server_address)
 
-            # Step 3: Abort all in-flight requests on this server.
-            # FullyAsyncLLMServerManager.generate() catches stop_reason="aborted"
-            # and automatically re-submits with the already-generated prefix tokens,
-            # continuing generation on another server (partial rollout auto-resume).
-            replica = self._elastic_replicas.get(server_address)
-            if replica:
-                try:
-                    await replica.abort_all_requests()
-                    logger.info(
-                        f"[ElasticAgentLoopManager] Aborted in-flight requests on {server_address}; "
-                        f"partial-rollout resume will redirect them to healthy servers"
-                    )
-                except Exception as e:
-                    logger.warning(f"[ElasticAgentLoopManager] Error aborting requests: {e}")
+            # Step 3: Abort in-flight requests → triggers partial-rollout resume
+            try:
+                await replica.abort_all_requests()
+                logger.info(
+                    f"[ElasticAgentLoopManager] Aborted in-flight requests on {server_address}; "
+                    f"partial-rollout resume will redirect them to healthy servers"
+                )
+            except Exception as e:
+                logger.warning(f"[ElasticAgentLoopManager] Error aborting requests on {server_address}: {e}")
 
-            # Step 4: Fully clean up LB entry
+            # Step 4: Full LB cleanup
             await self.global_load_balancer.cleanup_removed_server.remote(server_id=server_address)
 
-            # Remove from tracking
-            self._elastic_replicas.pop(server_address, None)
+            # Remove tracking state
+            self._elastic_replicas.pop(resource_id)
+            self._elastic_addresses.pop(resource_id)
+            self._elastic_versions.pop(resource_id)
+            self._total_elastic_removes += 1
+            self._last_elastic_remove_time = time.time()
 
-            logger.info(f"[ElasticAgentLoopManager] Server {server_address} removed successfully")
+            logger.info(
+                f"[ElasticAgentLoopManager] Replica {resource_id} removed. Total elastic: {len(self._elastic_replicas)}"
+            )
             return True
 
         except Exception as e:
-            logger.error(f"[ElasticAgentLoopManager] Failed to remove server {server_address}: {e}")
+            logger.error(f"[ElasticAgentLoopManager] Failed to remove replica {resource_id}: {e}")
             return False
 
-    async def _notify_workers_server_added(self, server_address: str, server_handle):
-        """Notify all AgentLoopWorkers that a new server was added."""
-        if not hasattr(self, "agent_loop_workers") or not self.agent_loop_workers:
-            return
+    def update_elastic_replica_version(self, resource_id: str, param_version: int) -> None:
+        """Update the tracked parameter version for an elastic replica."""
+        if resource_id in self._elastic_versions:
+            self._elastic_versions[resource_id] = param_version
+            logger.debug(f"[ElasticAgentLoopManager] Updated param version for {resource_id} to {param_version}")
 
-        notify_futures = []
-        for worker in self.agent_loop_workers:
-            # Try to call add_server on the worker
-            try:
-                notify_futures.append(worker.add_server.remote(server_address, server_handle))
-            except AttributeError:
-                logger.debug("[ElasticAgentLoopManager] Worker doesn't support add_server()")
+    # -------------------------------------------------------------------------
+    # Statistics / introspection
+    # -------------------------------------------------------------------------
 
-        if notify_futures:
-            results = await asyncio.gather(
-                *[asyncio.wrap_future(f.future()) for f in notify_futures],
-                return_exceptions=True,
-            )
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.warning(f"[ElasticAgentLoopManager] Worker add_server failed: {result}")
+    def get_num_elastic_replicas(self) -> int:
+        """Return the number of currently active elastic replicas."""
+        return len(self._elastic_replicas)
 
-    async def _notify_workers_server_removed(self, server_address: str):
-        """Notify all AgentLoopWorkers that a server was removed."""
-        if not hasattr(self, "agent_loop_workers") or not self.agent_loop_workers:
-            return
+    def get_elastic_replicas_info(self) -> list[dict]:
+        """Return metadata for all active elastic replicas."""
+        return [
+            {
+                "resource_id": rid,
+                "server_address": self._elastic_addresses.get(rid, "unknown"),
+                "param_version": self._elastic_versions.get(rid, -1),
+            }
+            for rid in self._elastic_replicas
+        ]
 
-        notify_futures = []
-        for worker in self.agent_loop_workers:
-            try:
-                notify_futures.append(worker.remove_server.remote(server_address))
-            except AttributeError:
-                logger.debug("[ElasticAgentLoopManager] Worker doesn't support remove_server()")
-
-        if notify_futures:
-            await asyncio.gather(
-                *[asyncio.wrap_future(f.future()) for f in notify_futures],
-                return_exceptions=True,
-            )
-
-    async def _drain_server(self, server_address: str, timeout: float = 30.0):
-        """
-        Wait for in-flight requests to drain from a server.
-
-        Args:
-            server_address: Server to drain
-            timeout: Maximum wait time in seconds
-        """
-        start_time = time.time()
-        last_log = start_time
-
-        while time.time() - start_time < timeout:
-            try:
-                inflight = ray.get(self.global_load_balancer.get_inflight_count.remote(server_id=server_address))
-                if inflight == 0:
-                    logger.info(
-                        f"[ElasticAgentLoopManager] Server {server_address} drained in {time.time() - start_time:.1f}s"
-                    )
-                    return
-
-                # Log progress periodically
-                if time.time() - last_log > 5.0:
-                    logger.info(
-                        f"[ElasticAgentLoopManager] Waiting for {inflight} in-flight requests on {server_address}..."
-                    )
-                    last_log = time.time()
-
-            except Exception as e:
-                logger.warning(f"[ElasticAgentLoopManager] Error checking inflight: {e}")
-                break
-
-            await asyncio.sleep(0.5)
-
-        logger.warning(f"[ElasticAgentLoopManager] Drain timeout for {server_address} after {timeout}s")
+    def get_elastic_statistics(self) -> dict:
+        """Return elastic-specific counters for monitoring."""
+        return {
+            "elastic/num_elastic_replicas": len(self._elastic_replicas),
+            "elastic/total_adds": self._total_elastic_adds,
+            "elastic/total_removes": self._total_elastic_removes,
+            "elastic/last_add_time": self._last_elastic_add_time,
+            "elastic/last_remove_time": self._last_elastic_remove_time,
+            "elastic/replica_param_versions": dict(self._elastic_versions),
+        }
 
     def get_active_server_count(self) -> int:
-        """Get number of currently active rollout servers."""
-        fixed_count = len(self.rollout_replicas) if hasattr(self, "rollout_replicas") else 0
-        elastic_count = len(self._elastic_replicas)
-        return fixed_count + elastic_count
+        """Total active rollout servers (fixed + elastic)."""
+        fixed = len(self.rollout_replicas) if hasattr(self, "rollout_replicas") else 0
+        return fixed + len(self._elastic_replicas)
 
     def get_server_info(self) -> list[dict]:
-        """Get information about all active servers."""
+        """Metadata for all active rollout servers."""
         servers = []
-
-        # Fixed servers
         if hasattr(self, "rollout_replicas"):
             for replica in self.rollout_replicas:
                 servers.append(
@@ -382,15 +353,75 @@ class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
                         "is_elastic": False,
                     }
                 )
-
-        # Elastic servers
-        for address, replica in self._elastic_replicas.items():
+        for rid, address in self._elastic_addresses.items():
             servers.append(
                 {
                     "address": address,
+                    "resource_id": rid,
                     "type": "elastic",
                     "is_elastic": True,
                 }
             )
-
         return servers
+
+    # -------------------------------------------------------------------------
+    # Private helpers
+    # -------------------------------------------------------------------------
+
+    async def _notify_workers_server_added(self, server_address: str, server_handle) -> None:
+        """Notify all AgentLoopWorkers that a new server is available."""
+        if not getattr(self, "agent_loop_workers", None):
+            return
+        futures = []
+        for worker in self.agent_loop_workers:
+            try:
+                futures.append(worker.add_server.remote(server_address, server_handle))
+            except AttributeError:
+                logger.debug("[ElasticAgentLoopManager] Worker doesn't support add_server()")
+        if futures:
+            results = await asyncio.gather(
+                *[asyncio.wrap_future(f.future()) for f in futures],
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning(f"[ElasticAgentLoopManager] Worker add_server failed: {result}")
+
+    async def _notify_workers_server_removed(self, server_address: str) -> None:
+        """Notify all AgentLoopWorkers that a server is no longer available."""
+        if not getattr(self, "agent_loop_workers", None):
+            return
+        futures = []
+        for worker in self.agent_loop_workers:
+            try:
+                futures.append(worker.remove_server.remote(server_address))
+            except AttributeError:
+                logger.debug("[ElasticAgentLoopManager] Worker doesn't support remove_server()")
+        if futures:
+            await asyncio.gather(
+                *[asyncio.wrap_future(f.future()) for f in futures],
+                return_exceptions=True,
+            )
+
+    async def _drain_server(self, server_address: str, timeout: float = 30.0) -> None:
+        """Wait for in-flight requests to drain from a server (optional helper)."""
+        start = time.time()
+        last_log = start
+        while time.time() - start < timeout:
+            try:
+                inflight = ray.get(self.global_load_balancer.get_inflight_count.remote(server_id=server_address))
+                if inflight == 0:
+                    logger.info(
+                        f"[ElasticAgentLoopManager] Server {server_address} drained in {time.time() - start:.1f}s"
+                    )
+                    return
+                if time.time() - last_log > 5.0:
+                    logger.info(
+                        f"[ElasticAgentLoopManager] Waiting for {inflight} in-flight requests on {server_address}..."
+                    )
+                    last_log = time.time()
+            except Exception as e:
+                logger.warning(f"[ElasticAgentLoopManager] Error checking inflight: {e}")
+                break
+            await asyncio.sleep(0.5)
+        logger.warning(f"[ElasticAgentLoopManager] Drain timeout for {server_address} after {timeout}s")
