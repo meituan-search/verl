@@ -32,7 +32,7 @@ class TestElasticResourceConfig:
         # Skip if peft is not available (needed for full module import)
         pytest.importorskip("peft", reason="peft module required for full module import")
 
-        from verl.experimental.elastic_scheduling.resource_manager import (
+        from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
             ElasticResourceConfig,
         )
 
@@ -51,7 +51,7 @@ class TestElasticResourceConfig:
 
         pytest.importorskip("peft", reason="peft module required for full module import")
 
-        from verl.experimental.elastic_scheduling.resource_manager import (
+        from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
             ElasticResourceConfig,
         )
 
@@ -73,7 +73,7 @@ class TestHybridEngineMode:
 
     def test_mode_values(self):
         """Test enum values"""
-        from verl.experimental.elastic_scheduling.resource_manager import (
+        from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
             HybridEngineMode,
         )
 
@@ -90,7 +90,7 @@ class TestHybridEngineResource:
 
     def test_resource_creation(self):
         """Test creating a resource"""
-        from verl.experimental.elastic_scheduling.resource_manager import (
+        from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
             HybridEngineMode,
             HybridEngineResource,
         )
@@ -110,7 +110,7 @@ class TestHybridEngineResource:
 
     def test_resource_mode_properties(self):
         """Test mode properties"""
-        from verl.experimental.elastic_scheduling.resource_manager import (
+        from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
             HybridEngineMode,
             HybridEngineResource,
         )
@@ -135,7 +135,7 @@ class TestElasticResourceManager:
 
     def test_initialization(self):
         """Test manager initialization"""
-        from verl.experimental.elastic_scheduling.resource_manager import (
+        from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
             ElasticResourceConfig,
             ElasticResourceManager,
         )
@@ -158,7 +158,7 @@ class TestElasticResourceManager:
 
     def test_initial_modes(self):
         """Test initial resource modes"""
-        from verl.experimental.elastic_scheduling.resource_manager import (
+        from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
             ElasticResourceConfig,
             ElasticResourceManager,
             HybridEngineMode,
@@ -178,7 +178,7 @@ class TestElasticResourceManager:
 
     def test_get_active_count(self):
         """Test getting active resource counts"""
-        from verl.experimental.elastic_scheduling.resource_manager import (
+        from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
             ElasticResourceConfig,
             ElasticResourceManager,
         )
@@ -204,7 +204,7 @@ class TestElasticResourceManager:
 
     def test_cooldown(self):
         """Test switch cooldown mechanism"""
-        from verl.experimental.elastic_scheduling.resource_manager import (
+        from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
             ElasticResourceConfig,
             ElasticResourceManager,
         )
@@ -224,7 +224,7 @@ class TestElasticResourceManager:
         assert manager._can_switch(resource.resource_id) is True
 
         # Add a switch record
-        from verl.experimental.elastic_scheduling.resource_manager import HybridEngineMode, SwitchRecord
+        from verl.experimental.elastic_scheduling.model_engine.resource_manager import HybridEngineMode, SwitchRecord
 
         manager._switch_history.append(
             SwitchRecord(
@@ -240,7 +240,7 @@ class TestElasticResourceManager:
 
     def test_register_worker(self):
         """Test worker registration"""
-        from verl.experimental.elastic_scheduling.resource_manager import (
+        from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
             ElasticResourceConfig,
             ElasticResourceManager,
         )
@@ -263,7 +263,7 @@ class TestElasticResourceManager:
 
     def test_get_status_summary(self):
         """Test status summary"""
-        from verl.experimental.elastic_scheduling.resource_manager import (
+        from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
             ElasticResourceConfig,
             ElasticResourceManager,
         )
@@ -376,7 +376,7 @@ class TestResourceCoordinator:
             CongestionMonitor,
             ResourceCoordinator,
         )
-        from verl.experimental.elastic_scheduling.resource_manager import (
+        from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
             ElasticResourceConfig,
             ElasticResourceManager,
         )
@@ -407,7 +407,7 @@ class TestResourceCoordinator:
             CongestionMonitor,
             ResourceCoordinator,
         )
-        from verl.experimental.elastic_scheduling.resource_manager import (
+        from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
             ElasticResourceConfig,
             ElasticResourceManager,
         )

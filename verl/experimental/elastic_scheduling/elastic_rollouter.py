@@ -47,7 +47,7 @@ from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.utils import Role, WorkerType
 
 if TYPE_CHECKING:
-    from verl.experimental.elastic_scheduling.elastic_agent_loop import ElasticAgentLoopManager
+    from verl.experimental.elastic_scheduling.agent_loop.elastic_agent_loop import ElasticAgentLoopManager
 
 logger = logging.getLogger(__name__)
 

@@ -332,7 +332,7 @@ class MegatronDPRebuildManager:
         """
         Capture model + optimizer state to CPU, then release GPU memory.
         """
-        from verl.experimental.elastic_scheduling.dynamic_dp_manager import (
+        from verl.experimental.elastic_scheduling.model_engine.dynamic_dp_manager import (
             ModelStateSnapshot,
             OptimizerStateSnapshot,
         )

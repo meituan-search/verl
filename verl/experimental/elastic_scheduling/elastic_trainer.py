@@ -239,23 +239,20 @@ class ElasticTrainer(FullyAsyncTrainer):
             )
 
             try:
-                # Collect all current training world ranks
-                current_dp_ranks = self._get_current_train_ranks()
+                # Collect all current training world ranks via ElasticActorWorker.get_global_rank()
+                current_dp_ranks = await self._get_current_train_ranks()
 
-                # Compute new world ranks
+                # Compute new world ranks using worker-group-level rank queries
                 add_ranks = []
                 for rid in self._pending_elastic_adds:
-                    if rid in self._elastic_actor_handles:
-                        handles = self._elastic_actor_handles[rid]
-                        # Get the global ranks of this worker group
-                        ranks = await self._get_worker_ranks(handles)
+                    if rid in self._elastic_actor_wgs:
+                        ranks = await self._get_worker_group_ranks(self._elastic_actor_wgs[rid])
                         add_ranks.extend(ranks)
 
                 remove_ranks = []
                 for rid in self._pending_elastic_removes:
-                    if rid in self._elastic_actor_handles:
-                        handles = self._elastic_actor_handles[rid]
-                        ranks = await self._get_worker_ranks(handles)
+                    if rid in self._elastic_actor_wgs:
+                        ranks = await self._get_worker_group_ranks(self._elastic_actor_wgs[rid])
                         remove_ranks.extend(ranks)
 
                 new_world_ranks = [r for r in (current_dp_ranks + add_ranks) if r not in remove_ranks]
@@ -305,54 +302,40 @@ class ElasticTrainer(FullyAsyncTrainer):
         """
         Coordinate DP group rebuild across all training workers.
 
-        This sends rebuild signals to:
-        1. Fixed actor worker group (actor_wg)
-        2. All existing elastic actor worker groups
-        3. New elastic worker groups being added
+        Broadcasts rebuild_dp_group(new_world_ranks) to every worker group
+        that participates in the new DP topology:
+          1. Fixed actor worker group (actor_wg)
+          2. Existing elastic actor groups that are NOT being removed
+          3. New elastic worker groups being added
 
-        All workers must participate simultaneously for the rebuild to succeed.
+        All workers must call rebuild_dp_group concurrently because the
+        underlying dist.new_group() is a collective that requires every
+        current-world-size rank to participate simultaneously.
+
+        The strategy-specific logic lives entirely in
+        ElasticActorWorker.rebuild_dp_group(); the trainer is strategy-agnostic.
 
         Args:
             new_world_ranks: Complete list of ranks in new DP group
             add_resource_ids: Resource IDs being added
             remove_resource_ids: Resource IDs being removed
         """
-        # Determine training strategy for rebuild routing
-        strategy = self.config.actor_rollout_ref.actor.strategy
-
         rebuild_futures = []
 
         # 1. Trigger rebuild on fixed actor workers
         if hasattr(self, "actor_wg") and self.actor_wg is not None:
-            rebuild_futures.append(
-                self._trigger_rebuild_on_worker_group(
-                    worker_group=self.actor_wg,
-                    new_world_ranks=new_world_ranks,
-                    strategy=strategy,
-                )
-            )
+            rebuild_futures.append(self._trigger_rebuild_on_worker_group(self.actor_wg, new_world_ranks))
 
         # 2. Trigger rebuild on existing elastic actor workers (not being removed)
         for rid, wg in self._elastic_actor_wgs.items():
             if rid not in remove_resource_ids:
-                rebuild_futures.append(
-                    self._trigger_rebuild_on_worker_group(
-                        worker_group=wg,
-                        new_world_ranks=new_world_ranks,
-                        strategy=strategy,
-                    )
-                )
+                rebuild_futures.append(self._trigger_rebuild_on_worker_group(wg, new_world_ranks))
 
         # 3. Trigger rebuild on new elastic workers being added
         for rid in add_resource_ids:
             if rid in self._elastic_actor_wgs:
-                wg = self._elastic_actor_wgs[rid]
                 rebuild_futures.append(
-                    self._trigger_rebuild_on_worker_group(
-                        worker_group=wg,
-                        new_world_ranks=new_world_ranks,
-                        strategy=strategy,
-                    )
+                    self._trigger_rebuild_on_worker_group(self._elastic_actor_wgs[rid], new_world_ranks)
                 )
 
         # Execute all rebuilds concurrently
@@ -367,56 +350,76 @@ class ElasticTrainer(FullyAsyncTrainer):
         self,
         worker_group: RayWorkerGroup,
         new_world_ranks: list[int],
-        strategy: str,
     ):
         """
         Trigger DP rebuild on a specific worker group.
 
-        Calls the appropriate rebuild method on each worker based on strategy.
+        Calls ElasticActorWorker.rebuild_dp_group(new_world_ranks) on every
+        worker in the group.  The strategy-specific logic (fsdp / fsdp2 /
+        megatron) is fully encapsulated in ElasticActorWorker; the trainer
+        does not need to know which strategy is in use.
+
+        Args:
+            worker_group: The RayWorkerGroup to broadcast the rebuild to.
+            new_world_ranks: Complete, ordered list of global ranks that form
+                the new data-parallel group.
         """
-        if strategy in ("fsdp2", "fsdp"):
-            # Call FSDP2 rebuild on all workers in the group
-            try:
-                futures = worker_group.execute_all(
-                    "rebuild_fsdp2_dp_group",
-                    new_world_ranks=new_world_ranks,
-                )
-                ray.get(futures)
-            except Exception as e:
-                logger.warning(
-                    f"[ElasticTrainer] FSDP2 rebuild call failed (method may not exist): {e}. "
-                    f"Falling back to coordinator-managed rebuild."
-                )
-        elif strategy == "megatron":
-            # Call Megatron rebuild on all workers in the group
-            try:
-                futures = worker_group.execute_all(
-                    "rebuild_megatron_dp_group",
-                    new_world_ranks=new_world_ranks,
-                )
-                ray.get(futures)
-            except Exception as e:
-                logger.warning(
-                    f"[ElasticTrainer] Megatron rebuild call failed (method may not exist): {e}. "
-                    f"Falling back to coordinator-managed rebuild."
-                )
+        try:
+            futures = worker_group.execute_all(
+                "rebuild_dp_group",
+                new_world_ranks=new_world_ranks,
+            )
+            ray.get(futures)
+        except Exception as e:
+            logger.error(f"[ElasticTrainer] rebuild_dp_group failed on worker group: {e}")
+            raise
 
-    def _get_current_train_ranks(self) -> list[int]:
-        """Get global ranks of all current training workers."""
-        all_ranks = []
+    async def _get_current_train_ranks(self) -> list[int]:
+        """
+        Get global ranks of all current fixed training workers.
 
-        # Get ranks from fixed actor worker group
-        if hasattr(self, "actor_wg") and self.actor_wg is not None:
-            try:
-                # Try to get ranks via worker group API
-                all_ranks.extend(range(self.actor_wg.world_size))
-            except Exception:
-                pass
+        Calls ElasticActorWorker.get_global_rank() on each worker in the
+        fixed actor worker group.  Returns the sorted unique rank list.
+        """
+        if not (hasattr(self, "actor_wg") and self.actor_wg is not None):
+            return []
+        return await self._get_worker_group_ranks(self.actor_wg)
 
-        return all_ranks
+    async def _get_worker_group_ranks(self, worker_group: RayWorkerGroup) -> list[int]:
+        """
+        Query each worker in worker_group for its global rank.
+
+        Calls ElasticActorWorker.get_global_rank() on all workers via
+        worker_group.execute_all().  This replaces the old approach of
+        holding Ray actor handles separately.
+
+        Args:
+            worker_group: The RayWorkerGroup to query.
+
+        Returns:
+            Sorted list of global ranks reported by each worker.
+        """
+        try:
+            futures = worker_group.execute_all("get_global_rank")
+            ranks = ray.get(futures)
+            return sorted(set(ranks))
+        except Exception as e:
+            logger.warning(f"[ElasticTrainer] Could not get worker ranks: {e}")
+            return []
 
     async def _get_worker_ranks(self, handles: list) -> list[int]:
-        """Get global ranks of a list of Ray actor handles."""
+        """
+        Get global ranks from a list of elastic actor handles.
+
+        Kept for backward compatibility; prefer _get_worker_group_ranks() for
+        new code.  Calls get_global_rank.remote() on each handle directly.
+
+        Args:
+            handles: List of Ray actor handles (ElasticActorWorker instances).
+
+        Returns:
+            List of global ranks, one per handle.
+        """
         ranks = []
         try:
             rank_futures = [handle.get_global_rank.remote() for handle in handles]

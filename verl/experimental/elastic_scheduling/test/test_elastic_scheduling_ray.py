@@ -27,7 +27,7 @@ import ray
 
 def test_config_creation():
     """Test creating config with default values"""
-    from verl.experimental.elastic_scheduling.resource_manager import (
+    from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
         ElasticResourceConfig,
     )
 
@@ -44,7 +44,7 @@ def test_config_creation():
 
 def test_config_custom_values():
     """Test creating config with custom values"""
-    from verl.experimental.elastic_scheduling.resource_manager import (
+    from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
         ElasticResourceConfig,
     )
 
@@ -64,7 +64,7 @@ def test_config_custom_values():
 
 def test_mode_values():
     """Test enum values"""
-    from verl.experimental.elastic_scheduling.resource_manager import (
+    from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
         HybridEngineMode,
     )
 
@@ -79,7 +79,7 @@ def test_mode_values():
 
 def test_resource_creation():
     """Test creating a resource"""
-    from verl.experimental.elastic_scheduling.resource_manager import (
+    from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
         HybridEngineMode,
         HybridEngineResource,
     )
@@ -101,7 +101,7 @@ def test_resource_creation():
 
 def test_resource_mode_properties():
     """Test mode properties"""
-    from verl.experimental.elastic_scheduling.resource_manager import (
+    from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
         HybridEngineMode,
         HybridEngineResource,
     )
@@ -124,7 +124,7 @@ def test_resource_mode_properties():
 
 def test_manager_initialization():
     """Test manager initialization"""
-    from verl.experimental.elastic_scheduling.resource_manager import (
+    from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
         ElasticResourceConfig,
         ElasticResourceManager,
     )
@@ -149,7 +149,7 @@ def test_manager_initialization():
 
 def test_initial_modes():
     """Test initial resource modes"""
-    from verl.experimental.elastic_scheduling.resource_manager import (
+    from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
         ElasticResourceConfig,
         ElasticResourceManager,
         HybridEngineMode,
@@ -171,7 +171,7 @@ def test_initial_modes():
 
 def test_get_active_count():
     """Test getting active resource counts"""
-    from verl.experimental.elastic_scheduling.resource_manager import (
+    from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
         ElasticResourceConfig,
         ElasticResourceManager,
     )
@@ -199,7 +199,7 @@ def test_get_active_count():
 
 def test_cooldown():
     """Test switch cooldown mechanism"""
-    from verl.experimental.elastic_scheduling.resource_manager import (
+    from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
         ElasticResourceConfig,
         ElasticResourceManager,
         HybridEngineMode,
@@ -237,7 +237,7 @@ def test_cooldown():
 
 def test_register_worker():
     """Test worker registration"""
-    from verl.experimental.elastic_scheduling.resource_manager import (
+    from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
         ElasticResourceConfig,
         ElasticResourceManager,
     )
@@ -262,7 +262,7 @@ def test_register_worker():
 
 def test_get_status_summary():
     """Test status summary"""
-    from verl.experimental.elastic_scheduling.resource_manager import (
+    from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
         ElasticResourceConfig,
         ElasticResourceManager,
     )
@@ -377,7 +377,7 @@ def test_coordinator_creation():
         CongestionMonitor,
         ResourceCoordinator,
     )
-    from verl.experimental.elastic_scheduling.resource_manager import (
+    from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
         ElasticResourceConfig,
         ElasticResourceManager,
     )
@@ -410,7 +410,7 @@ def test_coordinator_status():
         CongestionMonitor,
         ResourceCoordinator,
     )
-    from verl.experimental.elastic_scheduling.resource_manager import (
+    from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
         ElasticResourceConfig,
         ElasticResourceManager,
     )

@@ -42,10 +42,13 @@ from typing import TYPE_CHECKING, Callable, Optional
 import ray
 
 # Import for type hints
-from .resource_manager import HybridEngineMode
+from verl.experimental.elastic_scheduling.model_engine.resource_manager import HybridEngineMode
 
 if TYPE_CHECKING:
-    from .resource_manager import ElasticResourceManager, HybridEngineResource
+    from verl.experimental.elastic_scheduling.model_engine.resource_manager import (
+        ElasticResourceManager,
+        HybridEngineResource,
+    )
 
 logger = logging.getLogger(__name__)
 
