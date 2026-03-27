@@ -19,8 +19,10 @@ Extends DetachActorWorker with all worker-side elastic operations:
 
   rebuild_dp_group(new_world_ranks)
       Rebuild the data-parallel communication group after elastic resources
-      join or leave training.  Strategy-specific implementations for fsdp /
-      fsdp2 and megatron are dispatched automatically.
+      join or leave training.  The call is **delegated to the engine**, which
+      must be one of the elastic engine classes from ``elastic_engines.py``
+      (e.g. ``ElasticFSDPEngine``, ``ElasticMegatronEngine``).  The worker
+      itself has no strategy-specific knowledge.
 
   get_global_rank()
       Return this worker's global rank so that ElasticTrainer can compute
@@ -28,8 +30,7 @@ Extends DetachActorWorker with all worker-side elastic operations:
 
 All elastic methods are registered with Dispatch.ONE_TO_ALL so that
 ElasticTrainer can broadcast the call to every worker in a worker group
-with a single worker_group.execute_all() call, keeping the trainer free
-of strategy-specific knowledge.
+with a single worker_group.execute_all() call.
 """
 
 import logging
@@ -48,14 +49,23 @@ class ElasticActorWorker(DetachActorWorker):
     """
     Worker class that adds elastic DP management on top of DetachActorWorker.
 
-    ElasticTrainer calls the three methods below (via worker_group.execute_all)
-    whenever elastic resources switch between training and rollout mode:
+    Design
+    ------
+    Strategy-specific DP rebuild logic is fully encapsulated inside the engine
+    (see ``elastic_engines.py``).  This worker acts only as a thin dispatcher:
 
-      rebuild_dp_group   – rebuild the DP process group after membership change
-      get_global_rank    – query this worker's global rank (for rank-list building)
+    * ``get_global_rank``   – returns ``dist.get_rank()`` for rank-list building.
+    * ``rebuild_dp_group``  – delegates to ``self.actor.engine.rebuild_dp_group()``.
 
-    All methods are decorated with Dispatch.ONE_TO_ALL so that they are
-    broadcast to every process in the worker group automatically.
+    The engine must be one of the ``Elastic*`` classes from ``elastic_engines.py``
+    (created by ``get_elastic_engine_cls``), which mixes in either
+    ``ElasticFSDPMixin`` or ``ElasticMegatronMixin`` depending on the strategy.
+    This means the worker never checks ``config.actor.strategy`` for the rebuild
+    path.
+
+    Both methods are decorated with ``Dispatch.ONE_TO_ALL`` so that
+    ElasticTrainer can broadcast calls to every worker in a group via a single
+    ``worker_group.execute_all()`` invocation.
     """
 
     # -------------------------------------------------------------------------
@@ -67,11 +77,11 @@ class ElasticActorWorker(DetachActorWorker):
         """
         Return this worker's global rank in the distributed process group.
 
-        ElasticTrainer calls this to build the new_world_ranks list before
+        ElasticTrainer calls this to build the ``new_world_ranks`` list before
         triggering a DP group rebuild.
 
         Returns:
-            int: torch.distributed global rank of this process.
+            int: ``torch.distributed`` global rank of this process.
         """
         return dist.get_rank()
 
@@ -82,137 +92,53 @@ class ElasticActorWorker(DetachActorWorker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def rebuild_dp_group(self, new_world_ranks: list[int]) -> None:
         """
-        Rebuild the data-parallel process group with a new set of ranks.
+        Rebuild the data-parallel process group.
 
-        Called by ElasticTrainer._trigger_rebuild_on_worker_group() after an
-        elastic resource joins or leaves the training pool.  All workers that
-        participate in the new DP group must call this method simultaneously.
+        Delegates to the engine object (``self.actor.engine``), which must
+        implement ``rebuild_dp_group`` via one of the elastic engine mixins
+        defined in ``elastic_engines.py``.
 
-        The implementation is delegated to a strategy-specific helper:
-          - fsdp / fsdp2  →  _rebuild_dp_group_fsdp(new_world_ranks)
-          - megatron       →  _rebuild_dp_group_megatron(new_world_ranks)
+        Collective-call contract
+        ~~~~~~~~~~~~~~~~~~~~~~~~
+        ``dist.new_group`` is a collective operation – **every** rank currently
+        in the global process group must call ``rebuild_dp_group`` simultaneously.
+        Ranks absent from ``new_world_ranks`` are expected to participate in the
+        collective and then return early (handled inside the engine mixin).
 
         Args:
             new_world_ranks: Complete, ordered list of global ranks that form
                 the new data-parallel group.
         """
-        strategy = self.config.actor.strategy
-        logger.info(
-            f"[ElasticActorWorker rank={dist.get_rank()}] rebuild_dp_group "
-            f"strategy={strategy} new_world_ranks={new_world_ranks}"
-        )
-
-        if strategy in ("fsdp", "fsdp2"):
-            self._rebuild_dp_group_fsdp(new_world_ranks)
-        elif strategy == "megatron":
-            self._rebuild_dp_group_megatron(new_world_ranks)
-        else:
-            raise NotImplementedError(
-                f"[ElasticActorWorker] rebuild_dp_group: unsupported strategy '{strategy}'. "
-                f"Supported: fsdp, fsdp2, megatron."
-            )
-
-    # -------------------------------------------------------------------------
-    # Strategy-specific DP rebuild helpers (not exposed as remote methods)
-    # -------------------------------------------------------------------------
-
-    def _rebuild_dp_group_fsdp(self, new_world_ranks: list[int]) -> None:
-        """
-        Rebuild the DP process group for FSDP / FSDP2 strategies.
-
-        Creates a new torch.distributed process group containing exactly the
-        ranks in new_world_ranks and re-registers it on self.device_mesh so
-        that subsequent FSDP all-reduce operations use the updated group.
-
-        Args:
-            new_world_ranks: Ordered list of global ranks in the new DP group.
-        """
         my_rank = dist.get_rank()
+        logger.info(f"[ElasticActorWorker rank={my_rank}] rebuild_dp_group new_world_ranks={new_world_ranks}")
 
-        # All *current* ranks must call new_group together, even those that
-        # are leaving the new group, to satisfy the NCCL collective contract.
-        new_dp_group = dist.new_group(ranks=new_world_ranks)
-
-        if my_rank not in new_world_ranks:
-            # This worker is being removed from the DP group; nothing more to do.
-            logger.info(f"[ElasticActorWorker rank={my_rank}] removed from DP group")
+        engine = self._get_engine()
+        if engine is None:
+            logger.warning(f"[ElasticActorWorker rank={my_rank}] No engine found; cannot rebuild DP group.")
             return
 
-        # Re-wire device_mesh so that the FSDP sharding group uses the new group.
-        # self.device_mesh is a DeviceMesh; for a 1-D mesh the single group is
-        # the DP group itself.  For 2-D (ddp × fsdp) the outer "ddp" dim is DP.
-        if hasattr(self, "device_mesh") and self.device_mesh is not None:
-            try:
-                if self.device_mesh.ndim == 1:
-                    # 1-D mesh: the single group IS the DP group
-                    self.device_mesh._dim_group_infos[0] = (new_dp_group, new_world_ranks)
-                elif self.device_mesh.ndim == 2:
-                    # 2-D mesh (ddp × fsdp): update the outer "ddp" dim
-                    self.device_mesh._dim_group_infos[0] = (new_dp_group, new_world_ranks)
-                logger.info(
-                    f"[ElasticActorWorker rank={my_rank}] FSDP device_mesh DP group updated "
-                    f"(new size={len(new_world_ranks)})"
-                )
-            except Exception as e:
-                logger.warning(
-                    f"[ElasticActorWorker rank={my_rank}] Could not update device_mesh directly: {e}. "
-                    f"New group created but mesh not patched."
-                )
-
-        # Barrier inside the new group to confirm all members are ready.
-        dist.barrier(group=new_dp_group)
-        logger.info(
-            f"[ElasticActorWorker rank={my_rank}] FSDP DP group rebuild complete (group size={len(new_world_ranks)})"
-        )
-
-    def _rebuild_dp_group_megatron(self, new_world_ranks: list[int]) -> None:
-        """
-        Rebuild the DP process group for the Megatron strategy.
-
-        Creates a new torch.distributed process group and updates Megatron's
-        model-parallel utilities (mpu) so that data-parallel collectives use
-        the rebuilt group.
-
-        Args:
-            new_world_ranks: Ordered list of global ranks in the new DP group.
-        """
-        try:
-            from megatron.core import mpu
-        except ImportError as exc:
-            raise RuntimeError(
-                "[ElasticActorWorker] Megatron-Core is not installed but "
-                "strategy='megatron' was requested for rebuild_dp_group."
-            ) from exc
-
-        my_rank = dist.get_rank()
-
-        # All current ranks must participate in new_group().
-        new_dp_group = dist.new_group(ranks=new_world_ranks)
-
-        if my_rank not in new_world_ranks:
-            logger.info(f"[ElasticActorWorker rank={my_rank}] removed from Megatron DP group")
-            return
-
-        # Patch Megatron's internal DP group reference.
-        try:
-            mpu.set_data_parallel_group(new_dp_group)
-            logger.info(
-                f"[ElasticActorWorker rank={my_rank}] Megatron DP group updated (new size={len(new_world_ranks)})"
+        if not callable(getattr(engine, "rebuild_dp_group", None)):
+            raise AttributeError(
+                f"[ElasticActorWorker rank={my_rank}] engine {type(engine).__name__} "
+                "does not implement rebuild_dp_group().  Make sure the engine was "
+                "created with get_elastic_engine_cls() from elastic_engines.py."
             )
-        except AttributeError:
-            # Older Megatron versions may not expose set_data_parallel_group;
-            # fall back to patching the private attribute directly.
-            if hasattr(mpu, "_DATA_PARALLEL_GROUP"):
-                mpu._DATA_PARALLEL_GROUP = new_dp_group
-                logger.info(f"[ElasticActorWorker rank={my_rank}] Patched mpu._DATA_PARALLEL_GROUP directly")
-            else:
-                logger.warning(
-                    f"[ElasticActorWorker rank={my_rank}] Cannot patch Megatron DP group: "
-                    f"mpu has no set_data_parallel_group or _DATA_PARALLEL_GROUP attribute."
-                )
 
-        dist.barrier(group=new_dp_group)
-        logger.info(
-            f"[ElasticActorWorker rank={my_rank}] Megatron DP group rebuild complete "
-            f"(group size={len(new_world_ranks)})"
-        )
+        engine.rebuild_dp_group(new_world_ranks)
+
+    # -------------------------------------------------------------------------
+    # Helpers
+    # -------------------------------------------------------------------------
+
+    def _get_engine(self):
+        """
+        Return the underlying training engine, if available.
+
+        Looks for ``self.actor.engine`` (set by ``TrainingWorker`` inside
+        ``engine_workers.py``).  Returns ``None`` when no actor is present
+        (e.g. rollout-only workers).
+        """
+        actor = getattr(self, "actor", None)
+        if actor is None:
+            return None
+        return getattr(actor, "engine", None)

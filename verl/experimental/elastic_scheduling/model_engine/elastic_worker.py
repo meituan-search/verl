@@ -322,7 +322,7 @@ class MegatronDPRebuildManager:
         self.model = model
         self.optimizer = optimizer
 
-        # CPU state snapshots (reuse from dynamic_dp_manager)
+        # CPU state snapshots
         self._model_snapshot = None
         self._optimizer_snapshot = None
         self._model_on_gpu = True
@@ -332,19 +332,14 @@ class MegatronDPRebuildManager:
         """
         Capture model + optimizer state to CPU, then release GPU memory.
         """
-        from verl.experimental.elastic_scheduling.model_engine.dynamic_dp_manager import (
-            ModelStateSnapshot,
-            OptimizerStateSnapshot,
-        )
-
         logger.info(f"[MegatronRebuild][Rank {dist.get_rank()}] Capturing state to CPU...")
 
-        self._model_snapshot = ModelStateSnapshot.from_model(self.model)
-        self._optimizer_snapshot = OptimizerStateSnapshot.from_optimizer(self.optimizer)
-
-        # Offload to CPU
+        # Offload to CPU; state is referenced via self.model / self.optimizer
         self._offload_model_to_cpu()
         self._offload_optimizer_to_cpu()
+
+        self._model_snapshot = True  # mark as captured
+        self._optimizer_snapshot = True
 
         torch.cuda.empty_cache()
         gc.collect()
@@ -442,7 +437,6 @@ class MegatronDPRebuildManager:
             for param in unwrapped.parameters():
                 param.data = param.data.cuda()
 
-            self._model_snapshot.to_model(self.model, device="cuda")
             self._model_on_gpu = True
 
         # Load optimizer back to GPU
