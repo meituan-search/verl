@@ -1100,23 +1100,21 @@ class ElasticCoordinator:
                     if isinstance(result, Exception):
                         logger.warning(f"[ElasticCoordinator] Worker switch result error: {result}")
 
-        # Step 3: Create rollout replica from worker handles and add to rollouter
-        # The replica wraps the workers for rollout scheduling
+        # Step 3: Activate the pre-registered elastic replica in the rollouter.
+        # The replica was pre-registered via ElasticAgentLoopManager.create() at
+        # initialisation time; we only need to pass resource_id + param_version.
         try:
-            rollout_replica = await self._create_rollout_replica_from_handles(resource_id, resource_info.worker_handles)
-            if rollout_replica is not None:
-                success = await asyncio.wrap_future(
-                    self.rollouter.add_elastic_replica.remote(
-                        resource_id=resource_id,
-                        replica=rollout_replica,
-                        param_version=resource_info.param_version,
-                    ).future()
-                )
-                if success:
-                    resource_info.rollout_replica = rollout_replica
+            success = await asyncio.wrap_future(
+                self.rollouter.add_elastic_replica.remote(
+                    resource_id=resource_id,
+                    param_version=resource_info.param_version,
+                ).future()
+            )
+            if not success:
+                logger.warning(f"[ElasticCoordinator] Rollouter add_elastic_replica failed for {resource_id}")
 
         except Exception as e:
-            logger.error(f"[ElasticCoordinator] Failed to add {resource_id} to rollouter: {e}")
+            logger.error(f"[ElasticCoordinator] Failed to activate {resource_id} in rollouter: {e}")
             raise
 
         # Update state

@@ -19,6 +19,23 @@ Thin extension of FullyAsyncRollouter that:
 - Overrides _init_async_rollout_manager to use ElasticAgentLoopManager
 - Delegates all elastic replica lifecycle to ElasticAgentLoopManager
 - Keeps ElasticRollouter focused on sample production, not server management
+
+Resource model
+--------------
+ElasticRollouter manages two kinds of rollout resources simultaneously:
+
+  Fixed standalone replicas  (managed by base class)
+    Always-on rollout servers with their own GPU pool, initialised via
+    init_standalone() during start-up.  Never touched by add/remove_elastic_replica.
+
+  Elastic hybrid replicas  (managed by ElasticAgentLoopManager)
+    Share GPUs with the training engine (elastic_worker_group).
+    RolloutReplica objects are created and initialised (init_hybrid) inside
+    ElasticAgentLoopManager.create() from the elastic_worker_group returned by
+    _get_elastic_worker_group().  After initialisation they are put to sleep.
+    They start sleeping and are activated / deactivated on demand:
+      add_elastic_replica(resource_id):    wake_up() → LB register
+      remove_elastic_replica(resource_id): abort → LB cleanup → sleep()
 """
 
 import logging
@@ -31,7 +48,6 @@ from verl.trainer.ppo.utils import Role, WorkerType
 
 if TYPE_CHECKING:
     from verl.experimental.elastic_scheduling.elastic_agent_loop import ElasticAgentLoopManager
-    from verl.workers.rollout.replica import RolloutReplica
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +96,17 @@ class ElasticRollouter(FullyAsyncRollouter):
     # -------------------------------------------------------------------------
 
     async def _init_async_rollout_manager(self):
-        """Use ElasticAgentLoopManager instead of FullyAsyncAgentLoopManager."""
+        """
+        Use ElasticAgentLoopManager instead of FullyAsyncAgentLoopManager.
+
+        Fixed standalone replicas are created by the base class initialisation
+        (worker_group=None → init_standalone for each replica).
+
+        Elastic hybrid replicas are created inside ElasticAgentLoopManager.create()
+        from the elastic_worker_group returned by _get_elastic_worker_group().
+        Subclasses that have elastic resources should override that hook to
+        return the relevant worker group.
+        """
         enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
         reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
 
@@ -91,28 +117,41 @@ class ElasticRollouter(FullyAsyncRollouter):
             config=self.config,
             worker_group=self.rollout_wg,
             reward_loop_worker_handles=reward_loop_worker_handles,
+            elastic_worker_group=self._get_elastic_worker_group(),
         )
         logger.info(
             f"[ElasticRollouter] ElasticAgentLoopManager initialised with "
-            f"{len(self.async_rollout_manager.rollout_replicas)} fixed replicas"
+            f"{len(self.async_rollout_manager.rollout_replicas)} fixed replicas, "
+            f"{len(self.async_rollout_manager._registered_elastic_replicas)} elastic replicas registered (sleeping)"
         )
+
+    def _get_elastic_worker_group(self) -> "RayWorkerGroup | None":
+        """
+        Return the worker group for elastic hybrid replicas.
+
+        Override this method in subclasses that have elastic resources.  The
+        returned worker group is passed to ElasticAgentLoopManager.create(),
+        which will create RolloutReplica objects via init_hybrid() and
+        immediately sleep them.
+        The default returns None (no elastic replicas at start).
+        """
+        return None
 
     # -------------------------------------------------------------------------
     # Elastic replica management – thin delegation to async_rollout_manager
     # -------------------------------------------------------------------------
 
-    async def add_elastic_replica(
-        self,
-        resource_id: str,
-        replica: "RolloutReplica",
-        param_version: int,
-    ) -> bool:
+    async def add_elastic_replica(self, resource_id: str, param_version: int) -> bool:
         """
-        Add an elastic rollout replica.  Fully handled by ElasticAgentLoopManager.
+        Activate a pre-registered elastic hybrid replica.
+
+        The replica must have been supplied via _get_elastic_replicas() at
+        initialisation time.  ElasticAgentLoopManager will wake_up() the server
+        and register it with the load balancer.
 
         Also adjusts max_concurrent_samples to account for the new replica.
         """
-        ok = await self.async_rollout_manager.add_elastic_replica(resource_id, replica, param_version)
+        ok = await self.async_rollout_manager.add_elastic_replica(resource_id, param_version)
         if ok and self.max_concurrent_samples is not None:
             async with self.lock:
                 self.max_concurrent_samples += 16  # ~16 slots per replica
@@ -120,7 +159,11 @@ class ElasticRollouter(FullyAsyncRollouter):
 
     async def remove_elastic_replica(self, resource_id: str) -> bool:
         """
-        Remove an elastic rollout replica.  Fully handled by ElasticAgentLoopManager.
+        Deactivate an active elastic hybrid replica.
+
+        ElasticAgentLoopManager will abort in-flight requests, deregister from
+        the LB, then sleep() the server to return GPUs to the training engine.
+        The replica remains pre-registered and can be re-activated later.
 
         Also adjusts max_concurrent_samples.
         """

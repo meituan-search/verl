@@ -156,16 +156,37 @@ class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
     """
     Elastic Agent Loop Manager with dynamic server management.
 
-    Extends FullyAsyncAgentLoopManager to support:
-    1. Adding elastic rollout replicas when resources switch to rollout mode
-    2. Removing elastic rollout replicas when resources switch to training mode
-    3. Centralised tracking of replica lifecycle, param versions, and statistics
+    Extends FullyAsyncAgentLoopManager with the ability to dynamically add and
+    remove hybrid (shared-GPU) rollout replicas at runtime.
 
-    All state for elastic replicas lives here; ElasticRollouter is a thin
-    delegation layer that calls add_elastic_replica / remove_elastic_replica.
+    Resource model
+    --------------
+    ElasticRollouter manages two kinds of resources simultaneously:
+
+    Fixed standalone replicas
+        Always-on rollout servers with their own GPU pool (init_standalone).
+        Created during initialisation by the base AgentLoopManager.create().
+        These are the ordinary rollout workers and are never touched by the
+        elastic add/remove API.
+
+    Elastic hybrid replicas
+        Share GPUs with the training engine (elastic_worker_group).
+        Their RolloutReplica objects are created and initialised (init_hybrid)
+        inside ElasticAgentLoopManager.create() using the provided
+        elastic_worker_group.  After initialisation they are put to sleep so
+        the training engine can reclaim their GPUs.
+        They start in a sleeping state and are NOT added to the active LB pool
+        until add_elastic_replica() is called.
+
+    Dynamic lifecycle (hybrid replicas only)
+        add_elastic_replica():    wake_up() → register with LB
+        remove_elastic_replica(): abort in-flight → LB cleanup → sleep()
+
+    Use ElasticAgentLoopManager.create() (not the base create()) so that the
+    elastic replicas are created and registered during initialisation.
 
     Ordering guarantee for partial-rollout auto-resume on removal:
-      LB mark-removing → workers remove handle → abort_all_requests → LB cleanup
+      LB mark-removing → workers remove handle → abort_all_requests → LB cleanup → sleep()
     """
 
     def __init__(
@@ -186,18 +207,139 @@ class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
             teacher_model_manager=teacher_model_manager,
             reward_loop_worker_handles=reward_loop_worker_handles,
         )
-        # resource_id -> RolloutReplica
+        # resource_id -> RolloutReplica  (hybrid elastic replicas only)
         self._elastic_replicas: dict[str, RolloutReplica] = {}
-        # resource_id -> server_address (for LB / worker notification)
+        # resource_id -> server_address  (for LB / worker notification)
         self._elastic_addresses: dict[str, str] = {}
         # resource_id -> param_version
         self._elastic_versions: dict[str, int] = {}
+
+        # Pre-registered elastic replicas: bound at init time but still sleeping.
+        # Keyed by resource_id; populated by create() before add_elastic_replica().
+        self._registered_elastic_replicas: dict[str, RolloutReplica] = {}
 
         # Timing / counters
         self._total_elastic_adds: int = 0
         self._total_elastic_removes: int = 0
         self._last_elastic_add_time: float = 0.0
         self._last_elastic_remove_time: float = 0.0
+
+    @classmethod
+    async def create(
+        cls,
+        config: DictConfig,
+        worker_group: RayWorkerGroup = None,
+        rollout_resource_pool=None,
+        reward_loop_worker_handles: list = None,
+        teacher_model_manager=None,
+        elastic_worker_group: RayWorkerGroup | None = None,
+    ) -> "ElasticAgentLoopManager":
+        """
+        Create an ElasticAgentLoopManager.
+
+        This overrides AgentLoopManager.create() to additionally create and
+        register hybrid elastic replicas from elastic_worker_group.  Replicas
+        are instantiated and initialised (init_hybrid) here, then put to sleep
+        so the training engine can reclaim their GPUs.  add_elastic_replica()
+        later wakes them up on demand.
+
+        Fixed standalone replicas are initialised by the base class as usual
+        (init_standalone when worker_group is None, init_hybrid otherwise).
+
+        Args:
+            config: Full training configuration.
+            worker_group: ActorRolloutRef worker group for fixed standalone
+                replicas; None means standalone mode for the fixed pool.
+            rollout_resource_pool: Resource pool for hybrid fixed replicas
+                (TRT-LLM colocated mode).
+            reward_loop_worker_handles: Actor handles for streaming reward
+                computation.
+            teacher_model_manager: Manager for distillation teacher servers.
+            elastic_worker_group: Worker group whose GPUs are shared with the
+                training engine and will be used for elastic hybrid replicas.
+                RolloutReplica objects are created and initialised via
+                init_hybrid() inside this method, then immediately put to sleep.
+                Pass None (default) when there are no elastic resources.
+
+        Returns:
+            Fully initialised ElasticAgentLoopManager.
+        """
+        instance = cls(
+            config=config,
+            worker_group=worker_group,
+            rollout_resource_pool=rollout_resource_pool,
+            teacher_model_manager=teacher_model_manager,
+            reward_loop_worker_handles=reward_loop_worker_handles,
+        )
+        await instance._initialize_llm_servers()
+        await instance._init_global_load_balancer()
+        await instance._init_agent_loop_workers()
+
+        # Create elastic hybrid replicas from elastic_worker_group, initialise
+        # them via init_hybrid(), then sleep them so the training engine can
+        # reclaim GPU memory.  They are kept in _registered_elastic_replicas
+        # and activated on demand via add_elastic_replica().
+        if elastic_worker_group is not None:
+            await instance._initialize_elastic_replicas(elastic_worker_group)
+
+        logger.info(
+            f"[ElasticAgentLoopManager] Created: "
+            f"{len(instance.rollout_replicas)} fixed replicas, "
+            f"{len(instance._registered_elastic_replicas)} elastic replicas registered (sleeping)"
+        )
+        return instance
+
+    async def _initialize_elastic_replicas(self, elastic_worker_group: RayWorkerGroup) -> None:
+        """
+        Create, initialise (init_hybrid), and sleep elastic hybrid replicas.
+
+        Called internally by create() when elastic_worker_group is provided.
+        Each replica is assigned a contiguous slice of workers from
+        elastic_worker_group in the same way _initialize_llm_servers() slices
+        the fixed worker_group.
+
+        After init_hybrid() the replica is immediately put to sleep so that
+        the training engine can use the shared GPUs.  The replica is stored in
+        _registered_elastic_replicas keyed by "elastic_{replica_rank}" and can
+        be activated later via add_elastic_replica().
+
+        Args:
+            elastic_worker_group: Worker group whose workers back the elastic
+                hybrid replicas.  Must already be fully initialised.
+        """
+        rollout_world_size = (
+            self.rollout_config.tensor_model_parallel_size
+            * self.rollout_config.data_parallel_size
+            * self.rollout_config.pipeline_model_parallel_size
+        )
+        num_elastic_replicas = elastic_worker_group.world_size // rollout_world_size
+
+        elastic_replicas = [
+            self.rollout_replica_class(
+                replica_rank=replica_rank,
+                config=self.rollout_config,
+                model_config=self.model_config,
+                gpus_per_node=self.rollout_config.n_gpus_per_node,
+            )
+            for replica_rank in range(num_elastic_replicas)
+        ]
+
+        # Initialise all replicas concurrently.
+        await asyncio.gather(*[replica.init_hybrid(elastic_worker_group) for replica in elastic_replicas])
+
+        # Immediately sleep so the training engine can reclaim GPU memory.
+        await asyncio.gather(*[replica.sleep() for replica in elastic_replicas])
+
+        # Register without activating in the LB pool.
+        for replica_rank, replica in enumerate(elastic_replicas):
+            resource_id = f"elastic_{replica_rank}"
+            self._registered_elastic_replicas[resource_id] = replica
+            logger.info(
+                f"[ElasticAgentLoopManager] Elastic replica '{resource_id}' initialised "
+                f"at {replica._server_address} (sleeping, not yet in LB pool)"
+            )
+
+        logger.info(f"[ElasticAgentLoopManager] {num_elastic_replicas} elastic replicas initialised and sleeping")
 
     # -------------------------------------------------------------------------
     # Override: use ElasticGlobalRequestLoadBalancer
@@ -220,45 +362,59 @@ class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
     async def add_elastic_replica(
         self,
         resource_id: str,
-        replica: "RolloutReplica",
         param_version: int,
     ) -> bool:
         """
-        Add an elastic rollout replica to the production pool.
+        Activate a pre-registered elastic hybrid replica and add it to the
+        active server pool.
 
-        Initialises the replica if needed, registers it with the load balancer,
-        notifies all AgentLoopWorkers, and records tracking state.
+        The replica must have been pre-registered via the elastic_replicas
+        argument of ElasticAgentLoopManager.create().  Its server is already
+        bound to the shared resource pool (init_hybrid / init_colocated) and is
+        currently sleeping.  This method:
+          1. wake_up() — restores model weights / kv-cache
+          2. Registers the server with the load balancer
+          3. Notifies all AgentLoopWorkers
 
         Args:
-            resource_id: Unique identifier for the elastic resource.
-            replica: RolloutReplica already switched to rollout mode.
-            param_version: Parameter version the replica was synced to.
+            resource_id: Unique identifier of the elastic resource to activate.
+            param_version: Parameter version the replica has been synced to.
 
         Returns:
-            True on success, False on failure.
+            True on success, False on failure (e.g. not pre-registered, already active).
         """
         if resource_id in self._elastic_replicas:
-            logger.warning(f"[ElasticAgentLoopManager] Replica {resource_id} already registered, skipping")
+            logger.warning(f"[ElasticAgentLoopManager] Replica '{resource_id}' already active, skipping")
             return False
 
-        logger.info(f"[ElasticAgentLoopManager] Adding elastic replica {resource_id} (param_version={param_version})")
-        try:
-            # Ensure replica is initialised
-            server_address = getattr(replica, "_server_address", None)
-            server_handle = getattr(replica, "_server_handle", None)
-            if server_address is None or server_handle is None:
-                logger.info(f"[ElasticAgentLoopManager] Initialising replica {resource_id}...")
-                await replica.init_standalone()
-                server_address = replica._server_address
-                server_handle = replica._server_handle
+        replica = self._registered_elastic_replicas.get(resource_id)
+        if replica is None:
+            logger.error(
+                f"[ElasticAgentLoopManager] Replica '{resource_id}' is not registered. "
+                f"Elastic replicas are created inside ElasticAgentLoopManager.create() "
+                f"via elastic_worker_group; ensure that argument was provided."
+            )
+            return False
 
-            # 1. Register with load balancer
+        server_address = replica._server_address
+        server_handle = replica._server_handle
+
+        logger.info(
+            f"[ElasticAgentLoopManager] Activating elastic replica '{resource_id}' "
+            f"at {server_address} (param_version={param_version})"
+        )
+        try:
+            # 1. Wake up: restore model weights / kv-cache on the shared GPU pool.
+            await replica.wake_up()
+            logger.info(f"[ElasticAgentLoopManager] Replica '{resource_id}' woken up at {server_address}")
+
+            # 2. Register with load balancer.
             await self.global_load_balancer.add_server.remote(server_id=server_address)
 
-            # 2. Notify AgentLoopWorkers
+            # 3. Notify AgentLoopWorkers.
             await self._notify_workers_server_added(server_address, server_handle)
 
-            # 3. Record state
+            # 4. Record active state.
             self._elastic_replicas[resource_id] = replica
             self._elastic_addresses[resource_id] = server_address
             self._elastic_versions[resource_id] = param_version
@@ -266,32 +422,39 @@ class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
             self._last_elastic_add_time = time.time()
 
             logger.info(
-                f"[ElasticAgentLoopManager] Replica {resource_id} added at {server_address}. "
-                f"Total elastic: {len(self._elastic_replicas)}"
+                f"[ElasticAgentLoopManager] Replica '{resource_id}' added at {server_address}. "
+                f"Active elastic replicas: {len(self._elastic_replicas)}"
             )
             return True
 
         except Exception as e:
-            logger.error(f"[ElasticAgentLoopManager] Failed to add replica {resource_id}: {e}")
+            logger.error(f"[ElasticAgentLoopManager] Failed to activate replica '{resource_id}': {e}")
             return False
 
     async def remove_elastic_replica(self, resource_id: str) -> bool:
         """
-        Remove an elastic rollout replica from the production pool.
+        Deactivate an active elastic hybrid replica and return its GPUs to the
+        training engine.
+
+        "Removal" means sleeping the server so model weights / kv-cache are
+        released and the shared GPU pool can be reclaimed by the training engine.
+        The replica object is NOT destroyed; it remains in _registered_elastic_replicas
+        and can be re-activated later via add_elastic_replica().
 
         Ordering is critical for partial-rollout auto-resume:
           1. LB: mark server as removing (no NEW requests)
-          2. Workers: remove server handle BEFORE abort
-          3. abort_all_requests() → FullyAsyncLLMServerManager catches
-             stop_reason="aborted" and re-submits with already-generated
-             tokens → auto-resume on a healthy server
+          2. Workers: remove server handle BEFORE abort, so that when
+             FullyAsyncLLMServerManager retries after stop_reason="aborted" the
+             dead handle is already gone and traffic re-routes to healthy servers.
+          3. abort_all_requests() → triggers partial-rollout resume
           4. LB: full cleanup
+          5. sleep() — releases model weights / kv-cache; GPUs returned to trainer
 
         Args:
-            resource_id: Unique identifier of the elastic resource to remove.
+            resource_id: Unique identifier of the elastic resource to deactivate.
 
         Returns:
-            True on success, False if resource_id not found.
+            True on success, False if resource_id is not currently active.
         """
         if resource_id not in self._elastic_replicas:
             logger.warning(f"[ElasticAgentLoopManager] Replica {resource_id} not found, skipping")
@@ -320,6 +483,16 @@ class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
 
             # Step 4: Full LB cleanup
             await self.global_load_balancer.cleanup_removed_server.remote(server_id=server_address)
+
+            # Step 5: Sleep the replica to release model weights / kv-cache so the
+            #         training engine can reclaim the shared GPUs.
+            try:
+                await replica.sleep()
+                logger.info(
+                    f"[ElasticAgentLoopManager] Replica '{resource_id}' put to sleep; GPUs released for training engine"
+                )
+            except Exception as e:
+                logger.warning(f"[ElasticAgentLoopManager] Error sleeping replica '{resource_id}': {e}")
 
             # Remove tracking state
             self._elastic_replicas.pop(resource_id)
