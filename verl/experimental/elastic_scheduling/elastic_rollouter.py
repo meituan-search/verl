@@ -26,8 +26,6 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
-import ray
-
 from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncRollouter
 from verl.single_controller.ray import RayWorkerGroup
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
@@ -39,7 +37,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@ray.remote(num_cpus=10, max_concurrency=100)
 class ElasticRollouter(FullyAsyncRollouter):
     """
     Elastic Rollouter with dynamic DP management.

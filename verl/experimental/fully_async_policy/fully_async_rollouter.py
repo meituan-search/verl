@@ -39,7 +39,6 @@ from verl.utils.profiler import marked_timer
 from verl.utils.tracking import ValidationGenerationsLogger
 
 
-@ray.remote(num_cpus=10, max_concurrency=100)
 class FullyAsyncRollouter(SeparateRayPPOTrainer):
     """
     Asynchronous sample generator, responsible for continuously generating training samples

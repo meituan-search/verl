@@ -627,6 +627,218 @@ def test_real_model_memory_offload(model_path: str):
 
 
 # ============================================================================
+# Test R6: 真实模型 DP rebuild scale down（DP=4 → DP=2）
+# ============================================================================
+
+
+def test_real_model_dp_rebuild_scale_down(model_path: str):
+    """
+    验证真实模型下 DP 缩容：DP=4 → DP=2。
+
+    实现原理：Megatron 的 dp_size = dist.get_world_size() / (tp * pp)。
+    在 world_size=4 的环境下：
+      - tp=1, pp=1  →  dp = 4/1/1 = 4
+      - tp=2, pp=1  →  dp = 4/2/1 = 2  ← 通过增大 tp 来实现 dp 缩容
+
+    本测试流程：
+    1. 以 tp=1（dp=4）初始化
+    2. 加载真实模型权重
+    3. rebuild(tensor_model_parallel_size=2)  →  dp 从 4 缩容到 2
+    4. 验证 dp_size == 2
+    5. 验证参数在 Offload + Restore 流程中保持正确
+    """
+    from megatron.core import parallel_state
+
+    _ew_mod = sys.modules["verl.experimental.elastic_scheduling.elastic_worker"]
+    MegatronDPRebuildManager = _ew_mod.MegatronDPRebuildManager
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    print(f"rank={rank}, world_size={world_size}")
+
+    if world_size < 4:
+        record("Test R6: real model DP rebuild (scale down 4→2)", SKIP, f"需要 4 个 GPU，当前 {world_size}")
+        return
+
+    # 以 tp=1, dp=4 初始化
+    init_parallel_state(tp=1, pp=1)
+    dp_before = parallel_state.get_data_parallel_world_size()  # 4
+    log(f"初始 dp_size={dp_before}，tp=1，准备 rebuild 到 tp=2（dp=2）")
+
+    model = None
+    try:
+        model = load_real_model_with_mbridge(model_path)
+        dist.barrier()
+
+        # 记录 rebuild 前的参数
+        param_before = get_param_sample(model, n=8)
+
+        # 缩容：tp: 1→2，pp=1 不变  →  dp = 4/(2*1) = 2
+        manager = MegatronDPRebuildManager(model=model, optimizer=None)
+        manager.rebuild(
+            new_world_size=world_size,
+            tensor_model_parallel_size=2,  # tp 增大，导致 dp 缩小
+            pipeline_model_parallel_size=1,
+            new_member_ranks=None,
+        )
+
+        # rebuild 后重新注册 RNG 状态
+        set_random_seed(seed=42)
+
+        dp_after = parallel_state.get_data_parallel_world_size()
+        tp_after = parallel_state.get_tensor_model_parallel_world_size()
+        log(f"rebuild 后: dp={dp_after}, tp={tp_after}")
+
+        # 验证参数一致（Offload + Restore 流程正确）
+        ok, msg = params_match(model, param_before)
+        if not ok:
+            record("Test R6: real model DP rebuild (scale down 4→2)", FAIL, f"参数不一致: {msg}")
+            return
+
+        # 验证 dp 缩容结果
+        expected_dp = world_size // (2 * 1)  # 4 / 2 = 2
+        if dp_after != expected_dp:
+            record(
+                "Test R6: real model DP rebuild (scale down 4→2)",
+                FAIL,
+                f"期望 dp={expected_dp}，实际 dp={dp_after}",
+            )
+        else:
+            record(
+                "Test R6: real model DP rebuild (scale down 4→2)",
+                PASS,
+                f"dp: {dp_before}→{dp_after}（tp: 1→{tp_after}），params consistent",
+            )
+
+    finally:
+        release_model_memory(model)
+        destroy_parallel_state()
+        dist.barrier()
+
+
+# ============================================================================
+# Test R7: 真实模型 DP rebuild roundtrip（DP=4 → DP=2 → DP=4）
+# ============================================================================
+
+
+def test_real_model_dp_rebuild_roundtrip(model_path: str):
+    """
+    验证真实模型下 DP rebuild 往返：DP=4 → DP=2 → DP=4。
+
+    流程：
+    1. 以 tp=1（dp=4）初始化，加载真实模型
+    2. 第一次 rebuild(tp=2)  →  dp=2（缩容）
+    3. 验证 dp=2，参数正确
+    4. 第二次 rebuild(tp=1)  →  dp=4（扩容恢复）
+    5. 验证 dp=4，参数与初始状态一致
+    """
+    from megatron.core import parallel_state
+
+    _ew_mod = sys.modules["verl.experimental.elastic_scheduling.elastic_worker"]
+    MegatronDPRebuildManager = _ew_mod.MegatronDPRebuildManager
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    print(f"rank={rank}, world_size={world_size}")
+
+    if world_size < 4:
+        record("Test R7: real model DP rebuild (roundtrip 4→2→4)", SKIP, f"需要 4 个 GPU，当前 {world_size}")
+        return
+
+    # 以 tp=1, dp=4 初始化
+    init_parallel_state(tp=1, pp=1)
+    dp_initial = parallel_state.get_data_parallel_world_size()  # 4
+    log(f"初始 dp_size={dp_initial}，开始 roundtrip 测试")
+
+    model = None
+    try:
+        model = load_real_model_with_mbridge(model_path)
+        dist.barrier()
+
+        # 记录初始参数（用于最终验证）
+        param_initial = get_param_sample(model, n=8)
+
+        # ── 第一次 rebuild：DP=4 → DP=2（tp: 1→2）──
+        log("第一次 rebuild: tp=1→2，dp=4→2（缩容）")
+        manager = MegatronDPRebuildManager(model=model, optimizer=None)
+        manager.rebuild(
+            new_world_size=world_size,
+            tensor_model_parallel_size=2,
+            pipeline_model_parallel_size=1,
+            new_member_ranks=None,
+        )
+        set_random_seed(seed=42)
+
+        dp_mid = parallel_state.get_data_parallel_world_size()
+        tp_mid = parallel_state.get_tensor_model_parallel_world_size()
+        log(f"第一次 rebuild 后: dp={dp_mid}, tp={tp_mid}")
+
+        expected_dp_mid = world_size // (2 * 1)  # 2
+        if dp_mid != expected_dp_mid:
+            record(
+                "Test R7: real model DP rebuild (roundtrip 4→2→4)",
+                FAIL,
+                f"第一次 rebuild 后期望 dp={expected_dp_mid}，实际 dp={dp_mid}",
+            )
+            return
+
+        ok, msg = params_match(model, param_initial)
+        if not ok:
+            record(
+                "Test R7: real model DP rebuild (roundtrip 4→2→4)",
+                FAIL,
+                f"第一次 rebuild 后参数不一致: {msg}",
+            )
+            return
+        log(f"第一次 rebuild 验证通过: dp={dp_initial}→{dp_mid}，参数一致")
+
+        # ── 第二次 rebuild：DP=2 → DP=4（tp: 2→1）──
+        log("第二次 rebuild: tp=2→1，dp=2→4（扩容恢复）")
+        manager2 = MegatronDPRebuildManager(model=model, optimizer=None)
+        manager2.rebuild(
+            new_world_size=world_size,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            new_member_ranks=None,
+        )
+        set_random_seed(seed=42)
+
+        dp_final = parallel_state.get_data_parallel_world_size()
+        tp_final = parallel_state.get_tensor_model_parallel_world_size()
+        log(f"第二次 rebuild 后: dp={dp_final}, tp={tp_final}")
+
+        expected_dp_final = world_size // (1 * 1)  # 4
+        if dp_final != expected_dp_final:
+            record(
+                "Test R7: real model DP rebuild (roundtrip 4→2→4)",
+                FAIL,
+                f"第二次 rebuild 后期望 dp={expected_dp_final}，实际 dp={dp_final}",
+            )
+            return
+
+        ok, msg = params_match(model, param_initial)
+        if not ok:
+            record(
+                "Test R7: real model DP rebuild (roundtrip 4→2→4)",
+                FAIL,
+                f"第二次 rebuild 后参数不一致: {msg}",
+            )
+        else:
+            record(
+                "Test R7: real model DP rebuild (roundtrip 4→2→4)",
+                PASS,
+                f"dp: {dp_initial}→{dp_mid}→{dp_final}，tp: 1→{tp_mid}→{tp_final}，全程参数一致",
+            )
+
+    finally:
+        release_model_memory(model)
+        destroy_parallel_state()
+        dist.barrier()
+
+
+# ============================================================================
 # 主测试运行器
 # ============================================================================
 
@@ -649,6 +861,8 @@ def run_all_tests(model_path: str):
         ("Test R3: real model DP rebuild (same size)", lambda: test_real_model_dp_rebuild_same_size(model_path)),
         ("Test R4: real model elastic scale out", lambda: test_real_model_elastic_scale_out(model_path)),
         ("Test R5: real model memory offload", lambda: test_real_model_memory_offload(model_path)),
+        ("Test R6: real model DP rebuild (scale down 4→2)", lambda: test_real_model_dp_rebuild_scale_down(model_path)),
+        ("Test R7: real model DP rebuild (roundtrip 4→2→4)", lambda: test_real_model_dp_rebuild_roundtrip(model_path)),
     ]
 
     for test_name, test_fn in tests:

@@ -674,3 +674,115 @@ python -m verl.experimental.elastic_scheduling.main \
 
 4. **参数同步后端**：推荐使用 `nixl` 后端进行弹性副本同步，因其支持动态拓扑；
    `nccl` 后端在弹性场景下需要重建进程组，开销较大。
+
+
+Q&A:
+比如说2->4  2 先存cpu参数，然后4获取cpu参数，具体在机器上是如何分配参数的
+rank0,rank1,rank2,rank3 
+好问题。让我先读取相关代码来梳理清楚。
+
+代码已读完，现在可以完整回答这个问题了。
+
+---
+
+## DP 2→4 时参数在 rank0/1/2/3 上的分配方式
+
+### 前提：Megatron DP 模型是**完整副本**
+
+与 FSDP（参数切片分布）不同，**Megatron DP 每个 rank 持有完整的模型参数**。DP 组只影响梯度 all-reduce，不影响参数存储方式。
+
+---
+
+### 完整流程图（以测试 R4: DP=2→4 弹性扩容为例）
+
+```
+扩容前（DP=2，只有 rank0, rank1 在训练）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+rank0 GPU:  [完整模型参数 W]   ← 老成员
+rank1 GPU:  [完整模型参数 W]   ← 老成员（与rank0同步）
+rank2 GPU:  [随机权重 / 空]    ← 新成员，即将加入
+rank3 GPU:  [随机权重 / 空]    ← 新成员，即将加入
+```
+
+**Step 1: capture_and_offload()** — 每个 rank 独立执行，只操作自己本地内存
+
+```
+rank0: GPU[W]  →  CPU内存[snapshot_W]，GPU参数移到CPU
+rank1: GPU[W]  →  CPU内存[snapshot_W]，GPU参数移到CPU
+rank2: GPU[随机] → CPU内存[snapshot_随机]，GPU参数移到CPU
+rank3: GPU[随机] → CPU内存[snapshot_随机]，GPU参数移到CPU
+
+注意：没有任何跨机器的网络通信！每个rank只操作自己的内存
+```
+
+**Step 2: destroy_parallel_groups()** — 销毁旧的 DP=2 通信组
+
+**Step 3: barrier()** — 4 个 rank 全部就绪同步
+
+**Step 4: reinitialize_parallel_groups(tp=1, pp=1)** — 重建 DP=4 通信组
+
+```
+新的 DP group = [rank0, rank1, rank2, rank3]
+```
+
+**Step 5: restore_from_cpu()** — 每个 rank 从自己的 CPU 快照恢复到 GPU
+
+```
+rank0 GPU: ← CPU[snapshot_W]      ✅ 正确权重
+rank1 GPU: ← CPU[snapshot_W]      ✅ 正确权重
+rank2 GPU: ← CPU[snapshot_随机]   ❌ 随机权重（待同步）
+rank3 GPU: ← CPU[snapshot_随机]   ❌ 随机权重（待同步）
+```
+
+**Step 6: sync_new_member_params(new_member_ranks=[2,3])** — 广播参数给新成员
+
+```python
+# 关键代码：在新的 DP group 内，从 dp_rank=0（全局rank0）广播给所有人
+for param in model.parameters():
+    dist.broadcast(param.data, src=0, group=dp_group)
+```
+
+```
+rank0 GPU: [W]  →→→→→  broadcast(src=0)
+                              ↓         ↓         ↓
+rank1 GPU: [W]  (已正确，被覆盖也无影响)
+rank2 GPU: [随机] → 接收 → [W]   ✅ 现在正确
+rank3 GPU: [随机] → 接收 → [W]   ✅ 现在正确
+```
+
+---
+
+### 关键设计特点
+
+| 问题 | 答案 |
+|------|------|
+| CPU 快照是共享内存还是每个 rank 独立的？ | **每个 rank 完全独立**，存在各自节点的 CPU 内存里，无网络传输 |
+| rank2/3 的 CPU 快照有什么用？ | 只是用来恢复 GPU 内的 tensor 结构（shape/dtype），实际值会被 broadcast 覆盖 |
+| 为什么不直接从 rank0 网络传给 rank2/3，跳过 CPU offload？ | Megatron 的并行组（DP/TP/PP）是全局单例，必须先**销毁旧组**再**重建新组**，销毁时 NCCL 通信不可用，所以必须先存 CPU |
+| 4→2 缩容时（R6 测试，改 tp=2）参数怎么走？ | 无新成员，所有 rank 只做 `capture→destroy→reinit→restore`，无 broadcast，每个 rank 从自己 CPU 快照恢复，参数始终不变 |
+
+---
+
+### R6/R7 中（通过调整 tp 实现缩容）的参数分布
+
+```
+R6: DP=4(tp=1) → DP=2(tp=2)
+
+rebuild前 (tp=1, dp=4):
+  rank0,1 是 TP group [0,1]，rank2,3 是 TP group [2,3]
+  DP group = [rank0, rank2] 和 [rank1, rank3]（或全部4个，取决于分组方式）
+
+rebuild后 (tp=2, dp=2):
+  rank0,1 是 TP group [0,1]（共享同一层的不同张量切片）
+  rank2,3 是 TP group [2,3]
+  DP group = [rank0, rank2]（tp_rank=0 的两个dp成员）
+
+每个 rank 的参数：自己 CPU 快照恢复，无广播，参数值不变
+但 tp=2 时模型参数会被 Megatron 按 TP 维度切分访问（通信语义变了）
+```
+
+```python
+cd /Users/arron/Projects/verl && ray job submit --address='http://10.148.11.18:8420' --runtime-env=examples/mtp_trainer/runtime_env.yaml --working-dir=. -- torchrun 
+--nproc_per_node=4 --master-port=29603 verl/experimental/elastic_scheduling/test/test_megatron_dp_rebuild_real_model.py --model-path /home/hadoop-djst-algoplat/models/Qwen2.5-Math-7B
+```
+ 
