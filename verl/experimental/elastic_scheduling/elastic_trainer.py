@@ -33,6 +33,7 @@ from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncT
 from verl.single_controller.ray import RayWorkerGroup
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.utils import Role, WorkerType
+from verl.utils import omega_conf_to_dataclass
 from verl.utils.profiler import marked_timer
 
 if TYPE_CHECKING:
@@ -516,36 +517,68 @@ class ElasticTrainer(FullyAsyncTrainer):
     # Extended Parameter Sync
     # =========================================================================
 
-    def set_rollouter(self, rollouter):
+    def _setup_checkpoint_manager(self, rollouter):
         """
-        Override to additionally set up ElasticParameterSyncManager.
+        Override to use ElasticCheckpointManager instead of CheckpointEngineManager.
 
-        Calls parent's set_rollouter() to create the base CheckpointEngineManager,
-        then wraps it with ElasticParameterSyncManager for elastic replica support.
+        ElasticCheckpointManager inherits the full standalone-replica sync pipeline
+        and additionally supports hybrid replicas (add_hybrid_replica /
+        remove_hybrid_replica).  Both standalone and hybrid replicas are synced
+        in a single update_weights() call.
 
         Args:
             rollouter: Ray actor handle to ElasticRollouter
         """
-        # Call parent to create base checkpoint manager
-        super().set_rollouter(rollouter)
+        from verl.experimental.elastic_scheduling.elastic_checkpoint_engine import ElasticCheckpointManager
 
-        # Wrap with ElasticParameterSyncManager if available
-        try:
-            from verl.experimental.elastic_scheduling.elastic_param_sync import ElasticParameterSyncManager
+        replicas = ray.get(rollouter.get_replicas.remote())
+        checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
+        self.checkpoint_manager = ElasticCheckpointManager(
+            config=checkpoint_engine_config,
+            trainer=self.actor_wg,
+            replicas=replicas,
+        )
+        logger.info("[ElasticTrainer] ElasticCheckpointManager initialized")
 
-            if hasattr(self, "checkpoint_manager") and self.checkpoint_manager is not None:
-                elastic_sync_manager = ElasticParameterSyncManager(
-                    base_manager=self.checkpoint_manager,
-                    elastic_rollouter=rollouter,
-                )
-                # Replace the checkpoint_manager with elastic version
-                self.checkpoint_manager = elastic_sync_manager
-                logger.info("[ElasticTrainer] ElasticParameterSyncManager initialized")
-        except Exception as e:
+    def register_hybrid_replicas(self, replicas: dict) -> None:
+        """
+        Register hybrid rollout replicas with the checkpoint manager.
+
+        Call this once after initialisation to register all pre-bound elastic
+        hybrid replicas (those that share GPUs with the training engine).  These
+        replicas are registered **permanently** – they remain in the checkpoint
+        manager regardless of their current sleep state so that every
+        update_weights() call reaches all of them (sleeping replicas are woken up
+        for the sync and then put back to sleep; awake replicas are handled via
+        the normal abort → sync → resume flow).
+
+        This method is idempotent: calling it multiple times for the same
+        resource_id simply overwrites the previous entry.
+
+        Args:
+            replicas: Mapping of resource_id → RolloutReplica for all elastic
+                hybrid replicas that should participate in parameter sync.
+        """
+        if not hasattr(self, "checkpoint_manager") or self.checkpoint_manager is None:
             logger.warning(
-                f"[ElasticTrainer] Failed to create ElasticParameterSyncManager: {e}. "
-                f"Using base CheckpointEngineManager instead."
+                "[ElasticTrainer] register_hybrid_replicas called before checkpoint_manager "
+                "is ready (call set_rollouter first). Replicas not registered."
             )
+            return
+
+        from verl.experimental.elastic_scheduling.elastic_checkpoint_engine import ElasticCheckpointManager
+
+        if not isinstance(self.checkpoint_manager, ElasticCheckpointManager):
+            logger.warning(
+                "[ElasticTrainer] checkpoint_manager is not an ElasticCheckpointManager; "
+                "hybrid replicas cannot be registered."
+            )
+            return
+
+        for resource_id, replica in replicas.items():
+            self.checkpoint_manager.add_hybrid_replica(resource_id, replica)
+
+        logger.info(f"[ElasticTrainer] Registered {len(replicas)} hybrid replica(s) with checkpoint manager")
 
     def set_elastic_coordinator(self, coordinator):
         """
@@ -559,19 +592,17 @@ class ElasticTrainer(FullyAsyncTrainer):
 
     async def _fit_update_weights(self):
         """
-        Extended _fit_update_weights: syncs parameters to rollout replicas.
+        Sync parameters from trainer to all rollout replicas.
 
-        Role switches no longer happen here — they are executed earlier in
-        fit_step() via _elastic_on_before_fit_step(), when Train GPU is idle.
+        Role switches happen earlier (in _elastic_on_before_fit_step), so by
+        the time this is called the replica membership is stable.
 
-        This method only handles parameter broadcasting:
-        - Fixed rollout replicas (via base CheckpointEngineManager)
-        - Elastic rollout replicas (via ElasticParameterSyncManager if set)
+        ElasticCheckpointManager.update_weights() handles both:
+          - Standalone replicas (self.checkpoint_manager.replicas)
+          - Hybrid replicas (registered via add_hybrid_replica / remove_hybrid_replica),
+            including those currently sleeping and those currently awake.
         """
         await super()._fit_update_weights()
-
-        # Elastic sync for rollout-mode replicas is handled transparently by
-        # ElasticParameterSyncManager which wraps checkpoint_manager
 
     # =========================================================================
     # Consumption Rate Tracking
