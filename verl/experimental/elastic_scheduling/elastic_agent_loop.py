@@ -33,7 +33,10 @@ from typing import TYPE_CHECKING
 import ray
 from omegaconf import DictConfig
 
-from verl.experimental.fully_async_policy.agent_loop import FullyAsyncAgentLoopManager
+from verl.experimental.fully_async_policy.agent_loop import (
+    FullyAsyncAgentLoopManager,
+    FullyAsyncAgentLoopWorker,
+)
 from verl.single_controller.ray import RayWorkerGroup
 
 if TYPE_CHECKING:
@@ -118,6 +121,37 @@ class ElasticGlobalRequestLoadBalancer:
         return [sid for sid in self._inflight_requests if sid not in self._removed_servers]
 
 
+class ElasticAgentLoopWorker(FullyAsyncAgentLoopWorker):
+    def add_server(self, server_address: str, server_handle: ray.actor.ActorHandle) -> None:
+        """
+        Dynamically add a new rollout server to this worker's server manager.
+
+        Called by ElasticAgentLoopManager when an elastic resource switches to rollout mode.
+        After this call, the worker's load balancer can route requests to the new server.
+
+        Args:
+            server_address: The address/id of the new server (used as LB key).
+            server_handle: The Ray actor handle for the new vLLM/SGLang server.
+        """
+        self.server_manager._server_id_to_handle[server_address] = server_handle
+        logger.debug(f"[FullyAsyncAgentLoopWorker] Added server: {server_address}")
+
+    def remove_server(self, server_address: str) -> None:
+        """
+        Remove a rollout server from this worker's server manager.
+
+        Called by ElasticAgentLoopManager BEFORE abort_all_requests(), so that
+        when FullyAsyncLLMServerManager resumes after stop_reason="aborted",
+        the dead server handle is no longer in the map and the LB routes the
+        resume request to a healthy server (partial rollout auto-resume).
+
+        Args:
+            server_address: The address/id of the server to remove.
+        """
+        self.server_manager._server_id_to_handle.pop(server_address, None)
+        logger.debug(f"[FullyAsyncAgentLoopWorker] Removed server: {server_address}")
+
+
 class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
     """
     Elastic Agent Loop Manager with dynamic server management.
@@ -142,6 +176,9 @@ class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
         teacher_model_manager=None,
         reward_loop_worker_handles: list = None,
     ):
+        # Use ElasticAgentLoopWorker so the worker class is clearly named
+        # and can be extended with elastic-specific logic in the future.
+        self.agent_loop_workers_class = ray.remote(ElasticAgentLoopWorker)
         super().__init__(
             config=config,
             worker_group=worker_group,
@@ -369,7 +406,20 @@ class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
     # -------------------------------------------------------------------------
 
     async def _notify_workers_server_added(self, server_address: str, server_handle) -> None:
-        """Notify all AgentLoopWorkers that a new server is available."""
+        """
+        Notify all AgentLoopWorkers that a new server is available, and keep
+        the manager-level server lists (server_addresses / server_handles) in sync.
+
+        The manager-level lists are the source of truth used when spawning new
+        workers later (e.g. after a scale-out event).  Each existing worker's
+        FullyAsyncLLMServerManager._server_id_to_handle is updated via add_server().
+        """
+        # 1. Update manager-level server lists so future workers get the full pool.
+        if server_address not in self.server_addresses:
+            self.server_addresses.append(server_address)
+            self.server_handles.append(server_handle)
+
+        # 2. Notify each existing worker to add the new handle into its server_manager.
         if not getattr(self, "agent_loop_workers", None):
             return
         futures = []
@@ -388,7 +438,21 @@ class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
                     logger.warning(f"[ElasticAgentLoopManager] Worker add_server failed: {result}")
 
     async def _notify_workers_server_removed(self, server_address: str) -> None:
-        """Notify all AgentLoopWorkers that a server is no longer available."""
+        """
+        Notify all AgentLoopWorkers that a server is no longer available, and
+        remove it from the manager-level server lists.
+
+        Must be called BEFORE abort_all_requests() so that when
+        FullyAsyncLLMServerManager retries after stop_reason="aborted", the dead
+        handle is already gone from every worker's _server_id_to_handle.
+        """
+        # 1. Update manager-level server lists.
+        if server_address in self.server_addresses:
+            idx = self.server_addresses.index(server_address)
+            self.server_addresses.pop(idx)
+            self.server_handles.pop(idx)
+
+        # 2. Notify each existing worker to remove the stale handle.
         if not getattr(self, "agent_loop_workers", None):
             return
         futures = []

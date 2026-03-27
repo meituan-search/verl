@@ -124,7 +124,6 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         return final_output
 
 
-@ray.remote
 class FullyAsyncAgentLoopWorker(AgentLoopWorker):
     def __init__(
         self,
@@ -145,35 +144,6 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
             reward_loop_worker_handles,
         )
 
-    def add_server(self, server_address: str, server_handle: ray.actor.ActorHandle) -> None:
-        """
-        Dynamically add a new rollout server to this worker's server manager.
-
-        Called by ElasticAgentLoopManager when an elastic resource switches to rollout mode.
-        After this call, the worker's load balancer can route requests to the new server.
-
-        Args:
-            server_address: The address/id of the new server (used as LB key).
-            server_handle: The Ray actor handle for the new vLLM/SGLang server.
-        """
-        self.server_manager._server_id_to_handle[server_address] = server_handle
-        logger.debug(f"[FullyAsyncAgentLoopWorker] Added server: {server_address}")
-
-    def remove_server(self, server_address: str) -> None:
-        """
-        Remove a rollout server from this worker's server manager.
-
-        Called by ElasticAgentLoopManager BEFORE abort_all_requests(), so that
-        when FullyAsyncLLMServerManager resumes after stop_reason="aborted",
-        the dead server handle is no longer in the map and the LB routes the
-        resume request to a healthy server (partial rollout auto-resume).
-
-        Args:
-            server_address: The address/id of the server to remove.
-        """
-        self.server_manager._server_id_to_handle.pop(server_address, None)
-        logger.debug(f"[FullyAsyncAgentLoopWorker] Removed server: {server_address}")
-
 
 class FullyAsyncAgentLoopManager(AgentLoopManager):
     def __init__(
@@ -184,7 +154,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         teacher_model_manager: TeacherModelManager = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
     ):
-        self.agent_loop_workers_class = FullyAsyncAgentLoopWorker
+        self.agent_loop_workers_class = ray.remote(FullyAsyncAgentLoopWorker)
         super().__init__(config, worker_group, rollout_resource_pool, teacher_model_manager, reward_loop_worker_handles)
         if self.distillation_enabled:
             raise NotImplementedError("Distillation is not implemented in FullyAsyncAgentLoopManager yet.")

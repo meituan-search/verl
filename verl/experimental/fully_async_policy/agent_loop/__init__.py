@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .agent_loop import FullyAsyncAgentLoopManager
+from .agent_loop import FullyAsyncAgentLoopManager, FullyAsyncAgentLoopWorker
 
-__all__ = [FullyAsyncAgentLoopManager]
+__all__ = [FullyAsyncAgentLoopManager, FullyAsyncAgentLoopWorker]
