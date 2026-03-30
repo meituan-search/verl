@@ -11,9 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from verl.experimental.elastic_scheduling.engine.megatron.transformer_impl import (
+from verl.experimental.elastic_scheduling.engine.megatron.elastic_transformer_impl import (
+    ElasticMegatronEngineWithLMHead,
+    ElasticMegatronEngineWithValueHead,
     ElasticMegatronMixin,
-    MegatronDPRebuildManager,
 )
 
-__all__ = ["ElasticMegatronMixin", "MegatronDPRebuildManager"]
+__all__ = [
+    "ElasticMegatronEngineWithLMHead",
+    "ElasticMegatronEngineWithValueHead",
+    "ElasticMegatronMixin",
+]

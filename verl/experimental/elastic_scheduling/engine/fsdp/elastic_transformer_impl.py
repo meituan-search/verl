@@ -74,16 +74,20 @@ class FSDPModelStateSnapshot:
         while hasattr(unwrapped, "module"):
             unwrapped = unwrapped.module
 
-        # Capture parameters directly
+        # Capture parameters directly.
+        # FSDP2 parameters are DTensors; use to_local() to obtain the plain
+        # local shard tensor before copying to CPU.
         for name, param in unwrapped.named_parameters():
-            snapshot.state_dict[name] = param.data.detach().cpu().clone()
-            snapshot.num_parameters += param.numel()
-            if param.dtype in [torch.float32, torch.float16, torch.bfloat16]:
-                snapshot.dtype = param.dtype
+            local = param.to_local() if hasattr(param, "to_local") else param.data
+            snapshot.state_dict[name] = local.detach().cpu().clone()
+            snapshot.num_parameters += local.numel()
+            if local.dtype in [torch.float32, torch.float16, torch.bfloat16]:
+                snapshot.dtype = local.dtype
 
         # Capture buffers
         for name, buffer in unwrapped.named_buffers():
-            snapshot.state_dict[f"{name}.__buffer__"] = buffer.data.detach().cpu().clone()
+            local_buf = buffer.to_local() if hasattr(buffer, "to_local") else buffer.data
+            snapshot.state_dict[f"{name}.__buffer__"] = local_buf.detach().cpu().clone()
 
         if torch.distributed.get_rank() == 0:
             logger.info(f"FSDP Model snapshot captured: {snapshot.num_parameters} parameters, dtype={snapshot.dtype}")
@@ -104,12 +108,17 @@ class FSDPModelStateSnapshot:
         with torch.no_grad():
             for name, param in unwrapped.named_parameters():
                 if name in self.state_dict:
-                    param.data.copy_(self.state_dict[name].to(device=device, non_blocking=True))
+                    src = self.state_dict[name].to(device=device, non_blocking=True)
+                    # FSDP2 DTensor: copy into the local shard directly.
+                    local = param.to_local() if hasattr(param, "to_local") else param.data
+                    local.copy_(src)
 
             for name, buffer in unwrapped.named_buffers():
                 full_name = f"{name}.__buffer__"
                 if full_name in self.state_dict:
-                    buffer.data.copy_(self.state_dict[full_name].to(device=device, non_blocking=True))
+                    src = self.state_dict[full_name].to(device=device, non_blocking=True)
+                    local_buf = buffer.to_local() if hasattr(buffer, "to_local") else buffer.data
+                    local_buf.copy_(src)
 
 
 @dataclass
@@ -168,7 +177,7 @@ class FSDPOptimizerStateSnapshot:
             return
 
         try:
-            if hasattr(optimizer, "state_dict"):
+            if hasattr(optimizer, "state_dict") and hasattr(optimizer, "load_state_dict"):
                 opt_state_dict = optimizer.state_dict()
                 if "state" in opt_state_dict:
                     for param_id, state in opt_state_dict["state"].items():
@@ -180,6 +189,9 @@ class FSDPOptimizerStateSnapshot:
                                     state[k] = v.to(device=device, non_blocking=True)
                                 else:
                                     state[k] = v
+                    # Write the modified state dict back into the optimizer so
+                    # the in-place changes to the nested dicts take effect.
+                    optimizer.load_state_dict(opt_state_dict)
         except Exception as e:
             logger.warning(f"Failed to restore optimizer state: {e}")
 
@@ -246,31 +258,49 @@ class ElasticFSDPMixin:
             # Step 1: Capture state to CPU
             self._capture_state_to_cpu()
 
-            # Step 2: Barrier with all current ranks
+            # Step 2: Barrier with all current ranks (everyone must reach here)
             if dist.is_initialized():
                 dist.barrier()
 
-            # Step 3: If not in new group, return early
+            # Step 3: Rebuild FSDP groups – dist.new_group() is a collective that
+            # ALL current ranks must call simultaneously, including ranks that are
+            # being removed from the new DP group.  _rebuild_fsdp_groups() handles
+            # the new_group() call internally for all ranks.
+            self._rebuild_fsdp_groups(new_world_ranks)
+
+            # Step 4: Barrier after new_group creation (all ranks still present)
+            if dist.is_initialized():
+                dist.barrier()
+
+            # Step 5: If not in new group, return early now that all collectives
+            # (new_group + barrier above) have completed.
+            # NOTE: steps 6-7 below involve only new-group members and use the
+            # new sub-group for collectives (broadcast), so removed ranks do NOT
+            # need to participate.  The global barrier in step 4 is the last one
+            # that requires all-rank participation.
             if not is_in_new_group:
                 logger.info(f"[ElasticFSDPMixin rank={my_rank}] Rank removed from DP group, returning")
                 return
 
-            # Step 4: Rebuild FSDP groups
-            self._rebuild_fsdp_groups(new_world_ranks)
-
-            # Step 5: Barrier after reinitialization
-            if dist.is_initialized():
-                dist.barrier()
-
             # Step 6: Restore state from CPU
+            # Each rank restores its own shard from the per-rank snapshot.
+            # This is sufficient for same-size and scale-down rebuilds where
+            # every participating rank already held a valid state snapshot.
             self._restore_state_from_cpu()
 
-            # Step 7: Sync parameters to newly joined ranks
-            self._sync_params_to_new_members(new_world_ranks)
+            # Step 7: Sync parameters to newly joined ranks (scale-out only).
+            # Only broadcast when some ranks have zero/invalid parameters
+            # (e.g. new ranks that were not part of the previous group).
+            # For same-size rebuilds every rank already restored its own shard,
+            # so broadcasting would incorrectly overwrite shards with rank-0's
+            # local shard.  We skip broadcast unless explicit new members exist.
+            prev_ranks = getattr(self, "_prev_world_ranks", None)
+            has_new_members = prev_ranks is not None and any(r not in prev_ranks for r in new_world_ranks)
+            if has_new_members:
+                self._sync_params_to_new_members(new_world_ranks)
 
-            # Step 8: Final barrier
-            if dist.is_initialized():
-                dist.barrier()
+            # Remember current group membership for future rebuild calls.
+            self._prev_world_ranks = set(new_world_ranks)
 
             logger.info(
                 f"[ElasticFSDPMixin rank={my_rank}] DP group rebuild complete with {len(new_world_ranks)} ranks"
@@ -340,21 +370,55 @@ class ElasticFSDPMixin:
         gc.collect()
 
     def _rebuild_fsdp_groups(self, new_world_ranks: list[int]) -> None:
-        """Rebuild FSDP communication groups."""
+        """
+        Create a new DP process group and patch the device_mesh so that
+        subsequent FSDP all-reduce / reduce-scatter collectives use it.
+
+        Two steps:
+        1. ``dist.new_group(new_world_ranks)`` – collective on *all* current
+           ranks; returns the new group handle on participating ranks.
+        2. Patch ``mesh._dim_group_infos[0]`` so FSDP routes through the new
+           group without a full re-initialisation.
+
+        The group handle is saved in ``self._new_dp_group`` so that
+        ``_sync_params_to_new_members`` can reuse it without issuing a second
+        collective.
+        """
         my_rank = dist.get_rank()
         logger.info(f"[ElasticFSDPMixin rank={my_rank}] Rebuilding FSDP groups for {len(new_world_ranks)} ranks")
 
-        # For FSDP2, rebuild process groups
+        # Step 1: collective – every current rank participates.
         try:
-            # Create new subgroups for the new ranks
             new_group = dist.new_group(ranks=new_world_ranks)
-            logger.info(
-                f"[ElasticFSDPMixin rank={my_rank}] "
-                f"Created new process group for {len(new_world_ranks)} ranks "
-                f"new_group {new_group}"
-            )
+            # Cache for reuse in _sync_params_to_new_members.
+            self._new_dp_group = new_group
+            logger.info(f"[ElasticFSDPMixin rank={my_rank}] Created new process group for {len(new_world_ranks)} ranks")
         except Exception as e:
             logger.warning(f"[ElasticFSDPMixin rank={my_rank}] Error creating process group: {e}")
+            return
+
+        # Step 2: patch device_mesh so FSDP collectives use the new group.
+        # Prefer ulysses_device_mesh (Ulysses SP) over plain device_mesh.
+        # DP is always dim 0 in all supported layouts:
+        #   ["fsdp"]        – 1-D FSDP
+        #   ["ddp", "fsdp"] – HSDP
+        #   ["dp",  "sp"]   – Ulysses SP
+        mesh = getattr(self, "ulysses_device_mesh", None) or getattr(self, "device_mesh", None)
+        if mesh is not None:
+            try:
+                mesh._dim_group_infos[0] = (new_group, new_world_ranks)
+                logger.info(
+                    f"[ElasticFSDPMixin rank={my_rank}] device_mesh patched (new dp_size={len(new_world_ranks)})"
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[ElasticFSDPMixin rank={my_rank}] Could not patch device_mesh: {exc}. "
+                    "New group was created but mesh was not updated."
+                )
+        else:
+            logger.warning(
+                f"[ElasticFSDPMixin rank={my_rank}] No device_mesh found; FSDP collectives may still use the old group."
+            )
 
     def _restore_state_from_cpu(self) -> None:
         """Restore model and optimizer state from CPU memory to GPU."""
@@ -378,26 +442,58 @@ class ElasticFSDPMixin:
         torch.cuda.empty_cache()
 
     def _sync_params_to_new_members(self, new_world_ranks: list[int]) -> None:
-        """Broadcast parameters from existing ranks to newly joined ranks."""
+        """
+        Broadcast parameters from the lowest-ranked member to all members of
+        the new DP group.
+
+        Reuses ``self._new_dp_group`` set by ``_rebuild_fsdp_groups`` to avoid
+        issuing a second ``dist.new_group`` collective.  The broadcast is a
+        no-op for parameters that are already correct on existing ranks; newly
+        joined ranks receive fresh weights without disk I/O.
+        """
         my_rank = dist.get_rank()
+        logger.info(f"[ElasticFSDPMixin rank={my_rank}] Syncing params to {len(new_world_ranks)} ranks")
 
-        logger.info(
-            f"[ElasticFSDPMixin rank={my_rank}] Syncing params to new members among {len(new_world_ranks)} ranks"
-        )
+        if not (hasattr(self, "module") and self.module is not None):
+            return
 
-        if hasattr(self, "module") and self.module is not None:
-            # Create process group for the new ranks
+        # Reuse the group created in _rebuild_fsdp_groups; fall back to a new
+        # collective only if the cached handle is missing (shouldn't happen).
+        new_group = getattr(self, "_new_dp_group", None)
+        if new_group is None:
+            logger.warning(
+                f"[ElasticFSDPMixin rank={my_rank}] _new_dp_group not set; creating a new group (extra collective)"
+            )
             new_group = dist.new_group(ranks=new_world_ranks)
 
-            # Broadcast from rank 0 in new group
-            unwrapped = self.module
-            while hasattr(unwrapped, "module"):
-                unwrapped = unwrapped.module
+        unwrapped = self.module
+        while hasattr(unwrapped, "module"):
+            unwrapped = unwrapped.module
 
-            for param in unwrapped.parameters():
-                dist.broadcast(param.data, src=0, group=new_group)
+        # Broadcast from the lowest-ranked member (new_world_ranks[0]).
+        # After _offload_to_cpu the local shard may be on CPU; move it to the
+        # current CUDA device before issuing the NCCL broadcast.
+        device = get_device_name()
+        src = new_world_ranks[0]
+        for param in unwrapped.parameters():
+            # FSDP2 parameters are DTensors; use to_local() to get the plain
+            # local tensor shard.
+            local_shard = param.to_local() if hasattr(param, "to_local") else param.data
+            # Ensure the tensor is on a CUDA device for NCCL.
+            if local_shard.device.type != "cuda":
+                local_shard = local_shard.to(device=device, non_blocking=False)
+            dist.broadcast(local_shard, src=src, group=new_group)
+            # Copy broadcast result back into the parameter storage.
+            with torch.no_grad():
+                target = param.to_local() if hasattr(param, "to_local") else param.data
+                if target.device.type != local_shard.device.type:
+                    target.copy_(local_shard.cpu() if target.device.type == "cpu" else local_shard)
+                else:
+                    target.copy_(local_shard)
 
-            logger.info(f"[ElasticFSDPMixin rank={my_rank}] Param sync complete")
+        # Clean up cached handle.
+        self._new_dp_group = None
+        logger.info(f"[ElasticFSDPMixin rank={my_rank}] Param sync complete")
 
 
 @EngineRegistry.register(model_type="language_model", backend="fsdp2_elastic")

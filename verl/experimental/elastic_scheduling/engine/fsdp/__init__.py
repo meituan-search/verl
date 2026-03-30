@@ -15,6 +15,15 @@
 from verl.experimental.elastic_scheduling.engine.fsdp.elastic_transformer_impl import (
     ElasticFSDPEngineWithLMHead,
     ElasticFSDPEngineWithValueHead,
+    ElasticFSDPMixin,
+    FSDPModelStateSnapshot,
+    FSDPOptimizerStateSnapshot,
 )
 
-__all__ = ["ElasticFSDPEngineWithLMHead", "ElasticFSDPEngineWithValueHead"]
+__all__ = [
+    "ElasticFSDPMixin",
+    "ElasticFSDPEngineWithLMHead",
+    "ElasticFSDPEngineWithValueHead",
+    "FSDPModelStateSnapshot",
+    "FSDPOptimizerStateSnapshot",
+]

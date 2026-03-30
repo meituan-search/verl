@@ -62,8 +62,8 @@ Usage
     self.actor.engine.rebuild_dp_group(new_world_ranks)
 """
 
-from verl.experimental.elastic_scheduling.engine.fsdp import ElasticFSDPMixin, FSDP2DPRebuildManager
-from verl.experimental.elastic_scheduling.engine.megatron import ElasticMegatronMixin, MegatronDPRebuildManager
+from verl.experimental.elastic_scheduling.engine.fsdp import ElasticFSDPMixin
+from verl.experimental.elastic_scheduling.engine.megatron import ElasticMegatronMixin
 
 # ---------------------------------------------------------------------------
 # Strategy → Mixin mapping
@@ -133,7 +133,4 @@ def get_elastic_engine_cls(strategy: str, base_cls: type) -> type:
 __all__ = [
     "ElasticFSDPMixin",
     "ElasticMegatronMixin",
-    "FSDP2DPRebuildManager",
-    "MegatronDPRebuildManager",
-    "get_elastic_engine_cls",
 ]
