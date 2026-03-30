@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """
 Elastic Actor Worker for VERL
 
@@ -20,7 +21,8 @@ Extends DetachActorWorker with all worker-side elastic operations:
   rebuild_dp_group(new_world_ranks)
       Rebuild the data-parallel communication group after elastic resources
       join or leave training.  The call is **delegated to the engine**, which
-      must be one of the elastic engine classes from ``elastic_engines.py``
+      must be one of the elastic engine classes from
+      ``verl.experimental.elastic_scheduling.engine.elastic_engines``
       (e.g. ``ElasticFSDPEngine``, ``ElasticMegatronEngine``).  The worker
       itself has no strategy-specific knowledge.
 
@@ -52,14 +54,17 @@ class ElasticActorWorker(DetachActorWorker):
     Design
     ------
     Strategy-specific DP rebuild logic is fully encapsulated inside the engine
-    (see ``elastic_engines.py``).  This worker acts only as a thin dispatcher:
+    (see ``verl.experimental.elastic_scheduling.engine.fsdp`` /
+    ``verl.experimental.elastic_scheduling.engine.megatron``).  This worker acts only as a thin dispatcher:
 
     * ``get_global_rank``   – returns ``dist.get_rank()`` for rank-list building.
     * ``rebuild_dp_group``  – delegates to ``self.actor.engine.rebuild_dp_group()``.
 
-    The engine must be one of the ``Elastic*`` classes from ``elastic_engines.py``
-    (created by ``get_elastic_engine_cls``), which mixes in either
-    ``ElasticFSDPMixin`` or ``ElasticMegatronMixin`` depending on the strategy.
+    The engine must be one of the ``Elastic*`` classes produced by
+    ``get_elastic_engine_cls`` (from
+    ``verl.experimental.elastic_scheduling.engine.elastic_engines``), which mixes
+    in either ``ElasticFSDPMixin`` or ``ElasticMegatronMixin`` depending on the
+    strategy.
     This means the worker never checks ``config.actor.strategy`` for the rebuild
     path.
 
@@ -96,7 +101,8 @@ class ElasticActorWorker(DetachActorWorker):
 
         Delegates to the engine object (``self.actor.engine``), which must
         implement ``rebuild_dp_group`` via one of the elastic engine mixins
-        defined in ``elastic_engines.py``.
+        defined in ``verl.experimental.elastic_scheduling.engine.fsdp`` or
+        ``verl.experimental.elastic_scheduling.engine.megatron``.
 
         Collective-call contract
         ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -112,33 +118,12 @@ class ElasticActorWorker(DetachActorWorker):
         my_rank = dist.get_rank()
         logger.info(f"[ElasticActorWorker rank={my_rank}] rebuild_dp_group new_world_ranks={new_world_ranks}")
 
-        engine = self._get_engine()
-        if engine is None:
-            logger.warning(f"[ElasticActorWorker rank={my_rank}] No engine found; cannot rebuild DP group.")
-            return
-
-        if not callable(getattr(engine, "rebuild_dp_group", None)):
+        if not callable(getattr(self.actor.engine, "rebuild_dp_group", None)):
             raise AttributeError(
-                f"[ElasticActorWorker rank={my_rank}] engine {type(engine).__name__} "
+                f"[ElasticActorWorker rank={my_rank}] engine {type(self.actor.engine).__name__} "
                 "does not implement rebuild_dp_group().  Make sure the engine was "
-                "created with get_elastic_engine_cls() from elastic_engines.py."
+                "created with get_elastic_engine_cls() from "
+                "verl.experimental.elastic_scheduling.engine.elastic_engines."
             )
 
-        engine.rebuild_dp_group(new_world_ranks)
-
-    # -------------------------------------------------------------------------
-    # Helpers
-    # -------------------------------------------------------------------------
-
-    def _get_engine(self):
-        """
-        Return the underlying training engine, if available.
-
-        Looks for ``self.actor.engine`` (set by ``TrainingWorker`` inside
-        ``engine_workers.py``).  Returns ``None`` when no actor is present
-        (e.g. rollout-only workers).
-        """
-        actor = getattr(self, "actor", None)
-        if actor is None:
-            return None
-        return getattr(actor, "engine", None)
+        self.actor.engine.rebuild_dp_group(new_world_ranks)
