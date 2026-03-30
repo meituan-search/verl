@@ -324,7 +324,7 @@ class SFTTrainer:
 
                     global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
 
-                    data = tu.reorder_tensordict(data, global_idx)
+                    data = tu.index_select_tensor_dict(data, global_idx)
 
                 # start profile in SPMD mode
                 if global_step == self.start_profile_step:
