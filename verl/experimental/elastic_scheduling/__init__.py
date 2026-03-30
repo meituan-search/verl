@@ -59,6 +59,12 @@ Quick Start
 """
 
 # Engines
+# Workers
+from verl.experimental.elastic_scheduling.elastic_engine_workers import (
+    ElasticActorWorker,
+    ElasticMode,
+    ElasticState,
+)
 from verl.experimental.elastic_scheduling.engine import (
     get_elastic_engine_cls,
 )
@@ -71,18 +77,11 @@ from verl.experimental.elastic_scheduling.engine.megatron import (
     MegatronDPRebuildManager,
 )
 
-# Workers
-from verl.experimental.elastic_scheduling.hybrid_engine_workers import (
-    ElasticMode,
-    ElasticState,
-    HybridElasticActorWorker,
-)
-
 __all__ = [
     # Workers
     "ElasticMode",
     "ElasticState",
-    "HybridElasticActorWorker",
+    "ElasticActorWorker",
     # Engines
     "get_elastic_engine_cls",
     "ElasticMegatronMixin",

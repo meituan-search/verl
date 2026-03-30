@@ -89,7 +89,7 @@ class ElasticState:
         self.total_switches += 1
 
 
-class HybridElasticActorWorker(ActorRolloutRefWorker):
+class ElasticActorWorker(ActorRolloutRefWorker):
     """
     Elastic worker that can dynamically switch between training and rollout.
 
