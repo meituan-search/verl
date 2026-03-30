@@ -15,10 +15,14 @@ from verl.experimental.elastic_scheduling.engine.megatron.elastic_transformer_im
     ElasticMegatronEngineWithLMHead,
     ElasticMegatronEngineWithValueHead,
     ElasticMegatronMixin,
+    ModelStateSnapshot,
+    OptimizerStateSnapshot,
 )
 
 __all__ = [
     "ElasticMegatronEngineWithLMHead",
     "ElasticMegatronEngineWithValueHead",
     "ElasticMegatronMixin",
+    "ModelStateSnapshot",
+    "OptimizerStateSnapshot",
 ]

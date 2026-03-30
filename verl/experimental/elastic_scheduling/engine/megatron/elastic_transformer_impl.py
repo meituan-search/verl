@@ -120,16 +120,17 @@ class ElasticMegatronMixin:
             # Step 2: Destroy old parallel groups
             self._destroy_parallel_groups()
 
-            # Step 3: Barrier with all current ranks
-            if dist.is_initialized():
-                dist.barrier()
+            # Step 3: Collective — ALL ranks must participate in new_group and
+            # initialize_model_parallel (both call dist.new_group internally).
+            # We do this BEFORE the early-return so that ranks removed from the
+            # new group still execute the same number of collectives.
+            #
+            # 3a. Pre-create the sync group (used later for param broadcast).
+            #     Every rank participates regardless of is_in_new_group.
+            sync_group = dist.new_group(ranks=new_world_ranks)
 
-            # Step 4: If not in new group, return early
-            if not is_in_new_group:
-                logger.info(f"[ElasticMegatronMixin rank={my_rank}] Rank removed from DP group, returning")
-                return
-
-            # Step 5: Reinitialize parallel groups
+            # 3b. Reinitialize Megatron parallel groups (contains dist.new_group
+            #     calls; ranks not in new_world_ranks still need to participate).
             self._reinitialize_parallel_groups(
                 tensor_model_parallel_size=tensor_model_parallel_size,
                 pipeline_model_parallel_size=pipeline_model_parallel_size,
@@ -138,17 +139,23 @@ class ElasticMegatronMixin:
                 expert_tensor_parallel_size=expert_tensor_parallel_size,
             )
 
-            # Step 6: Barrier after reinitialization
+            # Step 4: Global barrier — all ranks synchronize after collectives.
             if dist.is_initialized():
                 dist.barrier()
 
-            # Step 7: Restore state from CPU
+            # Step 5: If not in new group, nothing more to do for this rank.
+            if not is_in_new_group:
+                logger.info(f"[ElasticMegatronMixin rank={my_rank}] Rank removed from DP group, returning")
+                return
+
+            # Step 6: Restore state from CPU to GPU
             self._restore_state_from_cpu()
 
-            # Step 8: Sync parameters to newly joined ranks
-            self._sync_params_to_new_members(new_world_ranks)
+            # Step 7: Broadcast parameters from new_world_ranks[0] to all other
+            #         ranks in the new group (using pre-created sync_group).
+            self._sync_params_to_new_members(new_world_ranks, sync_group=sync_group)
 
-            # Step 9: Final barrier
+            # Step 8: Final barrier among the new group members
             if dist.is_initialized():
                 dist.barrier()
 
@@ -281,37 +288,38 @@ class ElasticMegatronMixin:
 
         torch.cuda.empty_cache()
 
-    def _sync_params_to_new_members(self, new_world_ranks: list[int]) -> None:
-        """Broadcast parameters from existing ranks to newly joined ranks."""
+    def _sync_params_to_new_members(
+        self,
+        new_world_ranks: list[int],
+        sync_group=None,
+    ) -> None:
+        """Broadcast parameters from new_world_ranks[0] to all ranks in the group.
+
+        ``sync_group`` must be pre-created by the caller (via ``dist.new_group``)
+        **before** any early-return so that all global ranks participate in the
+        collective.  Passing it in avoids a second ``dist.new_group`` call here.
+        """
         my_rank = dist.get_rank()
 
-        # Identify new member ranks
-        try:
-            current_dp_group = mpu.get_data_parallel_group()
-            current_dp_ranks = sorted(list(dist.get_process_group_ranks(current_dp_group)))
-        except Exception as e:
-            logger.warning(f"[ElasticMegatronMixin rank={my_rank}] Could not get current DP ranks: {e}")
-            current_dp_ranks = []
-
-        new_member_ranks = [r for r in new_world_ranks if r not in current_dp_ranks]
-
-        if not new_member_ranks:
-            logger.info(f"[ElasticMegatronMixin rank={my_rank}] No new member ranks to sync")
+        if not hasattr(self, "module") or self.module is None:
             return
 
-        logger.info(f"[ElasticMegatronMixin rank={my_rank}] Syncing params to new members: {new_member_ranks}")
+        logger.info(
+            f"[ElasticMegatronMixin rank={my_rank}] Syncing params via broadcast from rank {new_world_ranks[0]}"
+        )
 
-        if hasattr(self, "module") and self.module is not None:
-            dp_group = mpu.get_data_parallel_group()
+        src_rank = new_world_ranks[0]
 
-            for module in self.module if isinstance(self.module, list) else [self.module]:
-                unwrapped = module
-                while hasattr(unwrapped, "module"):
-                    unwrapped = unwrapped.module
+        for module in self.module if isinstance(self.module, list) else [self.module]:
+            unwrapped = module
+            while hasattr(unwrapped, "module"):
+                unwrapped = unwrapped.module
 
-                # Broadcast from DP rank 0 to all DP members
-                for param in unwrapped.parameters():
-                    dist.broadcast(param.data, src=0, group=dp_group)
+            for param in unwrapped.parameters():
+                # Guard: NCCL only supports CUDA tensors.
+                if param.data.device.type != "cuda":
+                    param.data = param.data.cuda()
+                dist.broadcast(param.data, src=src_rank, group=sync_group)
 
 
 @dataclass
@@ -381,12 +389,15 @@ class ModelStateSnapshot:
 
                 for name, param in unwrapped.named_parameters():
                     if name in self.state_dict:
-                        param.data.copy_(self.state_dict[name].to(device=device, non_blocking=True))
+                        # Use direct assignment instead of copy_ so that params
+                        # offloaded to CPU (via param.data = param.data.cpu())
+                        # are properly moved back to the target device.
+                        param.data = self.state_dict[name].to(device=device)
 
                 for name, buffer in unwrapped.named_buffers():
                     full_name = f"{name}.buffer"
                     if full_name in self.state_dict:
-                        buffer.data.copy_(self.state_dict[full_name].to(device=device, non_blocking=True))
+                        buffer.data = self.state_dict[full_name].to(device=device)
 
 
 @dataclass

@@ -17,8 +17,8 @@
 真实模型端到端测试：使用 mbridge 加载 Qwen2-Math-7B，验证 Megatron DP 变化时的
 参数保存、通信组重建和参数加载能力。
 
-本脚本参考 verl/workers/engine/megatron/transformer_impl.py 中的 MegatronEngine
-实现，使用完全相同的初始化流程（vanilla mbridge 路径）加载真实模型。
+本脚本基于 ElasticMegatronMixin（verl/experimental/elastic_scheduling/engine/megatron/
+elastic_transformer_impl.py），验证其完整的弹性 DP rebuild 流程。
 
 测试场景（4 GPU，tp=1, pp=1, dp=4）：
 
@@ -34,18 +34,23 @@
     - 验证恢复后 GPU 参数值与快照一致
 
   Test R3 - DP 通信组重建（DP=4 → 销毁 → 重建 DP=4）
-    - 使用真实模型执行 MegatronDPRebuildManager.rebuild()
+    - 使用真实模型执行 ElasticMegatronMixin.rebuild_dp_group()
     - 验证参数在 rebuild 前后保持一致
     - 验证通信组 dp world_size 正确
 
   Test R4 - 弹性扩容：DP=2 → DP=4（新成员参数广播）
     - rank 0,1 持有真实模型权重（老成员）
     - rank 2,3 持有随机权重（新成员）
-    - rebuild(new_member_ranks=[2,3])
+    - rebuild_dp_group(new_world_ranks=[0,1,2,3])
     - 验证 rank 2,3 的参数广播后与 rank 0,1 一致
 
   Test R5 - GPU 内存释放（真实大模型场景）
-    - 验证 capture_and_offload 后 GPU 显存有效释放
+    - 验证 _capture_state_to_cpu 后 GPU 显存有效释放
+
+  Test R6 - 真实模型 DP rebuild scale down（DP=4 → DP=2）
+    - 以 tp=1（dp=4）初始化，rebuild 到 tp=2（dp=2）
+
+  Test R7 - 真实模型 DP rebuild roundtrip（DP=4 → DP=2 → DP=4）
 
 运行方式（需要 4 个 GPU）：
     torchrun --nproc_per_node=4 \\
@@ -56,14 +61,14 @@
     ray job submit \\
         --address='http://10.148.11.18:8420' \\
         --runtime-env=examples/mtp_trainer/runtime_env.yaml \\
-        --working-dir=/Users/arron/Projects/verl \\
+        --working-dir=. \\
+        --entrypoint-num-gpus 4 \\
         -- torchrun --nproc_per_node=4 --master-port=29603 \\
            verl/experimental/elastic_scheduling/test/test_megatron_dp_rebuild_real_model.py \\
-           --model-path /home/hadoop-djst-algoplat/models/Qwen2-Math-7B
+           --model-path /home/hadoop-djst-algoplat/models/Qwen2.5-Math-7B
 """
 
 import argparse
-import importlib.util
 import os
 import sys
 import traceback
@@ -72,52 +77,13 @@ import torch
 import torch.distributed as dist
 
 # ============================================================================
-# 模块注入（绕过 elastic_scheduling/__init__.py 的 Ray actor 继承问题）
+# 路径设置
 # ============================================================================
 
-
-def _load_file_as_module(full_module_name: str, abs_path: str):
-    if full_module_name in sys.modules:
-        return sys.modules[full_module_name]
-    spec = importlib.util.spec_from_file_location(full_module_name, abs_path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[full_module_name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def _inject_elastic_scheduling_modules():
-    here = os.path.dirname(os.path.abspath(__file__))
-    # test/ → elastic_scheduling/ → experimental/ → verl/ → project_root
-    project_root = os.path.abspath(os.path.join(here, "..", "..", "..", ".."))
-    es_dir = os.path.join(project_root, "verl", "experimental", "elastic_scheduling")
-
-    # 确保 project_root 在 sys.path 中，让 verl.* 可正常 import
-    if project_root not in sys.path:
-        sys.path.insert(0, project_root)
-
-    # 只对 elastic_scheduling 包本身用 stub 占位（避免触发其 __init__.py）
-    # 不影响 verl、verl.experimental 的正常导入
-    if "verl.experimental.elastic_scheduling" not in sys.modules:
-        stub = importlib.util.module_from_spec(
-            importlib.util.spec_from_loader("verl.experimental.elastic_scheduling", loader=None)
-        )
-        stub.__path__ = [es_dir]
-        stub.__package__ = "verl.experimental.elastic_scheduling"
-        sys.modules["verl.experimental.elastic_scheduling"] = stub
-
-    # 直接加载所需子模块到完整包路径
-    submodules = {
-        "verl.experimental.elastic_scheduling.dynamic_dp_manager": os.path.join(es_dir, "dynamic_dp_manager.py"),
-        "verl.experimental.elastic_scheduling.elastic_worker": os.path.join(es_dir, "elastic_worker.py"),
-    }
-    for full_name, path in submodules.items():
-        _load_file_as_module(full_name, path)
-
-
-# 在模块级别立即注入
-_inject_elastic_scheduling_modules()
-
+_here = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.abspath(os.path.join(_here, "..", "..", "..", ".."))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 # ============================================================================
 # 工具函数
@@ -190,13 +156,11 @@ def load_real_model_with_mbridge(model_path: str, dtype: torch.dtype = torch.bfl
     Returns:
         model: Megatron model list（[Float16Module(GPTModel)] 或 [DDP(Float16Module(GPTModel))]）
     """
-    # 使用 verl/models/mcore/mbridge.py 中同样的导入方式
     from verl.models.mcore.mbridge import AutoBridge
 
     rank = dist.get_rank()
     log(f"Loading model from {model_path} via mbridge (vanilla bridge path)...")
 
-    # Step 1: 构建 TransformerConfig（与 MegatronEngine._build_tf_config 中 vanilla 路径一致）
     bridge = AutoBridge.from_pretrained(model_path)
     bridge.set_extra_args(
         variable_seq_lengths=True,
@@ -212,8 +176,6 @@ def load_real_model_with_mbridge(model_path: str, dtype: torch.dtype = torch.bfl
             f"fp16={tf_config.fp16}, bf16={tf_config.bf16}"
         )
 
-    # Step 2: 构建 Megatron 模型（与 MegatronEngine._build_megatron_module vanilla 路径一致）
-    # 参考 make_megatron_module 中 bridge is not None and provider is None 的分支
     model = bridge.get_model(
         post_model_creation_callbacks=[],
         wrap_with_ddp=True,
@@ -222,7 +184,6 @@ def load_real_model_with_mbridge(model_path: str, dtype: torch.dtype = torch.bfl
         ddp_config=None,
     )
 
-    # Step 3: 加载 HF 权重（与 MegatronEngine._build_megatron_module 中 vanilla 路径一致）
     bridge.load_weights(model, model_path)
 
     if rank == 0:
@@ -235,12 +196,10 @@ def load_real_model_with_mbridge(model_path: str, dtype: torch.dtype = torch.bfl
 def get_param_sample(model, n: int = 3) -> dict:
     """
     采样模型的前 n 个参数，返回 {name: cpu_tensor} 字典。
-    用于在 rebuild 前后比较参数值。
     穿透 DDP -> Float16Module -> GPTModel 层层 wrapper。
     """
     samples = {}
     count = 0
-    # 穿透所有 wrapper（DDP, Float16Module 等）
     inner = model[0]
     while hasattr(inner, "module"):
         inner = inner.module
@@ -254,10 +213,7 @@ def get_param_sample(model, n: int = 3) -> dict:
 
 
 def params_match(model, reference: dict, atol: float = 1e-4) -> tuple:
-    """
-    验证模型参数是否与 reference 字典匹配。
-    返回 (ok, error_msg)。
-    """
+    """验证模型参数是否与 reference 字典匹配，返回 (ok, error_msg)。"""
     inner = model[0]
     while hasattr(inner, "module"):
         inner = inner.module
@@ -275,8 +231,7 @@ def params_match(model, reference: dict, atol: float = 1e-4) -> tuple:
 
 def init_parallel_state(tp=1, pp=1):
     """
-    初始化 Megatron 并行状态，参考 MegatronEngine._init_device_mesh。
-    同时调用 set_random_seed 注册 Megatron RNG 状态（解决 cuda rng state 错误）。
+    初始化 Megatron 并行状态，同时调用 set_random_seed 注册 Megatron RNG 状态。
     """
     from megatron.core import parallel_state
 
@@ -285,7 +240,6 @@ def init_parallel_state(tp=1, pp=1):
             tensor_model_parallel_size=tp,
             pipeline_model_parallel_size=pp,
         )
-        # 必须在 initialize_model_parallel 之后调用，注册 model-parallel-rng 等 CUDA RNG 状态
         set_random_seed(seed=42)
         log(f"Parallel state initialized: tp={tp}, pp={pp}, dp={parallel_state.get_data_parallel_world_size()}")
 
@@ -302,10 +256,7 @@ def destroy_parallel_state():
 
 
 def release_model_memory(model):
-    """
-    显式释放模型占用的 GPU 显存。
-    在每个测试的 finally 块调用，避免测试间累积导致 OOM。
-    """
+    """显式释放模型占用的 GPU 显存。"""
     import gc
 
     try:
@@ -323,14 +274,43 @@ def release_model_memory(model):
 
 
 # ============================================================================
+# Mixin 包装：将 list of model chunks 包装成 ElasticMegatronMixin 可操作的对象
+# ============================================================================
+
+
+def make_elastic_mixin(model):
+    """
+    创建一个轻量 wrapper，使 ElasticMegatronMixin 的私有方法可以被测试直接调用。
+
+    ElasticMegatronMixin 设计为 Engine 的 mixin，通过 self.module 访问模型。
+    这里用 wrapper 模拟 engine 的接口，无需真正实例化 MegatronEngine。
+    """
+    from verl.experimental.elastic_scheduling.engine.megatron.elastic_transformer_impl import ElasticMegatronMixin
+
+    class _Wrapper(ElasticMegatronMixin):
+        def __init__(self, model_chunks):
+            # 不调用 super().__init__() 以避免依赖 MegatronEngine
+            self.module = model_chunks
+            self._model_snapshot = None
+            self._optimizer_snapshot = None
+            self._model_on_gpu = True
+            self._optimizer_on_gpu = True
+            # ElasticMegatronMixin._reinitialize_parallel_groups 中通过
+            # getattr(self.engine_config, "virtual_pipeline_model_parallel_size", None)
+            # 读取此属性，测试场景不需要 vpp，设为 None 即可。
+            self.engine_config = None
+
+    return _Wrapper(model)
+
+
+# ============================================================================
 # Test R1: 真实模型参数保存到 CPU
 # ============================================================================
 
 
 def test_real_model_snapshot_save(model_path: str):
     """验证真实 Qwen2 模型参数能正确保存到 CPU 快照"""
-    _ddp_mod = sys.modules["verl.experimental.elastic_scheduling.dynamic_dp_manager"]
-    ModelStateSnapshot = _ddp_mod.ModelStateSnapshot
+    from verl.experimental.elastic_scheduling.engine.megatron.elastic_transformer_impl import ModelStateSnapshot
 
     init_parallel_state(tp=1, pp=1)
 
@@ -339,10 +319,8 @@ def test_real_model_snapshot_save(model_path: str):
         model = load_real_model_with_mbridge(model_path)
         dist.barrier()
 
-        # 采样前几个参数用于验证
         param_samples = get_param_sample(model, n=5)
 
-        # 保存快照
         torch.cuda.synchronize()
         snapshot = ModelStateSnapshot.from_model(model)
         torch.cuda.synchronize()
@@ -359,6 +337,9 @@ def test_real_model_snapshot_save(model_path: str):
         log(f"快照包含 {snapshot.num_parameters:,} 个参数，dtype={snapshot.dtype}")
         record("Test R1: real model snapshot save", PASS, f"{snapshot.num_parameters:,} params, dtype={snapshot.dtype}")
 
+    except Exception as e:
+        record("Test R1: real model snapshot save", FAIL, str(e))
+        raise
     finally:
         release_model_memory(model)
         destroy_parallel_state()
@@ -372,8 +353,7 @@ def test_real_model_snapshot_save(model_path: str):
 
 def test_real_model_snapshot_restore(model_path: str):
     """验证 CPU 快照能正确恢复到真实模型的 GPU 参数"""
-    _ddp_mod = sys.modules["verl.experimental.elastic_scheduling.dynamic_dp_manager"]
-    ModelStateSnapshot = _ddp_mod.ModelStateSnapshot
+    from verl.experimental.elastic_scheduling.engine.megatron.elastic_transformer_impl import ModelStateSnapshot
 
     init_parallel_state(tp=1, pp=1)
 
@@ -382,11 +362,10 @@ def test_real_model_snapshot_restore(model_path: str):
         model = load_real_model_with_mbridge(model_path)
         dist.barrier()
 
-        # 保存快照（含原始值）
         snapshot = ModelStateSnapshot.from_model(model)
         original_samples = get_param_sample(model, n=5)
 
-        # 清零 GPU 参数（验证清零生效）
+        # 清零 GPU 参数
         inner = model[0]
         while hasattr(inner, "module"):
             inner = inner.module
@@ -394,7 +373,6 @@ def test_real_model_snapshot_restore(model_path: str):
             for p in inner.parameters():
                 p.data.zero_()
 
-        # 验证清零
         first_param = next(inner.parameters())
         assert first_param.data.abs().max().item() < 1e-9, "清零后参数应为 0"
         log("参数已清零，开始恢复...")
@@ -402,7 +380,6 @@ def test_real_model_snapshot_restore(model_path: str):
         # 从 CPU 快照恢复
         snapshot.to_model(model, device="cuda")
 
-        # 验证恢复后与原始值一致
         ok, msg = params_match(model, original_samples)
         if not ok:
             record("Test R2: real model snapshot restore", FAIL, msg)
@@ -411,6 +388,9 @@ def test_real_model_snapshot_restore(model_path: str):
                 "Test R2: real model snapshot restore", PASS, f"{snapshot.num_parameters:,} params restored correctly"
             )
 
+    except Exception as e:
+        record("Test R2: real model snapshot restore", FAIL, str(e))
+        raise
     finally:
         release_model_memory(model)
         destroy_parallel_state()
@@ -418,20 +398,17 @@ def test_real_model_snapshot_restore(model_path: str):
 
 
 # ============================================================================
-# Test R3: 真实模型 DP 通信组重建（same size）
+# Test R3: 真实模型 DP 通信组重建（same size，DP=4 → DP=4）
 # ============================================================================
 
 
 def test_real_model_dp_rebuild_same_size(model_path: str):
     """
     使用真实 Qwen2 模型验证 DP rebuild 流程：
-    DP=4 → capture_and_offload → destroy → reinit DP=4 → restore
-    参数值在 rebuild 前后保持一致
+    DP=4 → capture → destroy → reinit DP=4 → restore
+    参数值在 rebuild 前后保持一致。
     """
     from megatron.core import parallel_state
-
-    _ew_mod = sys.modules["verl.experimental.elastic_scheduling.elastic_worker"]
-    MegatronDPRebuildManager = _ew_mod.MegatronDPRebuildManager
 
     world_size = dist.get_world_size()
     init_parallel_state(tp=1, pp=1)
@@ -442,27 +419,23 @@ def test_real_model_dp_rebuild_same_size(model_path: str):
         model = load_real_model_with_mbridge(model_path)
         dist.barrier()
 
-        # 记录 rebuild 前的参数样本
         param_before = get_param_sample(model, n=8)
         log(f"rebuild 前采样参数: {list(param_before.keys())[:3]}...")
 
-        # 执行 rebuild（world_size 不变）
-        manager = MegatronDPRebuildManager(model=model, optimizer=None)
-        manager.rebuild(
-            new_world_size=world_size,
+        wrapper = make_elastic_mixin(model)
+        # new_world_ranks = 全部 ranks（world_size 不变）
+        all_ranks = list(range(world_size))
+        wrapper.rebuild_dp_group(
+            new_world_ranks=all_ranks,
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
-            new_member_ranks=None,
         )
 
-        # rebuild 后需要重新注册 RNG 状态（因为 rebuild 会重新 initialize_model_parallel）
         set_random_seed(seed=42)
 
-        # 验证通信组
         dp_after = parallel_state.get_data_parallel_world_size()
         assert dp_after == dp_before, f"dp_size 应保持 {dp_before}，实际 {dp_after}"
 
-        # 验证参数一致性
         ok, msg = params_match(model, param_before)
         if not ok:
             record("Test R3: real model DP rebuild (same size)", FAIL, msg)
@@ -473,6 +446,9 @@ def test_real_model_dp_rebuild_same_size(model_path: str):
                 f"dp={dp_before}→{dp_after}, params consistent after rebuild",
             )
 
+    except Exception as e:
+        record("Test R3: real model DP rebuild (same size)", FAIL, str(e))
+        raise
     finally:
         release_model_memory(model)
         destroy_parallel_state()
@@ -489,13 +465,10 @@ def test_real_model_elastic_scale_out(model_path: str):
     验证真实模型下的弹性扩容广播：
     - rank 0,1 加载真实权重（老成员）
     - rank 2,3 使用随机权重（新成员）
-    - rebuild(new_member_ranks=[2,3])
+    - rebuild_dp_group(new_world_ranks=[0,1,2,3])
     - 验证 rank 2,3 的参数广播后与 rank 0,1 一致
     """
     from megatron.core import parallel_state
-
-    _ew_mod = sys.modules["verl.experimental.elastic_scheduling.elastic_worker"]
-    MegatronDPRebuildManager = _ew_mod.MegatronDPRebuildManager
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -508,7 +481,6 @@ def test_real_model_elastic_scale_out(model_path: str):
 
     model = None
     try:
-        # 所有 rank 都加载模型（保证 Megatron 集体通信正确）
         model = load_real_model_with_mbridge(model_path)
 
         if rank >= 2:
@@ -525,21 +497,18 @@ def test_real_model_elastic_scale_out(model_path: str):
 
         dist.barrier()
 
-        manager = MegatronDPRebuildManager(model=model, optimizer=None)
-        manager.rebuild(
-            new_world_size=world_size,
+        wrapper = make_elastic_mixin(model)
+        all_ranks = list(range(world_size))
+        wrapper.rebuild_dp_group(
+            new_world_ranks=all_ranks,
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
-            new_member_ranks=[2, 3],
         )
 
-        # rebuild 后重新注册 RNG 状态
         set_random_seed(seed=42)
-
         dist.barrier()
 
         # 验证：所有 rank 的参数应与老成员（rank 0）保持一致
-        # 通过广播：rank 0 → rank 1,2,3
         inner = model[0]
         while hasattr(inner, "module"):
             inner = inner.module
@@ -549,7 +518,7 @@ def test_real_model_elastic_scale_out(model_path: str):
             record("Test R4: real model elastic scale out", FAIL, "模型参数为空")
             return
 
-        # 取第一个参数，rank 0 广播其值，所有 rank 验证
+        # rank 0 广播第一个参数，所有 rank 验证
         check_param = params_list[0].data.clone()
         dist.broadcast(check_param, src=0)
 
@@ -569,6 +538,9 @@ def test_real_model_elastic_scale_out(model_path: str):
                 f"rank={rank}, dp_size={dp_size}, params broadcast correctly from old members",
             )
 
+    except Exception as e:
+        record("Test R4: real model elastic scale out", FAIL, str(e))
+        raise
     finally:
         release_model_memory(model)
         destroy_parallel_state()
@@ -582,12 +554,9 @@ def test_real_model_elastic_scale_out(model_path: str):
 
 def test_real_model_memory_offload(model_path: str):
     """
-    验证真实大模型 capture_and_offload 后 GPU 显存有效释放。
+    验证真实大模型 _capture_state_to_cpu 后 GPU 显存有效释放。
     7B 模型期望释放约 13GB 显存（bfloat16）。
     """
-    _ew_mod = sys.modules["verl.experimental.elastic_scheduling.elastic_worker"]
-    MegatronDPRebuildManager = _ew_mod.MegatronDPRebuildManager
-
     init_parallel_state(tp=1, pp=1)
 
     model = None
@@ -600,8 +569,8 @@ def test_real_model_memory_offload(model_path: str):
         mem_before = torch.cuda.memory_allocated()
         log(f"offload 前 GPU 显存: {mem_before / 1024**3:.2f} GB")
 
-        manager = MegatronDPRebuildManager(model=model, optimizer=None)
-        manager.capture_and_offload()
+        wrapper = make_elastic_mixin(model)
+        wrapper._capture_state_to_cpu()
 
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
@@ -611,7 +580,7 @@ def test_real_model_memory_offload(model_path: str):
         freed_gb = (mem_before - mem_after) / 1024**3
         log(f"释放显存: {freed_gb:.2f} GB")
 
-        if freed_gb > 1.0:  # 7B 模型至少应释放 1GB
+        if freed_gb > 1.0:
             record("Test R5: real model memory offload", PASS, f"freed {freed_gb:.2f} GB GPU memory")
         else:
             record(
@@ -620,6 +589,9 @@ def test_real_model_memory_offload(model_path: str):
                 f"freed {freed_gb:.2f} GB (may be low due to allocator caching)",
             )
 
+    except Exception as e:
+        record("Test R5: real model memory offload", FAIL, str(e))
+        raise
     finally:
         release_model_memory(model)
         destroy_parallel_state()
@@ -639,31 +611,20 @@ def test_real_model_dp_rebuild_scale_down(model_path: str):
     在 world_size=4 的环境下：
       - tp=1, pp=1  →  dp = 4/1/1 = 4
       - tp=2, pp=1  →  dp = 4/2/1 = 2  ← 通过增大 tp 来实现 dp 缩容
-
-    本测试流程：
-    1. 以 tp=1（dp=4）初始化
-    2. 加载真实模型权重
-    3. rebuild(tensor_model_parallel_size=2)  →  dp 从 4 缩容到 2
-    4. 验证 dp_size == 2
-    5. 验证参数在 Offload + Restore 流程中保持正确
     """
     from megatron.core import parallel_state
-
-    _ew_mod = sys.modules["verl.experimental.elastic_scheduling.elastic_worker"]
-    MegatronDPRebuildManager = _ew_mod.MegatronDPRebuildManager
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    print(f"rank={rank}, world_size={world_size}")
+    log(f"rank={rank}, world_size={world_size}")
 
     if world_size < 4:
         record("Test R6: real model DP rebuild (scale down 4→2)", SKIP, f"需要 4 个 GPU，当前 {world_size}")
         return
 
-    # 以 tp=1, dp=4 初始化
     init_parallel_state(tp=1, pp=1)
-    dp_before = parallel_state.get_data_parallel_world_size()  # 4
+    dp_before = parallel_state.get_data_parallel_world_size()
     log(f"初始 dp_size={dp_before}，tp=1，准备 rebuild 到 tp=2（dp=2）")
 
     model = None
@@ -671,33 +632,28 @@ def test_real_model_dp_rebuild_scale_down(model_path: str):
         model = load_real_model_with_mbridge(model_path)
         dist.barrier()
 
-        # 记录 rebuild 前的参数
         param_before = get_param_sample(model, n=8)
 
-        # 缩容：tp: 1→2，pp=1 不变  →  dp = 4/(2*1) = 2
-        manager = MegatronDPRebuildManager(model=model, optimizer=None)
-        manager.rebuild(
-            new_world_size=world_size,
+        wrapper = make_elastic_mixin(model)
+        all_ranks = list(range(world_size))
+        wrapper.rebuild_dp_group(
+            new_world_ranks=all_ranks,
             tensor_model_parallel_size=2,  # tp 增大，导致 dp 缩小
             pipeline_model_parallel_size=1,
-            new_member_ranks=None,
         )
 
-        # rebuild 后重新注册 RNG 状态
         set_random_seed(seed=42)
 
         dp_after = parallel_state.get_data_parallel_world_size()
         tp_after = parallel_state.get_tensor_model_parallel_world_size()
         log(f"rebuild 后: dp={dp_after}, tp={tp_after}")
 
-        # 验证参数一致（Offload + Restore 流程正确）
         ok, msg = params_match(model, param_before)
         if not ok:
             record("Test R6: real model DP rebuild (scale down 4→2)", FAIL, f"参数不一致: {msg}")
             return
 
-        # 验证 dp 缩容结果
-        expected_dp = world_size // (2 * 1)  # 4 / 2 = 2
+        expected_dp = world_size // (2 * 1)
         if dp_after != expected_dp:
             record(
                 "Test R6: real model DP rebuild (scale down 4→2)",
@@ -711,6 +667,9 @@ def test_real_model_dp_rebuild_scale_down(model_path: str):
                 f"dp: {dp_before}→{dp_after}（tp: 1→{tp_after}），params consistent",
             )
 
+    except Exception as e:
+        record("Test R6: real model DP rebuild (scale down 4→2)", FAIL, str(e))
+        raise
     finally:
         release_model_memory(model)
         destroy_parallel_state()
@@ -725,49 +684,38 @@ def test_real_model_dp_rebuild_scale_down(model_path: str):
 def test_real_model_dp_rebuild_roundtrip(model_path: str):
     """
     验证真实模型下 DP rebuild 往返：DP=4 → DP=2 → DP=4。
-
-    流程：
-    1. 以 tp=1（dp=4）初始化，加载真实模型
-    2. 第一次 rebuild(tp=2)  →  dp=2（缩容）
-    3. 验证 dp=2，参数正确
-    4. 第二次 rebuild(tp=1)  →  dp=4（扩容恢复）
-    5. 验证 dp=4，参数与初始状态一致
     """
     from megatron.core import parallel_state
-
-    _ew_mod = sys.modules["verl.experimental.elastic_scheduling.elastic_worker"]
-    MegatronDPRebuildManager = _ew_mod.MegatronDPRebuildManager
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    print(f"rank={rank}, world_size={world_size}")
+    log(f"rank={rank}, world_size={world_size}")
 
     if world_size < 4:
         record("Test R7: real model DP rebuild (roundtrip 4→2→4)", SKIP, f"需要 4 个 GPU，当前 {world_size}")
         return
 
-    # 以 tp=1, dp=4 初始化
     init_parallel_state(tp=1, pp=1)
-    dp_initial = parallel_state.get_data_parallel_world_size()  # 4
+    dp_initial = parallel_state.get_data_parallel_world_size()
     log(f"初始 dp_size={dp_initial}，开始 roundtrip 测试")
+
+    all_ranks = list(range(world_size))
 
     model = None
     try:
         model = load_real_model_with_mbridge(model_path)
         dist.barrier()
 
-        # 记录初始参数（用于最终验证）
         param_initial = get_param_sample(model, n=8)
 
         # ── 第一次 rebuild：DP=4 → DP=2（tp: 1→2）──
         log("第一次 rebuild: tp=1→2，dp=4→2（缩容）")
-        manager = MegatronDPRebuildManager(model=model, optimizer=None)
-        manager.rebuild(
-            new_world_size=world_size,
+        wrapper = make_elastic_mixin(model)
+        wrapper.rebuild_dp_group(
+            new_world_ranks=all_ranks,
             tensor_model_parallel_size=2,
             pipeline_model_parallel_size=1,
-            new_member_ranks=None,
         )
         set_random_seed(seed=42)
 
@@ -775,7 +723,7 @@ def test_real_model_dp_rebuild_roundtrip(model_path: str):
         tp_mid = parallel_state.get_tensor_model_parallel_world_size()
         log(f"第一次 rebuild 后: dp={dp_mid}, tp={tp_mid}")
 
-        expected_dp_mid = world_size // (2 * 1)  # 2
+        expected_dp_mid = world_size // (2 * 1)
         if dp_mid != expected_dp_mid:
             record(
                 "Test R7: real model DP rebuild (roundtrip 4→2→4)",
@@ -796,12 +744,11 @@ def test_real_model_dp_rebuild_roundtrip(model_path: str):
 
         # ── 第二次 rebuild：DP=2 → DP=4（tp: 2→1）──
         log("第二次 rebuild: tp=2→1，dp=2→4（扩容恢复）")
-        manager2 = MegatronDPRebuildManager(model=model, optimizer=None)
-        manager2.rebuild(
-            new_world_size=world_size,
+        wrapper2 = make_elastic_mixin(model)
+        wrapper2.rebuild_dp_group(
+            new_world_ranks=all_ranks,
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
-            new_member_ranks=None,
         )
         set_random_seed(seed=42)
 
@@ -809,7 +756,7 @@ def test_real_model_dp_rebuild_roundtrip(model_path: str):
         tp_final = parallel_state.get_tensor_model_parallel_world_size()
         log(f"第二次 rebuild 后: dp={dp_final}, tp={tp_final}")
 
-        expected_dp_final = world_size // (1 * 1)  # 4
+        expected_dp_final = world_size // (1 * 1)
         if dp_final != expected_dp_final:
             record(
                 "Test R7: real model DP rebuild (roundtrip 4→2→4)",
@@ -832,6 +779,9 @@ def test_real_model_dp_rebuild_roundtrip(model_path: str):
                 f"dp: {dp_initial}→{dp_mid}→{dp_final}，tp: 1→{tp_mid}→{tp_final}，全程参数一致",
             )
 
+    except Exception as e:
+        record("Test R7: real model DP rebuild (roundtrip 4→2→4)", FAIL, str(e))
+        raise
     finally:
         release_model_memory(model)
         destroy_parallel_state()
@@ -852,7 +802,7 @@ def run_all_tests(model_path: str):
         print("Megatron DP Rebuild 真实模型端到端测试", flush=True)
         print(f"model_path={model_path}", flush=True)
         print(f"world_size={world_size}, CUDA={torch.cuda.is_available()}", flush=True)
-        print("参考实现: verl/workers/engine/megatron/transformer_impl.py (vanilla mbridge 路径)", flush=True)
+        print("被测代码: verl/experimental/elastic_scheduling/engine/megatron/elastic_transformer_impl.py", flush=True)
         print("=" * 70 + "\n", flush=True)
 
     tests = [
