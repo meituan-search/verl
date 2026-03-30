@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from verl.experimental.elastic_scheduling.engine.fsdp.transformer_impl import ElasticFSDPMixin, FSDP2DPRebuildManager
+from verl.experimental.elastic_scheduling.engine.fsdp.elastic_transformer_impl import (
+    ElasticFSDPEngineWithLMHead,
+    ElasticFSDPEngineWithValueHead,
+)
 
-__all__ = ["ElasticFSDPMixin", "FSDP2DPRebuildManager"]
+__all__ = ["ElasticFSDPEngineWithLMHead", "ElasticFSDPEngineWithValueHead"]

@@ -13,37 +13,36 @@
 # limitations under the License.
 
 """
-Hybrid Elastic Actor Worker for VERL
+Elastic Actor Worker for VERL
 
-HybridElasticActorWorker extends ActorRolloutRefWorker to support dynamic
-switching between rollout and training roles within the same process group.
+ElasticActorWorker extends ActorRolloutRefWorker to support dynamic switching
+of the **training engine** between active-training and offloaded states.
 
-Overview
---------
-Unlike a static worker that is permanently assigned to either training or
-rollout, HybridElasticActorWorker can participate in either role depending
-on the current scheduling decision. This enables elastic resource sharing:
-workers not needed for training can serve rollout requests, and vice versa.
+Design principle
+----------------
+This class is **training-engine-only**:
 
-Resource allocation is controlled at the rank level:
-- A rank assigned to ``TRAIN`` participates in the DP training group.
-- A rank assigned to ``ROLLOUT`` serves inference requests.
-- Roles can be reassigned at any PPO iteration boundary.
+- ``switch_to_train``   – load actor weights back to GPU and rebuild DP group.
+- ``switch_to_rollout`` – offload actor weights to CPU (free GPU for rollout server).
+- ``rebuild_dp_group``  – rebuild the DP communication group (FSDP2 / Megatron).
 
-Usage
------
-::
+All rollout server lifecycle (wake_up / sleep / abort) is managed exclusively
+by ``ElasticAgentLoopManager``.  ElasticTrainer calls into the rollouter to
+trigger those operations; ElasticActorWorker never touches the rollout server.
 
-    worker = HybridElasticActorWorker(config, role="actor_rollout")
-    worker.init_model()
+Role transitions
+----------------
+TRAIN → ROLLOUT:
+    1. Offload actor model weights to CPU  (frees GPU for rollout server).
+    (Rollout server wake_up is done by ElasticAgentLoopManager via rollouter.)
 
-    # Route rank 0-3 to training, rank 4-7 to rollout
-    worker.switch_to_train(new_train_world_ranks=[0, 1, 2, 3], param_version=0)
-    # Later, reassign
-    worker.switch_to_rollout(param_version=1)
+ROLLOUT → TRAIN:
+    1. Load actor model weights back to GPU.
+    2. Rebuild DP communication group.
+    (Rollout server sleep is done by ElasticAgentLoopManager via rollouter
+    *before* this call, so GPU memory is already available.)
 """
 
-import gc
 import logging
 import os
 import time
@@ -51,7 +50,6 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional
 
-import ray
 import torch
 import torch.distributed as dist
 
@@ -63,22 +61,21 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class ElasticMode(Enum):
-    """Current role of a hybrid elastic worker."""
+    """Current role of an elastic actor worker."""
 
     TRAIN = auto()  # Participating in training DP group
-    ROLLOUT = auto()  # Serving inference requests
-    SWITCHING = auto()  # Transitioning between roles
+    ROLLOUT = auto()  # Actor weights offloaded; GPU used by rollout server
+    SWITCHING = auto()
 
 
 @dataclass
 class ElasticState:
-    """Runtime state of a hybrid elastic worker."""
+    """Runtime state of an elastic actor worker."""
 
     resource_id: str
     current_mode: ElasticMode = ElasticMode.TRAIN
     param_version: int = -1
     train_world_ranks: list = field(default_factory=list)
-    rollout_world_ranks: list = field(default_factory=list)
     last_switch_time: float = 0.0
     total_switches: int = 0
     is_healthy: bool = True
@@ -91,23 +88,27 @@ class ElasticState:
 
 class ElasticActorWorker(ActorRolloutRefWorker):
     """
-    Elastic worker that can dynamically switch between training and rollout.
+    Elastic actor worker that manages **training engine** state only.
 
-    On ``init_model``, the actor engine is patched in-place with the
-    appropriate elastic mixin (``ElasticFSDPMixin`` or
-    ``ElasticMegatronMixin``) so that ``rebuild_dp_group`` is available
-    without subclassing the engine.
+    Rollout server lifecycle (wake_up / sleep / abort_all_requests) is
+    handled entirely by ``ElasticAgentLoopManager`` and is NOT the
+    responsibility of this class.
 
-    Mode transitions
-    ----------------
-    TRAIN → ROLLOUT:
-        1. Offload actor weights to CPU.
-        2. Wake up the rollout server.
+    The typical switch sequence orchestrated by ``ElasticCoordinator`` is:
 
-    ROLLOUT → TRAIN:
-        1. Sleep the rollout server (free GPU memory).
-        2. Load actor weights back to GPU.
-        3. Rebuild the DP communication group.
+    TRAIN → ROLLOUT
+    ~~~~~~~~~~~~~~~
+    1. [ElasticActorWorker]   offload actor weights to CPU
+                              (``switch_to_rollout``)
+    2. [ElasticAgentLoopManager via rollouter]  wake_up rollout server
+                              (``add_elastic_replica``)
+
+    ROLLOUT → TRAIN
+    ~~~~~~~~~~~~~~~
+    1. [ElasticAgentLoopManager via rollouter]  sleep rollout server + abort
+                              (``remove_elastic_replica``)
+    2. [ElasticActorWorker]   load actor weights to GPU + rebuild DP group
+                              (``switch_to_train``)
     """
 
     def __init__(self, *args, **kwargs):
@@ -127,53 +128,45 @@ class ElasticActorWorker(ActorRolloutRefWorker):
             self._patch_engine_to_elastic()
 
         self._elastic_state = ElasticState(resource_id=f"rank{dist.get_rank()}")
-        logger.info(f"[HybridElasticActorWorker] Initialized, rank={dist.get_rank()}")
+        logger.info(f"[ElasticActorWorker] Initialized, rank={dist.get_rank()}")
 
     def _patch_engine_to_elastic(self) -> None:
         """
         Patch ``self.actor.engine`` in-place with the elastic mixin so that
         ``engine.rebuild_dp_group`` becomes available.
 
-        The mixin is selected based on the actor strategy in config. If the
-        engine already has ``rebuild_dp_group`` (e.g., already patched or an
-        elastic subclass), this is a no-op.
+        If the engine already has ``rebuild_dp_group`` this is a no-op.
         """
         from verl.experimental.elastic_scheduling.engine import get_elastic_engine_cls
 
         engine = self.actor.engine
 
         if callable(getattr(engine, "rebuild_dp_group", None)):
-            logger.debug("[HybridElasticActorWorker] Engine already has rebuild_dp_group, skipping patch")
+            logger.debug("[ElasticActorWorker] Engine already has rebuild_dp_group, skipping patch")
             return
 
         strategy = self._get_actor_strategy()
         if strategy is None:
-            logger.warning("[HybridElasticActorWorker] Cannot detect actor strategy; engine not patched")
+            logger.warning("[ElasticActorWorker] Cannot detect actor strategy; engine not patched")
             return
 
         original_cls = type(engine)
         try:
             elastic_cls = get_elastic_engine_cls(strategy, original_cls)
         except KeyError:
-            logger.warning(f"[HybridElasticActorWorker] No elastic mixin registered for strategy={strategy!r}")
+            logger.warning(f"[ElasticActorWorker] No elastic mixin for strategy={strategy!r}")
             return
 
         engine.__class__ = elastic_cls
-        logger.info(f"[HybridElasticActorWorker] Engine patched: {original_cls.__name__} → {elastic_cls.__name__}")
+        logger.info(f"[ElasticActorWorker] Engine patched: {original_cls.__name__} → {elastic_cls.__name__}")
 
     def _get_actor_strategy(self) -> Optional[str]:
-        """
-        Read actor strategy from config.
-
-        Returns the strategy string (e.g. ``"megatron"``, ``"fsdp"``,
-        ``"fsdp2"``) or ``None`` if it cannot be determined.
-        """
+        """Read actor strategy from config or infer from engine class name."""
         try:
             return self.config.actor.strategy
         except AttributeError:
             pass
 
-        # Fallback: infer from engine class name
         if self.actor and self.actor.engine:
             cls_name = type(self.actor.engine).__name__.lower()
             if "megatron" in cls_name:
@@ -184,40 +177,43 @@ class ElasticActorWorker(ActorRolloutRefWorker):
         return None
 
     # -------------------------------------------------------------------------
-    # Mode switching
+    # Training engine state transitions
     # -------------------------------------------------------------------------
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def switch_to_train(self, new_train_world_ranks: list[int], param_version: int) -> bool:
         """
-        Switch this worker from rollout to training mode.
+        Restore actor weights to GPU and rebuild DP group.
+
+        Called **after** the rollout server on this resource has been put to
+        sleep by ``ElasticAgentLoopManager`` (GPU memory already released).
 
         Steps:
-        1. Sleep the rollout server to free GPU memory for training.
-        2. Load actor weights back to GPU.
-        3. Rebuild the DP communication group.
+        1. Load actor model weights from CPU back to GPU.
+        2. Rebuild the DP communication group.
 
         Args:
             new_train_world_ranks: Global ranks forming the new training DP group.
             param_version: Parameter version to record in elastic state.
 
         Returns:
-            True if the switch succeeded, False otherwise.
+            True if successful, False otherwise.
         """
-        assert self._elastic_state is not None, "call init_model() before switch_to_train()"
+        assert self._elastic_state is not None, "call init_model() first"
 
         if self._elastic_state.current_mode == ElasticMode.TRAIN:
-            logger.debug("[HybridElasticActorWorker] Already in TRAIN mode")
+            logger.debug("[ElasticActorWorker] Already in TRAIN mode")
             return True
 
         logger.info(
-            f"[HybridElasticActorWorker rank={dist.get_rank()}] "
+            f"[ElasticActorWorker rank={dist.get_rank()}] "
             f"ROLLOUT → TRAIN  dp_size={len(new_train_world_ranks)}  param_version={param_version}"
         )
 
         try:
-            self._sleep_rollout()
+            # Step 1: Load actor model to GPU (rollout server already sleeping)
             self._load_actor_to_gpu()
+            # Step 2: Rebuild DP group
             self._rebuild_dp_group(new_train_world_ranks)
 
             self._elastic_state.train_world_ranks = new_train_world_ranks
@@ -226,43 +222,45 @@ class ElasticActorWorker(ActorRolloutRefWorker):
             return True
 
         except Exception:
-            logger.exception("[HybridElasticActorWorker] switch_to_train failed")
+            logger.exception("[ElasticActorWorker] switch_to_train failed")
             self._elastic_state.is_healthy = False
             return False
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def switch_to_rollout(self, param_version: int) -> bool:
         """
-        Switch this worker from training to rollout mode.
+        Offload actor weights to CPU so the rollout server can use the GPU.
 
-        Steps:
-        1. Offload actor weights to CPU to free GPU memory.
-        2. Wake up the rollout server.
+        Called **before** the rollout server on this resource is woken up by
+        ``ElasticAgentLoopManager``.
+
+        Step:
+        1. Offload actor model weights to CPU.
 
         Args:
             param_version: Parameter version to record in elastic state.
 
         Returns:
-            True if the switch succeeded, False otherwise.
+            True if successful, False otherwise.
         """
-        assert self._elastic_state is not None, "call init_model() before switch_to_rollout()"
+        assert self._elastic_state is not None, "call init_model() first"
 
         if self._elastic_state.current_mode == ElasticMode.ROLLOUT:
-            logger.debug("[HybridElasticActorWorker] Already in ROLLOUT mode")
+            logger.debug("[ElasticActorWorker] Already in ROLLOUT mode")
             return True
 
-        logger.info(f"[HybridElasticActorWorker rank={dist.get_rank()}] TRAIN → ROLLOUT  param_version={param_version}")
+        logger.info(f"[ElasticActorWorker rank={dist.get_rank()}] TRAIN → ROLLOUT  param_version={param_version}")
 
         try:
+            # Offload actor model so rollout server can reclaim GPU memory
             self._offload_actor_to_cpu()
-            self._wake_up_rollout()
 
             self._elastic_state.param_version = param_version
             self._elastic_state.record_switch(ElasticMode.ROLLOUT)
             return True
 
         except Exception:
-            logger.exception("[HybridElasticActorWorker] switch_to_rollout failed")
+            logger.exception("[ElasticActorWorker] switch_to_rollout failed")
             self._elastic_state.is_healthy = False
             return False
 
@@ -275,9 +273,8 @@ class ElasticActorWorker(ActorRolloutRefWorker):
         """
         Rebuild the training DP process group.
 
-        Delegates to ``self.actor.engine.rebuild_dp_group``. All ranks in the
-        current global process group must call this simultaneously because
-        ``dist.new_group`` is a collective operation.
+        All ranks in the current global process group must call this
+        simultaneously because ``dist.new_group`` is a collective.
 
         Args:
             new_world_ranks: Ordered list of global ranks in the new DP group.
@@ -304,14 +301,13 @@ class ElasticActorWorker(ActorRolloutRefWorker):
             "current_mode": s.current_mode.name,
             "param_version": s.param_version,
             "train_world_ranks": s.train_world_ranks,
-            "rollout_world_ranks": s.rollout_world_ranks,
             "last_switch_time": s.last_switch_time,
             "total_switches": s.total_switches,
             "is_healthy": s.is_healthy,
         }
 
     # -------------------------------------------------------------------------
-    # Private helpers
+    # Private helpers – training engine only
     # -------------------------------------------------------------------------
 
     def _rebuild_dp_group(self, new_world_ranks: list[int]) -> None:
@@ -324,36 +320,41 @@ class ElasticActorWorker(ActorRolloutRefWorker):
             )
         self.actor.engine.rebuild_dp_group(new_world_ranks)
 
-    def _sleep_rollout(self) -> None:
-        """Put the rollout server to sleep to free GPU memory."""
-        if not hasattr(self, "rollout") or self.rollout is None:
-            return
-        if hasattr(self.rollout, "servers") and self.rollout.servers:
-            ray.get([server.sleep.remote() for server in self.rollout.servers])
-        elif hasattr(self.rollout, "sleep"):
-            self.rollout.sleep()
-        torch.cuda.empty_cache()
-        gc.collect()
-
-    def _wake_up_rollout(self) -> None:
-        """Resume the rollout server for inference."""
-        if not hasattr(self, "rollout") or self.rollout is None:
-            return
-        if hasattr(self.rollout, "servers") and self.rollout.servers:
-            ray.get([server.wake_up.remote() for server in self.rollout.servers])
-        elif hasattr(self.rollout, "wake_up"):
-            self.rollout.wake_up()
-
     def _offload_actor_to_cpu(self) -> None:
-        """Move actor model weights to CPU, keeping optimizer state on CPU too."""
-        if not hasattr(self, "actor") or self.actor is None:
+        """
+        Move actor model weights to CPU, freeing GPU memory for the rollout
+        server.  Optimizer state is left on GPU (it will not be used during
+        rollout mode) unless the engine's ``to()`` helper handles it.
+        """
+        if not (hasattr(self, "actor") and self.actor is not None):
             return
-        self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
+        if callable(getattr(self.actor.engine, "to", None)):
+            self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
+        else:
+            # Fallback: move module parameters manually
+            engine = self.actor.engine
+            if hasattr(engine, "module") and engine.module is not None:
+                engine.module.cpu()
         torch.cuda.empty_cache()
+        import gc
+
         gc.collect()
+        logger.info(f"[ElasticActorWorker rank={dist.get_rank()}] Actor model offloaded to CPU")
 
     def _load_actor_to_gpu(self) -> None:
-        """Restore actor model weights from CPU back to GPU."""
-        if not hasattr(self, "actor") or self.actor is None:
+        """
+        Restore actor model weights from CPU back to GPU.
+
+        The rollout server on this resource must already be sleeping before
+        this is called so that GPU memory is available.
+        """
+        if not (hasattr(self, "actor") and self.actor is not None):
             return
-        self.actor.engine.to("device", model=True, optimizer=False, grad=False)
+        if callable(getattr(self.actor.engine, "to", None)):
+            self.actor.engine.to("device", model=True, optimizer=False, grad=False)
+        else:
+            engine = self.actor.engine
+            if hasattr(engine, "module") and engine.module is not None:
+                device = torch.cuda.current_device()
+                engine.module.to(device)
+        logger.info(f"[ElasticActorWorker rank={dist.get_rank()}] Actor model loaded back to GPU")

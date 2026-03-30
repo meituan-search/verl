@@ -15,40 +15,63 @@
 """
 Elastic Scheduling Main Entry Point for VERL
 
-This module wires together all elastic scheduling components:
-- ElasticRollouter: Extends FullyAsyncRollouter with dynamic rollout replica management
-- ElasticTrainer: Extends FullyAsyncTrainer with dynamic training DP management
-- ElasticCoordinator: Monitors production/consumption rates and triggers role switches
-- ElasticParameterSyncManager: Handles parameter sync to both fixed and elastic replicas
-- MessageQueue: The shared buffer between rollouter and trainer
+Wires together all elastic scheduling components.
 
-Architecture:
-    ElasticSchedulingTaskRunner (Ray actor)
-        ├── ElasticRollouter (Ray actor)
-        │     ├── ElasticAgentLoopManager
-        │     │     ├── ElasticGlobalRequestLoadBalancer
-        │     │     └── AgentLoopWorkers (dynamic)
-        │     └── Elastic Replicas (managed by coordinator)
-        ├── ElasticTrainer (Ray actor)
-        │     └── Elastic Actor WGs (managed by coordinator)
-        ├── MessageQueue (Ray actor, shared buffer)
-        ├── ElasticCoordinator (Ray actor)
-        │     ├── Polls queue size from MessageQueue
-        │     ├── Polls rates from Rollouter/Trainer
-        │     └── Switches elastic resources between modes
-        └── ElasticParameterSyncManager (local in trainer process)
-              ├── Fixed replicas via CheckpointEngineManager
-              └── Elastic replicas via additional sync calls
+Component diagram
+-----------------
 
-Usage:
-    python -m verl.experimental.elastic_scheduling.main \
-        --config-path config \
-        --config-name elastic_ppo_trainer
+    ElasticSchedulingTaskRunner (Ray actor, num_cpus=4)
+    │
+    ├── ElasticRollouter (Ray actor)
+    │     └── ElasticAgentLoopManager
+    │             ├── Fixed rollout replicas  (dedicated rollout GPU pool)
+    │             └── Elastic hybrid replicas (shared GPU pool, created at init, sleeping)
+    │
+    ├── ElasticTrainer (Ray actor)
+    │     ├── Fixed actor worker group  (dedicated training GPUs)
+    │     └── Elastic actor registry    (elastic wgs added/removed via switch API)
+    │
+    ├── MessageQueue (Ray actor)  — FIFO sample buffer
+    │
+    └── ElasticCoordinator (Ray actor)
+            ├── Polls queue metrics  →  decides pending_action
+            └── on_before_fit_step() hook (called by ElasticTrainer)
+                  └── delegates switch to ElasticTrainer.switch_elastic_to_rollout/train()
 
-    Or with OmegaConf override:
-        trainer.nnodes=2 trainer.n_gpus_per_node=8 \
-        rollout.nnodes=1 rollout.n_gpus_per_node=8 \
-        elastic_scheduling.elastic_nnodes=1 elastic_scheduling.elastic_n_gpus_per_node=8
+Elastic resource lifecycle
+--------------------------
+Elastic resources are ActorRolloutRef worker groups whose GPUs are **shared**
+between the training engine and rollout servers.
+
+1. At init time:
+   a. ElasticActorWorkerGroup is created (same process as training).
+   b. Each worker calls init_model() → builds actor engine.
+   c. ElasticRollouter.set_elastic_worker_group(elastic_wg) is called.
+   d. ElasticRollouter.init_workers() uses elastic_wg to call
+      ElasticAgentLoopManager.create(elastic_worker_group=elastic_wg), which
+      creates RolloutReplica objects and puts them to sleep immediately.
+   e. ElasticTrainer.register_elastic_worker_group(resource_id, wg) is called
+      for each elastic wg so that switch_elastic_to_train() can find them.
+
+2. During training:
+   TRAIN → ROLLOUT (triggered by ElasticCoordinator via ElasticTrainer):
+     a. ElasticTrainer.remove_elastic_actor()  – DP rebuild without this wg
+     b. elastic_wg.switch_to_rollout()          – offload actor to CPU
+     c. ElasticRollouter.add_elastic_replica()  – wake up rollout server
+
+   ROLLOUT → TRAIN (triggered by ElasticCoordinator via ElasticTrainer):
+     a. ElasticRollouter.remove_elastic_replica() – sleep rollout server
+     b. elastic_wg.switch_to_train()               – load actor to GPU
+     c. ElasticTrainer.add_elastic_actor()          – DP rebuild with this wg
+
+Usage
+-----
+    python -m verl.experimental.elastic_scheduling.main \\
+        --config-path config --config-name elastic_ppo_trainer \\
+        trainer.nnodes=2 trainer.n_gpus_per_node=8 \\
+        rollout.nnodes=1 rollout.n_gpus_per_node=8 \\
+        elastic_scheduling.n_elastic_resources=1 \\
+        elastic_scheduling.elastic_n_gpus_per_node=4
 """
 
 import asyncio
@@ -76,23 +99,21 @@ class ElasticSchedulingTaskRunner:
     Ray remote class for elastic scheduling PPO training.
 
     This creates and manages:
-    1. ElasticRollouter: async sample generation with dynamic replica pool
-    2. ElasticTrainer: async training with dynamic DP pool
-    3. MessageQueue: FIFO buffer between rollouter and trainer
+    1. ElasticRollouter : async sample generation with dynamic replica pool
+    2. ElasticTrainer   : async training with dynamic DP pool
+    3. MessageQueue     : FIFO buffer between rollouter and trainer
     4. ElasticCoordinator: monitoring + role switching loop
-    5. ElasticParameterSyncManager: handles param sync to all replicas
 
-    The ElasticCoordinator acts as the brain of the system, continuously:
-    - Monitoring queue utilization (production vs consumption rates)
-    - Deciding when to switch elastic resources between rollout and train modes
-    - Ensuring role switches happen BEFORE parameter sync cycles
-    - Coordinating DP group rebuilds on train workers
-
-    Elastic Resource Configuration:
-        Fixed rollout resources: Always in rollout mode (dedicated inference)
-        Fixed train resources: Always in train mode (dedicated training)
-        Elastic resources: Can switch between rollout and train modes
-                          (initialized as either rollout or train based on config)
+    Elastic Resource Configuration (from config.elastic_scheduling)
+    ---------------------------------------------------------------
+    n_elastic_resources       (int)    : number of elastic resource groups
+    elastic_n_gpus_per_node   (int)    : GPUs per node for each elastic group
+    elastic_n_nodes           (int)    : nodes per elastic group  (default 1)
+    elastic_initial_mode      (str)    : "rollout" | "train" (default "rollout")
+    rollout_queue_high_watermark (float): scale-rollout threshold (default 0.8)
+    rollout_queue_low_watermark  (float): scale-train threshold   (default 0.3)
+    cooldown_seconds          (float)  : min seconds between switches (default 30)
+    check_interval            (float)  : monitoring poll period (default 2)
     """
 
     def __init__(self):
@@ -103,11 +124,7 @@ class ElasticSchedulingTaskRunner:
     def run(self, config: DictConfig):
         """Main entry point. Initializes all components and starts training."""
         logger.info(f"[ElasticSchedulingTaskRunner] Starting on {socket.gethostname()}")
-
-        # Initialize all components
         self._initialize_components(config)
-
-        # Run training loop (blocking)
         self._run_training_loop()
 
     # =========================================================================
@@ -115,55 +132,65 @@ class ElasticSchedulingTaskRunner:
     # =========================================================================
 
     def _initialize_components(self, config: DictConfig):
-        """Initialize all components in the correct order."""
+        """Initialize all components in the correct dependency order."""
         logger.info("[ElasticSchedulingTaskRunner] Initializing components...")
 
-        # 1. Load tokenizer and processor
+        # 1. Load tokenizer / processor
         self._init_tokenizer(config)
 
-        # 2. Create resource pool managers and role-worker mappings
+        # 2. Create role-worker mappings
         self._init_resource_mappings(config)
 
-        # 3. Create ElasticTrainer and ElasticRollouter
-        self._init_trainer_and_rollouter(config)
+        # 3. Create elastic worker groups (BEFORE rollouter/trainer init)
+        self._init_elastic_worker_groups(config)
 
-        # 4. Setup MessageQueue
+        # 4. Create ElasticTrainer (reserves fixed training GPUs)
+        self._create_elastic_trainer(config)
+
+        # 5. Create ElasticRollouter (injects elastic wg before init_workers)
+        self._create_elastic_rollouter(config)
+
+        # 6. Wire elastic wg references between trainer / rollouter
+        self._wire_elastic_worker_groups(config)
+
+        # 7. Setup MessageQueue and connect to rollouter + trainer
         self._init_message_queue(config)
 
-        # 5. Setup ElasticCoordinator
+        # 8. Setup ElasticCoordinator
         self._init_coordinator(config)
 
-        # 6. Connect ElasticParameterSyncManager (wraps trainer's checkpoint manager)
+        # 9. Connect rollouter → trainer (initializes checkpoint manager)
         self._init_elastic_param_sync(config)
 
-        # 7. Load checkpoints
+        # 10. Load checkpoints
         self._load_checkpoints()
 
-        # 8. Initial parameter sync
+        # 11. Initial parameter sync
         self._initial_param_sync()
 
         logger.info("[ElasticSchedulingTaskRunner] All components initialized")
 
+    # -------------------------------------------------------------------------
+    # Tokenizer
+    # -------------------------------------------------------------------------
+
     def _init_tokenizer(self, config: DictConfig):
-        """Load model tokenizer and processor."""
         local_path = copy_to_local(
             config.actor_rollout_ref.model.path,
             use_shm=config.actor_rollout_ref.model.get("use_shm", False),
         )
         from verl.utils import hf_processor, hf_tokenizer
 
-        tokenizer = hf_tokenizer(local_path)
-        processor = hf_processor(local_path, use_fast=False)
-
-        self.components["tokenizer"] = tokenizer
-        self.components["processor"] = processor
+        self.components["tokenizer"] = hf_tokenizer(local_path)
+        self.components["processor"] = hf_processor(local_path, use_fast=False)
         self.components["config"] = config
         logger.info("[ElasticSchedulingTaskRunner] Tokenizer loaded")
 
-    def _init_resource_mappings(self, config: DictConfig):
-        """Create role-worker mappings for rollouter and trainer."""
+    # -------------------------------------------------------------------------
+    # Role / Resource Mappings
+    # -------------------------------------------------------------------------
 
-        # Try to use separation utils if available
+    def _init_resource_mappings(self, config: DictConfig):
         try:
             from verl.experimental.separation.utils import (
                 create_resource_pool_manager,
@@ -174,7 +201,6 @@ class ElasticSchedulingTaskRunner:
             self.components["role_worker_mapping"] = role_worker_mapping
             self.components["ray_worker_group_cls"] = ray_worker_group_cls
             self.components["create_resource_pool_manager"] = create_resource_pool_manager
-
         except ImportError:
             logger.warning("[ElasticSchedulingTaskRunner] separation.utils not available, using defaults")
             from verl.single_controller.ray import RayWorkerGroup
@@ -183,20 +209,69 @@ class ElasticSchedulingTaskRunner:
             self.components["role_worker_mapping"] = {}
             self.components["create_resource_pool_manager"] = None
 
-    def _init_trainer_and_rollouter(self, config: DictConfig):
-        """Create ElasticTrainer and ElasticRollouter sequentially."""
+    # -------------------------------------------------------------------------
+    # Elastic Worker Groups
+    # -------------------------------------------------------------------------
 
-        logger.info("[ElasticSchedulingTaskRunner] Creating ElasticTrainer and ElasticRollouter...")
+    def _init_elastic_worker_groups(self, config: DictConfig):
+        """
+        Create one ElasticActorWorker group per elastic resource entry.
 
-        # Create trainer first (it needs more resources and must reserve GPUs)
-        self._create_elastic_trainer(config)
-        # Then create rollouter (uses remaining resources)
-        self._create_elastic_rollouter(config)
+        Each group is an ActorRolloutRef worker group whose GPUs are shared
+        between the training engine and the rollout server.  After creation:
+        - Workers call init_model() to initialise the actor engine.
+        - Each group is stored as components["elastic_wg_{i}"].
+        - A combined list is kept as components["elastic_worker_groups"].
 
-        logger.info("[ElasticSchedulingTaskRunner] ElasticTrainer and ElasticRollouter created")
+        The worker groups are NOT yet connected to the rollouter / trainer;
+        that happens in _wire_elastic_worker_groups().
+        """
+        elastic_config = getattr(config, "elastic_scheduling", {})
+        n_elastic = int(getattr(elastic_config, "n_elastic_resources", 0))
+
+        if n_elastic == 0:
+            self.components["elastic_worker_groups"] = []
+            logger.info("[ElasticSchedulingTaskRunner] No elastic resources configured")
+            return
+
+        from verl.experimental.elastic_scheduling.elastic_engine_workers import ElasticActorWorker
+        from verl.single_controller.ray import RayWorkerGroup
+
+        elastic_n_gpus_per_node = int(getattr(elastic_config, "elastic_n_gpus_per_node", 1))
+        elastic_n_nodes = int(getattr(elastic_config, "elastic_n_nodes", 1))
+        ray_worker_group_cls = self.components.get("ray_worker_group_cls", RayWorkerGroup)
+
+        elastic_worker_groups = []
+        for i in range(n_elastic):
+            resource_id = f"elastic_{i}"
+            try:
+                wg = ray_worker_group_cls(
+                    resource_pool=None,
+                    ray_cls=ray.remote(ElasticActorWorker),
+                    num_nodes=elastic_n_nodes,
+                    n_gpus_per_node=elastic_n_gpus_per_node,
+                    name_prefix=f"elastic_actor_{i}",
+                )
+                # Initialise actor model on the workers
+                ray.get(wg.execute_all("init_model"))
+                elastic_worker_groups.append((resource_id, wg))
+                self.components[f"elastic_wg_{i}"] = wg
+                logger.info(
+                    f"[ElasticSchedulingTaskRunner] Elastic worker group '{resource_id}' created "
+                    f"({elastic_n_nodes}×{elastic_n_gpus_per_node} GPUs)"
+                )
+            except Exception as e:
+                logger.error(f"[ElasticSchedulingTaskRunner] Failed to create elastic wg {i}: {e}")
+                raise
+
+        self.components["elastic_worker_groups"] = elastic_worker_groups
+        logger.info(f"[ElasticSchedulingTaskRunner] {n_elastic} elastic worker group(s) created and model-initialised")
+
+    # -------------------------------------------------------------------------
+    # Trainer
+    # -------------------------------------------------------------------------
 
     def _create_elastic_trainer(self, config: DictConfig):
-        """Create ElasticTrainer Ray actor."""
         from verl.experimental.elastic_scheduling.elastic_trainer import ElasticTrainer
         from verl.trainer.ppo.utils import Role
 
@@ -204,9 +279,7 @@ class ElasticSchedulingTaskRunner:
         role_worker_mapping = self.components.get("role_worker_mapping", {})
         ray_worker_group_cls = self.components.get("ray_worker_group_cls")
 
-        # Trainer roles: Actor (training), optionally Critic and Ref
         trainer_roles = {role: wcls for role, wcls in role_worker_mapping.items() if role != Role.Rollout}
-
         trainer_resource_pool_manager = create_rp(config, roles=list(trainer_roles.keys())) if create_rp else None
 
         trainer = ElasticTrainer.remote(
@@ -217,13 +290,20 @@ class ElasticSchedulingTaskRunner:
             ray_worker_group_cls=ray_worker_group_cls,
             processor=self.components["processor"],
         )
-
         ray.get(trainer.init_workers.remote())
         self.components["trainer"] = trainer
         logger.info("[ElasticSchedulingTaskRunner] ElasticTrainer created and workers initialized")
 
+    # -------------------------------------------------------------------------
+    # Rollouter (injects elastic wg before init_workers)
+    # -------------------------------------------------------------------------
+
     def _create_elastic_rollouter(self, config: DictConfig):
-        """Create ElasticRollouter Ray actor."""
+        """
+        Create ElasticRollouter and inject the elastic worker group BEFORE
+        calling init_workers() so that ElasticAgentLoopManager.create()
+        receives elastic_worker_group and initialises hybrid replicas.
+        """
         from verl.experimental.elastic_scheduling.elastic_rollouter import ElasticRollouter
         from verl.trainer.ppo.utils import Role
 
@@ -242,21 +322,66 @@ class ElasticSchedulingTaskRunner:
             processor=self.components["processor"],
         )
 
+        # Inject the combined elastic worker group (all groups merged or first group,
+        # depending on whether there is exactly one elastic DP slice at a time).
+        elastic_worker_groups = self.components.get("elastic_worker_groups", [])
+        if elastic_worker_groups:
+            # For now inject only the first elastic wg.
+            # TODO: support multiple elastic replicas by supplying a merged wg.
+            _, first_wg = elastic_worker_groups[0]
+            ray.get(rollouter.set_elastic_worker_group.remote(first_wg))
+            logger.info("[ElasticSchedulingTaskRunner] Injected elastic worker group into rollouter")
+
         ray.get(rollouter.init_workers.remote())
-        # Note: set_max_required_samples requires message_queue_client to be set first
-        # This will be called from _init_message_queue()
+        # Note: set_max_required_samples requires message_queue_client set first
         self.components["rollouter"] = rollouter
         logger.info("[ElasticSchedulingTaskRunner] ElasticRollouter created and workers initialized")
 
+    # -------------------------------------------------------------------------
+    # Wire elastic worker groups into trainer
+    # -------------------------------------------------------------------------
+
+    def _wire_elastic_worker_groups(self, config: DictConfig):
+        """
+        Register elastic worker groups with ElasticTrainer so that
+        switch_elastic_to_train() can look them up at switch time.
+
+        Also wire rollouter reference into trainer (needed for the trainer to
+        call add/remove_elastic_replica on the rollouter during a switch).
+        """
+        trainer = self.components["trainer"]
+        elastic_worker_groups = self.components.get("elastic_worker_groups", [])
+        for resource_id, wg in elastic_worker_groups:
+            ray.get(trainer.register_elastic_worker_group.remote(resource_id, wg))
+            logger.info(f"[ElasticSchedulingTaskRunner] Registered '{resource_id}' with ElasticTrainer")
+
+        # Wire rollouter into trainer for switch sequences
+        ray.get(trainer.set_rollouter.remote(self.components["rollouter"]))
+        logger.info("[ElasticSchedulingTaskRunner] Rollouter wired into ElasticTrainer")
+
+        # Register hybrid replicas with the trainer's checkpoint manager
+        # (need to get replica objects from the rollouter after init_workers)
+        try:
+            all_replicas = ray.get(self.components["rollouter"].get_all_elastic_replicas.remote())
+            if all_replicas:
+                ray.get(trainer.register_hybrid_replicas.remote(all_replicas))
+                logger.info(
+                    f"[ElasticSchedulingTaskRunner] Registered {len(all_replicas)} hybrid replica(s) "
+                    "with ElasticCheckpointManager"
+                )
+        except Exception as e:
+            logger.warning(f"[ElasticSchedulingTaskRunner] Could not register hybrid replicas: {e}")
+
+    # -------------------------------------------------------------------------
+    # MessageQueue
+    # -------------------------------------------------------------------------
+
     def _init_message_queue(self, config: DictConfig):
-        """Setup MessageQueue and connect to rollouter and trainer."""
         from verl.experimental.fully_async_policy.message_queue import MessageQueue, MessageQueueClient
 
-        # First set up max_required_samples to determine queue size
         ray.get(self.components["rollouter"].set_max_required_samples.remote())
         max_queue_size = ray.get(self.components["rollouter"].get_max_queue_size.remote())
 
-        # Synchronize total train steps from rollouter to trainer
         total_train_steps = ray.get(self.components["rollouter"].get_total_train_steps.remote())
         ray.get(self.components["trainer"].set_total_train_steps.remote(total_train_steps))
         logger.info(
@@ -265,30 +390,23 @@ class ElasticSchedulingTaskRunner:
 
         message_queue = MessageQueue.remote(config, max_queue_size)
         message_queue_client = MessageQueueClient(message_queue)
-
         self.components["message_queue"] = message_queue
         self.components["message_queue_client"] = message_queue_client
 
-        # Connect queue to rollouter and trainer
         ray.get(self.components["rollouter"].set_message_queue_client.remote(message_queue_client))
         ray.get(self.components["trainer"].set_message_queue_client.remote(message_queue_client))
-
         logger.info(f"[ElasticSchedulingTaskRunner] MessageQueue initialized (capacity={max_queue_size})")
 
-    def _init_coordinator(self, config: DictConfig):
-        """
-        Setup ElasticCoordinator.
+    # -------------------------------------------------------------------------
+    # Coordinator
+    # -------------------------------------------------------------------------
 
-        Parses elastic resource info from config and creates coordinator.
-        The coordinator is responsible for monitoring and switching elastic resources.
-        """
+    def _init_coordinator(self, config: DictConfig):
         from verl.experimental.elastic_scheduling.coordinator import ElasticCoordinator
 
         elastic_config = getattr(config, "elastic_scheduling", {})
 
-        # Parse elastic resource info
-        # In a real deployment, worker handles would come from the resource pool manager
-        # For now, we initialize with empty list and resources can be registered later
+        # Build resource info from the elastic_worker_groups we created
         elastic_resource_infos = self._build_elastic_resource_infos(config)
 
         coordinator_config = {
@@ -313,72 +431,82 @@ class ElasticSchedulingTaskRunner:
 
         self.components["coordinator"] = coordinator
 
-        # Wire coordinator to trainer for pre-sync hook
+        # Wire coordinator into trainer for pre-fit-step hook
         ray.get(self.components["trainer"].set_elastic_coordinator.remote(coordinator))
 
         logger.info(
             f"[ElasticSchedulingTaskRunner] ElasticCoordinator initialized with "
-            f"{len(elastic_resource_infos)} elastic resources"
+            f"{len(elastic_resource_infos)} elastic resource(s)"
         )
 
-    def _build_elastic_resource_infos(self, config: DictConfig) -> list:
+    def _build_elastic_resource_infos(self, config: DictConfig) -> list[dict]:
         """
-        Build elastic resource info list from config.
+        Build the ElasticResourceInfo list from already-created elastic worker groups.
 
-        In production, this would query the resource pool manager for
-        the elastic worker handles. For now returns an empty list.
+        Each entry maps a resource_id to its initial mode and the worker handles
+        from the corresponding elastic worker group.  The coordinator uses this
+        to track state and (optionally) issue direct worker calls for monitoring.
+
+        The actual role-switch operations are always delegated to ElasticTrainer;
+        worker_handles here are for state tracking only.
         """
         elastic_config = getattr(config, "elastic_scheduling", {})
-        n_elastic = int(getattr(elastic_config, "n_elastic_resources", 0))
+        initial_mode = getattr(elastic_config, "elastic_initial_mode", "rollout")
 
-        # TODO: Get actual worker handles from resource pool manager
-        # For now, return placeholder info
+        elastic_worker_groups = self.components.get("elastic_worker_groups", [])
         elastic_resource_infos = []
-        for i in range(n_elastic):
+
+        for resource_id, wg in elastic_worker_groups:
+            # Retrieve global ranks from the worker group as proxy for "handles"
+            try:
+                worker_handles = wg.get_all_actor_handles()
+            except AttributeError:
+                # RayWorkerGroup may not have this helper; fall back to empty list.
+                worker_handles = []
+
             elastic_resource_infos.append(
                 {
-                    "resource_id": f"elastic_{i}",
-                    "initial_mode": getattr(elastic_config, "elastic_initial_mode", "rollout"),
-                    "worker_handles": [],  # Will be populated after workers are initialized
+                    "resource_id": resource_id,
+                    "initial_mode": initial_mode,
+                    "worker_handles": worker_handles,
                 }
             )
 
         return elastic_resource_infos
 
+    # -------------------------------------------------------------------------
+    # Parameter Sync
+    # -------------------------------------------------------------------------
+
     def _init_elastic_param_sync(self, config: DictConfig):
         """
-        Setup ElasticParameterSyncManager.
-
-        This wraps the CheckpointEngineManager to also handle elastic replicas.
-        The manager is created inside the trainer process (not as a separate Ray actor).
+        Wire rollouter into trainer.  This triggers ElasticTrainer to call
+        _setup_checkpoint_manager() which creates an ElasticCheckpointManager
+        covering both fixed (standalone) and elastic (hybrid) replicas.
         """
+        # Note: rollouter was already wired in _wire_elastic_worker_groups;
+        # call it again only if set_rollouter is idempotent.
+        # The checkpoint manager is initialised inside set_rollouter().
+        logger.info("[ElasticSchedulingTaskRunner] Elastic parameter sync ready (via ElasticCheckpointManager)")
 
-        # Connect rollouter to trainer (triggers checkpoint manager initialization)
-        ray.get(self.components["trainer"].set_rollouter.remote(self.components["rollouter"]))
-
-        # Note: ElasticParameterSyncManager is used inside the trainer process
-        # The trainer's _fit_update_weights() will use it automatically
-        # when self.checkpoint_manager is set to an ElasticParameterSyncManager
-
-        logger.info("[ElasticSchedulingTaskRunner] ElasticParameterSyncManager initialized")
+    # -------------------------------------------------------------------------
+    # Checkpoint + Initial Sync
+    # -------------------------------------------------------------------------
 
     def _load_checkpoints(self):
-        """Load checkpoints for resume training."""
         logger.info("[ElasticSchedulingTaskRunner] Loading checkpoints...")
         ray.get(self.components["trainer"].load_checkpoint.remote())
         ray.get(self.components["rollouter"].load_checkpoint.remote())
 
     def _initial_param_sync(self):
-        """Perform initial parameter sync from trainer to rollouter."""
         logger.info("[ElasticSchedulingTaskRunner] Performing initial parameter sync...")
-        # _fit_update_weights is an async Ray method - call it via ray.get()
-        # This syncs trainer weights to rollout replicas before training starts
         try:
             ray.get(self.components["trainer"]._fit_update_weights.remote())
             logger.info("[ElasticSchedulingTaskRunner] Initial parameter sync complete")
         except Exception as e:
             logger.warning(
-                f"[ElasticSchedulingTaskRunner] Initial param sync failed (may be OK if checkpoint loaded): {e}"
+                f"[ElasticSchedulingTaskRunner] Initial param sync failed "
+                f"(may be OK if checkpoint was already loaded): {e}"
             )
 
     # =========================================================================
@@ -386,40 +514,28 @@ class ElasticSchedulingTaskRunner:
     # =========================================================================
 
     def _run_training_loop(self):
-        """
-        Run the main training loop.
-
-        Starts rollouter, trainer, and coordinator concurrently.
-        Waits for completion or handles failures.
-        """
         self.running = True
         logger.info("[ElasticSchedulingTaskRunner] Starting training loop...")
 
-        # Start coordinator (async background task, fire-and-forget)
+        # Start coordinator background monitoring
         self.components["coordinator"].start.remote()
 
-        # Start rollouter and trainer
         rollouter_future = self.components["rollouter"].fit.remote()
         trainer_future = self.components["trainer"].fit.remote()
 
         try:
-            # Wait for rollouter and trainer to complete
             futures = [rollouter_future, trainer_future]
-
             while futures:
                 done_futures, remaining_futures = ray.wait(futures, num_returns=1, timeout=None)
-
                 for future in done_futures:
                     try:
                         ray.get(future)
                         logger.info("[ElasticSchedulingTaskRunner] Component completed successfully")
                     except Exception as e:
                         logger.error(f"[ElasticSchedulingTaskRunner] Component failed: {e}")
-                        # Cancel remaining futures
                         for remaining in remaining_futures:
                             ray.cancel(remaining)
                         raise
-
                 futures = remaining_futures
 
         except Exception as e:
@@ -427,11 +543,9 @@ class ElasticSchedulingTaskRunner:
             raise
 
         finally:
-            # Stop coordinator
             logger.info("[ElasticSchedulingTaskRunner] Stopping coordinator...")
             ray.get(self.components["coordinator"].stop.remote())
 
-            # Clear message queue
             message_queue_client = self.components.get("message_queue_client")
             if message_queue_client:
                 asyncio.run(message_queue_client.clear_queue())
@@ -440,78 +554,25 @@ class ElasticSchedulingTaskRunner:
             logger.info("[ElasticSchedulingTaskRunner] Training completed")
 
     # =========================================================================
-    # Monitoring / Statistics
+    # Monitoring
     # =========================================================================
 
     def get_status(self) -> dict:
-        """Get current status of all components."""
-        status = {
-            "running": self.running,
-        }
+        status = {"running": self.running}
 
-        try:
-            coordinator_status = ray.get(self.components["coordinator"].get_status.remote())
-            status["coordinator"] = coordinator_status
-        except Exception:
-            pass
-
-        try:
-            elastic_stats = ray.get(self.components["trainer"].get_elastic_statistics.remote())
-            status["trainer"] = elastic_stats
-        except Exception:
-            pass
-
-        try:
-            elastic_stats = ray.get(self.components["rollouter"].get_elastic_statistics.remote())
-            status["rollouter"] = elastic_stats
-        except Exception:
-            pass
+        for key, method in [
+            ("coordinator", "get_status"),
+            ("trainer", "get_elastic_statistics"),
+            ("rollouter", "get_elastic_statistics"),
+        ]:
+            try:
+                component = self.components.get(key)
+                if component is not None:
+                    status[key] = ray.get(getattr(component, method).remote())
+            except Exception:
+                pass
 
         return status
-
-
-# ============================================================================
-# Helper: wrap existing trainer/rollouter for backward compatibility
-# ============================================================================
-
-
-def _add_rate_tracking_to_rollouter(rollouter):
-    """
-    Monkey-patch a rollouter to track total produced samples.
-
-    This is used if the rollouter doesn't already have this method.
-    """
-    # Check if already has the method
-    try:
-        ray.get(rollouter.get_total_produced_samples.remote())
-        return  # Already has it
-    except Exception:
-        pass
-
-    # Add the method by setting an attribute
-    # (Note: can't monkey-patch Ray actor, this is just documentation)
-    logger.warning(
-        "[ElasticScheduling] ElasticRollouter.get_total_produced_samples() not found. "
-        "Make sure ElasticRollouter is used instead of FullyAsyncRollouter."
-    )
-
-
-def _add_rate_tracking_to_trainer(trainer):
-    """
-    Monkey-patch a trainer to track total consumed samples.
-
-    This is used if the trainer doesn't already have this method.
-    """
-    try:
-        ray.get(trainer.get_total_consumed_samples.remote())
-        return  # Already has it
-    except Exception:
-        pass
-
-    logger.warning(
-        "[ElasticScheduling] ElasticTrainer.get_total_consumed_samples() not found. "
-        "Make sure ElasticTrainer is used instead of FullyAsyncTrainer."
-    )
 
 
 # ============================================================================
@@ -524,14 +585,12 @@ def main(config: DictConfig):
     """
     Main entry point for elastic scheduling PPO training.
 
-    This function:
-    1. Initializes Ray
-    2. Creates ElasticSchedulingTaskRunner as a Ray actor
-    3. Runs training to completion
+    1. Initialize Ray.
+    2. Create ElasticSchedulingTaskRunner as a Ray actor.
+    3. Run training to completion.
     """
     logger.info(f"[ElasticScheduling] Starting with config:\n{OmegaConf.to_yaml(config)}")
 
-    # Initialize Ray
     if not ray.is_initialized():
         ray.init(
             address=getattr(config, "ray_address", "auto"),
@@ -541,7 +600,6 @@ def main(config: DictConfig):
 
     logger.info(f"[ElasticScheduling] Ray initialized. Resources: {ray.cluster_resources()}")
 
-    # Create and run the task runner
     task_runner = ElasticSchedulingTaskRunner.remote()
     ray.get(task_runner.run.remote(config))
 
