@@ -139,6 +139,9 @@ class ElasticTrainer(FullyAsyncTrainer):
         self._total_elastic_removes: int = 0
         self._total_dp_rebuilds: int = 0
         self._last_dp_rebuild_time: float = 0.0
+        # Latency of the most recent complete role switch (seconds, 0 before first switch)
+        self._last_switch_latency: float = 0.0
+        self._switch_start_time: float = 0.0
 
         # Coordinator reference (optional, for pre-sync hook)
         self._elastic_coordinator = None
@@ -219,6 +222,7 @@ class ElasticTrainer(FullyAsyncTrainer):
             True if all three steps succeeded, False otherwise.
         """
         logger.info(f"[ElasticTrainer] switch_elastic_to_rollout: {resource_id}")
+        _t0 = time.time()
 
         if resource_id not in self._elastic_actor_wgs:
             logger.warning(f"[ElasticTrainer] {resource_id} not in elastic actor registry")
@@ -251,11 +255,17 @@ class ElasticTrainer(FullyAsyncTrainer):
                     )
                     if not ok:
                         logger.warning(f"[ElasticTrainer] rollouter.add_elastic_replica failed for {resource_id}")
+                    else:
+                        # Update cached active rollout replica count
+                        self._elastic_rollout_replicas_cache = list(
+                            getattr(self, "_elastic_rollout_replicas_cache", [])
+                        ) + [resource_id]
                 except Exception as e:
                     logger.error(f"[ElasticTrainer] Failed to add elastic replica for {resource_id}: {e}")
                     return False
 
-            logger.info(f"[ElasticTrainer] {resource_id} switched to rollout mode")
+            self._last_switch_latency = time.time() - _t0
+            logger.info(f"[ElasticTrainer] {resource_id} switched to rollout mode in {self._last_switch_latency:.2f}s")
             return True
 
         except Exception as e:
@@ -278,6 +288,7 @@ class ElasticTrainer(FullyAsyncTrainer):
             True if all three steps succeeded, False otherwise.
         """
         logger.info(f"[ElasticTrainer] switch_elastic_to_train: {resource_id}")
+        _t0 = time.time()
 
         wg = self._get_elastic_wg_by_resource_id(resource_id)
         if wg is None:
@@ -298,6 +309,12 @@ class ElasticTrainer(FullyAsyncTrainer):
                     )
                     if not ok:
                         logger.warning(f"[ElasticTrainer] rollouter.remove_elastic_replica failed for {resource_id}")
+                    else:
+                        # Update cached active rollout replica count
+                        cache = list(getattr(self, "_elastic_rollout_replicas_cache", []))
+                        if resource_id in cache:
+                            cache.remove(resource_id)
+                        self._elastic_rollout_replicas_cache = cache
                 except Exception as e:
                     logger.warning(f"[ElasticTrainer] Failed to remove elastic replica for {resource_id}: {e}")
 
@@ -328,7 +345,8 @@ class ElasticTrainer(FullyAsyncTrainer):
                 param_version=param_version,
             )
 
-            logger.info(f"[ElasticTrainer] {resource_id} switched to train mode")
+            self._last_switch_latency = time.time() - _t0
+            logger.info(f"[ElasticTrainer] {resource_id} switched to train mode in {self._last_switch_latency:.2f}s")
             return True
 
         except Exception as e:
@@ -503,12 +521,16 @@ class ElasticTrainer(FullyAsyncTrainer):
                 self._total_dp_rebuilds += 1
                 self._last_dp_rebuild_time = time.time()
 
+                # 7.4: update required_samples to match new DP size
+                self._update_required_samples()
+
                 if self._on_dp_rebuild_complete:
                     await self._on_dp_rebuild_complete(len(new_world_ranks))
 
                 logger.info(
                     f"[ElasticTrainer] DP changes applied. "
                     f"New world size: {len(new_world_ranks)}, "
+                    f"required_samples updated to {self.required_samples}, "
                     f"Total DP rebuilds: {self._total_dp_rebuilds}"
                 )
 
@@ -566,6 +588,63 @@ class ElasticTrainer(FullyAsyncTrainer):
         except Exception as e:
             logger.error(f"[ElasticTrainer] rebuild_dp_group failed: {e}")
             raise
+
+    # =========================================================================
+    # 7.4  Dynamic required_samples (DP-aware)
+    # =========================================================================
+
+    def _get_current_dp_size(self) -> int:
+        """
+        Return the number of actor workers currently participating in training.
+
+        Counts:
+        - fixed actor_wg (world_size / tp_size / pp_size, i.e. dp_size contribution)
+        - each elastic actor_wg in TRAIN mode (same calculation)
+
+        We use world_size as a proxy for the DP contribution because all actor
+        worker groups use the same TP/PP topology.  Dividing by tp×pp gives the
+        DP size, but for the purpose of required_samples we only need the total
+        number of data-parallel replicas across all wgs.
+        """
+        tp = getattr(self.config.actor_rollout_ref.actor, "tensor_model_parallel_size", 1)
+        pp = getattr(self.config.actor_rollout_ref.actor, "pipeline_model_parallel_size", 1)
+        parallelism = tp * pp
+        parallelism = max(parallelism, 1)  # guard against zero
+
+        dp_size = 0
+        if hasattr(self, "actor_wg") and self.actor_wg is not None:
+            dp_size += self.actor_wg.world_size // parallelism
+        for wg in self._elastic_actor_wgs.values():
+            dp_size += wg.world_size // parallelism
+        return max(dp_size, 1)  # at least 1 to avoid division-by-zero
+
+    def _update_required_samples(self) -> None:
+        """
+        Recompute required_samples so that it is always a multiple of both
+        ppo_mini_batch_size and the current DP size.
+
+        Formula::
+
+            dp_size         = current number of DP replicas
+            required_samples = ppo_mini_batch_size × require_batches × dp_size
+
+        This guarantees that every DP rank receives exactly
+        ``ppo_mini_batch_size × require_batches`` samples per step, avoiding
+        shape mismatches that arise when sample counts are not evenly divisible
+        by the data-parallel degree.
+
+        Called automatically at the end of ``_apply_pending_dp_changes()``.
+        """
+        mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+        require_batches = self.config.async_training.require_batches
+        dp_size = self._get_current_dp_size()
+        new_required = mini_batch_size * require_batches * dp_size
+        old_required = self.required_samples
+        self.required_samples = new_required
+        logger.info(
+            f"[ElasticTrainer] required_samples updated: {old_required} → {new_required} "
+            f"(dp_size={dp_size}, mini_batch={mini_batch_size}, require_batches={require_batches})"
+        )
 
     async def _get_current_train_ranks(self) -> list[int]:
         if not (hasattr(self, "actor_wg") and self.actor_wg is not None):
@@ -683,6 +762,11 @@ class ElasticTrainer(FullyAsyncTrainer):
             trainer=self.actor_wg,
             replicas=replicas,
         )
+        # Cache the IDs of fixed (standalone) rollout replicas for metrics.
+        # Elastic rollout replica counts are tracked separately via
+        # _elastic_rollout_replicas_cache, updated by switch_elastic_to_*.
+        self._fixed_rollout_replicas_cache = list(replicas.keys()) if replicas else []
+        self._elastic_rollout_replicas_cache = []
         logger.info("[ElasticTrainer] ElasticCheckpointManager initialized")
 
     def register_hybrid_replicas(self, replicas: dict) -> None:
@@ -738,7 +822,7 @@ class ElasticTrainer(FullyAsyncTrainer):
     # =========================================================================
 
     def _fit_postprocess_step(self):
-        """Extended postprocess: track consumption rate."""
+        """Extended postprocess: track consumption rate and report elastic metrics."""
         super()._fit_postprocess_step()
 
         n_consumed = getattr(self, "required_samples", 0)
@@ -758,6 +842,27 @@ class ElasticTrainer(FullyAsyncTrainer):
                 )
             self._last_report_time = current_time
             self._samples_consumed_since_last_report = 0
+
+        # 7.5 Elastic metrics – written into self.metrics so they are picked
+        # up by metrics_aggregator.add_step_metrics() in the base class.
+        # num_rollout_replicas requires access to the rollouter; query it
+        # asynchronously only if already available (avoid blocking here).
+        num_fixed_replicas = len(getattr(self, "_fixed_rollout_replicas_cache", []))
+        num_elastic_replicas = len(getattr(self, "_elastic_rollout_replicas_cache", []))
+        num_rollout = num_fixed_replicas + num_elastic_replicas
+
+        self.metrics.update(
+            {
+                "elastic/total_switch_to_rollout": self._total_elastic_removes,
+                "elastic/total_switch_to_train": self._total_elastic_adds,
+                "elastic/last_switch_latency_s": self._last_switch_latency,
+                "elastic/num_train_actors": self.get_num_active_train_actors(),
+                "elastic/current_dp_size": self._get_current_dp_size(),
+                "elastic/required_samples": self.required_samples,
+            }
+        )
+        if num_rollout > 0:
+            self.metrics["elastic/num_rollout_replicas"] = num_rollout
 
     def get_consumption_rate(self) -> float:
         """Current consumption rate (samples/sec)."""

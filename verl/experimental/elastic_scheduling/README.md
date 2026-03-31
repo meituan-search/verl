@@ -492,23 +492,77 @@ elastic_scheduling:
 | 重建后 broadcast | 有（新成员接收老成员参数） | 有（新成员接收 rank0 参数） |
 
 
-### 7.3 rollout 弹性与非弹性分配
-你再看下AgentLoopManager的实现，弹性的rollout资源也要收敛到AgentLoop中，弹性的server_id, 和非弹性的 server_id 发生了冲突，
-同时必须要先初始化弹性资源，之后再初始化非弹性资源，因为在多机多卡场景下，需要优先给训练分配资源，这样资源亲和性比较高，然后剩余的资源，
-再分配给独立的资源，同时server_id 需要唯一。
+### 7.3 Rollout 弹性与非弹性 replica 分配
 
-即使亲和的问题可以解决，无论是独立资源先创建server，还是弹性资源先创建server, 全局只有一个agent_loop_manager, server_id 不能重复。
+**问题**：`AgentLoopManager` 全局唯一，其内部所有 `RolloutReplica` 共享同一个 `ElasticGlobalRequestLoadBalancer`。
+Replica 的 Ray 命名 actor 格式为 `sglang_server_{replica_rank}_{node_rank}`，若弹性与非弹性 replica 的
+`replica_rank` 均从 0 开始，则必然产生 `ActorAlreadyExistsError`。
+
+**资源亲和性要求**：在多机多卡场景中，弹性资源（与训练引擎共享 GPU 的 hybrid replica）应当优先占用
+Placement Group 的低编号 bundle，这些 bundle 与训练引擎所在节点物理相邻，NCCL 通信延迟更低。
+独占 rollout 资源（standalone replica）使用剩余 bundle，亲和性要求较低。
+
+**解决方案**：`ElasticAgentLoopManager.create()` 采用三步初始化顺序，确保全局 `replica_rank` 唯一：
+
+```
+Step 1  弹性 hybrid replica (rank 0 … N_e-1)
+        └── init_hybrid(elastic_worker_group) → 立即 sleep()
+            (占用最低编号 bundle，最大化 GPU 亲和性)
+
+Step 2  固定 standalone replica (rank N_e … N_e+N_f-1)
+        └── init_standalone()  start_rank=N_e，actor 名不与弹性重叠
+
+Step 3  构建 ElasticGlobalRequestLoadBalancer（只含固定 replica 的地址）
+        弹性 replica 以 sleeping 状态注册到 _registered_elastic_replicas，
+        通过 add_elastic_replica() 按需激活后再加入 LB
+```
+
+关键代码路径：
+- `_initialize_elastic_replicas(start_rank=0)` → 返回 `num_elastic`
+- `_initialize_llm_servers(start_rank=num_elastic)` → 固定 replica rank 从 `num_elastic` 开始
+- `replica_rank` 直接决定 Ray named actor 名称，全局唯一即可避免命名冲突
 
 
 ### 7.4 弹性资源对于样本数量的动态获取
-由于DP发生改变，训练获取的样本数量需要可以整除DP
+
+**问题**：训练引擎的 `required_samples`（每步从队列拉取的最小样本数）在初始化时由
+`ppo_mini_batch_size × require_batches` 固定计算。当弹性切换改变 DP 大小后，每个 DP rank
+处理的 micro-batch 数不变，但 **全局 batch size = micro_batch × DP_size** 发生变化。
+若 `required_samples` 不同步更新，则可能：
+1. 拉取到的样本数无法被新的 DP 整除，导致数据截断或 shape 不一致
+2. DP 扩大后每步实际消费量不足，训练效率下降
+
+**解决方案**：`ElasticTrainer` 覆盖 `_fit_generate()` 前的逻辑，在 `_apply_pending_dp_changes()`
+完成 DP rebuild 后，调用 `_update_required_samples()` 重新计算：
+
+```
+required_samples = ppo_mini_batch_size × require_batches × current_dp_size
+```
+
+其中 `current_dp_size` = 固定 actor_wg 大小（若存在）＋ 所有处于 TRAIN 状态的弹性 actor_wg 大小之和。
+`required_samples` 必须为 `ppo_mini_batch_size` 的整数倍（DP 可整除性由此保证）。
+
+时序保证：`_update_required_samples()` 在 `_apply_pending_dp_changes()` 的末尾调用，
+而 `_apply_pending_dp_changes()` 发生在 `fit_step` 的 Phase 3（GPU 空闲窗口），
+下一次 `_fit_generate()` 进入队列拉取时已使用更新后的值。
 
 
 ### 7.5 指标记录
-* 弹性切换次数
-* 弹性切换延迟
-* rollout 资源数 (包含独占资源)
-* trainer 资源数
+
+弹性调度相关指标在每个 `fit_step` 结束时通过 `_fit_postprocess_step()` 写入 `self.metrics`，
+随正常训练 metrics 一起上报到日志系统。
+
+| 指标键 | 含义 | 来源 |
+|--------|------|------|
+| `elastic/total_switch_to_rollout` | 累计 Train→Rollout 切换次数 | `ElasticTrainer._total_elastic_removes` |
+| `elastic/total_switch_to_train` | 累计 Rollout→Train 切换次数 | `ElasticTrainer._total_elastic_adds` |
+| `elastic/last_switch_latency_s` | 最近一次切换耗时（秒） | `ElasticTrainer._last_switch_latency` |
+| `elastic/num_rollout_replicas` | 当前活跃 rollout replica 数（固定 + 弹性） | `ElasticAgentLoopManager` 统计 |
+| `elastic/num_train_actors` | 当前参与训练的 actor 数（固定 + 弹性） | `ElasticTrainer.get_num_active_train_actors()` |
+| `elastic/current_dp_size` | 当前训练 DP 并行度 | 固定 wg + 弹性 TRAIN wg 之和 |
+| `elastic/required_samples` | 本步目标样本数（随 DP 动态更新） | `ElasticTrainer.required_samples` |
+
+指标写入时机：`_fit_postprocess_step()` → `self.metrics.update(...)` → `metrics_aggregator.add_step_metrics()`
 
 ### 7.6 样本 Staleness 处理
 
