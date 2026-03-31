@@ -492,6 +492,7 @@ class AgentLoopWorker:
             sampling_params["top_p"] = config.val_kwargs.top_p
             sampling_params["top_k"] = config.val_kwargs.top_k
             sampling_params["temperature"] = config.val_kwargs.temperature
+            sampling_params["validate"] = True
 
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch.non_tensor_batch:
@@ -804,7 +805,7 @@ class AgentLoopWorker:
         if inputs[0].response_logprobs is not None:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
         if inputs[0].response_oldlogprobs is not None:
-            optional_outputs["old_log_probs_server"] = torch.cat(
+            optional_outputs["server_old_log_probs"] = torch.cat(
                 [input.response_oldlogprobs for input in inputs], dim=0
             )
         if inputs[0].routed_experts is not None:

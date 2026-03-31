@@ -327,11 +327,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             # Create OldLogProbServer Ray actor for batched inference + deferred weight loading
             from verl.workers.old_log_prob import OldLogProbServer
 
-            old_log_prob_cfg = self.config.old_log_prob
             self.old_log_prob_server = OldLogProbServer.remote(
                 old_log_prob_worker_group=self.old_log_prob_server_wg,
-                batch_size=old_log_prob_cfg.get("batch_size", 8),
-                timeout=old_log_prob_cfg.get("timeout", 10.0),
+                old_log_prob_cfg=self.config.old_log_prob,
             )
         else:
             self.old_log_prob_server = None

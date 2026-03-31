@@ -29,6 +29,7 @@ from verl.experimental.agent_loop.agent_loop import (
 )
 from verl.protocol import DataProto
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup
+from verl.utils import tensordict_utils as tu
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.ray_utils import auto_await
 from verl.utils.rollout_trace import (
@@ -89,6 +90,7 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         elif "max_new_tokens" in sampling_params:
             limit_key = "max_new_tokens"
         original_max_tokens = sampling_params.get(limit_key) if limit_key else None
+        validate = sampling_params.pop("validate", None)
 
         final_output = TokenOutput(
             token_ids=[],
@@ -109,7 +111,9 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
             )
             current_prompt_ids = prompt_ids + final_output.token_ids
             current_temperature = sampling_params.get("temperature", 1.0)
-            output = await self._recompute_old_log_prob(output, current_prompt_ids, current_temperature)
+            # Skip old log prob computation during validation
+            if not validate:
+                output = await self._recompute_old_log_prob(output, current_prompt_ids, current_temperature)
             # 2. merge output into final_output
             final_output.token_ids.extend(output.token_ids)
             if output.log_probs is not None:
@@ -141,6 +145,8 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
             # 4. check stop reason
             if output.stop_reason not in ("aborted", "abort") or not self.config.async_training.partial_rollout:
                 break
+        if validate:  # restore for multi-turn use
+            sampling_params["validate"] = validate
         final_output.extra_fields["global_steps"] = global_steps
         final_output.extra_fields["min_global_steps"] = min_global_steps
         final_output.extra_fields["max_global_steps"] = max_global_steps
@@ -150,14 +156,12 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         if self.old_log_prob_server_handle is None:
             return output
         # Convert TokenOutput -> fixed-shape TensorDict for OldLogProbServer.
-        # Requests are batched by TensorDict.cat in OldLogProbServer, so each request
-        # must have identical tensor shapes.
         if self.config.get("actor_rollout_ref"):
             rollout_config = self.config.actor_rollout_ref.rollout
         else:
             rollout_config = self.config.rollout
 
-        # Prompt grows during partial-rollout resume. Reserve prompt slots for
+        # Prompt grows during partial-rollout/multi-turn. Reserve prompt slots for
         # [original prompt + at most full response length] to keep shapes static.
         max_prompt_len = int(rollout_config.prompt_length) + int(rollout_config.response_length)
         max_response_len = int(rollout_config.response_length)
@@ -167,10 +171,8 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
             output.old_log_probs = []
             return output
 
-        prompt_tensor = torch.tensor(context_prompt_ids, dtype=torch.long)
-        response_tensor = torch.tensor(output.token_ids, dtype=torch.long)
-        prompt_len = prompt_tensor.shape[0]
-        response_len = response_tensor.shape[0]
+        prompt_len = len(context_prompt_ids)
+        response_len = len(output.token_ids)
 
         if prompt_len > max_prompt_len:
             raise ValueError(
@@ -178,78 +180,69 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
                 "for old_log_prob recomputation"
             )
         if response_len > max_response_len:
-            raise ValueError(
+            print(
                 f"response length {response_len} exceeds padded response length {max_response_len} "
                 "for old_log_prob recomputation"
             )
+            output.token_ids = output.token_ids[:max_response_len]
+            response_len = max_response_len
 
         tokenizer = self.tokenizer
         if tokenizer is None:
             raise RuntimeError("tokenizer is required for old_log_prob recomputation padding")
 
         original_padding_side = tokenizer.padding_side
-        try:
-            tokenizer.padding_side = "left"
-            prompt_output = tokenizer.pad(
-                {"input_ids": context_prompt_ids},
-                padding="max_length",
-                max_length=max_prompt_len,
-                return_tensors="pt",
-                return_attention_mask=True,
-            )
-            if prompt_output["input_ids"].dim() == 1:
-                prompt_output["input_ids"] = prompt_output["input_ids"].unsqueeze(0)
-                prompt_output["attention_mask"] = prompt_output["attention_mask"].unsqueeze(0)
+        tokenizer.padding_side = "left"
+        prompt_output = tokenizer.pad(
+            {"input_ids": context_prompt_ids},
+            padding="max_length",
+            max_length=max_prompt_len,
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
+        if prompt_output["input_ids"].dim() == 1:
+            prompt_output["input_ids"] = prompt_output["input_ids"].unsqueeze(0)
+            prompt_output["attention_mask"] = prompt_output["attention_mask"].unsqueeze(0)
 
-            tokenizer.padding_side = "right"
-            response_output = tokenizer.pad(
-                {"input_ids": output.token_ids},
-                padding="max_length",
-                max_length=max_response_len,
-                return_tensors="pt",
-                return_attention_mask=True,
-            )
-            if response_output["input_ids"].dim() == 1:
-                response_output["input_ids"] = response_output["input_ids"].unsqueeze(0)
-                response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
-        finally:
-            tokenizer.padding_side = original_padding_side
+        tokenizer.padding_side = "right"
+        response_output = tokenizer.pad(
+            {"input_ids": output.token_ids},
+            padding="max_length",
+            max_length=max_response_len,
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
+        if response_output["input_ids"].dim() == 1:
+            response_output["input_ids"] = response_output["input_ids"].unsqueeze(0)
+            response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
+        tokenizer.padding_side = original_padding_side
 
-        padded_prompt = prompt_output["input_ids"][0]
-        prompt_attention = prompt_output["attention_mask"][0]
-        padded_response = response_output["input_ids"][0]
-        response_attention = response_output["attention_mask"][0]
-
-        input_ids = torch.cat([padded_prompt, padded_response], dim=0).unsqueeze(0)
-        attention_mask = torch.cat([prompt_attention, response_attention], dim=0).unsqueeze(0)
-        # response_mask follows AgentLoop shape convention: [1, response_length]
-        response_mask = response_attention.unsqueeze(0)
+        input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
+        attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
         position_ids = compute_position_id_with_mask(attention_mask)
+        response_mask = response_output["attention_mask"]
 
-        temperature_tensor = torch.tensor([float(temperature)], dtype=torch.float32)
         data_td = TensorDict(
             {
+                "prompts": prompt_output["input_ids"],
+                "responses": response_output["input_ids"],
                 "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "response_mask": response_mask,
-                # Megatron engine consumes loss_mask in forward_backward_batch.
-                # Keep it aligned with response_mask for log-prob computation.
-                "loss_mask": response_mask,
-                # Megatron forward_step reads batch["temperature"] directly.
-                "temperature": temperature_tensor,
                 "position_ids": position_ids,
-                "prompts": padded_prompt.unsqueeze(0),
-                "responses": padded_response.unsqueeze(0),
+                "response_mask": response_mask,
+                "attention_mask": attention_mask,
+                "loss_mask": response_mask,
             },
             batch_size=[1],
         )
 
-        # Call OldLogProbServer via Ray remote interface
+        tu.assign_non_tensor(
+            data_td,
+            temperature=temperature,
+            max_response_len=max_response_len,
+        )
         result_td = await self.old_log_prob_server_handle.compute_old_log_prob.remote(data_td)
 
         # Keep only valid response tokens; drop right-padding region.
-        from verl.utils import tensordict_utils as tu
-
         log_probs_tensor = tu.get(result_td, "log_probs")
         output.old_log_probs = log_probs_tensor[0, :response_len].tolist()
         return output
