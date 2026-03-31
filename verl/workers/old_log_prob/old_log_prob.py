@@ -145,11 +145,11 @@ class OldLogProbWorker(Worker, DistProfilerExtension):
         staged = {}
         async for name, tensor in self.checkpoint_engine.receive_weights():
             staged[name] = tensor.clone().to("cpu", non_blocking=True)
-            logger.debug(f"[old_log_prob] update_weights, {name=}, shape={tensor.shape}")
+            logger.debug(f"[OldLogProbWorker] update_weights, {name=}, shape={tensor.shape}")
 
         torch.cuda.synchronize()
         self._staged_state_dict = staged
-        logger.info(f"Rank {self.rank}: staged {len(staged)} params to CPU")
+        logger.info(f"[OldLogProbWorker] Rank {self.rank}: staged {len(staged)} params to CPU")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_staged_weights(self):
@@ -162,7 +162,7 @@ class OldLogProbWorker(Worker, DistProfilerExtension):
 
         self._staged_state_dict = None
         torch.cuda.empty_cache()
-        logger.info(f"Rank {self.rank}: loaded staged weights into engine")
+        logger.info(f"[OldLogProbWorker] Rank {self.rank}: loaded staged weights into engine")
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):

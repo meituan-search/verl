@@ -359,6 +359,8 @@ class CheckpointEngineManager:
         self.trainer = trainer
         self.replicas = replicas
         self.extra_groups = list(extra_groups) if extra_groups else []
+        # Keep references to background tasks
+        self._background_tasks: set[asyncio.Task] = set()
 
     def build_process_group(self, rollout: RayWorkerGroup):
         """Build process group for trainer and rollout replicas."""
@@ -454,11 +456,12 @@ class CheckpointEngineManager:
         await asyncio.gather(*[r.sleep() for r in self.replicas])
 
     @auto_await
-    async def update_weights(self, global_steps: int = None):
+    async def update_weights(self, global_steps: int = None, post_finalize_callback=None):
         """Update weights from trainer to rollout replicas.
 
         Args:
             global_steps: The global steps of the trainer.
+            post_finalize_callback: An optional async callable function.
         """
 
         # 0. update weights for sync training with colocated trainer and rollout
@@ -479,6 +482,12 @@ class CheckpointEngineManager:
         # 3. build process group
         self.build_process_group(rollout)
 
+        # + 3.5 wait for any background tasks from the previous update_weights call
+        # (e.g. drain_and_load_weights for old_log_prob_server) to complete before
+        # transferring new weights.
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks)
+
         # 4. update weights of all workers
         update_refs = trainer.update_weights(global_steps=global_steps) + rollout.update_weights(
             global_steps=global_steps
@@ -494,6 +503,11 @@ class CheckpointEngineManager:
         for wg in self.extra_groups:
             finalize_refs += wg.execute_checkpoint_engine(["finalize"] * wg.world_size)
         ray.get(finalize_refs)
+
+        # + 5.5 fire post-finalize callback, without awaiting it
+        # (e.g. drain_and_load_weights for old_log_prob_server)
+        if post_finalize_callback is not None:
+            self._background_tasks.add(asyncio.create_task(post_finalize_callback()))
 
         # 6. resume all unfinished requests for partial rollout
         await asyncio.gather(*[r.resume_generation() for r in self.replicas])

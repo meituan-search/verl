@@ -541,10 +541,16 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         if self.local_trigger_step != 1:
             return
 
+        async def _drain_and_load_old_log_prob_weights():
+            await self.old_log_prob_server.drain_and_load_weights.remote()
+
+        post_finalize_callback = _drain_and_load_old_log_prob_weights if self.old_log_prob_server is not None else None
+
         with marked_timer("timing_s/param_sync", self.timing_raw):
-            await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
-            if self.old_log_prob_server is not None:
-                ray.get(self.old_log_prob_server.drain_and_load_weights.remote())
+            await self.checkpoint_manager.update_weights(
+                global_steps=self.current_param_version,
+                post_finalize_callback=post_finalize_callback,
+            )
         print(
             f"[FullyAsyncTrainer] _fit_update_weights, "
             f"timing_s/param_sync: {self.timing_raw['timing_s/param_sync']:.4f} seconds "
