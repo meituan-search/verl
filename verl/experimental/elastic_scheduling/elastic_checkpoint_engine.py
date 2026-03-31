@@ -15,46 +15,61 @@
 """
 Elastic Parameter Synchronization for VERL
 
-Extends CheckpointEngineManager with hybrid replica support:
+Extends CheckpointEngineManager with hybrid replica support.
 
-  Standalone replicas  (self.replicas, inherited)
-      Fixed rollout servers with dedicated GPUs.  Handled by the base
-      CheckpointEngineManager.update_weights() unchanged.
+  self.replicas  (inherited from CheckpointEngineManager)
+      = standalone replicas  +  awake hybrid replicas (ROLLOUT mode)
+      Both groups use the base-class NCCL sync flow with release_kv_cache /
+      resume_kv_cache so that model weights are never disturbed:
 
-  Hybrid replicas  (self._hybrid_replicas)
-      Share GPUs with the training engine.  May be sleeping (GPU held by
-      trainer) or awake (serving requests) at the time of a sync.
-      All hybrid replicas — regardless of current sleep state — receive the
-      latest parameters on every update_weights() call:
+        abort_all_requests
+        → release_kv_cache   (free kv-cache only, weights stay)
+        → build NCCL group
+        → trainer.update_weights() + replica.update_weights()
+        → finalize
+        → resume_kv_cache    (restore kv-cache)
+        → resume_generation
 
-        - Awake replicas (ROLLOUT mode): actor weights are offloaded to CPU.
-          Follow the same abort → sleep → NCCL sync → wake_up → resume flow
-          as standalone replicas, through a dedicated per-replica NCCL group.
+  _sleep_hybrid_replicas  (sleeping hybrid replicas, TRAIN mode)
+      GPU is held by the training engine; rollout server is sleeping with
+      both weights and kv-cache released.  Use the naive (in-process) path:
 
-        - Sleeping replicas (TRAIN mode): GPU is held by the training engine.
-          Use in-process sync via the corresponding ElasticActorWorker.update_weights().
-          This is equivalent to "naive" backend: the actor and rollout engine share
-          the same process, so weights are copied directly in GPU memory without
-          any NCCL communication group.  The rollout server stays asleep throughout.
+        actor_wg.update_weights()
 
-  The per-replica group approach (one NCCL group per awake hybrid replica) avoids
-  the need for a global topology rebuild that would require all replicas to
-  participate simultaneously.
+      The actor and rollout engine share the same Ray worker process.
+      With checkpoint_engine.backend == "naive", this directly copies actor
+      parameters into the rollout engine's weight buffers in GPU memory.
+      No NCCL group is required and the rollout server stays asleep.
 
-  Key insight: because update_weights() is called periodically for ALL hybrid
-  replicas regardless of sleep state, the rollout engine always holds the latest
-  parameters when an elastic resource is woken up for serving.  No extra sync is
-  needed after wake_up() during an elastic switch.
+  Replica lifecycle
+  -----------------
+  add_hybrid_replicas(replicas, actor_wgs)
+      Registers replicas in SLEEPING state by default:
+        • stored in _sleep_hybrid_replicas (NOT added to self.replicas)
+        • actor_wg stored for naive sync
+
+  mark_hybrid_awake(resource_ids)   [Train → Rollout switch]
+      • removes from _sleep_hybrid_replicas
+      • calls super().add_replicas() → added to self.replicas (NCCL path)
+
+  mark_hybrid_sleeping(resource_ids)  [Rollout → Train switch]
+      • calls super().remove_replicas() → removed from self.replicas
+      • adds to _sleep_hybrid_replicas (naive path)
+
+  remove_hybrid_replicas(resource_ids)
+      • removes from whichever set currently holds the replica
+
+  update_weights(global_steps)
+      1. super().update_weights()  – handles self.replicas (standalone + awake hybrid)
+      2. naive sync loop           – handles _sleep_hybrid_replicas
 """
 
-import asyncio
 import logging
 
 import ray
 
 from verl.checkpoint_engine import CheckpointEngineManager
-from verl.checkpoint_engine.base import _worker_cls
-from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
+from verl.single_controller.ray import RayWorkerGroup
 from verl.workers.config import CheckpointEngineConfig
 from verl.workers.rollout import RolloutReplica
 
@@ -63,28 +78,25 @@ logger = logging.getLogger(__name__)
 
 class ElasticCheckpointManager(CheckpointEngineManager):
     """
-    Checkpoint manager that handles both standalone and hybrid rollout replicas.
+    Checkpoint manager for elastic scheduling.
 
-    Inherits the full standalone-replica sync pipeline from CheckpointEngineManager
-    and adds:
+    Replica sets managed by this class
+    -----------------------------------
+    self.replicas  (inherited)
+        Standalone replicas  +  Awake hybrid replicas (ROLLOUT mode).
+        The base-class update_weights() syncs all of them via NCCL using
+        release_kv_cache / resume_kv_cache.
 
-    - add_hybrid_replica(resource_id, replica, actor_wg)  – register a hybrid replica
-    - remove_hybrid_replica(resource_id)                  – deregister a hybrid replica
-    - update_weights(global_steps)                        – sync ALL replicas in one call
+    self._sleep_hybrid_replicas
+        Sleeping hybrid replicas (TRAIN mode).
+        Synced via naive in-process actor_wg.update_weights(); no NCCL group.
 
-    Hybrid replica sync (per replica):
-      awake replica (ROLLOUT mode)
-          → abort_all_requests → sleep → build NCCL group → sync → wake_up → resume
-      sleeping replica (TRAIN mode)
-          → actor_wg.update_weights()   (in-process, no NCCL needed)
-
-    The per-replica group approach (one NCCL group per awake hybrid replica) avoids
-    the need for a global topology rebuild that would require all replicas to
-    participate simultaneously.
-
-    For sleeping replicas, the corresponding ElasticActorWorker (actor_wg) is called
-    directly.  Since the actor and rollout engine share the same Ray worker process,
-    this is an in-GPU-memory copy with no inter-process communication overhead.
+    State transitions
+    -----------------
+    add_hybrid_replicas()   → initial state is SLEEPING (_sleep_hybrid_replicas)
+    mark_hybrid_awake()     → SLEEPING → AWAKE  (move into self.replicas)
+    mark_hybrid_sleeping()  → AWAKE → SLEEPING  (move out of self.replicas)
+    remove_hybrid_replicas()→ removed from whichever set currently holds it
     """
 
     def __init__(
@@ -94,90 +106,126 @@ class ElasticCheckpointManager(CheckpointEngineManager):
         replicas: list[RolloutReplica],
     ) -> None:
         super().__init__(config=config, trainer=trainer, replicas=replicas)
-        # resource_id -> RolloutReplica  (hybrid replicas only)
-        self._hybrid_replicas: dict[str, RolloutReplica] = {}
-        # resource_id -> RayWorkerGroup  (ElasticActorWorker wg for each hybrid replica)
-        # Used for in-process weight sync when the replica is sleeping (TRAIN mode).
+
+        # resource_id → RolloutReplica  (sleeping hybrid replicas only)
+        self._sleep_hybrid_replicas: dict[str, RolloutReplica] = {}
+        # resource_id → RolloutReplica  (awake hybrid replicas only, also in self.replicas)
+        self._awake_hybrid_replicas: dict[str, RolloutReplica] = {}
+        # resource_id → RayWorkerGroup  (ElasticActorWorker wg, for naive sync)
         self._hybrid_actor_wgs: dict[str, RayWorkerGroup] = {}
-        # Set of resource_ids that are currently AWAKE (ROLLOUT mode).
-        # Managed by mark_hybrid_awake() / mark_hybrid_sleeping() called from ElasticTrainer
-        # during elastic switch sequences.  Replicas NOT in this set are treated as sleeping
-        # (TRAIN mode) and synced via in-process actor_wg.update_weights().
-        self._awake_hybrid_replicas: set[str] = set()
 
     # -------------------------------------------------------------------------
     # Hybrid replica registry
     # -------------------------------------------------------------------------
 
-    def add_hybrid_replica(
+    def add_hybrid_replicas(
         self,
-        resource_id: str,
-        replica: RolloutReplica,
-        actor_wg: RayWorkerGroup | None = None,
+        replicas: dict[str, RolloutReplica],
+        actor_wgs: dict[str, RayWorkerGroup] | None = None,
     ) -> None:
         """
-        Register a hybrid replica for parameter synchronization.
+        Register hybrid replicas.  New replicas start in SLEEPING state.
 
-        Call this when an elastic resource switches to rollout mode (or at
-        init time for pre-bound replicas).  The replica will receive parameters
-        on the next update_weights() call regardless of its current sleep state.
-
-        Args:
-            resource_id: Unique identifier (e.g. "elastic_0").
-            replica: The RolloutReplica object (init_hybrid already called).
-            actor_wg: The ElasticActorWorker RayWorkerGroup that backs this
-                hybrid replica.  Required for in-process weight sync when the
-                replica is sleeping (TRAIN mode).  If None, sleeping-replica
-                sync is skipped with a warning.
-        """
-        self._hybrid_replicas[resource_id] = replica
-        if actor_wg is not None:
-            self._hybrid_actor_wgs[resource_id] = actor_wg
-        logger.info(f"[ElasticCheckpointManager] Registered hybrid replica: {resource_id}")
-
-    def remove_hybrid_replica(self, resource_id: str) -> None:
-        """
-        Deregister a hybrid replica.
-
-        Call this when an elastic resource switches back to training mode.
-        Subsequent update_weights() calls will no longer include this replica.
+        Sleeping replicas are NOT added to self.replicas; they will be moved
+        there by mark_hybrid_awake() when the Train→Rollout switch happens.
 
         Args:
-            resource_id: Unique identifier of the replica to remove.
+            replicas: Mapping of resource_id → RolloutReplica.
+            actor_wgs: Optional mapping of resource_id → ElasticActorWorker
+                RayWorkerGroup for naive in-process sync (TRAIN mode).
         """
-        self._hybrid_replicas.pop(resource_id, None)
-        self._hybrid_actor_wgs.pop(resource_id, None)
-        self._awake_hybrid_replicas.discard(resource_id)
-        logger.info(f"[ElasticCheckpointManager] Deregistered hybrid replica: {resource_id}")
+        actor_wgs = actor_wgs or {}
+        for resource_id, replica in replicas.items():
+            self._sleep_hybrid_replicas[resource_id] = replica
+            wg = actor_wgs.get(resource_id)
+            if wg is not None:
+                self._hybrid_actor_wgs[resource_id] = wg
+        logger.info(
+            f"[ElasticCheckpointManager] Registered {len(replicas)} hybrid replica(s) (SLEEPING): , ".join(
+                replicas.keys()
+            )
+        )
 
-    def mark_hybrid_awake(self, resource_id: str) -> None:
+    def remove_hybrid_replicas(self, resource_ids: list[str]) -> None:
         """
-        Mark a hybrid replica as AWAKE (ROLLOUT mode).
+        Deregister hybrid replicas (from whichever state they are currently in).
 
-        Call this after a Train→Rollout switch completes (i.e., after
-        ElasticAgentLoopManager.add_elastic_replica() succeeds).
-        On the next update_weights(), this replica will use the NCCL sync path.
+        If a replica is AWAKE it is also removed from self.replicas via the
+        base-class remove_replicas() so it is no longer synced over NCCL.
 
         Args:
-            resource_id: Unique identifier of the elastic resource.
+            resource_ids: List of resource_ids to deregister.
         """
-        self._awake_hybrid_replicas.add(resource_id)
-        logger.debug(f"[ElasticCheckpointManager] Marked hybrid replica '{resource_id}' as AWAKE")
+        awake_to_remove = [
+            self._awake_hybrid_replicas[rid] for rid in resource_ids if rid in self._awake_hybrid_replicas
+        ]
+        if awake_to_remove:
+            super().remove_replicas(awake_to_remove)
 
-    def mark_hybrid_sleeping(self, resource_id: str) -> None:
+        for resource_id in resource_ids:
+            self._awake_hybrid_replicas.pop(resource_id, None)
+            self._sleep_hybrid_replicas.pop(resource_id, None)
+            self._hybrid_actor_wgs.pop(resource_id, None)
+
+        logger.info(
+            f"[ElasticCheckpointManager] Deregistered {len(resource_ids)} hybrid replica(s): , ".join(resource_ids)
+        )
+
+    def mark_hybrid_awake(self, resource_ids: list[str] | str) -> None:
         """
-        Mark a hybrid replica as SLEEPING (TRAIN mode).
+        Transition hybrid replicas from SLEEPING → AWAKE (Train → Rollout switch).
 
-        Call this after a Rollout→Train switch completes (i.e., after
-        ElasticAgentLoopManager.remove_elastic_replica() succeeds).
-        On the next update_weights(), this replica will use the in-process
-        actor_wg.update_weights() path instead of NCCL.
+        Replicas are moved from _sleep_hybrid_replicas into self.replicas via
+        super().add_replicas() so the base-class NCCL sync picks them up on
+        the next update_weights() call.
 
         Args:
-            resource_id: Unique identifier of the elastic resource.
+            resource_ids: A single resource_id string or a list of them.
         """
-        self._awake_hybrid_replicas.discard(resource_id)
-        logger.debug(f"[ElasticCheckpointManager] Marked hybrid replica '{resource_id}' as SLEEPING")
+        if isinstance(resource_ids, str):
+            resource_ids = [resource_ids]
+
+        to_add: list[RolloutReplica] = []
+        for rid in resource_ids:
+            replica = self._sleep_hybrid_replicas.pop(rid, None)
+            if replica is None:
+                logger.warning(f"[ElasticCheckpointManager] mark_hybrid_awake: '{rid}' not in sleep set, skipping")
+                continue
+            self._awake_hybrid_replicas[rid] = replica
+            to_add.append(replica)
+
+        if to_add:
+            super().add_replicas(to_add)
+
+        logger.debug(f"[ElasticCheckpointManager] Marked as AWAKE: {resource_ids}")
+
+    def mark_hybrid_sleeping(self, resource_ids: list[str] | str) -> None:
+        """
+        Transition hybrid replicas from AWAKE → SLEEPING (Rollout → Train switch).
+
+        Replicas are removed from self.replicas via super().remove_replicas() and
+        moved into _sleep_hybrid_replicas so the next update_weights() uses the
+        naive in-process path.
+
+        Args:
+            resource_ids: A single resource_id string or a list of them.
+        """
+        if isinstance(resource_ids, str):
+            resource_ids = [resource_ids]
+
+        to_remove: list[RolloutReplica] = []
+        for rid in resource_ids:
+            replica = self._awake_hybrid_replicas.pop(rid, None)
+            if replica is None:
+                logger.warning(f"[ElasticCheckpointManager] mark_hybrid_sleeping: '{rid}' not in awake set, skipping")
+                continue
+            self._sleep_hybrid_replicas[rid] = replica
+            to_remove.append(replica)
+
+        if to_remove:
+            super().remove_replicas(to_remove)
+
+        logger.debug(f"[ElasticCheckpointManager] Marked as SLEEPING: {resource_ids}")
 
     # -------------------------------------------------------------------------
     # Weight synchronization
@@ -187,137 +235,34 @@ class ElasticCheckpointManager(CheckpointEngineManager):
         """
         Synchronize parameters from trainer to ALL replicas.
 
-        Standalone replicas (self.replicas)
-            Delegated to base CheckpointEngineManager.update_weights() unchanged.
+        Step 1 – NCCL path (delegated to base class)
+            Handles self.replicas = standalone replicas + awake hybrid replicas.
+            The base class calls release_kv_cache_replicas() before sync and
+            resume_kv_cache_replicas() after, so model weights are never touched.
 
-        Hybrid replicas (self._hybrid_replicas)
-            Each replica is synced independently to avoid a global collective
-            barrier across all replicas.  The flow per hybrid replica depends on
-            the replica's current mode:
-
-              Awake replica (ROLLOUT mode – actor offloaded to CPU):
-                1. abort_all_requests()   – save in-flight state
-                2. sleep()                – release kv-cache GPU memory
-                3. build_process_group()  – establish NCCL trainer ↔ replica channel
-                4. trainer.update_weights() + replica.update_weights()
-                5. finalize()             – tear down the temp NCCL channel
-                6. wake_up()              – restore kv-cache
-                7. resume_generation()    – replay saved in-flight requests
-
-              Sleeping replica (TRAIN mode – GPU held by training engine):
-                actor_wg.update_weights()  – in-process sync via ElasticActorWorker.
-                The actor and rollout engine share the same Ray worker process, so
-                weights are copied directly in GPU memory.  No NCCL group is needed
-                and the rollout server remains asleep throughout.
+        Step 2 – Naive path (in-process)
+            Handles _sleep_hybrid_replicas (TRAIN mode).
+            Each sleeping replica is synced via its actor_wg.update_weights().
+            No NCCL group required; processed serially.
 
         Args:
-            global_steps: Current training step, used as the parameter version
-                tag propagated to the rollout servers.
+            global_steps: Current training step used as the parameter version tag.
         """
-        # Step 1: sync standalone replicas via base class
+        # Step 1: NCCL sync for standalone + awake hybrid replicas (base class)
         if self.replicas:
             await super().update_weights(global_steps)
 
-        # Step 2: sync all hybrid replicas (sleeping and awake)
-        if self._hybrid_replicas:
-            sync_tasks = [
-                self._sync_hybrid_replica(resource_id, replica, global_steps)
-                for resource_id, replica in self._hybrid_replicas.items()
-            ]
-            results = await asyncio.gather(*sync_tasks, return_exceptions=True)
-            for resource_id, result in zip(self._hybrid_replicas, results, strict=False):
-                if isinstance(result, Exception):
-                    logger.error(f"[ElasticCheckpointManager] Failed to sync hybrid replica '{resource_id}': {result}")
-
-    async def _sync_hybrid_replica(
-        self,
-        resource_id: str,
-        replica: RolloutReplica,
-        global_steps: int | None,
-    ) -> None:
-        """
-        Synchronize parameters to a single hybrid replica.
-
-        The sync path depends on the current mode of the elastic resource:
-
-        ROLLOUT mode (replica is awake, actor weights offloaded to CPU):
-            Follows the same NCCL-based flow as a standalone replica.
-            A temporary NCCL process group is built between the trainer and the
-            rollout workers of this replica; weights are pushed over NCCL; then
-            the group is torn down and the replica resumes serving.
-
-        TRAIN mode (replica is sleeping, GPU held by training engine):
-            Uses in-process sync via the registered ElasticActorWorker wg.
-            The actor and rollout engine share the same Ray worker process, so
-            ``actor_wg.update_weights()`` copies weights directly in GPU memory
-            without any inter-process communication.  The rollout server stays
-            asleep throughout.
-
-        Args:
-            resource_id: Identifier used only for logging.
-            replica: The hybrid RolloutReplica to synchronize.
-            global_steps: Parameter version to tag the replica with.
-        """
-        logger.info(f"[ElasticCheckpointManager] Syncing hybrid replica '{resource_id}'...")
-
-        # Determine sleep state from the authoritative _awake_hybrid_replicas set.
-        # This set is maintained by mark_hybrid_awake() / mark_hybrid_sleeping() which
-        # are called by ElasticTrainer during elastic switch sequences.
-        # Default (not in set): treat as sleeping (TRAIN mode) — safe conservative choice
-        # since an in-process sync on a sleeping replica is always safe.
-        is_sleeping = resource_id not in self._awake_hybrid_replicas
-
-        # -----------------------------------------------------------------------
-        # Path A: TRAIN mode (sleeping) – in-process sync via ElasticActorWorker
-        # -----------------------------------------------------------------------
-        if is_sleeping:
+        # Step 2: naive sync for sleeping hybrid replicas
+        for resource_id, _replica in self._sleep_hybrid_replicas.items():
             actor_wg = self._hybrid_actor_wgs.get(resource_id)
             if actor_wg is None:
                 logger.warning(
                     f"[ElasticCheckpointManager] No actor_wg for sleeping hybrid replica "
-                    f"'{resource_id}'. Skipping in-process sync (register via add_hybrid_replica)."
+                    f"'{resource_id}'. Skipping sync."
                 )
-                return
-
-            # actor_wg.update_weights() calls ActorRolloutRefWorker.update_weights() which
-            # runs in the ElasticActorWorker process.  When checkpoint_engine.backend==naive
-            # (i.e. hybrid/colocated mode), this directly copies actor params → rollout engine
-            # via the shared in-process rollout handle.  No NCCL group is required.
-            ray.get(actor_wg.update_weights(global_steps=global_steps))
-            logger.info(f"[ElasticCheckpointManager] Hybrid replica '{resource_id}' synced (in-process, TRAIN mode).")
-            return
-
-        # -----------------------------------------------------------------------
-        # Path B: ROLLOUT mode (awake) – NCCL sync (same as standalone replicas)
-        # -----------------------------------------------------------------------
-
-        # 1. Abort in-flight requests to save partial rollout state.
-        await replica.abort_all_requests()
-
-        # 2. Sleep the replica to free kv-cache GPU memory for the weight transfer.
-        await replica.sleep()
-
-        # 3. Build a temporary trainer ↔ this-replica NCCL process group.
-        rollout_wg = RayWorkerGroup(
-            worker_handles=list(replica.workers),
-            ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls),
-        )
-        self.build_process_group(rollout_wg)
-
-        # 4. Transfer weights over NCCL.
-        ray.get(
-            self.trainer.update_weights(global_steps=global_steps)
-            + rollout_wg.update_weights(global_steps=global_steps)
-        )
-
-        # 5. Finalize (tear down temp NCCL group / release buffers).
-        ray.get(
-            self.trainer.execute_checkpoint_engine(["finalize"] * self.trainer.world_size)
-            + rollout_wg.execute_checkpoint_engine(["finalize"] * rollout_wg.world_size)
-        )
-
-        # 6. Restore: wake up and resume serving requests.
-        await replica.wake_up()
-        await replica.resume_generation()
-
-        logger.info(f"[ElasticCheckpointManager] Hybrid replica '{resource_id}' synced (NCCL, ROLLOUT mode).")
+                continue
+            try:
+                ray.get(actor_wg.update_weights(global_steps=global_steps))
+                logger.info(f"[ElasticCheckpointManager] Sleeping replica '{resource_id}' synced (naive, TRAIN mode).")
+            except Exception as e:
+                logger.exception(f"[ElasticCheckpointManager] Failed to sync sleeping replica '{resource_id}': {e}")

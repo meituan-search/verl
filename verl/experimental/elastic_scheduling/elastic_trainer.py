@@ -262,7 +262,7 @@ class ElasticTrainer(FullyAsyncTrainer):
                         # Mark the hybrid replica as AWAKE so that the next
                         # update_weights() uses NCCL sync instead of in-process sync.
                         if hasattr(self, "checkpoint_manager") and self.checkpoint_manager is not None:
-                            self.checkpoint_manager.mark_hybrid_awake(resource_id)
+                            self.checkpoint_manager.mark_hybrid_awake([resource_id])
                 except Exception as e:
                     logger.error(f"[ElasticTrainer] Failed to add elastic replica for {resource_id}: {e}")
                     return False
@@ -321,7 +321,7 @@ class ElasticTrainer(FullyAsyncTrainer):
                         # Mark the hybrid replica as SLEEPING so that the next
                         # update_weights() uses in-process sync instead of NCCL.
                         if hasattr(self, "checkpoint_manager") and self.checkpoint_manager is not None:
-                            self.checkpoint_manager.mark_hybrid_sleeping(resource_id)
+                            self.checkpoint_manager.mark_hybrid_sleeping([resource_id])
                 except Exception as e:
                     logger.warning(f"[ElasticTrainer] Failed to remove elastic replica for {resource_id}: {e}")
 
@@ -788,7 +788,7 @@ class ElasticTrainer(FullyAsyncTrainer):
         For each hybrid replica, the corresponding ElasticActorWorker worker
         group is looked up from ``_elastic_wg_registry`` (populated by
         ``register_elastic_worker_group()``) and passed to
-        ``ElasticCheckpointManager.add_hybrid_replica()`` so that the
+        ``ElasticCheckpointManager.add_hybrid_replicas()`` so that the
         checkpoint manager can perform in-process weight sync when the replica
         is in TRAIN mode (sleeping).
 
@@ -806,15 +806,15 @@ class ElasticTrainer(FullyAsyncTrainer):
             return
 
         elastic_wg_registry = getattr(self, "_elastic_wg_registry", {})
-        for resource_id, replica in replicas.items():
-            actor_wg = elastic_wg_registry.get(resource_id)
-            if actor_wg is None:
-                logger.warning(
-                    f"[ElasticTrainer] No actor_wg found for hybrid replica '{resource_id}'. "
-                    "In-process sync (TRAIN mode) will be skipped. "
-                    "Make sure register_elastic_worker_group() is called before register_hybrid_replicas()."
-                )
-            self.checkpoint_manager.add_hybrid_replica(resource_id, replica, actor_wg=actor_wg)
+        missing = [rid for rid in replicas if rid not in elastic_wg_registry]
+        for rid in missing:
+            logger.warning(
+                f"[ElasticTrainer] No actor_wg found for hybrid replica '{rid}'. "
+                "In-process sync (TRAIN mode) will be skipped. "
+                "Make sure register_elastic_worker_group() is called before register_hybrid_replicas()."
+            )
+        actor_wgs = {rid: elastic_wg_registry[rid] for rid in replicas if rid in elastic_wg_registry}
+        self.checkpoint_manager.add_hybrid_replicas(replicas, actor_wgs=actor_wgs)
 
         logger.info(f"[ElasticTrainer] Registered {len(replicas)} hybrid replica(s) with checkpoint manager")
 

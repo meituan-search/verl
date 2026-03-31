@@ -539,33 +539,44 @@ Hybrid Replica 在任意时刻有两种状态：
 
 #### 7.4.2 参数同步策略
 
-`ElasticCheckpointManager.update_weights()` 统一处理所有类型的 Replica：
+`ElasticCheckpointManager` 通过两个副本集合划分同步路径：
 
-**Standalone Replica**（委托给基类 `CheckpointEngineManager`）：
-```
-abort_all_requests → sleep → build NCCL group → trainer/rollout update_weights → finalize → wake_up → resume_generation
-```
+| 副本集合 | 内容 | 同步路径 |
+|----------|------|----------|
+| `self.replicas`（基类） | Standalone + **唤醒状态的 Hybrid** | NCCL（基类 `update_weights` 统一处理）|
+| `_sleep_hybrid_replicas` | **休眠状态的 Hybrid** | naive 进程内同步 |
 
-**唤醒状态的 Hybrid Replica**（与 Standalone 完全相同的 NCCL 同步流程）：
+**NCCL 路径**（Standalone + 唤醒 Hybrid，由基类 `CheckpointEngineManager.update_weights()` 统一处理）：
 ```
-abort_all_requests → sleep → build NCCL group → trainer/rollout update_weights → finalize → wake_up → resume_generation
+abort_all_requests → release_kv_cache → build NCCL group → trainer/rollout update_weights → finalize → resume_kv_cache → resume_generation
 ```
-此时 actor 权重已在 CPU，rollout server 通过 NCCL 接收 trainer 发来的参数。
+HYBRID 模式下 `sleep` 会同时释放 kv_cache **和** weights，若复用 `sleep` 则 rollout engine 的权重缓冲区被销毁，NCCL 无法写入。因此改用 `release_kv_cache` / `resume_kv_cache` 专用接口——**只操作 kv_cache，model weights 始终保留在 GPU**，NCCL 直接将新权重写入已有缓冲区。
 
-**休眠状态的 Hybrid Replica**（进程内直接同步，无需 NCCL）：
+**naive 路径**（休眠状态的 Hybrid，进程内直接同步）：
 ```
 actor_worker_wg.update_weights()  ← 在 ElasticActorWorker 进程内直接将 actor 参数写入 rollout 内存
 ```
-由于 rollout server 与 training engine 在**同一批进程**内运行（即 `ElasticActorWorker`），actor 的权重可以通过进程内函数调用直接同步给 rollout engine，等价于 `checkpoint_engine.backend="naive"` 语义。此路径不需要建立 NCCL 通信组，也不需要唤醒 rollout server。
+rollout server 与 training engine 在**同一批进程**内运行（`ElasticActorWorker`），actor 权重可通过进程内函数调用直接同步给 rollout engine，等价于 `checkpoint_engine.backend="naive"` 语义。此路径无需建立 NCCL 通信组，rollout server 保持休眠。
+
+**副本状态转换与 `self.replicas` 维护**：
+```
+add_hybrid_replicas()    → 初始放入 _sleep_hybrid_replicas（不进入 self.replicas）
+mark_hybrid_awake()      → _sleep_hybrid_replicas → self.replicas（调用 super().add_replicas()）
+mark_hybrid_sleeping()   → self.replicas → _sleep_hybrid_replicas（调用 super().remove_replicas()）
+remove_hybrid_replicas() → 从当前所在集合移除（若 AWAKE 则同步调用 super().remove_replicas()）
+```
+
+> **新增接口**：`release_kv_cache` / `resume_kv_cache` 已在 `RolloutReplica` 基类及
+> sglang / vllm / trtllm 三个实现中添加，语义为"只操作 kv_cache 显存，不触碰 model weights"。
 
 #### 7.4.3 弹性切换后无需单独同步
 
 **Train → Rollout 切换**（`switch_elastic_to_rollout`）：
 1. actor 权重 offload 到 CPU
-2. **此前 `update_weights` 已在休眠状态将最新参数同步到 rollout engine**
+2. **此前 `update_weights`（naive 路径）已将最新参数写入 rollout engine 的权重缓冲区**
 3. `wake_up()` 直接唤醒 rollout server，rollout engine 持有的权重即为最新版本
 
-因此，弹性切换的 wake_up 流程中**无需额外参数同步**。这是因为每次 `update_weights`（周期性触发）均覆盖了所有 hybrid replica（无论唤醒/休眠），保证休眠中的 replica 也始终持有最新参数。
+因此，弹性切换的 wake_up 流程中**无需额外参数同步**。每次 `update_weights`（周期性触发）均覆盖了所有 hybrid replica——休眠时走 naive 路径（进程内写入 rollout weights 缓冲区），唤醒时走 NCCL 路径——因此无论 replica 处于哪种状态，rollout engine 持有的权重始终是最新版本。
 
 #### 7.4.4 cuda_graph 初始化
 
@@ -577,10 +588,9 @@ actor_worker_wg.update_weights()  ← 在 ElasticActorWorker 进程内直接将 
 训练循环 fit_step:
   Phase 1: _fit_generate()         ← 从队列拉取样本（rollout 并行生成中）
   Phase 2: _fit_training_step()    ← 训练更新
-  Phase 3: _fit_update_weights()   ← 参数同步（每 trigger_parameter_sync_step 步触发一次）
-              ├─ standalone replicas → NCCL sync（abort → sleep → sync → wake_up → resume）
-              ├─ 唤醒的 hybrid replicas → NCCL sync（同上）
-              └─ 休眠的 hybrid replicas → in-process sync（actor_worker.update_weights()）
+    Phase 3: _fit_update_weights()   ← 参数同步（每 trigger_parameter_sync_step 步触发一次）
+                ├─ self.replicas（standalone + 唤醒的 hybrid） → NCCL sync（abort → release_kv_cache → sync → resume_kv_cache → resume）
+                └─ _sleep_hybrid_replicas（休眠的 hybrid）     → naive sync（actor_wg.update_weights()，进程内直接写入）
   Phase 4: _apply_pending_dp_changes()  ← 处理弹性切换（wake_up / sleep）
 ```
 

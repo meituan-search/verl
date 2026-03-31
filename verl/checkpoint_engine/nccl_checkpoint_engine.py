@@ -204,8 +204,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
             self.world_size = world_size
             return
 
-        group_already_initialized = collective.is_group_initialized(self.group_name)
-        if self.rebuild_group or not group_already_initialized:
+        if self.rebuild_group or not collective.is_group_initialized(self.group_name):
             collective.init_collective_group(world_size, rank, "nccl", self.group_name)
             self.rank = rank
             self.world_size = world_size
@@ -215,17 +214,9 @@ class NCCLCheckpointEngine(CheckpointEngine):
                 f"world_size {world_size} is not equal to self.world_size {self.world_size}"
             )
 
-        # Only reconnect zmq and run barrier when the group is newly created (or rebuilt).
-        # When reusing an already-initialized group (rebuild_group=False and group existed),
-        # skipping these calls avoids:
-        #   1. zmq socket leaks from repeated _connect_zmq_client calls.
-        #   2. ActorAlreadyExistsError: collective.barrier internally calls _generate_nccl_uid
-        #      which tries to create a detached NCCLUniqueIDStore actor with the same name as
-        #      an existing one, causing failure on the second and subsequent update_weights().
-        if self.rebuild_group or not group_already_initialized:
-            if self.rank > 0:
-                self._connect_zmq_client(master_metadata)
-            collective.barrier(self.group_name)
+        if self.rank > 0:
+            self._connect_zmq_client(master_metadata)
+        collective.barrier(self.group_name)
 
         logger.info(f"init_process_group rank: {self.rank}, world_size: {self.world_size}")
 

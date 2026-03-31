@@ -336,6 +336,29 @@ class SGLangHttpServer:
             obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
             await self.tokenizer_manager.release_memory_occupation(obj, None)
 
+    async def release_kv_cache(self):
+        """Release only kv_cache GPU memory, keeping model weights intact.
+
+        Used in the NCCL weight-sync path (for both STANDALONE and awake HYBRID
+        replicas) to free GPU memory before weight transfer without disturbing
+        model weights.  Call resume_kv_cache() after the transfer completes.
+        """
+        if self.node_rank != 0 or not self.config.free_cache_engine:
+            return
+        obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
+        await self.tokenizer_manager.release_memory_occupation(obj, None)
+
+    async def resume_kv_cache(self):
+        """Restore kv_cache GPU memory after a weight sync.
+
+        Counterpart to release_kv_cache().
+        """
+        if self.node_rank != 0:
+            return
+        obj = ResumeMemoryOccupationReqInput(tags=["kv_cache"])
+        await self.tokenizer_manager.resume_memory_occupation(obj, None)
+        await self.tokenizer_manager.flush_cache()
+
     async def clear_kv_cache(self):
         if self.node_rank == 0:
             await self.tokenizer_manager.flush_cache()
