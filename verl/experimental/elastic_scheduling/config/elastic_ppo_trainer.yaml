@@ -55,6 +55,18 @@ actor_rollout_ref:
 
     checkpoint_engine:
       backend: "nccl"
+      # rebuild_group=True is required for elastic scheduling:
+      # Each update_weights() call may involve a different set of replicas
+      # (as hybrid replicas join/leave self.replicas across elastic switches).
+      # With rebuild_group=False the NCCL group is never destroyed, so when
+      # the next init_process_group() call detects is_group_initialized=False
+      # (after a destroy) but the detached NCCLUniqueIDStore Ray actor is still
+      # alive, Ray raises ActorAlreadyExistsError.
+      # rebuild_group=True ensures finalize() fully tears down the group and
+      # its store actor so the next round can create a fresh one safely.
+      engine_kwargs:
+        nccl:
+          rebuild_group: True
 
   actor:
     # Must use rollout log probs for training

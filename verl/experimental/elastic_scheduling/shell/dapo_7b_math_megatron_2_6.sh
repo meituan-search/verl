@@ -6,7 +6,7 @@
 set -xeuo pipefail
 
 project_name='DAPO'
-exp_name='DAPO-mimo-7b-rl-megatron-elastic'
+exp_name='DAPO-7b-elastic'
 
 adv_estimator=grpo
 

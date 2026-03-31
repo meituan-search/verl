@@ -806,14 +806,38 @@ class ElasticTrainer(FullyAsyncTrainer):
             return
 
         elastic_wg_registry = getattr(self, "_elastic_wg_registry", {})
-        missing = [rid for rid in replicas if rid not in elastic_wg_registry]
+
+        # A single elastic worker group (e.g. "elastic_0") may be sliced by
+        # the rollouter into multiple DP replicas named "elastic_0", "elastic_1",
+        # "elastic_2", etc.  The registry only holds one entry per physical wg
+        # (keyed by the wg's own resource_id, typically "elastic_0").
+        # For replicas that have no direct key match we fall back to the first
+        # registry entry that shares the same group prefix (e.g. "elastic_").
+        def _lookup_wg(rid: str):
+            if rid in elastic_wg_registry:
+                return elastic_wg_registry[rid]
+            # Extract group prefix: "elastic_1" → "elastic_"
+            prefix = rid.rsplit("_", 1)[0] + "_" if "_" in rid else rid
+            for key, wg in elastic_wg_registry.items():
+                if key.startswith(prefix):
+                    return wg
+            return None
+
+        actor_wgs = {}
+        missing = []
+        for rid in replicas:
+            wg = _lookup_wg(rid)
+            if wg is not None:
+                actor_wgs[rid] = wg
+            else:
+                missing.append(rid)
+
         for rid in missing:
             logger.warning(
                 f"[ElasticTrainer] No actor_wg found for hybrid replica '{rid}'. "
                 "In-process sync (TRAIN mode) will be skipped. "
                 "Make sure register_elastic_worker_group() is called before register_hybrid_replicas()."
             )
-        actor_wgs = {rid: elastic_wg_registry[rid] for rid in replicas if rid in elastic_wg_registry}
         self.checkpoint_manager.add_hybrid_replicas(replicas, actor_wgs=actor_wgs)
 
         logger.info(f"[ElasticTrainer] Registered {len(replicas)} hybrid replica(s) with checkpoint manager")

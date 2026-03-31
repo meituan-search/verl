@@ -350,6 +350,15 @@ class CheckpointEngineManager:
         """Build process group for trainer and rollout replicas."""
         trainer = self.trainer
 
+        import logging as _logging
+
+        _logger = _logging.getLogger(__name__)
+        _logger.info(
+            f"[CheckpointEngineManager] build_process_group: "
+            f"trainer.world_size={trainer.world_size}, rollout.world_size={rollout.world_size}, "
+            f"backend={self.backend}"
+        )
+
         # 1. prepare all workers
         metadata = ray.get(
             trainer.execute_checkpoint_engine(["prepare"] * trainer.world_size)

@@ -248,6 +248,14 @@ class ElasticCheckpointManager(CheckpointEngineManager):
         Args:
             global_steps: Current training step used as the parameter version tag.
         """
+        nccl_replicas = len(self.replicas)
+        sleep_replicas = len(self._sleep_hybrid_replicas)
+        logger.info(
+            f"[ElasticCheckpointManager] update_weights step={global_steps}: "
+            f"NCCL replicas={nccl_replicas} (standalone+awake hybrid), "
+            f"naive replicas={sleep_replicas} (sleeping hybrid)"
+        )
+
         # Step 1: NCCL sync for standalone + awake hybrid replicas (base class)
         if self.replicas:
             await super().update_weights(global_steps)
