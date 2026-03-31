@@ -59,12 +59,9 @@ from verl.trainer.ppo.utils import Role, WorkerType
 if TYPE_CHECKING:
     pass
 
-import ray
-
 logger = logging.getLogger(__name__)
 
 
-@ray.remote(num_cpus=4)
 class ElasticRollouter(FullyAsyncRollouter):
     """
     Elastic Rollouter – thin wrapper over FullyAsyncRollouter.

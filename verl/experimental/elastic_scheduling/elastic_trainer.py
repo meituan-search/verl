@@ -67,7 +67,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@ray.remote(num_cpus=10)
 class ElasticTrainer(FullyAsyncTrainer):
     """
     Elastic Trainer with dynamic DP management and role switching.
@@ -762,10 +761,11 @@ class ElasticTrainer(FullyAsyncTrainer):
             trainer=self.actor_wg,
             replicas=replicas,
         )
-        # Cache the IDs of fixed (standalone) rollout replicas for metrics.
+        # Cache the count of fixed (standalone) rollout replicas for metrics.
+        # replicas is a list[RolloutReplica] returned by rollouter.get_replicas().
         # Elastic rollout replica counts are tracked separately via
         # _elastic_rollout_replicas_cache, updated by switch_elastic_to_*.
-        self._fixed_rollout_replicas_cache = list(replicas.keys()) if replicas else []
+        self._fixed_rollout_replicas_cache = list(range(len(replicas))) if replicas else []
         self._elastic_rollout_replicas_cache = []
         logger.info("[ElasticTrainer] ElasticCheckpointManager initialized")
 

@@ -396,21 +396,25 @@ class ElasticSchedulingTaskRunner:
         trainer_roles = {role: wcls for role, wcls in role_worker_mapping.items() if role != Role.Rollout}
         trainer_resource_pool_manager = create_rp(config, roles=list(trainer_roles.keys())) if create_rp else None
 
-        trainer = ElasticTrainer.remote(
-            config=config,
-            tokenizer=self.components["tokenizer"],
-            role_worker_mapping=trainer_roles,
-            resource_pool_manager=trainer_resource_pool_manager,
-            ray_worker_group_cls=ray_worker_group_cls,
-            processor=self.components["processor"],
+        trainer = (
+            ray.remote(ElasticTrainer)
+            .options(num_cpus=10, max_concurrency=100)
+            .remote(
+                config=config,
+                tokenizer=self.components["tokenizer"],
+                role_worker_mapping=trainer_roles,
+                resource_pool_manager=trainer_resource_pool_manager,
+                ray_worker_group_cls=ray_worker_group_cls,
+                processor=self.components["processor"],
+            )
         )
         ray.get(trainer.init_workers.remote())
         self.components["trainer"] = trainer
         logger.info("[ElasticSchedulingTaskRunner] ElasticTrainer created and workers initialized")
 
-    # -------------------------------------------------------------------------
-    # Rollouter (injects elastic wg before init_workers)
-    # -------------------------------------------------------------------------
+        # -------------------------------------------------------------------------
+        # Rollouter (injects elastic wg before init_workers)
+        # -------------------------------------------------------------------------
 
     def _create_elastic_rollouter(self, config: DictConfig):
         """
@@ -427,13 +431,17 @@ class ElasticSchedulingTaskRunner:
 
         rollouter_resource_pool_manager = create_rp(config, roles=[Role.Rollout]) if create_rp else None
 
-        rollouter = ElasticRollouter.remote(
-            config=config,
-            tokenizer=self.components["tokenizer"],
-            role_worker_mapping=role_worker_mapping,
-            resource_pool_manager=rollouter_resource_pool_manager,
-            ray_worker_group_cls=ray_worker_group_cls,
-            processor=self.components["processor"],
+        rollouter = (
+            ray.remote(ElasticRollouter)
+            .options(num_cpus=10, max_concurrency=100)
+            .remote(
+                config=config,
+                tokenizer=self.components["tokenizer"],
+                role_worker_mapping=role_worker_mapping,
+                resource_pool_manager=rollouter_resource_pool_manager,
+                ray_worker_group_cls=ray_worker_group_cls,
+                processor=self.components["processor"],
+            )
         )
 
         # Inject the combined elastic worker group (all groups merged or first group,
