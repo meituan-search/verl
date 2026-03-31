@@ -259,6 +259,10 @@ class ElasticTrainer(FullyAsyncTrainer):
                         self._elastic_rollout_replicas_cache = list(
                             getattr(self, "_elastic_rollout_replicas_cache", [])
                         ) + [resource_id]
+                        # Mark the hybrid replica as AWAKE so that the next
+                        # update_weights() uses NCCL sync instead of in-process sync.
+                        if hasattr(self, "checkpoint_manager") and self.checkpoint_manager is not None:
+                            self.checkpoint_manager.mark_hybrid_awake(resource_id)
                 except Exception as e:
                     logger.error(f"[ElasticTrainer] Failed to add elastic replica for {resource_id}: {e}")
                     return False
@@ -314,6 +318,10 @@ class ElasticTrainer(FullyAsyncTrainer):
                         if resource_id in cache:
                             cache.remove(resource_id)
                         self._elastic_rollout_replicas_cache = cache
+                        # Mark the hybrid replica as SLEEPING so that the next
+                        # update_weights() uses in-process sync instead of NCCL.
+                        if hasattr(self, "checkpoint_manager") and self.checkpoint_manager is not None:
+                            self.checkpoint_manager.mark_hybrid_sleeping(resource_id)
                 except Exception as e:
                     logger.warning(f"[ElasticTrainer] Failed to remove elastic replica for {resource_id}: {e}")
 
@@ -777,6 +785,13 @@ class ElasticTrainer(FullyAsyncTrainer):
         hybrid replicas.  These replicas remain in the checkpoint manager
         regardless of their current sleep state.
 
+        For each hybrid replica, the corresponding ElasticActorWorker worker
+        group is looked up from ``_elastic_wg_registry`` (populated by
+        ``register_elastic_worker_group()``) and passed to
+        ``ElasticCheckpointManager.add_hybrid_replica()`` so that the
+        checkpoint manager can perform in-process weight sync when the replica
+        is in TRAIN mode (sleeping).
+
         Args:
             replicas: Dict[resource_id → RolloutReplica].
         """
@@ -790,8 +805,16 @@ class ElasticTrainer(FullyAsyncTrainer):
             logger.warning("[ElasticTrainer] checkpoint_manager is not an ElasticCheckpointManager")
             return
 
+        elastic_wg_registry = getattr(self, "_elastic_wg_registry", {})
         for resource_id, replica in replicas.items():
-            self.checkpoint_manager.add_hybrid_replica(resource_id, replica)
+            actor_wg = elastic_wg_registry.get(resource_id)
+            if actor_wg is None:
+                logger.warning(
+                    f"[ElasticTrainer] No actor_wg found for hybrid replica '{resource_id}'. "
+                    "In-process sync (TRAIN mode) will be skipped. "
+                    "Make sure register_elastic_worker_group() is called before register_hybrid_replicas()."
+                )
+            self.checkpoint_manager.add_hybrid_replica(resource_id, replica, actor_wg=actor_wg)
 
         logger.info(f"[ElasticTrainer] Registered {len(replicas)} hybrid replica(s) with checkpoint manager")
 

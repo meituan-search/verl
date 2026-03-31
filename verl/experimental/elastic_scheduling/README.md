@@ -522,8 +522,73 @@ Step 3  构建 ElasticGlobalRequestLoadBalancer（只含固定 replica 的地址
 - `_initialize_llm_servers(start_rank=num_elastic)` → 固定 replica rank 从 `num_elastic` 开始
 - `replica_rank` 直接决定 Ray named actor 名称，全局唯一即可避免命名冲突
 
+### 7.4 弹性资源的参数同步
 
-### 7.4 弹性资源对于样本数量的动态获取
+#### 7.4.1 Replica 分类
+
+弹性调度下存在两类 Rollout Replica：
+
+| 类型 | 描述 | GPU 归属 |
+|------|------|----------|
+| **Standalone Replica** | 专用 rollout 节点，GPU 始终由 rollout server 持有 | 固定分配给 rollout |
+| **Hybrid Replica** | 弹性节点，GPU 在训练引擎与 rollout server 之间动态切换 | 随弹性状态切换 |
+
+Hybrid Replica 在任意时刻有两种状态：
+- **唤醒状态（ROLLOUT 模式）**：rollout server 占用 GPU，actor 权重已 offload 到 CPU。
+- **休眠状态（TRAIN 模式）**：actor 权重在 GPU 上，rollout server 处于 sleep 状态（kv-cache 和权重均已释放）。
+
+#### 7.4.2 参数同步策略
+
+`ElasticCheckpointManager.update_weights()` 统一处理所有类型的 Replica：
+
+**Standalone Replica**（委托给基类 `CheckpointEngineManager`）：
+```
+abort_all_requests → sleep → build NCCL group → trainer/rollout update_weights → finalize → wake_up → resume_generation
+```
+
+**唤醒状态的 Hybrid Replica**（与 Standalone 完全相同的 NCCL 同步流程）：
+```
+abort_all_requests → sleep → build NCCL group → trainer/rollout update_weights → finalize → wake_up → resume_generation
+```
+此时 actor 权重已在 CPU，rollout server 通过 NCCL 接收 trainer 发来的参数。
+
+**休眠状态的 Hybrid Replica**（进程内直接同步，无需 NCCL）：
+```
+actor_worker_wg.update_weights()  ← 在 ElasticActorWorker 进程内直接将 actor 参数写入 rollout 内存
+```
+由于 rollout server 与 training engine 在**同一批进程**内运行（即 `ElasticActorWorker`），actor 的权重可以通过进程内函数调用直接同步给 rollout engine，等价于 `checkpoint_engine.backend="naive"` 语义。此路径不需要建立 NCCL 通信组，也不需要唤醒 rollout server。
+
+#### 7.4.3 弹性切换后无需单独同步
+
+**Train → Rollout 切换**（`switch_elastic_to_rollout`）：
+1. actor 权重 offload 到 CPU
+2. **此前 `update_weights` 已在休眠状态将最新参数同步到 rollout engine**
+3. `wake_up()` 直接唤醒 rollout server，rollout engine 持有的权重即为最新版本
+
+因此，弹性切换的 wake_up 流程中**无需额外参数同步**。这是因为每次 `update_weights`（周期性触发）均覆盖了所有 hybrid replica（无论唤醒/休眠），保证休眠中的 replica 也始终持有最新参数。
+
+#### 7.4.4 cuda_graph 初始化
+
+`ElasticActorWorker` 在 `init_model()` 阶段一次性完成 rollout engine 的 cuda_graph capture（如果 rollout 引擎支持）。弹性切换（sleep / wake_up）**不触发 cuda_graph 的重建**，wake_up 后直接复用已有的 cuda_graph，避免切换时的额外 warm-up 开销。
+
+#### 7.4.5 时序保障
+
+```
+训练循环 fit_step:
+  Phase 1: _fit_generate()         ← 从队列拉取样本（rollout 并行生成中）
+  Phase 2: _fit_training_step()    ← 训练更新
+  Phase 3: _fit_update_weights()   ← 参数同步（每 trigger_parameter_sync_step 步触发一次）
+              ├─ standalone replicas → NCCL sync（abort → sleep → sync → wake_up → resume）
+              ├─ 唤醒的 hybrid replicas → NCCL sync（同上）
+              └─ 休眠的 hybrid replicas → in-process sync（actor_worker.update_weights()）
+  Phase 4: _apply_pending_dp_changes()  ← 处理弹性切换（wake_up / sleep）
+```
+
+弹性切换发生在 Phase 4，而参数同步发生在 Phase 3，保证切换前已完成最新参数的下发。
+
+
+
+### 7.5 弹性资源对于样本数量的动态获取
 
 **问题**：训练引擎的 `required_samples`（每步从队列拉取的最小样本数）在初始化时由
 `ppo_mini_batch_size × require_batches` 固定计算。当弹性切换改变 DP 大小后，每个 DP rank
@@ -547,7 +612,7 @@ required_samples = ppo_mini_batch_size × require_batches × current_dp_size
 下一次 `_fit_generate()` 进入队列拉取时已使用更新后的值。
 
 
-### 7.5 指标记录
+### 7.6 指标记录
 
 弹性调度相关指标在每个 `fit_step` 结束时通过 `_fit_postprocess_step()` 写入 `self.metrics`，
 随正常训练 metrics 一起上报到日志系统。
@@ -564,7 +629,7 @@ required_samples = ppo_mini_batch_size × require_batches × current_dp_size
 
 指标写入时机：`_fit_postprocess_step()` → `self.metrics.update(...)` → `metrics_aggregator.add_step_metrics()`
 
-### 7.6 样本 Staleness 处理
+### 7.7 样本 Staleness 处理
 
 弹性切换可能导致 Rollout 参数版本落后：
 - 每个样本携带生成时的 `param_version`
@@ -590,3 +655,10 @@ required_samples = ppo_mini_batch_size × require_batches × current_dp_size
 2. `notify_workers_server_removed()` 的 `await` 保证 handle 在 `abort` 前已从所有 worker 删除
 3. `FullyAsyncLLMServerManager` 检测到 `stop_reason="aborted"` 后，自动将 `prompt + 已生成 tokens` 拼接发给新 server 续推，AgentLoop 无感知
 
+
+执行
+ray list jobs --address='http://10.148.11.18:8420' --format json 2>/dev/null | python3 -c "import sys,json; [print(j['job_id']) for j in json.load(sys.stdin) if
+j.get('status') in ('RUNNING','PENDING')]" | xargs -I{} ray job stop {} --address='http://10.148.11.18:8420'
+
+再执行
+ray job submit --address='http://10.148.11.18:8420' --runtime-env=verl/experimental/elastic_scheduling/shell/dapo_7b_math_megatron_2_6.yaml -- bash verl/experimental/elastic_scheduling/shell/dapo_7b_math_megatron_2_6.sh
