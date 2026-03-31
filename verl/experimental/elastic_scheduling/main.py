@@ -190,24 +190,129 @@ class ElasticSchedulingTaskRunner:
     # Role / Resource Mappings
     # -------------------------------------------------------------------------
 
-    def _init_resource_mappings(self, config: DictConfig):
-        try:
-            from verl.experimental.separation.utils import (
-                create_resource_pool_manager,
-                create_role_worker_mapping,
+    def _create_resource_pool_manager(self, config: DictConfig, roles: list):
+        """
+        Create a ResourcePoolManager for the given roles.
+
+        Mirrors the pattern in verl.experimental.separation.utils but lives here
+        so that elastic_scheduling.main has no hard dependency on the separation
+        sub-package.
+
+        Two resource pools are supported:
+        - ``trainer_pool``: covers Actor / ActorRollout / Critic / RefPolicy /
+          RewardModel roles.  Sized from ``config.trainer.{nnodes,n_gpus_per_node}``.
+        - ``rollout_pool``: covers the standalone Rollout role.  Sized from
+          ``config.rollout.{nnodes,n_gpus_per_node}``.
+
+        Args:
+            config: Top-level Hydra/OmegaConf config.
+            roles: List of :class:`~verl.trainer.ppo.utils.Role` values that
+                need resource pools.
+
+        Returns:
+            ResourcePoolManager
+        """
+        from verl.single_controller.ray import ResourcePoolManager
+        from verl.trainer.ppo.utils import Role
+
+        resource_pool_spec: dict[str, list[int]] = {}
+        mapping: dict = {}
+
+        # --- trainer pool (Actor / ActorRollout / Critic / RefPolicy / RewardModel) ---
+        # In fully-elastic mode, all training GPUs come from elastic worker groups so
+        # trainer.n_gpus_per_node may legitimately be 0.  Skip fixed trainer pool in
+        # that case – the elastic worker groups are wired in separately.
+        trainer_roles = [Role.Actor, Role.ActorRollout, Role.Critic, Role.RefPolicy, Role.RewardModel]
+        trainer_n_gpus = int(getattr(config.trainer, "n_gpus_per_node", 0))
+        trainer_nnodes = int(getattr(config.trainer, "nnodes", 0))
+        if any(role in roles for role in trainer_roles) and trainer_n_gpus > 0:
+            assert trainer_nnodes > 0, "config.trainer.nnodes must be > 0"
+
+            trainer_pool = [trainer_n_gpus] * trainer_nnodes
+            resource_pool_spec["trainer_pool"] = trainer_pool
+
+            for role in trainer_roles:
+                if role in roles:
+                    mapping[role] = "trainer_pool"
+
+        # --- rollout pool (standalone Rollout role) ---
+        if Role.Rollout in roles:
+            assert config.rollout.n_gpus_per_node > 0, "config.rollout.n_gpus_per_node must be > 0"
+            assert config.rollout.nnodes > 0, "config.rollout.nnodes must be > 0"
+
+            rollout_pool = [config.rollout.n_gpus_per_node] * config.rollout.nnodes
+            resource_pool_spec["rollout_pool"] = rollout_pool
+            mapping[Role.Rollout] = "rollout_pool"
+
+        return ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+
+    def _create_role_worker_mapping(self, config: DictConfig):
+        """
+        Build the role → worker-class mapping for ElasticTrainer / ElasticRollouter.
+
+        Mirrors the pattern in verl.experimental.separation.utils.create_role_worker_mapping
+        but lives here to keep elastic_scheduling self-contained.
+
+        Supported worker implementations:
+        - ``DetachActorWorker`` (from separation.engine_workers) for Actor /
+          ActorRollout / RefPolicy roles.
+        - ``TrainingWorker`` (from workers.engine_workers) for Critic.
+
+        The function requires ``config.trainer.use_legacy_worker_impl == "disable"``.
+
+        Args:
+            config: Top-level Hydra/OmegaConf config.
+
+        Returns:
+            tuple[dict, type[RayWorkerGroup]]:
+                role_worker_mapping, ray_worker_group_cls
+        """
+        import ray as _ray
+
+        from verl.experimental.separation.engine_workers import DetachActorWorker
+        from verl.single_controller.ray import RayWorkerGroup
+        from verl.trainer.ppo.utils import Role, need_reference_policy
+        from verl.workers.engine_workers import TrainingWorker
+
+        if config.trainer.get("use_legacy_worker_impl", "auto") != "disable":
+            raise NotImplementedError(
+                "ElasticScheduling requires use_legacy_worker_impl=disable (new engine worker implementation)"
             )
 
-            role_worker_mapping, ray_worker_group_cls = create_role_worker_mapping(config)
-            self.components["role_worker_mapping"] = role_worker_mapping
-            self.components["ray_worker_group_cls"] = ray_worker_group_cls
-            self.components["create_resource_pool_manager"] = create_resource_pool_manager
-        except ImportError:
-            logger.warning("[ElasticSchedulingTaskRunner] separation.utils not available, using defaults")
-            from verl.single_controller.ray import RayWorkerGroup
+        ray_worker_group_cls = RayWorkerGroup
 
-            self.components["ray_worker_group_cls"] = RayWorkerGroup
-            self.components["role_worker_mapping"] = {}
-            self.components["create_resource_pool_manager"] = None
+        # Must mirror the logic in FullyAsyncTrainer.__init__ so that the key in
+        # role_worker_mapping matches self.train_role inside the trainer.
+        use_trainer_do_validate = bool(config.get("async_training", {}).get("use_trainer_do_validate", False))
+        train_role = Role.ActorRollout if use_trainer_do_validate else Role.Actor
+
+        role_worker_mapping = {
+            train_role: _ray.remote(DetachActorWorker),
+            Role.Critic: _ray.remote(TrainingWorker),
+        }
+
+        # Add reference policy when KL-loss / reference reward is required
+        if need_reference_policy(config):
+            role_worker_mapping[Role.RefPolicy] = _ray.remote(DetachActorWorker)
+
+        return role_worker_mapping, ray_worker_group_cls
+
+    def _init_resource_mappings(self, config: DictConfig):
+        """
+        Populate ``self.components`` with:
+        - ``role_worker_mapping``         – role → Ray remote worker class
+        - ``ray_worker_group_cls``        – worker-group class (RayWorkerGroup)
+        - ``create_resource_pool_manager``– callable(config, roles) → ResourcePoolManager
+
+        Uses the local helpers ``_create_role_worker_mapping`` and
+        ``_create_resource_pool_manager`` so that this module has no hard
+        dependency on ``verl.experimental.separation.utils``.
+        """
+        role_worker_mapping, ray_worker_group_cls = self._create_role_worker_mapping(config)
+        self.components["role_worker_mapping"] = role_worker_mapping
+        self.components["ray_worker_group_cls"] = ray_worker_group_cls
+        # Store as a bound-method so callers can do create_rp(config, roles=...)
+        self.components["create_resource_pool_manager"] = self._create_resource_pool_manager
 
     # -------------------------------------------------------------------------
     # Elastic Worker Groups
@@ -235,7 +340,7 @@ class ElasticSchedulingTaskRunner:
             return
 
         from verl.experimental.elastic_scheduling.elastic_engine_workers import ElasticActorWorker
-        from verl.single_controller.ray import RayWorkerGroup
+        from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 
         elastic_n_gpus_per_node = int(getattr(elastic_config, "elastic_n_gpus_per_node", 1))
         elastic_n_nodes = int(getattr(elastic_config, "elastic_n_nodes", 1))
@@ -245,11 +350,20 @@ class ElasticSchedulingTaskRunner:
         for i in range(n_elastic):
             resource_id = f"elastic_{i}"
             try:
+                resource_pool = RayResourcePool(
+                    process_on_nodes=[elastic_n_gpus_per_node] * elastic_n_nodes,
+                    use_gpu=True,
+                    max_colocate_count=1,
+                    name_prefix=f"elastic_actor_{i}",
+                )
+                ray_cls_with_init = RayClassWithInitArgs(
+                    cls=ray.remote(ElasticActorWorker),
+                    config=config.actor_rollout_ref,
+                    role="actor_rollout",
+                )
                 wg = ray_worker_group_cls(
-                    resource_pool=None,
-                    ray_cls=ray.remote(ElasticActorWorker),
-                    num_nodes=elastic_n_nodes,
-                    n_gpus_per_node=elastic_n_gpus_per_node,
+                    resource_pool=resource_pool,
+                    ray_cls_with_init=ray_cls_with_init,
                     name_prefix=f"elastic_actor_{i}",
                 )
                 # Initialise actor model on the workers

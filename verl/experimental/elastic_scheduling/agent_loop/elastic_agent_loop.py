@@ -285,41 +285,64 @@ class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
             teacher_model_manager=teacher_model_manager,
             reward_loop_worker_handles=reward_loop_worker_handles,
         )
-        await instance._initialize_llm_servers()
+
+        # ── Step 1: elastic replicas first (replica_rank 0 … N_e-1) ──────────
+        # Initialise and immediately sleep them so the training engine can
+        # reclaim GPU memory.  Starting from rank 0 gives elastic actors the
+        # lowest-numbered placement-group bundles which are co-located with the
+        # training engine, maximising GPU affinity on multi-node deployments.
+        num_elastic = 0
+        if elastic_worker_group is not None:
+            num_elastic = await instance._initialize_elastic_replicas(elastic_worker_group, start_rank=0)
+
+        # ── Step 2: fixed replicas (replica_rank N_e … N_e+N_f-1) ───────────
+        # start_rank=num_elastic ensures the Ray actor names (e.g.
+        # sglang_server_{rank}_{node}) are globally unique and never collide
+        # with the elastic actors created above.
+        await instance._initialize_llm_servers(start_rank=num_elastic)
+
+        # ── Step 3: build LB with all currently active (fixed) servers ────────
+        # Elastic servers start sleeping; they are added to the LB on demand
+        # via add_elastic_replica().
         await instance._init_global_load_balancer()
         await instance._init_agent_loop_workers()
 
-        # Create elastic hybrid replicas from elastic_worker_group, initialise
-        # them via init_hybrid(), then sleep them so the training engine can
-        # reclaim GPU memory.  They are kept in _registered_elastic_replicas
-        # and activated on demand via add_elastic_replica().
-        if elastic_worker_group is not None:
-            await instance._initialize_elastic_replicas(elastic_worker_group)
-
         logger.info(
             f"[ElasticAgentLoopManager] Created: "
-            f"{len(instance.rollout_replicas)} fixed replicas, "
-            f"{len(instance._registered_elastic_replicas)} elastic replicas registered (sleeping)"
+            f"{len(instance.rollout_replicas)} fixed replicas (rank {num_elastic}+), "
+            f"{num_elastic} elastic replicas registered (sleeping, rank 0-{num_elastic - 1})"
         )
         return instance
 
-    async def _initialize_elastic_replicas(self, elastic_worker_group: RayWorkerGroup) -> None:
+    async def _initialize_elastic_replicas(
+        self,
+        elastic_worker_group: RayWorkerGroup,
+        start_rank: int = 0,
+    ) -> int:
         """
         Create, initialise (init_hybrid), and sleep elastic hybrid replicas.
 
         Called internally by create() when elastic_worker_group is provided.
         Each replica is assigned a contiguous slice of workers from
-        elastic_worker_group in the same way _initialize_llm_servers() slices
-        the fixed worker_group.
+        elastic_worker_group, and its ``replica_rank`` starts at ``start_rank``
+        so that it is globally unique across both elastic and fixed replicas
+        (avoiding Ray named-actor collisions such as ``sglang_server_0_0``).
 
         After init_hybrid() the replica is immediately put to sleep so that
         the training engine can use the shared GPUs.  The replica is stored in
-        _registered_elastic_replicas keyed by "elastic_{replica_rank}" and can
-        be activated later via add_elastic_replica().
+        _registered_elastic_replicas keyed by "elastic_{i}" (0-indexed within
+        the elastic group) and can be activated later via add_elastic_replica().
 
         Args:
             elastic_worker_group: Worker group whose workers back the elastic
                 hybrid replicas.  Must already be fully initialised.
+            start_rank: First global ``replica_rank`` to assign.  Pass 0 so
+                that elastic actors occupy the lowest-numbered Ray actor names
+                and therefore the best GPU affinity in multi-node deployments.
+
+        Returns:
+            Number of elastic replicas created (so the caller can pass
+            ``start_rank=num_elastic`` to ``_initialize_llm_servers``).
         """
         rollout_world_size = (
             self.rollout_config.tensor_model_parallel_size
@@ -330,12 +353,12 @@ class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
 
         elastic_replicas = [
             self.rollout_replica_class(
-                replica_rank=replica_rank,
+                replica_rank=start_rank + i,
                 config=self.rollout_config,
                 model_config=self.model_config,
                 gpus_per_node=self.rollout_config.n_gpus_per_node,
             )
-            for replica_rank in range(num_elastic_replicas)
+            for i in range(num_elastic_replicas)
         ]
 
         # Initialise all replicas concurrently.
@@ -345,15 +368,20 @@ class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
         await asyncio.gather(*[replica.sleep() for replica in elastic_replicas])
 
         # Register without activating in the LB pool.
-        for replica_rank, replica in enumerate(elastic_replicas):
-            resource_id = f"elastic_{replica_rank}"
+        for i, replica in enumerate(elastic_replicas):
+            resource_id = f"elastic_{i}"
             self._registered_elastic_replicas[resource_id] = replica
             logger.info(
-                f"[ElasticAgentLoopManager] Elastic replica '{resource_id}' initialised "
-                f"at {replica._server_address} (sleeping, not yet in LB pool)"
+                f"[ElasticAgentLoopManager] Elastic replica '{resource_id}' "
+                f"(rank={start_rank + i}) initialised at {replica._server_address} "
+                f"(sleeping, not yet in LB pool)"
             )
 
-        logger.info(f"[ElasticAgentLoopManager] {num_elastic_replicas} elastic replicas initialised and sleeping")
+        logger.info(
+            f"[ElasticAgentLoopManager] {num_elastic_replicas} elastic replicas "
+            f"initialised (rank {start_rank}–{start_rank + num_elastic_replicas - 1}), sleeping"
+        )
+        return num_elastic_replicas
 
     # -------------------------------------------------------------------------
     # Override: use ElasticGlobalRequestLoadBalancer

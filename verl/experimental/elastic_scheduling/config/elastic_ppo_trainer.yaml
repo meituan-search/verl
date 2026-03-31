@@ -82,6 +82,12 @@ elastic_scheduling:
   # Initial mode for elastic resources: "rollout" or "train"
   elastic_initial_mode: rollout
 
+  # Number of GPUs per node for each elastic resource group
+  elastic_n_gpus_per_node: 8
+
+  # Number of nodes per elastic resource group
+  elastic_n_nodes: 1
+
   # Number of GPUs per elastic resource group (typically equals TP*DP per group)
   # Must be divisible by tensor_model_parallel_size
   dp_size_per_resource: 8

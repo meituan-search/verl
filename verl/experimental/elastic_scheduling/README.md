@@ -491,7 +491,26 @@ elastic_scheduling:
 | Barrier 对称性要求 | 同 | 同（`dist.new_group` 必须全局对称） |
 | 重建后 broadcast | 有（新成员接收老成员参数） | 有（新成员接收 rank0 参数） |
 
-### 7.3 样本 Staleness 处理
+
+### 7.3 rollout 弹性与非弹性分配
+你再看下AgentLoopManager的实现，弹性的rollout资源也要收敛到AgentLoop中，弹性的server_id, 和非弹性的 server_id 发生了冲突，
+同时必须要先初始化弹性资源，之后再初始化非弹性资源，因为在多机多卡场景下，需要优先给训练分配资源，这样资源亲和性比较高，然后剩余的资源，
+再分配给独立的资源，同时server_id 需要唯一。
+
+即使亲和的问题可以解决，无论是独立资源先创建server，还是弹性资源先创建server, 全局只有一个agent_loop_manager, server_id 不能重复。
+
+
+### 7.4 弹性资源对于样本数量的动态获取
+由于DP发生改变，训练获取的样本数量需要可以整除DP
+
+
+### 7.5 指标记录
+* 弹性切换次数
+* 弹性切换延迟
+* rollout 资源数 (包含独占资源)
+* trainer 资源数
+
+### 7.6 样本 Staleness 处理
 
 弹性切换可能导致 Rollout 参数版本落后：
 - 每个样本携带生成时的 `param_version`

@@ -146,6 +146,63 @@ class ElasticTrainer(FullyAsyncTrainer):
         logger.info("[ElasticTrainer] Initialized with elastic DP support")
 
     # =========================================================================
+    # Worker Initialization Overrides
+    # =========================================================================
+
+    def _is_fully_elastic(self) -> bool:
+        """Return True when trainer.n_gpus_per_node == 0 (all-elastic mode)."""
+        return int(getattr(self.config.trainer, "n_gpus_per_node", 0)) == 0
+
+    def _create_actor_rollout_classes(self):
+        """
+        In fully-elastic mode (trainer.n_gpus_per_node=0), there is no fixed
+        training resource pool, so skip creating actor rollout classes here.
+        The elastic worker groups are wired in separately via
+        register_elastic_worker_group().
+
+        In normal mode, delegate to the parent implementation.
+        """
+        if self._is_fully_elastic():
+            logger.info("[ElasticTrainer] Fully-elastic mode: skipping fixed actor rollout class creation")
+            return
+        super()._create_actor_rollout_classes()
+
+    def _init_models(self):
+        """
+        In fully-elastic mode, skip actor_wg initialization (no fixed actor
+        resource pool).  Critic / ref-policy / reward-model are still
+        initialised as usual if present.
+        """
+        if self._is_fully_elastic():
+            logger.info("[ElasticTrainer] Fully-elastic mode: skipping fixed actor_wg init_model")
+            # Only initialise non-actor worker groups
+            if self.use_critic:
+                from verl.trainer.ppo.utils import Role as _Role
+
+                self.critic_wg = self.all_wg[str(_Role.Critic)]
+                self.critic_wg.init_model()
+
+            if self.use_reference_policy and not self.ref_in_actor:
+                from verl.trainer.ppo.utils import Role as _Role
+
+                self.ref_policy_wg = self.all_wg[str(_Role.RefPolicy)]
+                self.ref_policy_wg.init_model()
+
+            if self.use_rm:
+                from verl.trainer.ppo.utils import Role as _Role
+
+                self.rm_wg = self.all_wg[str(_Role.RewardModel)]
+                self.rm_wg.init_model()
+
+            # actor_wg / actor_rollout_wg will be set to the first elastic wg
+            # in register_elastic_worker_group() once elastic wgs are created.
+            self.actor_wg = None
+            self.actor_rollout_wg = None
+            return
+
+        super()._init_models()
+
+    # =========================================================================
     # Complete Switch Sequences (called by ElasticCoordinator)
     # =========================================================================
 
@@ -296,6 +353,15 @@ class ElasticTrainer(FullyAsyncTrainer):
         """
         self._elastic_wg_registry = getattr(self, "_elastic_wg_registry", {})
         self._elastic_wg_registry[resource_id] = worker_group
+
+        # In fully-elastic mode (no fixed actor pool), promote the first
+        # registered elastic wg to actor_wg so that the rest of the trainer
+        # (checkpoint manager, param-sync, etc.) has a valid handle.
+        if self._is_fully_elastic() and getattr(self, "actor_wg", None) is None:
+            self.actor_wg = worker_group
+            self.actor_rollout_wg = worker_group
+            logger.info(f"[ElasticTrainer] Fully-elastic mode: promoted '{resource_id}' as actor_wg")
+
         logger.info(f"[ElasticTrainer] Registered elastic worker group: {resource_id}")
 
     def _get_elastic_wg_by_resource_id(self, resource_id: str) -> Optional[RayWorkerGroup]:
