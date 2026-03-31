@@ -52,29 +52,33 @@ graph TB
 每个 `ElasticActorWorker` 同时持有 **Actor Engine**（训练引擎）和 **Rollout Engine**（推理服务器），两者互斥地占用同一份 GPU 显存：
 
 ```mermaid
-stateDiagram-v2
-    direction LR
-    [*] --> TRAIN : init_model()
+flowchart LR
+    INIT(["init_model()"]) --> TRAIN
 
-    TRAIN --> TRAIN_TO_ROLLOUT : switch_elastic_to_rollout()
-    TRAIN_TO_ROLLOUT --> ROLLOUT : 完成
+    TRAIN(["🟢 TRAIN\nActor Engine 在 GPU\nRollout Engine 休眠"])
+    ROLLOUT(["🔵 ROLLOUT\nRollout Engine 在 GPU\nActor Engine 在 CPU"])
 
-    ROLLOUT --> ROLLOUT_TO_TRAIN : switch_elastic_to_train()
-    ROLLOUT_TO_TRAIN --> TRAIN : 完成
+    TRAIN -->|"switch_elastic_to_rollout()"| T2R
+    T2R -->|完成| ROLLOUT
 
-    state TRAIN_TO_ROLLOUT {
-        s1 : 1. remove_elastic_actor()\nDP rebuild 排除本 rank
-        s2 : 2. actor.offload_to_cpu()\n释放 GPU 显存
-        s3 : 3. rollout.wake_up()\n加入 LB 池
+    ROLLOUT -->|"switch_elastic_to_train()"| R2T
+    R2T -->|完成| TRAIN
+
+    subgraph T2R ["Train → Rollout 切换步骤"]
+        direction TB
+        s1["① remove_elastic_actor()\nDP rebuild 排除本 rank"]
+        s2["② actor.offload_to_cpu()\n释放 GPU 显存"]
+        s3["③ rollout.wake_up()\n加入 LB 池开始生产"]
         s1 --> s2 --> s3
-    }
+    end
 
-    state ROLLOUT_TO_TRAIN {
-        t1 : 1. rollout.sleep() + abort\n释放 GPU 显存
-        t2 : 2. actor.load_to_gpu()\n恢复训练权重
-        t3 : 3. add_elastic_actor()\nDP rebuild 纳入本 rank
+    subgraph R2T ["Rollout → Train 切换步骤"]
+        direction TB
+        t1["① rollout.sleep() + abort\n释放 GPU 显存"]
+        t2["② actor.load_to_gpu()\n恢复训练权重"]
+        t3["③ add_elastic_actor()\nDP rebuild 纳入本 rank"]
         t1 --> t2 --> t3
-    }
+    end
 ```
 
 **GPU 显存安全保证**：
@@ -321,27 +325,27 @@ sequenceDiagram
 ### 3.3 DP 扩缩容时参数分布（以 Megatron DP=2→4 为例）
 
 ```mermaid
-block-beta
-    columns 4
-    block:before:4
-        %% 扩容前
-        r0["rank0 GPU\n[完整模型 W]\n老成员 ✅"]
-        r1["rank1 GPU\n[完整模型 W]\n老成员 ✅"]
-        r2["rank2 GPU\n[随机权重]\n新成员 ❌"]
-        r3["rank3 GPU\n[随机权重]\n新成员 ❌"]
+flowchart TB
+    subgraph BEFORE ["扩容前（DP=2，新成员持有随机权重）"]
+        direction LR
+        r0["rank0 GPU\n完整模型 W\n老成员 ✅"]
+        r1["rank1 GPU\n完整模型 W\n老成员 ✅"]
+        r2["rank2 GPU\n随机权重\n新成员 ❌"]
+        r3["rank3 GPU\n随机权重\n新成员 ❌"]
     end
-    space:4
-    block:after:4
-        %% broadcast 后
-        a0["rank0 GPU\n[W] src ✅"]
-        a1["rank1 GPU\n[W] 覆盖 ✅"]
-        a2["rank2 GPU\n[W] 接收 ✅"]
-        a3["rank3 GPU\n[W] 接收 ✅"]
+
+    subgraph AFTER ["broadcast 后（DP=4，全部同步）"]
+        direction LR
+        a0["rank0 GPU\nW  src ✅"]
+        a1["rank1 GPU\nW  覆盖 ✅"]
+        a2["rank2 GPU\nW  接收 ✅"]
+        a3["rank3 GPU\nW  接收 ✅"]
     end
-    r0 -- "broadcast\nsrc=rank0\nnew dp_group" --> a0
-    r0 --> a1
-    r0 --> a2
-    r0 --> a3
+
+    r0 -->|"broadcast src=rank0\nnew dp_group"| a0
+    r0 -->|broadcast| a1
+    r0 -->|broadcast| a2
+    r0 -->|broadcast| a3
 ```
 
 | 阶段 | 说明 |
@@ -512,3 +516,4 @@ elastic_scheduling:
 1. LB 的 `_removed_servers` 标记使新请求不路由到被删 server
 2. `notify_workers_server_removed()` 的 `await` 保证 handle 在 `abort` 前已从所有 worker 删除
 3. `FullyAsyncLLMServerManager` 检测到 `stop_reason="aborted"` 后，自动将 `prompt + 已生成 tokens` 拼接发给新 server 续推，AgentLoop 无感知
+

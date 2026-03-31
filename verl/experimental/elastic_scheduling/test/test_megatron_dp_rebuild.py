@@ -54,7 +54,7 @@ elastic_transformer_impl.py），验证其完整的弹性 DP rebuild 流程。
 
 运行方式（需要 4 个 GPU）：
     torchrun --nproc_per_node=4 \\
-        verl/experimental/elastic_scheduling/test/test_megatron_dp_rebuild_real_model.py \\
+        verl/experimental/elastic_scheduling/test/test_megatron_dp_rebuild.py \\
         --model-path /home/hadoop-djst-algoplat/models/Qwen2-Math-7B
 
 通过 ray job submit 运行：
@@ -64,7 +64,7 @@ elastic_transformer_impl.py），验证其完整的弹性 DP rebuild 流程。
         --working-dir=. \\
         --entrypoint-num-gpus 4 \\
         -- torchrun --nproc_per_node=4 --master-port=29603 \\
-           verl/experimental/elastic_scheduling/test/test_megatron_dp_rebuild_real_model.py \\
+           verl/experimental/elastic_scheduling/test/test_megatron_dp_rebuild.py \\
            --model-path /home/hadoop-djst-algoplat/models/Qwen2.5-Math-7B
 """
 

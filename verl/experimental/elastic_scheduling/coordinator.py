@@ -225,6 +225,11 @@ class ElasticCoordinator:
             "stats": dict(self._stats),
         }
 
+    def _set_ema_rates_for_test(self, prod_rate, cons_rate):
+        """Inject EMA rates directly – for unit testing only."""
+        self._ema_production_rate = prod_rate
+        self._ema_consumption_rate = cons_rate
+
     # =========================================================================
     # Training Boundary Hook
     # =========================================================================

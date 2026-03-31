@@ -3,7 +3,7 @@ hydra:
     - file://verl/trainer/config
 
 defaults:
-  - ppo_trainer
+  - ppo_megatron_trainer
   - _self_
 
 trainer:
@@ -14,10 +14,10 @@ async_training:
   # Maximum samples staleness threshold
   staleness_threshold: 0.1
 
-  # Frequency of parameter synchronization between rollouter and trainer,
+  # Frequency of parameter synchronization between rollouter and trainer, 
   # One step means trainer obtains a batch of required samples
   trigger_parameter_sync_step: 4
-
+  
   # The number of ppo_mini_batches that the FullyAsyncTrainer obtains once
   require_batches: 1
 
@@ -34,7 +34,7 @@ rollout:
   # Number of nodes used in the rollout
   nnodes: 1
 
-  # Number of GPUs per node
+  # Number of GPUs per node                     
   n_gpus_per_node: 8
 
   # number of responses (i.e. num sample times). > 1 for grpo
@@ -63,7 +63,6 @@ actor_rollout_ref:
   model:
     # To use remove padding (thd)
     use_remove_padding: True
-
 
 # Only then will the use of log probs be correct.
 # And it can be used in conjunction with other rollout_correction algorithms.

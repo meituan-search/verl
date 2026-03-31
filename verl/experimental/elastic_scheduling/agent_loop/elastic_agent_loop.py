@@ -120,6 +120,20 @@ class ElasticGlobalRequestLoadBalancer:
         """Get list of all active server IDs."""
         return [sid for sid in self._inflight_requests if sid not in self._removed_servers]
 
+    # ---- test helpers ----
+
+    def set_inflight_for_test(self, server_id: str, count: int) -> None:
+        """Directly set in-flight count for a server (test use only)."""
+        self._inflight_requests[server_id] = count
+
+    def is_server_removed(self, server_id: str) -> bool:
+        """Return True if the server is in the removed set (test use only)."""
+        return server_id in self._removed_servers
+
+    def has_server(self, server_id: str) -> bool:
+        """Return True if the server exists in the inflight table (test use only)."""
+        return server_id in self._inflight_requests
+
 
 class ElasticAgentLoopWorker(FullyAsyncAgentLoopWorker):
     def add_server(self, server_address: str, server_handle: ray.actor.ActorHandle) -> None:

@@ -279,7 +279,14 @@ class ElasticActorWorker(ActorRolloutRefWorker):
         Args:
             new_world_ranks: Ordered list of global ranks in the new DP group.
         """
-        self._rebuild_dp_group(new_world_ranks)
+        """Delegate DP group rebuild to the (patched) engine."""
+        if not callable(getattr(self.actor.engine, "rebuild_dp_group", None)):
+            raise AttributeError(
+                f"Engine {type(self.actor.engine).__name__} does not implement "
+                "rebuild_dp_group(). Ensure the engine was patched via "
+                "_patch_engine_to_elastic()."
+            )
+        self.actor.engine.rebuild_dp_group(new_world_ranks)
 
     # -------------------------------------------------------------------------
     # State introspection
@@ -309,17 +316,6 @@ class ElasticActorWorker(ActorRolloutRefWorker):
     # -------------------------------------------------------------------------
     # Private helpers – training engine only
     # -------------------------------------------------------------------------
-
-    def _rebuild_dp_group(self, new_world_ranks: list[int]) -> None:
-        """Delegate DP group rebuild to the (patched) engine."""
-        if not callable(getattr(self.actor.engine, "rebuild_dp_group", None)):
-            raise AttributeError(
-                f"Engine {type(self.actor.engine).__name__} does not implement "
-                "rebuild_dp_group(). Ensure the engine was patched via "
-                "_patch_engine_to_elastic()."
-            )
-        self.actor.engine.rebuild_dp_group(new_world_ranks)
-
     def _offload_actor_to_cpu(self) -> None:
         """
         Move actor model weights to CPU, freeing GPU memory for the rollout
