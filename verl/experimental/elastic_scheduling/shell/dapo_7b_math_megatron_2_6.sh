@@ -68,7 +68,7 @@ min_rollout_resources=0
 # ── Batch / mini-batch sizes ───────────────────────────────────
 train_prompt_bsz=128
 n_resp_per_prompt=16
-train_prompt_mini_bsz=32
+train_prompt_mini_bsz=48
 
 elastic_params=(
   # ---- Elastic resource topology ----

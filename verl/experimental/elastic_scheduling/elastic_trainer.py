@@ -145,6 +145,11 @@ class ElasticTrainer(FullyAsyncTrainer):
         # Coordinator reference (optional, for pre-sync hook)
         self._elastic_coordinator = None
 
+        # Initialize required_samples to be DP-size aware from the start.
+        # Parent class sets required_samples = ppo_mini_batch_size * require_batches,
+        # which may not be divisible by the initial DP size.
+        self._update_required_samples()
+
         logger.info("[ElasticTrainer] Initialized with elastic DP support")
 
     # =========================================================================
@@ -632,25 +637,42 @@ class ElasticTrainer(FullyAsyncTrainer):
 
         Formula::
 
-            dp_size         = current number of DP replicas
-            required_samples = ppo_mini_batch_size × require_batches × dp_size
+            base_per_dp    = ppo_mini_batch_size × require_batches
+            dp_size        = current number of DP replicas
+            required_samples = ceil(base_per_dp × dp_size)
+                               rounded UP to the nearest multiple of dp_size
 
-        This guarantees that every DP rank receives exactly
-        ``ppo_mini_batch_size × require_batches`` samples per step, avoiding
-        shape mismatches that arise when sample counts are not evenly divisible
-        by the data-parallel degree.
+        This guarantees that every DP rank receives an equal number of samples,
+        avoiding the assertion ``len(seqlen_list) % k_partitions == 0`` in
+        ``karmarkar_karp``.  We round UP rather than DOWN to ensure sufficient
+        samples for training progress.
 
         Called automatically at the end of ``_apply_pending_dp_changes()``.
         """
+        import math
+
         mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         require_batches = self.config.async_training.require_batches
         dp_size = self._get_current_dp_size()
-        new_required = mini_batch_size * require_batches * dp_size
+
+        # Minimum samples needed per DP rank (must be integer)
+        base_per_dp = mini_batch_size * require_batches
+
+        # Total samples = base_per_dp * dp_size, but we round UP to ensure
+        # the total is divisible by dp_size for equal partitioning.
+        # Since base_per_dp is already an integer, the formula simplifies to:
+        new_required = base_per_dp * dp_size
+        # Ensure new_required is divisible by dp_size (it always is now).
+        # Also ensure it's a multiple of mini_batch_size for minibatch slicing.
+        if new_required % mini_batch_size != 0:
+            new_required = math.ceil(new_required / mini_batch_size) * mini_batch_size
+
         old_required = self.required_samples
         self.required_samples = new_required
         logger.info(
             f"[ElasticTrainer] required_samples updated: {old_required} → {new_required} "
-            f"(dp_size={dp_size}, mini_batch={mini_batch_size}, require_batches={require_batches})"
+            f"(dp_size={dp_size}, mini_batch={mini_batch_size}, require_batches={require_batches}, "
+            f"base_per_dp={base_per_dp})"
         )
 
     async def _get_current_train_ranks(self) -> list[int]:

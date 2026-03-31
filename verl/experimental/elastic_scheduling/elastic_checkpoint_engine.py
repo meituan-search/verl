@@ -66,8 +66,6 @@ Extends CheckpointEngineManager with hybrid replica support.
 
 import logging
 
-import ray
-
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.single_controller.ray import RayWorkerGroup
 from verl.workers.config import CheckpointEngineConfig
@@ -261,16 +259,16 @@ class ElasticCheckpointManager(CheckpointEngineManager):
             await super().update_weights(global_steps)
 
         # Step 2: naive sync for sleeping hybrid replicas
-        for resource_id, _replica in self._sleep_hybrid_replicas.items():
-            actor_wg = self._hybrid_actor_wgs.get(resource_id)
-            if actor_wg is None:
-                logger.warning(
-                    f"[ElasticCheckpointManager] No actor_wg for sleeping hybrid replica "
-                    f"'{resource_id}'. Skipping sync."
-                )
-                continue
-            try:
-                ray.get(actor_wg.update_weights(global_steps=global_steps))
-                logger.info(f"[ElasticCheckpointManager] Sleeping replica '{resource_id}' synced (naive, TRAIN mode).")
-            except Exception as e:
-                logger.exception(f"[ElasticCheckpointManager] Failed to sync sleeping replica '{resource_id}': {e}")
+        # for resource_id, _replica in self._sleep_hybrid_replicas.items():
+        #     actor_wg = self._hybrid_actor_wgs.get(resource_id)
+        #     if actor_wg is None:
+        #         logger.warning(
+        #             f"[ElasticCheckpointManager] No actor_wg for sleeping hybrid replica "
+        #             f"'{resource_id}'. Skipping sync."
+        #         )
+        #         continue
+        #     try:
+        #         ray.get(actor_wg.update_weights(global_steps=global_steps))
+        #     logger.info(f"[ElasticCheckpointManager] Sleeping replica '{resource_id}' synced (naive, TRAIN mode).")
+        #     except Exception as e:
+        #         logger.exception(f"[ElasticCheckpointManager] Failed to sync sleeping replica '{resource_id}': {e}")
