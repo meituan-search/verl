@@ -448,6 +448,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             await self._fit_update_weights()
             await self._fit_validate()
         self._fit_save_checkpoint(force=True)
+        if self.old_log_prob_server is not None:
+            await self.old_log_prob_server.shutdown.remote()
 
     async def fit_step(self, batch_dict: dict = None):
         """

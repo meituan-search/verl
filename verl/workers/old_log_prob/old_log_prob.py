@@ -209,14 +209,11 @@ class OldLogProbServer:
 
         Args:
             old_log_prob_worker_group: The worker group for computing log probabilities.
-            batch_size: Number of requests to collect before dispatching a batch.
-                Should be a multiple of dp_size * micro_batch_size_per_gpu so
-                that full batches are always divisible without padding.
-            timeout: Maximum time (in seconds) to wait for a full batch before
-                dispatching a partial batch.
-            micro_batch_size_per_gpu: The micro-batch size per GPU used during
-                inference.  Must match the value set in OldLogProbWorker so that
-                prepare_micro_batches never fails with a divisibility assertion.
+            old_log_prob_cfg: Configuration containing:
+                - batch_size: Number of requests to collect before dispatching.
+                  Must be a multiple of dp_size * micro_batch_size_per_gpu.
+                - timeout: Maximum time (seconds) to wait for a full batch.
+                - micro_batch_size_per_gpu: Micro-batch size per GPU for inference.
         """
         self.old_log_prob_worker_group = old_log_prob_worker_group
         self.batch_size = old_log_prob_cfg.get("batch_size", 8)
@@ -239,127 +236,201 @@ class OldLogProbServer:
         if self.batch_size % self._min_dispatch_unit != 0:
             raise RuntimeError(f"OldLogProbServer {self.batch_size=} is not a multiple of {self._min_dispatch_unit=}. ")
 
-        # Batch control state
-        self._pending_requests: list[TensorDict] = []
-        self._pending_futures: list[asyncio.Future] = []
-        self._batch_lock = asyncio.Lock()
-        self._timer_task: asyncio.Task | None = None
-        # Ensures only one infer_batch call runs at a time
+        self._request_queue: asyncio.Queue = asyncio.Queue()
+        self._consumer_task: asyncio.Task | None = None
+        # Inference lock to serialize worker_group calls
         self._infer_lock = asyncio.Lock()
+        self._shutdown = False
+        self._drain_done = asyncio.Event()
+        self._drain_done.set()  # Initially open (not draining)
+
+        self._start_consumer()
+
+    def _start_consumer(self):
+        """Start the background batch consumer task."""
+        if self._consumer_task is None or self._consumer_task.done():
+            self._consumer_task = asyncio.create_task(self._batch_consumer())
+            logger.info("OldLogProbServer: Started batch consumer task")
+
+    async def _batch_consumer(self):
+        """
+        Background task that continuously collects and dispatches batches.
+
+        1. Wait until the drain gate is open (not in a drain/weight-load window)
+        2. Try to collect batch_size requests within the timeout window;
+        3. If timeout expires dispatch whatever is available
+        """
+        while not self._shutdown:
+            batch_requests = []
+            batch_futures = []
+
+            # 1. Wait until drain gate is open before starting a new collection round.
+            await self._drain_done.wait()
+            try:
+                # 2: Collect up to batch_size requests with timeout window
+                deadline = asyncio.get_event_loop().time() + self.timeout
+                drain_triggered = False
+
+                while len(batch_requests) < self.batch_size:
+                    remaining_time = deadline - asyncio.get_event_loop().time()
+                    if remaining_time <= 0:
+                        break
+
+                    try:
+                        # Wait for next request with remaining timeout
+                        item = await asyncio.wait_for(self._request_queue.get(), timeout=remaining_time)
+
+                        # After every await, check whether a drain has started.
+                        if not self._drain_done.is_set():
+                            # Put back items
+                            for req, fut in zip(batch_requests, batch_futures, strict=False):
+                                await self._request_queue.put((req, fut))
+                            await self._request_queue.put(item)
+                            batch_requests.clear()
+                            batch_futures.clear()
+                            drain_triggered = True
+                            break
+
+                        batch_requests.append(item[0])
+                        batch_futures.append(item[1])
+
+                        # Batch is full — dispatch immediately without waiting for timeout
+                        if len(batch_requests) >= self.batch_size:
+                            break
+
+                    except asyncio.TimeoutError:
+                        # Timeout window expired; dispatch whatever we have
+                        break
+
+                if drain_triggered:
+                    # Wait for the drain to finish before retrying.
+                    await self._drain_done.wait()
+                    continue
+
+                # 3. Dispatch the collected batch.
+                if batch_requests:
+                    await self._execute_batch(batch_requests, batch_futures)
+
+            except Exception as e:
+                logger.exception(f"OldLogProbServer: Error in batch consumer: {e}")
+                raise
+
+    async def _execute_batch(self, requests: list[TensorDict], futures: list[asyncio.Future]):
+        """
+        Execute inference for a batch of requests and resolve futures.
+        """
+        n_real = len(requests)
+        if n_real != self.batch_size:
+            logger.debug(f"OldLogProbServer: Dispatching partial batch {n_real=} (target={self.batch_size})")
+
+        batched_data = TensorDict.cat(requests, dim=0)
+
+        try:
+            loop = asyncio.get_event_loop()
+            # Use _infer_lock to serialize inference calls
+            async with self._infer_lock:
+                batched_output = await loop.run_in_executor(None, self.infer_batch, batched_data)
+
+            # Resolve all futures with their corresponding results
+            for i, future in enumerate(futures):
+                if not future.done():
+                    individual_result = batched_output[i : i + 1]
+                    future.set_result(individual_result)
+
+        except Exception as e:
+            logger.exception(f"OldLogProbServer: Batch inference failed: {e}")
+            # Propagate error to all futures in this batch
+            for future in futures:
+                if not future.done():
+                    future.set_exception(e)
 
     async def compute_old_log_prob(self, data: TensorDict) -> TensorDict:
-        """Compute old log probabilities for a single data item.
-
-        This method collects individual requests and batches them together.
-        When batch_size requests are collected or timeout is reached,
-        the batch is dispatched to infer_batch.
-
-        Args:
-            data: A TensorDict with batch_size=1 containing a single data item.
-
-        Returns:
-            A TensorDict containing the computed old log probabilities for this item.
-        """
+        """Compute old log probabilities for a single data item."""
+        if self._shutdown:
+            raise RuntimeError("OldLogProbServer is shutting down, cannot accept new requests")
         assert data.batch_size[0] == 1, "OldLogProbServer only supports batch size 1"
         missing_keys = [key for key in self._REQUIRED_REQUEST_KEYS if key not in data.keys()]
         if missing_keys:
             raise KeyError(f"OldLogProbServer request missing required keys: {missing_keys}")
 
+        # Wait until any in-progress drain/weight-load has finished before enqueuing.
+        await self._drain_done.wait()
+
         loop = asyncio.get_event_loop()
         future = loop.create_future()
+        await self._request_queue.put((data, future))
 
-        async with self._batch_lock:
-            self._pending_requests.append(data)
-            self._pending_futures.append(future)
-
-            if len(self._pending_requests) >= self.batch_size:
-                # Batch is full, dispatch one full batch immediately.
-                await self._dispatch_batch(max_items=self.batch_size)
-            elif self._timer_task is None or self._timer_task.done():
-                # Start a timeout timer for the first request in a new batch
-                self._timer_task = asyncio.create_task(self._timeout_handler())
-
-        # Wait for the result
         return await future
 
-    async def _timeout_handler(self):
-        """Wait for the timeout period, then dispatch whatever requests are pending."""
-        await asyncio.sleep(self.timeout)
-        async with self._batch_lock:
-            if self._pending_requests:
-                await self._dispatch_batch()
-
-    async def _dispatch_batch(self, max_items: int | None = None):
-        """
-        Dispatch pending requests as a batch.
-        """
-        # Cancel the timer if it's still running.
-        # If _dispatch_batch is called from the timeout task itself, do not self-cancel;
-        if self._timer_task is not None:
-            current_task = asyncio.current_task()
-            if self._timer_task is current_task:
-                self._timer_task = None
-            else:
-                if not self._timer_task.done():
-                    self._timer_task.cancel()
-                self._timer_task = None
-
-        # Take either all pending items or only the first max_items.
-        if max_items is None:
-            requests = self._pending_requests
-            futures = self._pending_futures
-            self._pending_requests = []
-            self._pending_futures = []
-        else:
-            requests = self._pending_requests[:max_items]
-            futures = self._pending_futures[:max_items]
-            self._pending_requests = self._pending_requests[max_items:]
-            self._pending_futures = self._pending_futures[max_items:]
-
-        # If requests remain queued, keep a timer for the remainder.
-        if self._pending_requests and (self._timer_task is None or self._timer_task.done()):
-            self._timer_task = asyncio.create_task(self._timeout_handler())
-
-        # Concatenate all single-item TensorDicts into one batch
-        batched_data = TensorDict.cat(requests, dim=0)
-
-        try:
-            # Acquire infer_lock to ensure only one infer_batch runs at a time.
-            loop = asyncio.get_event_loop()
-            async with self._infer_lock:
-                batched_output = await loop.run_in_executor(None, self.infer_batch, batched_data)
-
-            # Split the output and resolve each future
-            for i, future in enumerate(futures):
-                if not future.done():
-                    individual_result = batched_output[i : i + 1]
-                    future.set_result(individual_result)
-        except Exception as e:
-            import traceback
-
-            traceback.print_exc()
-            for future in futures:
-                if not future.done():
-                    future.set_exception(e)
-
     async def drain_and_load_weights(self):
-        """
-        Wait for all pending requests to finish, then load staged weights into the engine.
-        """
-        async with self._batch_lock:
-            if self._pending_requests:
-                await self._dispatch_batch()
+        """Flush requests already in the queue with the current weights, load new weights."""
+        logger.info("OldLogProbServer: Starting drain for weight update")
 
-            # Wait for any in-flight inference to finish, then load new weights
-            async with self._infer_lock:
-                self.old_log_prob_worker_group.load_staged_weights()
+        # _drain_done.wait() will block
+        self._drain_done.clear()
+
+        async with self._infer_lock:
+            # flush requests already in the queue with the old weights.
+            pre_drain_requests = []
+            pre_drain_futures = []
+            while not self._request_queue.empty():
+                try:
+                    item = self._request_queue.get_nowait()
+                    pre_drain_requests.append(item[0])
+                    pre_drain_futures.append(item[1])
+                except asyncio.QueueEmpty:
+                    break
+
+            if pre_drain_requests:
+                logger.info(
+                    f"OldLogProbServer: Flushing {len(pre_drain_requests)} pre-drain requests with current weights"
+                )
+                loop = asyncio.get_event_loop()
+                batched_data = TensorDict.cat(pre_drain_requests, dim=0)
+                try:
+                    batched_output = await loop.run_in_executor(None, self.infer_batch, batched_data)
+                    for i, future in enumerate(pre_drain_futures):
+                        if not future.done():
+                            future.set_result(batched_output[i : i + 1])
+                except Exception as e:
+                    logger.exception("OldLogProbServer: pre-drain flush failed")
+                    for future in pre_drain_futures:
+                        if not future.done():
+                            future.set_exception(e)
+
+            # Step 4: load new weights with the lock still held.
+            self.old_log_prob_worker_group.load_staged_weights()
+            logger.info("OldLogProbServer: Weights loaded successfully")
+        self._drain_done.set()
+        logger.info("OldLogProbServer: Drain complete, consumer resuming normal operation")
+
+    async def shutdown(self):
+        """Shutdown the server."""
+        logger.info("OldLogProbServer: Shutting down")
+        self._shutdown = True
+
+        # Cancel consumer task
+        if self._consumer_task and not self._consumer_task.done():
+            self._consumer_task.cancel()
+            try:
+                await self._consumer_task
+            except asyncio.CancelledError:
+                pass
+
+        # Fail any remaining requests in queue
+        while not self._request_queue.empty():
+            try:
+                _, future = self._request_queue.get_nowait()
+                if not future.done():
+                    future.set_exception(RuntimeError("Server shutdown"))
+            except asyncio.QueueEmpty:
+                break
+
+        logger.info("OldLogProbServer: Shutdown complete")
 
     def infer_batch(self, data: TensorDict) -> TensorDict:
-        """
-        Call the worker group to compute log probabilities for a batch.
-        """
+        """Call the worker group to compute log probabilities for a batch."""
         n_real = len(data)
-
         # Pad batch up to the nearest multiple of _min_dispatch_unit.
         remainder = n_real % self._min_dispatch_unit
         if remainder != 0:
