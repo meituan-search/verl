@@ -13,8 +13,6 @@
 # limitations under the License.
 
 from verl.experimental.elastic_scheduling.engine.fsdp.elastic_transformer_impl import (
-    ElasticFSDPEngineWithLMHead,
-    ElasticFSDPEngineWithValueHead,
     ElasticFSDPMixin,
     FSDPModelStateSnapshot,
     FSDPOptimizerStateSnapshot,
@@ -22,8 +20,6 @@ from verl.experimental.elastic_scheduling.engine.fsdp.elastic_transformer_impl i
 
 __all__ = [
     "ElasticFSDPMixin",
-    "ElasticFSDPEngineWithLMHead",
-    "ElasticFSDPEngineWithValueHead",
     "FSDPModelStateSnapshot",
     "FSDPOptimizerStateSnapshot",
 ]

@@ -141,9 +141,13 @@ def build_elastic_fsdp_engine(model_path: str, strategy: str = "fsdp2"):
     Returns:
         engine: 初始化完毕的 ElasticFSDPEngineWithLMHead
     """
-    from verl.experimental.elastic_scheduling.engine.fsdp.elastic_transformer_impl import ElasticFSDPEngineWithLMHead
+    from verl.experimental.elastic_scheduling.engine import get_elastic_engine_cls
     from verl.trainer.config import CheckpointConfig
     from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig
+    from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
+
+    # Compose elastic engine class at runtime (same path as production code).
+    ElasticFSDPEngineWithLMHead = get_elastic_engine_cls(strategy, FSDPEngineWithLMHead)
 
     rank = dist.get_rank()
     log(f"Building ElasticFSDPEngineWithLMHead: path={model_path}, strategy={strategy}")

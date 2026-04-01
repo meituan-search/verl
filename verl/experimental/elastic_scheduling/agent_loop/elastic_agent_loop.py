@@ -28,7 +28,6 @@ is centralized here; ElasticRollouter only delegates to this class.
 import asyncio
 import logging
 import time
-from typing import TYPE_CHECKING
 
 import ray
 from omegaconf import DictConfig
@@ -38,9 +37,7 @@ from verl.experimental.fully_async_policy.agent_loop import (
     FullyAsyncAgentLoopWorker,
 )
 from verl.single_controller.ray import RayWorkerGroup
-
-if TYPE_CHECKING:
-    from verl.workers.rollout.replica import RolloutReplica
+from verl.workers.rollout.replica import RolloutReplica
 
 logger = logging.getLogger(__name__)
 

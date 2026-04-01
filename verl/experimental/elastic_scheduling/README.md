@@ -453,6 +453,89 @@ verl/experimental/elastic_scheduling/
 
 ## 6. 配置说明
 
+### 6.1 资源配置语义
+
+弹性调度涉及两组资源参数，与标准训练语义保持一致：
+
+| 参数组 | 含义 | 说明 |
+|--------|------|------|
+| `rollout.nnodes` / `rollout.n_gpus_per_node` | 固定 Rollout 资源池 | 始终活跃，专用于推理生成，与标准训练 `rollout.*` 同义 |
+| `trainer.nnodes` / `trainer.n_gpus_per_node` | 弹性资源总量 | `nnodes × n_gpus_per_node` = 弹性 GPU 总数，与标准训练 `trainer.*` 同义 |
+
+**单一大 RayWorkerGroup 设计**：
+
+所有弹性 GPU 构成**唯一一个** `RayWorkerGroup`，`process_on_nodes = [n_gpus_per_node] * nnodes`，world_size = `nnodes × n_gpus_per_node`。
+这使所有弹性 workers 共享同一个 `dist.init_process_group` world，Megatron/FSDP 在其中自动划分 TP / PP / DP 组，所有 DP replica **同时训练并做梯度 all-reduce**。
+
+**关键推导关系**：
+
+```
+world_size      = trainer.nnodes × trainer.n_gpus_per_node
+gpus_per_group  = TP × PP × CP   （由 actor.megatron 并行配置决定）
+n_elastic       = world_size / gpus_per_group   （可弹性切换的最小单元数）
+DP_size         = n_elastic        （初始全部参与训练时的 DP 并行度）
+```
+
+弹性切换以 **1 个 elastic unit（= TP×PP×CP 个 ranks）** 为最小粒度，通过 `rebuild_dp_group(new_world_ranks)` 动态调整参与 DP 的 ranks 子集。
+
+**示例**（单节点 8 GPU，2 固定 Rollout + 6 弹性，TP=2）：
+
+```yaml
+rollout:
+  nnodes: 1
+  n_gpus_per_node: 2          # 2 GPU 固定 rollout
+
+trainer:
+  nnodes: 1
+  n_gpus_per_node: 6          # 6 GPU 弹性资源（1 个大 wg，world_size=6）
+
+actor_rollout_ref:
+  actor:
+    megatron:
+      tensor_model_parallel_size: 2   # TP=2
+      pipeline_model_parallel_size: 1 # PP=1
+      context_parallel_size: 1        # CP=1
+```
+
+→ `gpus_per_group = 2×1×1 = 2`，`n_elastic = 6/2 = 3` 个可切换单元，初始 `DP = 3`（全部参与训练，梯度 all-reduce 跨 3 个 replica）
+
+切换 1 个单元到 Rollout 后：`rebuild_dp_group([0,1,2,3])` → `DP = 2`，剩余 4 个 ranks 继续做梯度同步训练。
+
+### 6.2 与 Fully Async 的资源池设计区别
+
+两种模式均使用**单一 RayWorkerGroup**，但资源规模和 DP 管理方式不同：
+
+| 维度 | Fully Async | 弹性调度（Elastic） |
+|------|-------------|-------------------|
+| **RayWorkerGroup 数** | 1（固定 rollout + actor 共用，或分离） | 1（所有弹性 GPU 统一） |
+| **world_size** | `rollout.nnodes × rollout.n_gpus_per_node` | `trainer.nnodes × trainer.n_gpus_per_node` |
+| **DP 变化** | 固定，不变 | 动态，随弹性切换增减 |
+| **DP 调整方式** | — | `rebuild_dp_group(new_world_ranks)` |
+| **角色切换粒度** | 无（replica 永远在线） | TP×PP×CP 个 ranks 为一个弹性单元 |
+
+**为什么弹性调度也是单一大 wg（而非多个独立 wg）？**
+
+不同 `RayWorkerGroup` 的 workers 各自调用 `dist.init_process_group`，属于**不同的 PyTorch distributed world**。`dist.new_group()` 是全局 collective，要求所有参与进程在**同一个 world** 里同时执行——跨 wg 调用会 hang 或报错。
+
+弹性切换时，被切出的 ranks 通过 `rebuild_dp_group(new_world_ranks)` 退出当前 DP 组（仍参与 collective，但不再做梯度同步），留在 world 里等待后续切回。
+
+```
+total=12 GPU，TP=2，PP=1，CP=1
+→ 1 个 RayWorkerGroup，world_size=12，ranks=[0..11]
+→ 初始 DP=6，每个 elastic unit = ranks[0,1], [2,3], [4,5], [6,7], [8,9], [10,11]
+
+switch_elastic_to_rollout("elastic_0")：
+  → rebuild_dp_group([2,3,4,5,6,7,8,9,10,11])
+  → ranks[0,1] 退出 DP 组，offload actor 权重，rollout server 唤醒
+  → 剩余 ranks[2..11] DP=5，梯度 all-reduce 在 5 个 unit 之间继续
+
+switch_elastic_to_train("elastic_0")：
+  → rollout server sleep，actor 权重 load 回 GPU
+  → rebuild_dp_group([0,1,2,3,...,11])，DP 恢复 6
+```
+
+### 6.3 调度参数
+
 ```yaml
 elastic_scheduling:
   # 调度水位（基于 MessageQueue 利用率）
@@ -665,10 +748,11 @@ required_samples = ppo_mini_batch_size × require_batches × current_dp_size
 2. `notify_workers_server_removed()` 的 `await` 保证 handle 在 `abort` 前已从所有 worker 删除
 3. `FullyAsyncLLMServerManager` 检测到 `stop_reason="aborted"` 后，自动将 `prompt + 已生成 tokens` 拼接发给新 server 续推，AgentLoop 无感知
 
-
-执行
+```shell
+# 执行
 ray list jobs --address='http://10.148.11.18:8420' --format json 2>/dev/null | python3 -c "import sys,json; [print(j['job_id']) for j in json.load(sys.stdin) if
 j.get('status') in ('RUNNING','PENDING')]" | xargs -I{} ray job stop {} --address='http://10.148.11.18:8420'
 
-再执行
+# 再执行
 ray job submit --address='http://10.148.11.18:8420' --runtime-env=verl/experimental/elastic_scheduling/shell/dapo_7b_math_megatron_2_6.yaml -- bash verl/experimental/elastic_scheduling/shell/dapo_7b_math_megatron_2_6.sh
+```

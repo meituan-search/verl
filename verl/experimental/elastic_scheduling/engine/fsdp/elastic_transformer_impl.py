@@ -13,18 +13,17 @@
 # limitations under the License.
 
 """
-Elastic FSDP2 Engine for dynamic DP group resizing.
+Elastic FSDP2 Mixin for dynamic DP group resizing.
 
 Provides:
 - ElasticFSDPMixin: Mixin that adds DP rebuild capability to any FSDP engine
-- ElasticFSDPEngineWithLMHead: FSDP engine with elastic scaling support
-- ElasticFSDPEngineWithValueHead: FSDP value engine with elastic scaling support
 
 Key features:
 1. DP group rebuild without disk I/O (state stored in CPU memory)
 2. Support for adding/removing training resources
 3. Parameter synchronization for newly joined ranks
 4. Seamless integration with existing FSDPEngine interface
+
 """
 
 import gc
@@ -37,13 +36,8 @@ import torch
 import torch.distributed as dist
 
 from verl.utils.device import get_device_name
-from verl.workers.engine import EngineRegistry
 
 # Import FSDP engine classes - these will be imported conditionally
-from verl.workers.engine.fsdp.transformer_impl import (
-    FSDPEngineWithLMHead,
-    FSDPEngineWithValueHead,
-)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -494,27 +488,3 @@ class ElasticFSDPMixin:
         # Clean up cached handle.
         self._new_dp_group = None
         logger.info(f"[ElasticFSDPMixin rank={my_rank}] Param sync complete")
-
-
-@EngineRegistry.register(model_type="language_model", backend="fsdp2_elastic")
-class ElasticFSDPEngineWithLMHead(FSDPEngineWithLMHead, ElasticFSDPMixin):
-    """
-    Elastic FSDP Engine with LM head for language modeling.
-
-    Combines FSDPEngineWithLMHead (full forward/backward logic)
-    with ElasticFSDPMixin (DP rebuild capability).
-    """
-
-    pass
-
-
-@EngineRegistry.register(model_type="value_model", backend="fsdp2_elastic")
-class ElasticFSDPEngineWithValueHead(FSDPEngineWithValueHead, ElasticFSDPMixin):
-    """
-    Elastic FSDP Engine with value head for value modeling.
-
-    Combines FSDPEngineWithValueHead (full forward/backward logic)
-    with ElasticFSDPMixin (DP rebuild capability).
-    """
-
-    pass

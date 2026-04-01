@@ -12,16 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from verl.experimental.elastic_scheduling.engine.megatron.elastic_transformer_impl import (
-    ElasticMegatronEngineWithLMHead,
-    ElasticMegatronEngineWithValueHead,
     ElasticMegatronMixin,
     ModelStateSnapshot,
     OptimizerStateSnapshot,
 )
 
 __all__ = [
-    "ElasticMegatronEngineWithLMHead",
-    "ElasticMegatronEngineWithValueHead",
     "ElasticMegatronMixin",
     "ModelStateSnapshot",
     "OptimizerStateSnapshot",

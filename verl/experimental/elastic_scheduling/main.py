@@ -64,14 +64,6 @@ between the training engine and rollout servers.
      b. elastic_wg.switch_to_train()               – load actor to GPU
      c. ElasticTrainer.add_elastic_actor()          – DP rebuild with this wg
 
-Usage
------
-    python -m verl.experimental.elastic_scheduling.main \\
-        --config-path config --config-name elastic_ppo_trainer \\
-        trainer.nnodes=2 trainer.n_gpus_per_node=8 \\
-        rollout.nnodes=1 rollout.n_gpus_per_node=8 \\
-        elastic_scheduling.n_elastic_resources=1 \\
-        elastic_scheduling.elastic_n_gpus_per_node=4
 """
 
 import asyncio
@@ -104,12 +96,17 @@ class ElasticSchedulingTaskRunner:
     3. MessageQueue     : FIFO buffer between rollouter and trainer
     4. ElasticCoordinator: monitoring + role switching loop
 
-    Elastic Resource Configuration (from config.elastic_scheduling)
+    Elastic Resource Configuration
     ---------------------------------------------------------------
-    n_elastic_resources       (int)    : number of elastic resource groups
-    elastic_n_gpus_per_node   (int)    : GPUs per node for each elastic group
-    elastic_n_nodes           (int)    : nodes per elastic group  (default 1)
-    elastic_initial_mode      (str)    : "rollout" | "train" (default "rollout")
+    Uses the same trainer config fields as standard training:
+      trainer.nnodes          (int) : nodes in the elastic resource pool
+      trainer.n_gpus_per_node (int) : GPUs per node in the elastic resource pool
+
+    Total elastic GPU budget = trainer.nnodes × trainer.n_gpus_per_node.
+    GPUs per elastic group   = actor_rollout_ref.actor.n_gpus_per_node (TP size).
+    Number of elastic groups = total_elastic_gpus / gpus_per_group.
+
+    No elastic resources when trainer.n_gpus_per_node == 0.
     rollout_queue_high_watermark (float): scale-rollout threshold (default 0.8)
     rollout_queue_low_watermark  (float): scale-train threshold   (default 0.3)
     cooldown_seconds          (float)  : min seconds between switches (default 30)
@@ -219,13 +216,17 @@ class ElasticSchedulingTaskRunner:
         mapping: dict = {}
 
         # --- trainer pool (Actor / ActorRollout / Critic / RefPolicy / RewardModel) ---
-        # In fully-elastic mode, all training GPUs come from elastic worker groups so
-        # trainer.n_gpus_per_node may legitimately be 0.  Skip fixed trainer pool in
-        # that case – the elastic worker groups are wired in separately.
+        # trainer_pool is only created when *actor* roles are requested.  In the elastic
+        # scheduling scenario, actor GPUs come from elastic_worker_groups (not from a
+        # static ResourcePool), so actor roles are intentionally excluded from the roles
+        # list passed here.  Critic / RefPolicy roles alone must NOT trigger a trainer_pool
+        # of size trainer.n_gpus_per_node (which represents the elastic GPU budget, not
+        # the Critic's GPU requirement).
+        actor_trigger_roles = [Role.Actor, Role.ActorRollout]
         trainer_roles = [Role.Actor, Role.ActorRollout, Role.Critic, Role.RefPolicy, Role.RewardModel]
         trainer_n_gpus = int(getattr(config.trainer, "n_gpus_per_node", 0))
         trainer_nnodes = int(getattr(config.trainer, "nnodes", 0))
-        if any(role in roles for role in trainer_roles) and trainer_n_gpus > 0:
+        if any(role in roles for role in actor_trigger_roles) and trainer_n_gpus > 0:
             assert trainer_nnodes > 0, "config.trainer.nnodes must be > 0"
 
             trainer_pool = [trainer_n_gpus] * trainer_nnodes
@@ -331,55 +332,107 @@ class ElasticSchedulingTaskRunner:
         The worker groups are NOT yet connected to the rollouter / trainer;
         that happens in _wire_elastic_worker_groups().
         """
-        elastic_config = getattr(config, "elastic_scheduling", {})
-        n_elastic = int(getattr(elastic_config, "n_elastic_resources", 0))
+        # Resource layout:
+        #   trainer.nnodes × trainer.n_gpus_per_node = total elastic GPU budget
+        #
+        # All elastic GPUs form a SINGLE RayWorkerGroup with a unified
+        # PyTorch distributed process group (world_size = nnodes × n_gpus_per_node).
+        # Inside this group Megatron/FSDP derives:
+        #   DP = world_size / (TP × PP × CP)
+        # and all DP replicas participate in gradient all-reduce simultaneously.
+        #
+        # Each elastic unit = TP×PP×CP ranks.  When switched to rollout, that
+        # unit's ranks exit the DP group via rebuild_dp_group(new_active_ranks).
+        # n_elastic_units = total_elastic_gpus / (TP × PP × CP).
+        trainer_config = getattr(config, "trainer", {})
+        trainer_nnodes = int(getattr(trainer_config, "nnodes", 0))
+        trainer_n_gpus_per_node = int(getattr(trainer_config, "n_gpus_per_node", 0))
+        total_elastic_gpus = trainer_nnodes * trainer_n_gpus_per_node
 
-        if n_elastic == 0:
+        if total_elastic_gpus == 0:
             self.components["elastic_worker_groups"] = []
-            logger.info("[ElasticSchedulingTaskRunner] No elastic resources configured")
+            logger.info(
+                f"[ElasticSchedulingTaskRunner] No elastic resources configured "
+                f"(trainer.nnodes={trainer_nnodes}, trainer.n_gpus_per_node={trainer_n_gpus_per_node})"
+            )
             return
+
+        # Compute gpus_per_group = TP × PP × CP from actor megatron config.
+        # This is the minimum switchable unit: when one elastic unit is flipped
+        # to rollout, exactly gpus_per_group ranks leave the DP group.
+        actor_config = getattr(config.actor_rollout_ref, "actor", {})
+        megatron_config = getattr(actor_config, "megatron", None)
+        if megatron_config is not None:
+            tp = int(getattr(megatron_config, "tensor_model_parallel_size", 1))
+            pp = int(getattr(megatron_config, "pipeline_model_parallel_size", 1))
+            cp = int(getattr(megatron_config, "context_parallel_size", 1))
+            gpus_per_unit = tp * pp * cp
+        else:
+            gpus_per_unit = 1
+
+        if total_elastic_gpus % gpus_per_unit != 0:
+            raise ValueError(
+                f"total_elastic_gpus ({total_elastic_gpus}) must be divisible by "
+                f"gpus_per_unit=TP×PP×CP ({gpus_per_unit})"
+            )
+        n_elastic_units = total_elastic_gpus // gpus_per_unit
+
+        logger.info(
+            f"[ElasticSchedulingTaskRunner] Elastic resource budget: "
+            f"{trainer_nnodes}×{trainer_n_gpus_per_node}={total_elastic_gpus} GPUs, "
+            f"gpus_per_unit(TP×PP×CP)={gpus_per_unit}, "
+            f"n_elastic_units={n_elastic_units} (initial DP={n_elastic_units})"
+        )
 
         from verl.experimental.elastic_scheduling.elastic_engine_workers import ElasticActorWorker
         from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 
-        elastic_n_gpus_per_node = int(getattr(elastic_config, "elastic_n_gpus_per_node", 1))
-        elastic_n_nodes = int(getattr(elastic_config, "elastic_n_nodes", 1))
         ray_worker_group_cls = self.components.get("ray_worker_group_cls", RayWorkerGroup)
 
-        elastic_worker_groups = []
-        for i in range(n_elastic):
-            resource_id = f"elastic_{i}"
-            try:
-                resource_pool = RayResourcePool(
-                    process_on_nodes=[elastic_n_gpus_per_node] * elastic_n_nodes,
-                    use_gpu=True,
-                    max_colocate_count=1,
-                    name_prefix=f"elastic_actor_{i}",
-                )
-                ray_cls_with_init = RayClassWithInitArgs(
-                    cls=ray.remote(ElasticActorWorker),
-                    config=config.actor_rollout_ref,
-                    role="actor_rollout",
-                )
-                wg = ray_worker_group_cls(
-                    resource_pool=resource_pool,
-                    ray_cls_with_init=ray_cls_with_init,
-                    name_prefix=f"elastic_actor_{i}",
-                )
-                # Initialise actor model on the workers
-                ray.get(wg.execute_all("init_model"))
-                elastic_worker_groups.append((resource_id, wg))
-                self.components[f"elastic_wg_{i}"] = wg
-                logger.info(
-                    f"[ElasticSchedulingTaskRunner] Elastic worker group '{resource_id}' created "
-                    f"({elastic_n_nodes}×{elastic_n_gpus_per_node} GPUs)"
-                )
-            except Exception as e:
-                logger.error(f"[ElasticSchedulingTaskRunner] Failed to create elastic wg {i}: {e}")
-                raise
+        # Create ONE large RayWorkerGroup covering all elastic GPUs.
+        # process_on_nodes = [n_gpus_per_node] * nnodes ensures all workers
+        # share a single dist.init_process_group world (world_size = total_elastic_gpus).
+        resource_pool = RayResourcePool(
+            process_on_nodes=[trainer_n_gpus_per_node] * trainer_nnodes,
+            use_gpu=True,
+            max_colocate_count=1,
+            name_prefix="elastic_actor",
+        )
+        ray_cls_with_init = RayClassWithInitArgs(
+            cls=ray.remote(ElasticActorWorker),
+            config=config.actor_rollout_ref,
+            role="actor_rollout",
+        )
+        wg = ray_worker_group_cls(
+            resource_pool=resource_pool,
+            ray_cls_with_init=ray_cls_with_init,
+            name_prefix="elastic_actor",
+        )
+        ray.get(wg.execute_all("init_model"))
+        logger.info(
+            f"[ElasticSchedulingTaskRunner] Elastic worker group created "
+            f"({trainer_nnodes}×{trainer_n_gpus_per_node} GPUs, world_size={total_elastic_gpus})"
+        )
 
+        # Map each elastic unit to its contiguous rank range within the wg.
+        # elastic_0 → [0 .. gpus_per_unit-1]
+        # elastic_1 → [gpus_per_unit .. 2*gpus_per_unit-1]  etc.
+        elastic_unit_ranks: dict[str, list[int]] = {}
+        for i in range(n_elastic_units):
+            unit_id = f"elastic_{i}"
+            start = i * gpus_per_unit
+            elastic_unit_ranks[unit_id] = list(range(start, start + gpus_per_unit))
+
+        # Store: (resource_id, wg) list for backward compatibility with _wire / _build helpers
+        # All entries point to the SAME wg; resource_id is just a logical unit label.
+        elastic_worker_groups = [(uid, wg) for uid in elastic_unit_ranks]
         self.components["elastic_worker_groups"] = elastic_worker_groups
-        logger.info(f"[ElasticSchedulingTaskRunner] {n_elastic} elastic worker group(s) created and model-initialised")
+        self.components["elastic_wg"] = wg
+        self.components["elastic_unit_ranks"] = elastic_unit_ranks
+        logger.info(
+            f"[ElasticSchedulingTaskRunner] {n_elastic_units} elastic unit(s) defined "
+            f"(all share the same RayWorkerGroup, world_size={total_elastic_gpus})"
+        )
 
     # -------------------------------------------------------------------------
     # Trainer
@@ -394,7 +447,14 @@ class ElasticSchedulingTaskRunner:
         ray_worker_group_cls = self.components.get("ray_worker_group_cls")
 
         trainer_roles = {role: wcls for role, wcls in role_worker_mapping.items() if role != Role.Rollout}
-        trainer_resource_pool_manager = create_rp(config, roles=list(trainer_roles.keys())) if create_rp else None
+
+        # Elastic actor GPUs are managed by elastic_worker_groups (created separately in
+        # _create_elastic_worker_groups), NOT through ResourcePoolManager.  Pass only
+        # non-actor roles (Critic, RefPolicy, RewardModel) to create_rp so that no
+        # trainer_pool is created for actor/actor_rollout roles.
+        actor_roles = {Role.Actor, Role.ActorRollout}
+        non_actor_roles = [r for r in trainer_roles if r not in actor_roles]
+        trainer_resource_pool_manager = create_rp(config, roles=non_actor_roles) if create_rp else None
 
         trainer = (
             ray.remote(ElasticTrainer)
@@ -444,14 +504,10 @@ class ElasticSchedulingTaskRunner:
             )
         )
 
-        # Inject the combined elastic worker group (all groups merged or first group,
-        # depending on whether there is exactly one elastic DP slice at a time).
-        elastic_worker_groups = self.components.get("elastic_worker_groups", [])
-        if elastic_worker_groups:
-            # For now inject only the first elastic wg.
-            # TODO: support multiple elastic replicas by supplying a merged wg.
-            _, first_wg = elastic_worker_groups[0]
-            ray.get(rollouter.set_elastic_worker_group.remote(first_wg))
+        # All elastic units share the same large RayWorkerGroup; inject it once.
+        elastic_wg = self.components.get("elastic_wg")
+        if elastic_wg is not None:
+            ray.get(rollouter.set_elastic_worker_group.remote(elastic_wg))
             logger.info("[ElasticSchedulingTaskRunner] Injected elastic worker group into rollouter")
 
         ray.get(rollouter.init_workers.remote())
@@ -465,17 +521,26 @@ class ElasticSchedulingTaskRunner:
 
     def _wire_elastic_worker_groups(self, config: DictConfig):
         """
-        Register elastic worker groups with ElasticTrainer so that
-        switch_elastic_to_train() can look them up at switch time.
+        Register the single large elastic RayWorkerGroup plus the per-unit rank
+        mapping with ElasticTrainer so that switch_elastic_to_train/rollout()
+        can look up which ranks to add/remove from the DP group.
 
         Also wire rollouter reference into trainer (needed for the trainer to
         call add/remove_elastic_replica on the rollouter during a switch).
         """
         trainer = self.components["trainer"]
-        elastic_worker_groups = self.components.get("elastic_worker_groups", [])
-        for resource_id, wg in elastic_worker_groups:
-            ray.get(trainer.register_elastic_worker_group.remote(resource_id, wg))
-            logger.info(f"[ElasticSchedulingTaskRunner] Registered '{resource_id}' with ElasticTrainer")
+        elastic_wg = self.components.get("elastic_wg")
+        elastic_unit_ranks: dict = self.components.get("elastic_unit_ranks", {})
+
+        if elastic_wg is not None:
+            # Register the unified wg once, then register the rank mapping for
+            # each logical elastic unit.
+            ray.get(trainer.register_elastic_worker_group.remote("elastic_wg", elastic_wg))
+            ray.get(trainer.register_elastic_unit_ranks.remote(elastic_unit_ranks))
+            logger.info(
+                f"[ElasticSchedulingTaskRunner] Registered unified elastic wg + "
+                f"{len(elastic_unit_ranks)} unit rank mapping(s) with ElasticTrainer"
+            )
 
         # Wire rollouter into trainer for switch sequences
         ray.get(trainer.set_rollouter.remote(self.components["rollouter"]))
@@ -572,9 +637,6 @@ class ElasticSchedulingTaskRunner:
         The actual role-switch operations are always delegated to ElasticTrainer;
         worker_handles here are for state tracking only.
         """
-        elastic_config = getattr(config, "elastic_scheduling", {})
-        initial_mode = getattr(elastic_config, "elastic_initial_mode", "rollout")
-
         elastic_worker_groups = self.components.get("elastic_worker_groups", [])
         elastic_resource_infos = []
 
@@ -589,7 +651,7 @@ class ElasticSchedulingTaskRunner:
             elastic_resource_infos.append(
                 {
                     "resource_id": resource_id,
-                    "initial_mode": initial_mode,
+                    "initial_mode": "rollout",
                     "worker_handles": worker_handles,
                 }
             )
@@ -712,6 +774,12 @@ def main(config: DictConfig):
     3. Run training to completion.
     """
     logger.info(f"[ElasticScheduling] Starting with config:\n{OmegaConf.to_yaml(config)}")
+
+    # Mirror rollout topology into actor_rollout_ref.rollout so that
+    # FullyAsyncAgentLoopManager can infer world size in standalone mode.
+    # (Same as fully_async_main.py does before launching the task runner.)
+    OmegaConf.update(config, "actor_rollout_ref.rollout.nnodes", config.rollout.nnodes, merge=True)
+    OmegaConf.update(config, "actor_rollout_ref.rollout.n_gpus_per_node", config.rollout.n_gpus_per_node, merge=True)
 
     if not ray.is_initialized():
         ray.init(

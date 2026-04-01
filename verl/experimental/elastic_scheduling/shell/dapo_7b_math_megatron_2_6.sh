@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Elastic Scheduling: Single-node 8-GPU scenario
-#   Fixed Rollout  : 2 GPUs  (gen_tp=2, 1 rollout replica)
-#   Elastic        : 6 GPUs  (train_tp=2, elastic_dp=3), initial mode = train
+#   Fixed Rollout  : 2 GPUs  (rollout.nnodes=1, rollout.n_gpus_per_node=2)
+#   Elastic Trainer: 6 GPUs total  (trainer.nnodes=1, trainer.n_gpus_per_node=6)
 
 set -xeuo pipefail
 
@@ -49,21 +49,14 @@ val_top_p=0.7
 # Elastic       : 6 GPUs, TP=2 → elastic_dp=3 (6/2)
 # Total         : 8 GPUs (1 node)
 offload=False
-gen_tp=2       # rollout tensor parallel size (fixed rollout: 2 GPUs)
-train_tp=2     # train tensor parallel size   (elastic:       6 GPUs / TP=2 → dp=3)
+gen_tp=1       # rollout tensor parallel size (fixed rollout: 2 GPUs)
+train_tp=1     # train tensor parallel size   (elastic:       6 GPUs / TP=2 → dp=3)
 train_pp=1
 train_cp=1
 
 # Fixed rollout resource size
 rollout_gpus=2
-
-# Elastic resource: 1 group × 6 GPUs, initial mode = train
-n_elastic_resources=1
-elastic_n_gpus_per_node=6   # 6 GPUs per elastic group
-elastic_initial_mode=train  # start as training resource
-# At least 1 elastic resource stays in train so training never stops
-min_train_resources=1
-min_rollout_resources=0
+elastic_gpus=6
 
 # ── Batch / mini-batch sizes ───────────────────────────────────
 train_prompt_bsz=128
@@ -71,14 +64,10 @@ n_resp_per_prompt=16
 train_prompt_mini_bsz=48
 
 elastic_params=(
-  # ---- Elastic resource topology ----
-  elastic_scheduling.n_elastic_resources=${n_elastic_resources}
-  elastic_scheduling.elastic_n_gpus_per_node=${elastic_n_gpus_per_node}
-  elastic_scheduling.elastic_initial_mode=${elastic_initial_mode}
-  elastic_scheduling.dp_size_per_resource=${elastic_n_gpus_per_node}
   # ---- Safety constraints ----
-  elastic_scheduling.min_train_resources=${min_train_resources}
-  elastic_scheduling.min_rollout_resources=${min_rollout_resources}
+  # At least 1 elastic resource stays in train so training never stops
+  elastic_scheduling.min_train_resources=1
+  elastic_scheduling.min_rollout_resources=0
   # ---- Scheduling thresholds ----
   elastic_scheduling.rollout_queue_high_watermark=0.8
   elastic_scheduling.rollout_queue_low_watermark=0.3
@@ -97,13 +86,8 @@ fully_async=(
   # ---- Rollout cluster: fixed 2-GPU replica ----
   rollout.nnodes=1
   rollout.n_gpus_per_node=${rollout_gpus}
-  # actor_rollout_ref.rollout.nnodes/n_gpus_per_node must match rollout cluster size
-  # so that AgentLoopManager standalone mode can allocate the correct replica topology
-  actor_rollout_ref.rollout.nnodes=1
-  actor_rollout_ref.rollout.n_gpus_per_node=${rollout_gpus}
-  # ---- Trainer cluster: no dedicated trainer GPUs (all-elastic) ----
   trainer.nnodes=1
-  trainer.n_gpus_per_node=0
+  trainer.n_gpus_per_node=${elastic_gpus}
   # ---- Async training knobs ----
   async_training.staleness_threshold=0.5
   async_training.trigger_parameter_sync_step=4

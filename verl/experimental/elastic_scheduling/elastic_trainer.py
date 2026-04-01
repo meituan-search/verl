@@ -79,10 +79,14 @@ class ElasticTrainer(FullyAsyncTrainer):
     switch_elastic_to_train(resource_id, param_version) → bool
         Complete Rollout→Train sequence.
 
-    Internal elastic actor registry
-    ---------------------------------
-    _elastic_actor_wgs: resource_id → RayWorkerGroup
-        Worker groups currently in Train mode (for DP rebuild).
+    Internal elastic registries (single-wg architecture)
+    ------------------------------------------------------
+    _elastic_wg_registry: {"elastic_wg": RayWorkerGroup}
+        Single entry holding the unified large RayWorkerGroup.
+    _elastic_unit_ranks: resource_id → list[int]
+        Maps each elastic unit id to its wg-local ranks (TP×PP×CP ranks).
+    _elastic_active_units: set[str]
+        resource_ids currently in TRAIN mode (used for DP group membership).
 
     _pending_elastic_adds / _pending_elastic_removes
         DP changes deferred to mini-batch boundaries.
@@ -108,8 +112,17 @@ class ElasticTrainer(FullyAsyncTrainer):
             device_name=device_name,
         )
 
-        # Elastic actor registry: resource_id → RayWorkerGroup (train mode)
-        self._elastic_actor_wgs: dict[str, RayWorkerGroup] = {}
+        # Unified large RayWorkerGroup registry.  In the single-wg architecture
+        # there is only one entry keyed as "elastic_wg".
+        self._elastic_wg_registry: dict[str, RayWorkerGroup] = {}
+
+        # elastic_unit_ranks: resource_id → list of wg-local ranks for that unit
+        # e.g. {"elastic_0": [0,1], "elastic_1": [2,3], ...}  (TP×PP×CP ranks each)
+        self._elastic_unit_ranks: dict[str, list[int]] = {}
+
+        # Set of resource_ids currently in TRAIN mode (active in DP group)
+        self._elastic_active_units: set[str] = set()
+
         # resource_id → param_version when this actor joined training
         self._elastic_actor_versions: dict[str, int] = {}
 
@@ -157,28 +170,29 @@ class ElasticTrainer(FullyAsyncTrainer):
     # =========================================================================
 
     def _is_fully_elastic(self) -> bool:
-        """Return True when trainer.n_gpus_per_node == 0 (all-elastic mode)."""
-        return int(getattr(self.config.trainer, "n_gpus_per_node", 0)) == 0
+        """ElasticTrainer always operates in fully-elastic mode.
+
+        All actor GPUs come from elastic_worker_groups registered via
+        register_elastic_worker_group(), never from a static ResourcePool.
+        trainer.nnodes / trainer.n_gpus_per_node describe the *total elastic
+        GPU budget* (used to create elastic_worker_groups in main.py) and are
+        NOT used to allocate a fixed trainer ResourcePool.
+        """
+        return True
 
     def _create_actor_rollout_classes(self):
         """
-        In fully-elastic mode (trainer.n_gpus_per_node=0), there is no fixed
-        training resource pool, so skip creating actor rollout classes here.
-        The elastic worker groups are wired in separately via
-        register_elastic_worker_group().
-
-        In normal mode, delegate to the parent implementation.
+        ElasticTrainer has no fixed actor ResourcePool; all actor GPUs come
+        from elastic_worker_groups wired in via register_elastic_worker_group().
+        Skip the standard class-creation step entirely.
         """
-        if self._is_fully_elastic():
-            logger.info("[ElasticTrainer] Fully-elastic mode: skipping fixed actor rollout class creation")
-            return
-        super()._create_actor_rollout_classes()
+        logger.info("[ElasticTrainer] Fully-elastic mode: skipping fixed actor rollout class creation")
 
     def _init_models(self):
         """
-        In fully-elastic mode, skip actor_wg initialization (no fixed actor
-        resource pool).  Critic / ref-policy / reward-model are still
-        initialised as usual if present.
+        Skip actor_wg initialization (no fixed actor resource pool).
+        Critic / ref-policy / reward-model are still initialised as usual if present.
+        actor_wg / actor_rollout_wg will be set later when the first elastic wg is registered.
         """
         if self._is_fully_elastic():
             logger.info("[ElasticTrainer] Fully-elastic mode: skipping fixed actor_wg init_model")
@@ -228,25 +242,35 @@ class ElasticTrainer(FullyAsyncTrainer):
         logger.info(f"[ElasticTrainer] switch_elastic_to_rollout: {resource_id}")
         _t0 = time.time()
 
-        if resource_id not in self._elastic_actor_wgs:
-            logger.warning(f"[ElasticTrainer] {resource_id} not in elastic actor registry")
+        if resource_id not in self._elastic_active_units:
+            logger.warning(f"[ElasticTrainer] {resource_id} not in active training units")
             return False
 
-        wg = self._elastic_actor_wgs[resource_id]
+        unit_ranks = self._elastic_unit_ranks.get(resource_id, [])
+        wg = self._get_elastic_wg()
 
         try:
             # Step 1: Remove from training DP group (rebuild DP without this rank)
             await self.remove_elastic_actor(resource_id)
 
-            # Step 2: Offload actor weights to CPU on the worker
-            # (GPU memory freed for rollout server)
-            try:
-                futures = wg.execute_all("switch_to_rollout", param_version=param_version)
-                results = await asyncio.get_event_loop().run_in_executor(None, lambda: ray.get(futures))
-                if not all(results):
-                    logger.warning(f"[ElasticTrainer] Some workers failed switch_to_rollout for {resource_id}")
-            except Exception as e:
-                logger.warning(f"[ElasticTrainer] switch_to_rollout on worker failed: {e}")
+            # Step 2: Offload actor weights to CPU on the workers for this unit.
+            # GPU memory freed for rollout server.
+            if wg is not None and unit_ranks:
+                try:
+                    futures = wg.execute_rank_method(
+                        ranks=unit_ranks,
+                        method_name="switch_to_rollout",
+                        param_version=param_version,
+                    )
+                    results = await asyncio.get_event_loop().run_in_executor(None, lambda: ray.get(futures))
+                    if not all(results):
+                        logger.warning(f"[ElasticTrainer] Some workers failed switch_to_rollout for {resource_id}")
+                except AttributeError:
+                    # Fallback: execute_all if execute_rank_method is unavailable
+                    futures = wg.execute_all("switch_to_rollout", param_version=param_version)
+                    results = await asyncio.get_event_loop().run_in_executor(None, lambda: ray.get(futures))
+                except Exception as e:
+                    logger.warning(f"[ElasticTrainer] switch_to_rollout on worker failed: {e}")
 
             # Step 3: Wake up the rollout server via rollouter
             if self.rollouter is not None:
@@ -298,13 +322,15 @@ class ElasticTrainer(FullyAsyncTrainer):
         logger.info(f"[ElasticTrainer] switch_elastic_to_train: {resource_id}")
         _t0 = time.time()
 
-        wg = self._get_elastic_wg_by_resource_id(resource_id)
-        if wg is None:
+        if resource_id not in self._elastic_unit_ranks:
             logger.warning(
-                f"[ElasticTrainer] No worker group registered for {resource_id}. "
-                "Call register_elastic_worker_group() at init time."
+                f"[ElasticTrainer] {resource_id} not in unit_ranks registry. "
+                "Call register_elastic_unit_ranks() at init time."
             )
             return False
+
+        unit_ranks = self._elastic_unit_ranks[resource_id]
+        wg = self._get_elastic_wg()
 
         try:
             # Step 1: Sleep the rollout server (releases GPU for actor model)
@@ -330,30 +356,41 @@ class ElasticTrainer(FullyAsyncTrainer):
                 except Exception as e:
                     logger.warning(f"[ElasticTrainer] Failed to remove elastic replica for {resource_id}: {e}")
 
-            # Step 2: Compute the new train world ranks
-            # (current fixed ranks + this resource's ranks)
-            current_ranks = await self._get_current_train_ranks()
-            new_ranks = await self._get_worker_group_ranks(wg)
-            new_train_world_ranks = sorted(set(current_ranks) | set(new_ranks))
+            # Step 2: Compute the new train world ranks after adding this unit back.
+            # Active units already excludes this resource_id (it's in rollout mode),
+            # so the new set is: active_units ∪ {resource_id}.
+            new_active = self._elastic_active_units | {resource_id}
+            new_train_world_ranks: list[int] = []
+            for rid in new_active:
+                new_train_world_ranks.extend(self._elastic_unit_ranks.get(rid, []))
+            new_train_world_ranks = sorted(set(new_train_world_ranks))
 
-            # Load actor weights to GPU on the worker
-            try:
-                futures = wg.execute_all(
-                    "switch_to_train",
-                    new_train_world_ranks=new_train_world_ranks,
-                    param_version=param_version,
-                )
-                results = await asyncio.get_event_loop().run_in_executor(None, lambda: ray.get(futures))
-                if not all(results):
-                    logger.warning(f"[ElasticTrainer] Some workers failed switch_to_train for {resource_id}")
-            except Exception as e:
-                logger.warning(f"[ElasticTrainer] switch_to_train on worker failed: {e}")
+            # Load actor weights to GPU on the workers for this unit.
+            if wg is not None and unit_ranks:
+                try:
+                    futures = wg.execute_rank_method(
+                        ranks=unit_ranks,
+                        method_name="switch_to_train",
+                        new_train_world_ranks=new_train_world_ranks,
+                        param_version=param_version,
+                    )
+                    results = await asyncio.get_event_loop().run_in_executor(None, lambda: ray.get(futures))
+                    if not all(results):
+                        logger.warning(f"[ElasticTrainer] Some workers failed switch_to_train for {resource_id}")
+                except AttributeError:
+                    # Fallback: execute_all if execute_rank_method is unavailable
+                    futures = wg.execute_all(
+                        "switch_to_train",
+                        new_train_world_ranks=new_train_world_ranks,
+                        param_version=param_version,
+                    )
+                    results = await asyncio.get_event_loop().run_in_executor(None, lambda: ray.get(futures))
+                except Exception as e:
+                    logger.warning(f"[ElasticTrainer] switch_to_train on worker failed: {e}")
 
             # Step 3: Add to training DP group (rebuild DP with this rank)
             await self.add_elastic_actor(
                 resource_id=resource_id,
-                actor_worker_group=wg,
-                actor_handles=[],  # handles not needed; wg is sufficient
                 param_version=param_version,
             )
 
@@ -371,22 +408,23 @@ class ElasticTrainer(FullyAsyncTrainer):
 
     def register_elastic_worker_group(self, resource_id: str, worker_group: RayWorkerGroup) -> None:
         """
-        Pre-register an elastic worker group by resource_id.
+        Register the unified large elastic RayWorkerGroup.
 
-        Must be called at init time (before any switch) so that
-        switch_elastic_to_train() can look up the worker group when the
-        resource switches from rollout to train mode.
+        In the single-wg architecture all elastic units share the same
+        RayWorkerGroup; call this once with resource_id="elastic_wg".
+
+        Also promotes the wg to actor_wg in fully-elastic mode so that the
+        rest of the trainer (checkpoint manager, param-sync, etc.) has a
+        valid handle.
 
         Args:
-            resource_id: Unique identifier (e.g. "elastic_0").
-            worker_group: The RayWorkerGroup wrapping the elastic workers.
+            resource_id: Convention key, use "elastic_wg" for the unified wg.
+            worker_group: The single large RayWorkerGroup.
         """
-        self._elastic_wg_registry = getattr(self, "_elastic_wg_registry", {})
         self._elastic_wg_registry[resource_id] = worker_group
 
-        # In fully-elastic mode (no fixed actor pool), promote the first
-        # registered elastic wg to actor_wg so that the rest of the trainer
-        # (checkpoint manager, param-sync, etc.) has a valid handle.
+        # In fully-elastic mode (no fixed actor pool), promote to actor_wg
+        # so that the rest of the trainer has a valid handle.
         if self._is_fully_elastic() and getattr(self, "actor_wg", None) is None:
             self.actor_wg = worker_group
             self.actor_rollout_wg = worker_group
@@ -394,10 +432,29 @@ class ElasticTrainer(FullyAsyncTrainer):
 
         logger.info(f"[ElasticTrainer] Registered elastic worker group: {resource_id}")
 
-    def _get_elastic_wg_by_resource_id(self, resource_id: str) -> Optional[RayWorkerGroup]:
-        """Look up the pre-registered worker group for a resource."""
-        registry = getattr(self, "_elastic_wg_registry", {})
-        return registry.get(resource_id)
+    def register_elastic_unit_ranks(self, unit_ranks: dict) -> None:
+        """
+        Register the per-unit rank mapping.
+
+        Args:
+            unit_ranks: Mapping of resource_id → list of wg-local ranks.
+                e.g. {"elastic_0": [0,1], "elastic_1": [2,3], ...}
+
+        On registration, ALL units are assumed to be in TRAIN mode (initial
+        state: all elastic GPUs are allocated to training).
+        """
+        self._elastic_unit_ranks = dict(unit_ranks)
+        # Initially all units are in TRAIN mode
+        self._elastic_active_units = set(unit_ranks.keys())
+        logger.info(
+            f"[ElasticTrainer] Registered {len(unit_ranks)} elastic unit rank mapping(s): , ".join(
+                f"{rid}={ranks}" for rid, ranks in unit_ranks.items()
+            )
+        )
+
+    def _get_elastic_wg(self) -> Optional[RayWorkerGroup]:
+        """Return the single large elastic RayWorkerGroup (if registered)."""
+        return self._elastic_wg_registry.get("elastic_wg")
 
     # =========================================================================
     # Elastic Actor Management (lower-level, used internally)
@@ -406,39 +463,47 @@ class ElasticTrainer(FullyAsyncTrainer):
     async def add_elastic_actor(
         self,
         resource_id: str,
-        actor_worker_group: RayWorkerGroup,
-        actor_handles: list,
-        param_version: int,
+        actor_worker_group: RayWorkerGroup = None,
+        actor_handles: list = None,
+        param_version: int = 0,
     ) -> bool:
         """
-        Add an elastic actor worker group to the training pool and trigger
-        a DP group rebuild.
+        Add an elastic unit back into the training DP group and trigger
+        a rebuild via rebuild_dp_group().
 
-        Called by switch_elastic_to_train() after the actor weights are on GPU.
+        In the single-wg architecture, all units live in the same
+        RayWorkerGroup; this method simply marks the unit as ACTIVE and
+        schedules a DP rebuild that will include its ranks.
 
         Args:
-            resource_id: Unique identifier for the elastic resource.
-            actor_worker_group: The RayWorkerGroup for this elastic actor.
-            actor_handles: (unused) kept for API compatibility.
+            resource_id: Unique identifier for the elastic unit (e.g. "elastic_0").
+            actor_worker_group: Unused in single-wg mode; kept for API compat.
+            actor_handles: Unused; kept for API compatibility.
             param_version: Current parameter version.
 
         Returns:
-            True if successfully registered, False otherwise.
+            True if successfully queued, False otherwise.
         """
         async with self._dp_rebuild_lock:
-            if resource_id in self._elastic_actor_wgs:
-                logger.warning(f"[ElasticTrainer] {resource_id} already registered")
+            if resource_id in self._elastic_active_units:
+                logger.warning(f"[ElasticTrainer] {resource_id} already in active training units")
+                return False
+            if resource_id not in self._elastic_unit_ranks:
+                logger.warning(
+                    f"[ElasticTrainer] {resource_id} not in unit_ranks registry; call register_elastic_unit_ranks first"
+                )
                 return False
 
-            self._elastic_actor_wgs[resource_id] = actor_worker_group
+            self._elastic_active_units.add(resource_id)
             self._elastic_actor_versions[resource_id] = param_version
             self._pending_elastic_adds.append(resource_id)
             self._dp_rebuild_pending = True
             self._total_elastic_adds += 1
 
             logger.info(
-                f"[ElasticTrainer] Registered elastic actor {resource_id} "
-                f"(param_version={param_version}). DP rebuild deferred."
+                f"[ElasticTrainer] Queued elastic unit {resource_id} for ADD "
+                f"(ranks={self._elastic_unit_ranks[resource_id]}, "
+                f"param_version={param_version}). DP rebuild deferred."
             )
 
         # Apply the pending DP change immediately if we're not mid-step
@@ -449,28 +514,35 @@ class ElasticTrainer(FullyAsyncTrainer):
 
     async def remove_elastic_actor(self, resource_id: str) -> bool:
         """
-        Remove an elastic actor worker group from the training pool and trigger
-        a DP group rebuild.
+        Remove an elastic unit from the training DP group and trigger
+        a rebuild via rebuild_dp_group().
+
+        In the single-wg architecture, all units live in the same
+        RayWorkerGroup; this method marks the unit as INACTIVE and
+        schedules a DP rebuild that excludes its ranks.
 
         Called by switch_elastic_to_rollout() before the actor weights are
         offloaded.
 
         Args:
-            resource_id: Unique identifier for the elastic resource.
+            resource_id: Unique identifier for the elastic unit (e.g. "elastic_0").
 
         Returns:
             True if successfully queued for removal, False otherwise.
         """
         async with self._dp_rebuild_lock:
-            if resource_id not in self._elastic_actor_wgs:
-                logger.warning(f"[ElasticTrainer] {resource_id} not found for removal")
+            if resource_id not in self._elastic_active_units:
+                logger.warning(f"[ElasticTrainer] {resource_id} not found in active training units")
                 return False
 
             self._pending_elastic_removes.append(resource_id)
             self._dp_rebuild_pending = True
             self._total_elastic_removes += 1
 
-            logger.info(f"[ElasticTrainer] Queued elastic actor {resource_id} for removal. DP rebuild deferred.")
+            logger.info(
+                f"[ElasticTrainer] Queued elastic unit {resource_id} for REMOVE "
+                f"(ranks={self._elastic_unit_ranks.get(resource_id, [])}). DP rebuild deferred."
+            )
 
         # Apply immediately if not mid-step
         if not self._is_training_step:
@@ -499,31 +571,22 @@ class ElasticTrainer(FullyAsyncTrainer):
             )
 
             try:
-                current_dp_ranks = await self._get_current_train_ranks()
+                # Compute new active ranks from the unit-rank registry.
+                # _elastic_active_units already reflects adds; removes are
+                # still pending, so exclude them explicitly.
+                remove_set = set(self._pending_elastic_removes)
+                active_after = self._elastic_active_units - remove_set
 
-                add_ranks = []
-                for rid in self._pending_elastic_adds:
-                    if rid in self._elastic_actor_wgs:
-                        ranks = await self._get_worker_group_ranks(self._elastic_actor_wgs[rid])
-                        add_ranks.extend(ranks)
+                new_world_ranks: list[int] = []
+                for rid in active_after:
+                    new_world_ranks.extend(self._elastic_unit_ranks.get(rid, []))
+                new_world_ranks = sorted(set(new_world_ranks))
 
-                remove_ranks = []
+                await self._coordinate_dp_rebuild(new_world_ranks=new_world_ranks)
+
+                # Finalise removals: remove from active set
                 for rid in self._pending_elastic_removes:
-                    if rid in self._elastic_actor_wgs:
-                        ranks = await self._get_worker_group_ranks(self._elastic_actor_wgs[rid])
-                        remove_ranks.extend(ranks)
-
-                new_world_ranks = sorted(set(current_dp_ranks + add_ranks) - set(remove_ranks))
-
-                await self._coordinate_dp_rebuild(
-                    new_world_ranks=new_world_ranks,
-                    add_resource_ids=list(self._pending_elastic_adds),
-                    remove_resource_ids=list(self._pending_elastic_removes),
-                )
-
-                # Finalise removals
-                for rid in self._pending_elastic_removes:
-                    self._elastic_actor_wgs.pop(rid, None)
+                    self._elastic_active_units.discard(rid)
                     self._elastic_actor_versions.pop(rid, None)
 
                 self._pending_elastic_adds.clear()
@@ -550,43 +613,26 @@ class ElasticTrainer(FullyAsyncTrainer):
                 logger.error(f"[ElasticTrainer] Failed to apply DP changes: {e}")
                 raise
 
-    async def _coordinate_dp_rebuild(
-        self,
-        new_world_ranks: list[int],
-        add_resource_ids: list[str],
-        remove_resource_ids: list[str],
-    ):
+    async def _coordinate_dp_rebuild(self, new_world_ranks: list[int]):
         """
-        Broadcast rebuild_dp_group(new_world_ranks) to every worker group that
-        participates in the new DP topology.
+        Call rebuild_dp_group(new_world_ranks) on the single large elastic wg.
 
-        All current-world-size ranks must participate in dist.new_group()
-        simultaneously.
+        Because all elastic workers share the same PyTorch distributed world
+        (dist.init_process_group was called once for the whole wg), a single
+        broadcast to all workers is sufficient.  dist.new_group() is a global
+        collective; every rank in the world must call it simultaneously, which
+        is guaranteed here because execute_all() sends the call to every worker.
+
+        Args:
+            new_world_ranks: Sorted list of wg-local ranks that should form
+                             the new DP group after the rebuild.
         """
-        rebuild_futures = []
+        wg = self._get_elastic_wg()
+        if wg is None:
+            logger.warning("[ElasticTrainer] _coordinate_dp_rebuild: no elastic wg registered, skipping")
+            return
 
-        # Fixed actor workers
-        if hasattr(self, "actor_wg") and self.actor_wg is not None:
-            rebuild_futures.append(self._trigger_rebuild_on_worker_group(self.actor_wg, new_world_ranks))
-
-        # Existing elastic actors not being removed
-        for rid, wg in self._elastic_actor_wgs.items():
-            if rid not in remove_resource_ids:
-                rebuild_futures.append(self._trigger_rebuild_on_worker_group(wg, new_world_ranks))
-
-        # New elastic actors being added
-        for rid in add_resource_ids:
-            if rid in self._elastic_actor_wgs:
-                rebuild_futures.append(
-                    self._trigger_rebuild_on_worker_group(self._elastic_actor_wgs[rid], new_world_ranks)
-                )
-
-        if rebuild_futures:
-            results = await asyncio.gather(*rebuild_futures, return_exceptions=True)
-            for i, result in enumerate(results):
-                if isinstance(result, Exception):
-                    logger.error(f"[ElasticTrainer] DP rebuild failed for worker group {i}: {result}")
-                    raise result
+        await self._trigger_rebuild_on_worker_group(wg, new_world_ranks)
 
     async def _trigger_rebuild_on_worker_group(
         self,
@@ -605,30 +651,33 @@ class ElasticTrainer(FullyAsyncTrainer):
     # 7.4  Dynamic required_samples (DP-aware)
     # =========================================================================
 
+    def _get_actor_cfg(self):
+        """Shorthand accessor for actor_rollout_ref.actor config (may be None)."""
+        return getattr(self.config.actor_rollout_ref, "actor", None)
+
     def _get_current_dp_size(self) -> int:
         """
-        Return the number of actor workers currently participating in training.
+        Return the number of DP replicas currently participating in training.
 
-        Counts:
-        - fixed actor_wg (world_size / tp_size / pp_size, i.e. dp_size contribution)
-        - each elastic actor_wg in TRAIN mode (same calculation)
+        In the single-wg architecture each elastic unit maps to exactly one
+        DP replica (it covers TP×PP×CP ranks), so:
+            DP size = number of currently active elastic units
 
-        We use world_size as a proxy for the DP contribution because all actor
-        worker groups use the same TP/PP topology.  Dividing by tp×pp gives the
-        DP size, but for the purpose of required_samples we only need the total
-        number of data-parallel replicas across all wgs.
+        Falls back to actor_wg.world_size / (TP×PP) before
+        register_elastic_unit_ranks() is called.
         """
-        tp = getattr(self.config.actor_rollout_ref.actor, "tensor_model_parallel_size", 1)
-        pp = getattr(self.config.actor_rollout_ref.actor, "pipeline_model_parallel_size", 1)
-        parallelism = tp * pp
-        parallelism = max(parallelism, 1)  # guard against zero
+        if self._elastic_unit_ranks:
+            # Each registered unit is one DP replica by definition.
+            return max(len(self._elastic_active_units), 1)
 
-        dp_size = 0
-        if hasattr(self, "actor_wg") and self.actor_wg is not None:
-            dp_size += self.actor_wg.world_size // parallelism
-        for wg in self._elastic_actor_wgs.values():
-            dp_size += wg.world_size // parallelism
-        return max(dp_size, 1)  # at least 1 to avoid division-by-zero
+        # Fallback: derive from the static actor_wg world size.
+        actor_cfg = self._get_actor_cfg()
+        tp = getattr(actor_cfg, "tensor_model_parallel_size", 1)
+        pp = getattr(actor_cfg, "pipeline_model_parallel_size", 1)
+        cp = getattr(actor_cfg, "context_parallel_size", 1)
+        if getattr(self, "actor_wg", None) is not None:
+            return max(self.actor_wg.world_size // max(tp * pp * cp, 1), 1)
+        return 1
 
     def _update_required_samples(self) -> None:
         """
@@ -922,12 +971,13 @@ class ElasticTrainer(FullyAsyncTrainer):
         because trainer.n_gpus_per_node=0.  We derive the real count from the
         live worker group world sizes instead.
         """
-        # Trainer GPUs: fixed actor wg + all currently-active elastic actor wgs
+        # Trainer GPUs: count only the ranks currently in active training units
         trainer_gpus = 0
-        if hasattr(self, "actor_wg") and self.actor_wg is not None:
-            trainer_gpus += self.actor_wg.world_size
-        for wg in self._elastic_actor_wgs.values():
-            trainer_gpus += wg.world_size
+        if self._elastic_unit_ranks and self._elastic_active_units:
+            for rid in self._elastic_active_units:
+                trainer_gpus += len(self._elastic_unit_ranks.get(rid, []))
+        elif hasattr(self, "actor_wg") and self.actor_wg is not None:
+            trainer_gpus = self.actor_wg.world_size
 
         # Rollout GPUs: static config (rollout resources are not elastic)
         rollout_gpus = getattr(self.config.rollout, "nnodes", 0) * getattr(self.config.rollout, "n_gpus_per_node", 0)
@@ -1016,14 +1066,14 @@ class ElasticTrainer(FullyAsyncTrainer):
     # =========================================================================
 
     def get_num_active_train_actors(self) -> int:
-        """Total number of active training actors (fixed + elastic)."""
-        fixed = 1 if (hasattr(self, "actor_wg") and self.actor_wg is not None) else 0
-        return fixed + len(self._elastic_actor_wgs)
+        """Total number of active training elastic units."""
+        return len(self._elastic_active_units)
 
     def get_elastic_statistics(self) -> dict:
         """Elastic-specific statistics for monitoring."""
         return {
-            "elastic_trainer/num_elastic_actors": len(self._elastic_actor_wgs),
+            "elastic_trainer/num_elastic_active_units": len(self._elastic_active_units),
+            "elastic_trainer/num_elastic_units_total": len(self._elastic_unit_ranks),
             "elastic_trainer/total_adds": self._total_elastic_adds,
             "elastic_trainer/total_removes": self._total_elastic_removes,
             "elastic_trainer/total_dp_rebuilds": self._total_dp_rebuilds,

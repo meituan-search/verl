@@ -13,11 +13,10 @@
 # limitations under the License.
 
 """
-Elastic Megatron Engine for dynamic DP group resizing.
+Elastic Megatron Mixin for dynamic DP group resizing.
 
 Provides:
-- ElasticMegatronEngine: Base elastic engine with DP rebuild capability
-- ElasticMegatronEngineWithLMHead: LM head variant with dynamic DP support
+- ElasticMegatronMixin: Mixin that adds DP rebuild capability to any Megatron engine
 
 Key features:
 1. DP group rebuild without disk I/O (state stored in CPU memory)
@@ -37,11 +36,6 @@ import torch.distributed as dist
 from megatron.core import parallel_state as mpu
 
 from verl.utils.device import get_device_name
-from verl.workers.engine import EngineRegistry
-from verl.workers.engine.megatron.transformer_impl import (
-    MegatronEngineWithLMHead,
-    MegatronEngineWithValueHead,
-)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -474,27 +468,3 @@ class OptimizerStateSnapshot:
                             state[k] = v.to(device=device, non_blocking=True)
                         else:
                             state[k] = v
-
-
-@EngineRegistry.register(model_type="language_model", backend="megatron_elastic")
-class ElasticMegatronEngineWithLMHead(MegatronEngineWithLMHead, ElasticMegatronMixin):
-    """
-    Elastic Megatron Engine with LM head for language modeling.
-
-    Combines MegatronEngineWithLMHead (full forward/backward logic)
-    with ElasticMegatronMixin (DP rebuild capability).
-    """
-
-    pass
-
-
-@EngineRegistry.register(model_type="value_model", backend="megatron_elastic")
-class ElasticMegatronEngineWithValueHead(MegatronEngineWithValueHead, ElasticMegatronMixin):
-    """
-    Elastic Megatron Engine with value head for value modeling.
-
-    Combines MegatronEngineWithValueHead (full forward/backward logic)
-    with ElasticMegatronMixin (DP rebuild capability).
-    """
-
-    pass
