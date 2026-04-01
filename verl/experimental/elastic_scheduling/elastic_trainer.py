@@ -675,6 +675,31 @@ class ElasticTrainer(FullyAsyncTrainer):
             f"base_per_dp={base_per_dp})"
         )
 
+        # Update metrics_aggregator.total_gpus to reflect the current actual GPU
+        # count so that perf/throughput is computed correctly.
+        # In fully-elastic mode the static config gives 0 GPUs; we derive the real
+        # count from the registered actor worker groups and the rollout config.
+        self._update_metrics_aggregator_total_gpus()
+
+    def _update_metrics_aggregator_total_gpus(self) -> None:
+        """Sync metrics_aggregator.total_gpus with the current actual GPU count.
+
+        In fully-elastic mode the static config gives trainer.n_gpus_per_node=0,
+        so MetricsAggregator is initialised with total_gpus=0 and
+        perf/throughput would cause a ZeroDivisionError.  This method recomputes
+        the true GPU count via _get_n_gpus() and updates the aggregator.
+        """
+        if not hasattr(self, "metrics_aggregator"):
+            return
+
+        total_gpus = self._get_n_gpus()
+        if total_gpus > 0 and self.metrics_aggregator.total_gpus != total_gpus:
+            logger.info(
+                f"[ElasticTrainer] metrics_aggregator.total_gpus updated: "
+                f"{self.metrics_aggregator.total_gpus} → {total_gpus}"
+            )
+            self.metrics_aggregator.total_gpus = total_gpus
+
     async def _get_current_train_ranks(self) -> list[int]:
         if not (hasattr(self, "actor_wg") and self.actor_wg is not None):
             return []
@@ -885,6 +910,51 @@ class ElasticTrainer(FullyAsyncTrainer):
     def set_dp_rebuild_complete_callback(self, callback: Callable) -> None:
         """Set callback invoked after each DP rebuild."""
         self._on_dp_rebuild_complete = callback
+
+    # =========================================================================
+    # Metrics
+    # =========================================================================
+
+    def _get_n_gpus(self) -> int:
+        """Return the current total GPU count across all active worker groups.
+
+        In fully-elastic mode the static ResourcePoolManager reports 0 GPUs
+        because trainer.n_gpus_per_node=0.  We derive the real count from the
+        live worker group world sizes instead.
+        """
+        # Trainer GPUs: fixed actor wg + all currently-active elastic actor wgs
+        trainer_gpus = 0
+        if hasattr(self, "actor_wg") and self.actor_wg is not None:
+            trainer_gpus += self.actor_wg.world_size
+        for wg in self._elastic_actor_wgs.values():
+            trainer_gpus += wg.world_size
+
+        # Rollout GPUs: static config (rollout resources are not elastic)
+        rollout_gpus = getattr(self.config.rollout, "nnodes", 0) * getattr(self.config.rollout, "n_gpus_per_node", 0)
+
+        static_n_gpus = self.resource_pool_manager.get_n_gpus()
+        # Prefer the live count; fall back to static if we haven't registered
+        # any elastic workers yet.
+        return trainer_gpus + rollout_gpus if (trainer_gpus + rollout_gpus) > 0 else static_n_gpus
+
+    def _fit_collect_metrics(self, batch):
+        """Override to supply the dynamically-computed GPU count for throughput."""
+        from verl.trainer.ppo.metric_utils import (
+            compute_data_metrics,
+            compute_throughout_metrics,
+            compute_timing_metrics,
+            compute_variance_proxy_metrics,
+        )
+
+        metrics = self.metrics
+        timing_raw = self.timing_raw
+
+        metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+        metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+        n_gpus = self._get_n_gpus()
+        metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+        gradient_norm = metrics.get("actor/grad_norm", None)
+        metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
 
     # =========================================================================
     # Consumption Rate Tracking
