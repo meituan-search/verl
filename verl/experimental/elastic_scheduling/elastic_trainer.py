@@ -660,24 +660,50 @@ class ElasticTrainer(FullyAsyncTrainer):
         Return the number of DP replicas currently participating in training.
 
         In the single-wg architecture each elastic unit maps to exactly one
-        DP replica (it covers TP×PP×CP ranks), so:
+        DP replica (it covers the model-parallel ranks for that unit), so:
             DP size = number of currently active elastic units
 
-        Falls back to actor_wg.world_size / (TP×PP) before
-        register_elastic_unit_ranks() is called.
+        Falls back to actor_wg.world_size / gpus_per_unit before
+        register_elastic_unit_ranks() is called.  gpus_per_unit depends on
+        the actor strategy:
+          - Megatron : TP × PP × CP  (from actor.megatron.*)
+          - FSDP/FSDP2: ulysses_sequence_parallel_size  (from actor.fsdp_config.*)
         """
         if self._elastic_unit_ranks:
             # Each registered unit is one DP replica by definition.
             return max(len(self._elastic_active_units), 1)
 
         # Fallback: derive from the static actor_wg world size.
-        actor_cfg = self._get_actor_cfg()
-        tp = getattr(actor_cfg, "tensor_model_parallel_size", 1)
-        pp = getattr(actor_cfg, "pipeline_model_parallel_size", 1)
-        cp = getattr(actor_cfg, "context_parallel_size", 1)
+        gpus_per_unit = self._get_gpus_per_elastic_unit()
         if getattr(self, "actor_wg", None) is not None:
-            return max(self.actor_wg.world_size // max(tp * pp * cp, 1), 1)
+            return max(self.actor_wg.world_size // gpus_per_unit, 1)
         return 1
+
+    def _get_gpus_per_elastic_unit(self) -> int:
+        """
+        Return the number of GPUs per elastic unit based on actor strategy.
+
+        Megatron : TP × PP × CP
+        FSDP/FSDP2 : ulysses_sequence_parallel_size (SP acts as the
+                     intra-unit parallelism dimension; no TP/PP/CP)
+        """
+        actor_cfg = self._get_actor_cfg()
+        if actor_cfg is None:
+            return 1
+
+        strategy = getattr(actor_cfg, "strategy", "fsdp")
+
+        if strategy == "megatron":
+            megatron_cfg = getattr(actor_cfg, "megatron", None) or actor_cfg
+            tp = getattr(megatron_cfg, "tensor_model_parallel_size", 1)
+            pp = getattr(megatron_cfg, "pipeline_model_parallel_size", 1)
+            cp = getattr(megatron_cfg, "context_parallel_size", 1)
+            return max(tp * pp * cp, 1)
+        else:
+            # FSDP / FSDP2: intra-unit parallelism = Ulysses SP size
+            fsdp_cfg = getattr(actor_cfg, "fsdp_config", None) or actor_cfg
+            sp = getattr(fsdp_cfg, "ulysses_sequence_parallel_size", 1)
+            return max(sp, 1)
 
     def _update_required_samples(self) -> None:
         """
