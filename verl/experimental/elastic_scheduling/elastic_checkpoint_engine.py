@@ -34,7 +34,7 @@ Extends CheckpointEngineManager with hybrid replica support.
       GPU is held by the training engine; rollout server is sleeping with
       both weights and kv-cache released.  Use the naive (in-process) path:
 
-        actor_wg.update_weights()
+        actor_wg.sync_weights_to_rollout_naive()
 
       The actor and rollout engine share the same Ray worker process.
       With checkpoint_engine.backend == "naive", this directly copies actor
@@ -61,10 +61,20 @@ Extends CheckpointEngineManager with hybrid replica support.
 
   update_weights(global_steps)
       1. super().update_weights()  – handles self.replicas (standalone + awake hybrid)
-      2. naive sync loop           – handles _sleep_hybrid_replicas
+           naive backend: calls self.trainer.update_weights() → returns immediately
+           NCCL backend:  full NCCL flow (abort → release_kv_cache → sync → finalize
+                          → resume_kv_cache → resume)
+      2. actor_wg.update_weights() loop – handles _sleep_hybrid_replicas
+           always uses per-replica actor_wg (in-process, no NCCL) regardless of backend:
+           - naive: super() only covered self.trainer (fixed wg); sleeping hybrid wgs
+                    are separate and must be called individually.
+           - NCCL:  finalize() has already reset rank to None; must NOT call
+                    self.trainer.update_weights() again here.
 """
 
 import logging
+
+import ray
 
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.single_controller.ray import RayWorkerGroup
@@ -233,19 +243,31 @@ class ElasticCheckpointManager(CheckpointEngineManager):
         """
         Synchronize parameters from trainer to ALL replicas.
 
-        Step 1 – NCCL path (delegated to base class)
-            Handles self.replicas = standalone replicas + awake hybrid replicas.
-            The base class calls release_kv_cache_replicas() before sync and
-            resume_kv_cache_replicas() after, so model weights are never touched.
+        Two paths run unconditionally every call:
 
-        Step 2 – Naive path (in-process)
-            Handles _sleep_hybrid_replicas (TRAIN mode).
-            Each sleeping replica is synced via its actor_wg.update_weights().
-            No NCCL group required; processed serially.
+        Path A – NCCL (standalone + awake hybrid replicas = self.replicas)
+            Mirrors the base-class NCCL flow exactly:
+              abort_all_requests → release_kv_cache → build_process_group
+              → trainer/rollout update_weights → finalize
+              → resume_kv_cache → resume_generation
+            Skipped when self.replicas is empty.
+
+        Path B – naive / in-process (sleeping hybrid replicas)
+            Each sleeping replica's actor_wg.update_weights() is called
+            directly.  The actor and rollout engine share the same Ray worker
+            process, so this writes actor parameters into the rollout engine's
+            weight buffers without any NCCL group.
+            We MUST NOT reuse self.trainer here — finalize() in Path A has
+            already reset checkpoint_engine.rank to None.
 
         Args:
             global_steps: Current training step used as the parameter version tag.
         """
+        import asyncio
+
+        from verl.checkpoint_engine.base import _worker_cls
+        from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
+
         nccl_replicas = len(self.replicas)
         sleep_replicas = len(self._sleep_hybrid_replicas)
         logger.info(
@@ -254,21 +276,54 @@ class ElasticCheckpointManager(CheckpointEngineManager):
             f"naive replicas={sleep_replicas} (sleeping hybrid)"
         )
 
-        # Step 1: NCCL sync for standalone + awake hybrid replicas (base class)
+        # ── Path A: NCCL sync for standalone + awake hybrid replicas ──────────
         if self.replicas:
-            await super().update_weights(global_steps)
+            # 1. abort all unfinished requests
+            await asyncio.gather(*[r.abort_all_requests() for r in self.replicas])
 
-        # Step 2: naive sync for sleeping hybrid replicas
-        # for resource_id, _replica in self._sleep_hybrid_replicas.items():
-        #     actor_wg = self._hybrid_actor_wgs.get(resource_id)
-        #     if actor_wg is None:
-        #         logger.warning(
-        #             f"[ElasticCheckpointManager] No actor_wg for sleeping hybrid replica "
-        #             f"'{resource_id}'. Skipping sync."
-        #         )
-        #         continue
-        #     try:
-        #         ray.get(actor_wg.update_weights(global_steps=global_steps))
-        #     logger.info(f"[ElasticCheckpointManager] Sleeping replica '{resource_id}' synced (naive, TRAIN mode).")
-        #     except Exception as e:
-        #         logger.exception(f"[ElasticCheckpointManager] Failed to sync sleeping replica '{resource_id}': {e}")
+            # 2. build a temporary rollout worker group covering all replicas
+            workers = []
+            for replica in self.replicas:
+                workers.extend(replica.workers)
+            rollout = RayWorkerGroup(
+                worker_handles=workers,
+                ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls),
+            )
+            trainer = self.trainer
+
+            # 3. release kv_cache only (weights stay in GPU for NCCL recv)
+            await self.release_kv_cache_replicas()
+
+            # 4. build NCCL process group
+            self.build_process_group(rollout)
+
+            # 5. send weights (trainer → rollout)
+            ray.get(
+                trainer.update_weights(global_steps=global_steps) + rollout.update_weights(global_steps=global_steps)
+            )
+
+            # 6. finalize (destroys NCCL group, resets rank to None)
+            ray.get(
+                trainer.execute_checkpoint_engine(["finalize"] * trainer.world_size)
+                + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
+            )
+
+            # 7. restore kv_cache
+            await self.resume_kv_cache_replicas()
+
+            # 8. resume generation
+            await asyncio.gather(*[r.resume_generation() for r in self.replicas])
+
+        # ── Path B: naive in-process sync for sleeping hybrid replicas ────────
+        # actor_wg.update_weights() runs entirely inside the ElasticActorWorker
+        # process: actor engine → rollout engine, no NCCL required.
+        for rid in self._sleep_hybrid_replicas:
+            actor_wg = self._hybrid_actor_wgs.get(rid)
+            if actor_wg is None:
+                logger.warning(f"[ElasticCheckpointManager] no actor_wg for sleeping replica '{rid}', skipping")
+                continue
+            try:
+                ray.get(actor_wg.sync_weights_to_rollout_naive(global_steps=global_steps))
+                logger.debug(f"[ElasticCheckpointManager] naive sync done for sleeping replica '{rid}'")
+            except Exception as e:
+                logger.warning(f"[ElasticCheckpointManager] naive sync failed for '{rid}': {e}")

@@ -265,6 +265,90 @@ class ElasticActorWorker(ActorRolloutRefWorker):
             return False
 
     # -------------------------------------------------------------------------
+    # Weight synchronization
+    # -------------------------------------------------------------------------
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def sync_weights_to_rollout_naive(self, global_steps: int = None):
+        """Naive in-process weight sync for sleeping hybrid replicas (TRAIN mode).
+
+        Called exclusively by ElasticCheckpointManager Path B for sleeping
+        hybrid replicas.  Must NOT be confused with update_weights(), which is
+        the NCCL trainer-side send called by Path A.
+
+        The rollout server is sleeping (weights + kv_cache released).  This
+        method temporarily restores weight buffers, writes the latest actor
+        params, then releases them again — without waking the rollout server.
+        """
+        await self._update_weights_naive(global_steps=global_steps)
+
+    async def _update_weights_naive(self, global_steps: int = None):
+        """In-process weight sync for sleeping hybrid replicas (TRAIN mode).
+
+        HYBRID sleep releases both weights and kv_cache from GPU.  Before we
+        can copy the latest actor parameters into the rollout engine's weight
+        buffers we must restore those buffers first.
+
+        Flow
+        ----
+        1. resume(tags=["weights"])   – restore weight buffers to GPU
+        2. get_per_tensor_param()     – pull latest actor params (on GPU)
+        3. rollout.update_weights()   – copy actor params → rollout engine registry
+        4. release_weights()          – free weight buffers (GPU memory returned to
+                                        training engine); the rollout engine's internal
+                                        weight registry retains the latest version so
+                                        wake_up can restore them correctly.
+
+        The rollout server stays asleep throughout (no kv_cache, no serving).
+        We do NOT offload actor weights or resume kv_cache here — those are
+        handled by the switch sequences (switch_to_rollout / wake_up) managed
+        by ElasticAgentLoopManager.
+        """
+        from verl.utils.device import set_expandable_segments
+        from verl.utils.profiler import log_gpu_memory_usage
+
+        set_expandable_segments(False)
+        log_gpu_memory_usage("Before naive update_weights (sleeping)", logger=logger)
+
+        # 1. Restore rollout weight buffers to GPU (HYBRID sleep released them).
+        await self.rollout.resume(tags=["weights"])
+        log_gpu_memory_usage("After resume weights (sleeping)", logger=logger)
+
+        # 2. & 3. Pull actor params and write into rollout weight buffers.
+        per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
+            layered_summon=self.layered_summon, base_sync_done=True
+        )
+        await self.rollout.update_weights(
+            per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps
+        )
+
+        do_lora_base_sync = False
+        if not self.peft_merge and peft_config is not None:
+            self.rollout.sleep_level = 1
+            do_lora_base_sync = (not self.base_sync_done) or (
+                self.rollout.sleep_level != 1 and self.config.rollout.free_cache_engine
+            )
+
+        if do_lora_base_sync:
+            per_tensor_base_params, _ = self.actor.engine.get_per_tensor_param(
+                layered_summon=self.layered_summon, base_sync_done=False
+            )
+            await self.rollout.update_weights(per_tensor_base_params, peft_config=peft_config, base_sync_done=False)
+
+        # 4. Release weight buffers to reclaim GPU memory for the training engine.
+        #    The latest params have been written into the rollout engine's internal
+        #    weight store (SGLang/vLLM maintain a registered-weights registry that
+        #    survives release/resume cycles).
+        #    On Train→Rollout switch, wake_up resumes weights from that registry
+        #    (which now holds the latest version) and then resumes kv_cache.
+        await self.rollout.release_weights()
+        log_gpu_memory_usage("After release_weights (sleeping)", logger=logger)
+
+        self.base_sync_done = True
+        set_expandable_segments(True)
+        log_gpu_memory_usage("After naive update_weights (sleeping)", logger=logger)
+
+    # -------------------------------------------------------------------------
     # DP group rebuild (pass-through to engine)
     # -------------------------------------------------------------------------
 

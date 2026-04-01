@@ -749,10 +749,10 @@ required_samples = ppo_mini_batch_size × require_batches × current_dp_size
 3. `FullyAsyncLLMServerManager` 检测到 `stop_reason="aborted"` 后，自动将 `prompt + 已生成 tokens` 拼接发给新 server 续推，AgentLoop 无感知
 
 ```shell
-# 执行
+
 ray list jobs --address='http://10.148.11.18:8420' --format json 2>/dev/null | python3 -c "import sys,json; [print(j['job_id']) for j in json.load(sys.stdin) if
 j.get('status') in ('RUNNING','PENDING')]" | xargs -I{} ray job stop {} --address='http://10.148.11.18:8420'
 
-# 再执行
+
 ray job submit --address='http://10.148.11.18:8420' --runtime-env=verl/experimental/elastic_scheduling/shell/dapo_7b_math_megatron_2_6.yaml -- bash verl/experimental/elastic_scheduling/shell/dapo_7b_math_megatron_2_6.sh
 ```
