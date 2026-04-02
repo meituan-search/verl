@@ -239,6 +239,14 @@ class ElasticFSDPMixin:
         """
         my_rank = dist.get_rank()
 
+        # Lazy-init mixin state when the class was injected via __class__
+        # assignment (no __init__ call was made).
+        if not hasattr(self, "_model_on_gpu"):
+            self._model_on_gpu = True
+            self._optimizer_on_gpu = True
+            self._model_snapshot = None
+            self._optimizer_snapshot = None
+
         # Check if this rank is in new DP group
         is_in_new_group = my_rank in new_world_ranks
 

@@ -286,9 +286,11 @@ class TRTLLMHttpServer:
 
     async def wake_up(self):
         if self.rollout_mode == RolloutMode.HYBRID:
-            # In hybrid mode, rollout is wake up in `update_weights`
-            raise ValueError(f"wake_up not support rollout_mode {self.rollout_mode}")
-        if self.rollout_mode == RolloutMode.COLOCATED:
+            # In elastic scheduling, weights are pre-synced via the naive path
+            # (sync_weights_to_rollout_naive) before wake_up() is called.
+            # We only need to resume kv_cache + weights to restore GPU memory.
+            await self.llm.resume(tags=ServerAdapter.get_full_tags())
+        elif self.rollout_mode == RolloutMode.COLOCATED:
             await self.llm.resume(tags=ServerAdapter.get_full_tags())
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip wake_up in standalone mode")

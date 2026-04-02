@@ -179,6 +179,17 @@ class ElasticCoordinator:
             "last_action_time": 0.0,
         }
 
+        # [DEBUG] Force a Train→Rollout switch every step to verify the system works.
+        # Set via config key "debug_force_switch_every_step": true.
+        # In this mode the normal EMA / watermark logic is bypassed and cooldown is ignored.
+        self._debug_force_switch_every_step: bool = config.get("debug_force_switch_every_step", False)
+        if self._debug_force_switch_every_step:
+            logger.warning(
+                "[ElasticCoordinator] *** DEBUG MODE: debug_force_switch_every_step=True ***\n"
+                "  A Train→Rollout switch will be forced at every training boundary.\n"
+                "  This mode is for system sanity-checking ONLY and must NOT be used in production."
+            )
+
         logger.info(
             f"[ElasticCoordinator] Initialized with {len(self._resources)} elastic resources. "
             f"high_wm={self.high_watermark}, low_wm={self.low_watermark}, "
@@ -245,6 +256,15 @@ class ElasticCoordinator:
         Returns:
             True if a switch was executed, False otherwise.
         """
+        # [DEBUG] Force a Train→Rollout switch every step, bypassing all normal
+        # watermark / EMA / cooldown logic. Used to verify the switch pipeline works.
+        if self._debug_force_switch_every_step:
+            logger.warning(
+                f"[ElasticCoordinator][DEBUG] Forcing scale_rollout at step={step} (debug_force_switch_every_step=True)"
+            )
+            await self._switch_train_to_rollout(n=1, ignore_cooldown=True)
+            return True
+
         if self._pending_action is None:
             return False
 
@@ -406,7 +426,7 @@ class ElasticCoordinator:
         elif action == "scale_train":
             await self._switch_rollout_to_train()
 
-    async def _switch_train_to_rollout(self, n: int = 1):
+    async def _switch_train_to_rollout(self, n: int = 1, ignore_cooldown: bool = False):
         """
         Switch N elastic resources: Train → Rollout.
 
@@ -415,14 +435,25 @@ class ElasticCoordinator:
           1. remove_elastic_actor (DP rebuild)
           2. worker.switch_to_rollout (offload actor to CPU)
           3. rollouter.add_elastic_replica (wake up rollout server)
+
+        Args:
+            n: Number of resources to switch.
+            ignore_cooldown: When True (debug mode only), skip the per-resource
+                cooldown check so the switch is always attempted.
         """
         candidates = [
             r
             for r in self._resources.values()
-            if r.current_mode == "train" and r.is_healthy and (time.time() - r.last_switch_time) > self.cooldown_seconds
+            if r.current_mode == "train"
+            and r.is_healthy
+            and (ignore_cooldown or (time.time() - r.last_switch_time) > self.cooldown_seconds)
         ]
         if not candidates:
-            logger.debug("[ElasticCoordinator] No candidates for train→rollout switch")
+            all_modes = {r.resource_id: r.current_mode for r in self._resources.values()}
+            logger.warning(
+                f"[ElasticCoordinator] No candidates for train→rollout switch "
+                f"(ignore_cooldown={ignore_cooldown}). Current modes: {all_modes}"
+            )
             return
 
         for resource_info in candidates[:n]:

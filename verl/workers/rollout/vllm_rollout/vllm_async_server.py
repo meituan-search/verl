@@ -556,8 +556,11 @@ class vLLMHttpServer:
             return
 
         if self.rollout_mode == RolloutMode.HYBRID:
-            # In hybrid mode, rollout is wake up in `update_weights`
-            raise ValueError(f"wake_up not support rollout_mode {self.rollout_mode}")
+            # In elastic scheduling, weights are pre-synced via the naive path
+            # (sync_weights_to_rollout_naive) before wake_up() is called.
+            # We only need to resume kv_cache + weights to restore GPU memory.
+            await self.engine.wake_up(tags=self._get_wake_up_tags())
+            await self.engine.reset_prefix_cache()
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
             await self.engine.wake_up(tags=self._get_wake_up_tags())

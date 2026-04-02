@@ -208,9 +208,6 @@ class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
         teacher_model_manager=None,
         reward_loop_worker_handles: list = None,
     ):
-        # Use ElasticAgentLoopWorker so the worker class is clearly named
-        # and can be extended with elastic-specific logic in the future.
-        self.agent_loop_workers_class = ray.remote(ElasticAgentLoopWorker)
         super().__init__(
             config=config,
             worker_group=worker_group,
@@ -218,6 +215,12 @@ class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
             teacher_model_manager=teacher_model_manager,
             reward_loop_worker_handles=reward_loop_worker_handles,
         )
+        # Override after super().__init__() to prevent FullyAsyncAgentLoopManager
+        # from overwriting this with FullyAsyncAgentLoopWorker.  ElasticAgentLoopWorker
+        # is required so that _notify_workers_server_added/removed can call
+        # add_server() / remove_server() on each worker to keep their
+        # _server_id_to_handle maps in sync when elastic replicas are activated.
+        self.agent_loop_workers_class = ray.remote(ElasticAgentLoopWorker)
         # resource_id -> RolloutReplica  (hybrid elastic replicas only)
         self._elastic_replicas: dict[str, RolloutReplica] = {}
         # resource_id -> server_address  (for LB / worker notification)
@@ -412,8 +415,12 @@ class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
         bound to the shared resource pool (init_hybrid / init_colocated) and is
         currently sleeping.  This method:
           1. wake_up() — restores model weights / kv-cache
-          2. Registers the server with the load balancer
-          3. Notifies all AgentLoopWorkers
+          2. Notifies all AgentLoopWorkers (push handle into local map)
+          3. Registers the server with the load balancer (after workers are ready)
+
+        The worker notification MUST happen before LB registration to avoid a
+        race condition where the LB routes a request to the new server before
+        any worker has the handle in its _server_id_to_handle map.
 
         Args:
             resource_id: Unique identifier of the elastic resource to activate.
@@ -447,11 +454,13 @@ class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
             await replica.wake_up()
             logger.info(f"[ElasticAgentLoopManager] Replica '{resource_id}' woken up at {server_address}")
 
-            # 2. Register with load balancer.
-            await self.global_load_balancer.add_server.remote(server_id=server_address)
-
-            # 3. Notify AgentLoopWorkers.
+            # 2. Push the new handle into every AgentLoopWorker's local map FIRST,
+            #    so they can resolve the server_id before the LB starts routing to it.
             await self._notify_workers_server_added(server_address, server_handle)
+
+            # 3. Only after all workers have the handle, register with the load balancer
+            #    so new requests can be routed to this server without racing.
+            await self.global_load_balancer.add_server.remote(server_id=server_address)
 
             # 4. Record active state.
             self._elastic_replicas[resource_id] = replica

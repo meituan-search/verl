@@ -308,8 +308,12 @@ class SGLangHttpServer:
             return
 
         if self.rollout_mode == RolloutMode.HYBRID:
-            # In hybrid mode, rollout is wake up in `update_weights`
-            raise ValueError(f"wake_up not support rollout_mode {self.rollout_mode}")
+            # In elastic scheduling, weights are pre-synced via the naive path
+            # (sync_weights_to_rollout_naive) before wake_up() is called.
+            # We only need to resume kv_cache + weights to restore GPU memory.
+            obj = ResumeMemoryOccupationReqInput(tags=["kv_cache", "weights"])
+            await self.tokenizer_manager.resume_memory_occupation(obj, None)
+            await self.tokenizer_manager.flush_cache()
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
             obj = ResumeMemoryOccupationReqInput(tags=["kv_cache", "weights"])

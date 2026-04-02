@@ -73,6 +73,8 @@ elastic_params=(
   elastic_scheduling.rollout_queue_low_watermark=0.3
   elastic_scheduling.cooldown_seconds=30.0
   elastic_scheduling.confidence_threshold=0.6
+  # ---- [DEBUG] Force Train→Rollout switch every step (system sanity check) ----
+  +elastic_scheduling.debug_force_switch_every_step=True
 )
 
 fully_async=(

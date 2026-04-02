@@ -606,6 +606,8 @@ class ElasticSchedulingTaskRunner:
             "min_train_resources": int(getattr(elastic_config, "min_train_resources", 0)),
             "confidence_threshold": float(getattr(elastic_config, "confidence_threshold", 0.6)),
             "max_concurrent_switches": int(getattr(elastic_config, "max_concurrent_switches", 1)),
+            # [DEBUG] Force Train→Rollout switch every step for system sanity-checking
+            "debug_force_switch_every_step": bool(getattr(elastic_config, "debug_force_switch_every_step", False)),
         }
 
         coordinator = ElasticCoordinator.remote(
@@ -651,7 +653,11 @@ class ElasticSchedulingTaskRunner:
             elastic_resource_infos.append(
                 {
                     "resource_id": resource_id,
-                    "initial_mode": "rollout",
+                    # ElasticTrainer registers all units in TRAIN mode initially
+                    # (see register_elastic_unit_ranks → _elastic_active_units = set(unit_ranks.keys())).
+                    # Coordinator must mirror that state so it can find candidates
+                    # when the first scale_rollout action fires.
+                    "initial_mode": "train",
                     "worker_handles": worker_handles,
                 }
             )

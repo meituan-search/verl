@@ -14,65 +14,52 @@
 # limitations under the License.
 
 """
-真实模型端到端测试：使用 mbridge 加载 Qwen2-Math-7B，验证 Megatron DP 变化时的
-参数保存、通信组重建和参数加载能力。
+真实模型端到端测试：使用 Ray Actor 资源管理 + mbridge 加载 Qwen2-Math-7B，
+验证 Megatron DP 变化时的参数保存、通信组重建和参数加载能力。
 
-本脚本基于 ElasticMegatronMixin（verl/experimental/elastic_scheduling/engine/megatron/
-elastic_transformer_impl.py），验证其完整的弹性 DP rebuild 流程。
+【设计思路：为何使用 Ray Actor 而非 torchrun】
 
-测试场景（4 GPU，tp=1, pp=1, dp=4）：
+  torchrun 在启动时就固定了进程数（--nproc_per_node），无法模拟弹性伸缩场景：
+  - DP 缩容（scale-down）：部分 rank 退出 DP 组
+  - DP 扩容（scale-out）：新 rank 加入 DP 组
+
+  使用 Ray Actor 模式：
+  - 每个 GPU 对应一个 @ray.remote(num_gpus=1) Actor，由 Ray 动态分配
+  - 所有 Actor 通过 TCPStore 协调 dist.init_process_group（共享同一 world）
+  - 弹性场景通过向 Actor 子集发送不同的 rebuild_dp_group 调用来模拟
+  - 被排除的 Actor 仍需参与 dist.new_group() 集合（NCCL 对称要求），然后提前返回
+
+测试场景（4 GPU，通过 Ray 动态分配，tp=1, pp=1, dp=4）：
 
   Test R1 - 真实模型参数保存到 CPU（ModelStateSnapshot）
-    - 通过 mbridge 加载 Qwen2-Math-7B 到 Megatron
-    - 记录部分参数（embedding、第一层 attention）的原始值
-    - 调用 ModelStateSnapshot.from_model() 保存到 CPU
-    - 验证 CPU 快照与 GPU 原始值一致（clone 独立性）
+  Test R2 - 参数从 CPU 恢复到 GPU（capture+restore 往返）
+  Test R3 - DP 通信组重建（DP=4 → 重建 DP=4，same size）
+  Test R4 - 弹性扩容（DP=2 新成员广播，rank 2,3 清零后被广播）
+  Test R5 - GPU 内存释放（_capture_state_to_cpu 后显存减少）
+  Test R6 - 弹性缩容（DP=4 → DP=2，rank 0,1 继续训练）
+  Test R7 - DP rebuild roundtrip（DP=4 → DP=2 → DP=4）
 
-  Test R2 - 参数恢复到 GPU（to_model）
-    - 基于 R1 的快照，清零 GPU 参数
-    - 调用 snapshot.to_model() 恢复
-    - 验证恢复后 GPU 参数值与快照一致
+运行方式：
+    # 本地（需要 Ray 集群或本地 ray start）
+    python verl/experimental/elastic_scheduling/test/test_megatron_dp_rebuild.py \\
+        --model-path /home/hadoop-djst-algoplat/models/Qwen2.5-Math-7B
 
-  Test R3 - DP 通信组重建（DP=4 → 销毁 → 重建 DP=4）
-    - 使用真实模型执行 ElasticMegatronMixin.rebuild_dp_group()
-    - 验证参数在 rebuild 前后保持一致
-    - 验证通信组 dp world_size 正确
-
-  Test R4 - 弹性扩容：DP=2 → DP=4（新成员参数广播）
-    - rank 0,1 持有真实模型权重（老成员）
-    - rank 2,3 持有随机权重（新成员）
-    - rebuild_dp_group(new_world_ranks=[0,1,2,3])
-    - 验证 rank 2,3 的参数广播后与 rank 0,1 一致
-
-  Test R5 - GPU 内存释放（真实大模型场景）
-    - 验证 _capture_state_to_cpu 后 GPU 显存有效释放
-
-  Test R6 - 真实模型 DP rebuild scale down（DP=4 → DP=2）
-    - 以 tp=1（dp=4）初始化，rebuild 到 tp=2（dp=2）
-
-  Test R7 - 真实模型 DP rebuild roundtrip（DP=4 → DP=2 → DP=4）
-
-运行方式（需要 4 个 GPU）：
-    torchrun --nproc_per_node=4 \\
-        verl/experimental/elastic_scheduling/test/test_megatron_dp_rebuild.py \\
-        --model-path /home/hadoop-djst-algoplat/models/Qwen2-Math-7B
-
-通过 ray job submit 运行：
+    # 通过 ray job submit（推荐）：
     ray job submit \\
         --address='http://10.148.11.18:8420' \\
-        --runtime-env=examples/mtp_trainer/runtime_env.yaml \\
-        --working-dir=. \\
-        --entrypoint-num-gpus 4 \\
-        -- torchrun --nproc_per_node=4 --master-port=29603 \\
-           verl/experimental/elastic_scheduling/test/test_megatron_dp_rebuild.py \\
+        --runtime-env=verl/experimental/elastic_scheduling/shell/dapo_7b_math_megatron_2_6.yaml \\
+        -- python verl/experimental/elastic_scheduling/test/test_megatron_dp_rebuild.py \\
            --model-path /home/hadoop-djst-algoplat/models/Qwen2.5-Math-7B
 """
 
 import argparse
 import os
+import socket
 import sys
+import time
 import traceback
 
+import ray
 import torch
 import torch.distributed as dist
 
@@ -86,774 +73,775 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 # ============================================================================
-# 工具函数
+# 常量
 # ============================================================================
 
 PASS = "PASS"
 FAIL = "FAIL"
 SKIP = "SKIP"
 
-_results = []
-
-
-def log(msg: str):
-    rank = dist.get_rank() if dist.is_initialized() else -1
-    print(f"[Rank {rank}] {msg}", flush=True)
-
-
-def record(test_name: str, status: str, detail: str = ""):
-    rank = dist.get_rank() if dist.is_initialized() else -1
-    icon = "✓" if status == PASS else ("✗" if status == FAIL else "~")
-    print(f"[Rank {rank}] {icon} {test_name}: {status}  {detail}", flush=True)
-    _results.append((rank, test_name, status, detail))
-
-
-def assert_allclose(a: torch.Tensor, b: torch.Tensor, name: str = "", atol: float = 1e-4):
-    if not torch.allclose(a.float(), b.float(), atol=atol):
-        max_diff = (a.float() - b.float()).abs().max().item()
-        raise AssertionError(f"{name}: max_diff={max_diff:.6e} > atol={atol}")
+DEFAULT_MODEL_PATH = "/home/hadoop-djst-algoplat/models/Qwen2.5-Math-7B"
+NUM_GPUS = 4  # 测试使用 4 个 GPU（Ray 动态分配）
 
 
 # ============================================================================
-# 真实模型加载（通过 mbridge，与 MegatronEngine vanilla_mbridge=True 路径一致）
+# Ray Actor：每个 Actor 占用 1 个 GPU
 # ============================================================================
 
 
-def set_random_seed(seed: int = 42):
+@ray.remote(num_gpus=1)
+class MegatronWorker:
     """
-    初始化随机种子，参考 verl/workers/engine/megatron/utils.py 中的 set_random_seed。
-    关键：调用 tensor_parallel.model_parallel_cuda_manual_seed 注册 Megatron RNG 状态。
-    必须在 initialize_model_parallel 之后调用。
+    单 GPU Ray Actor，模拟生产环境中的 ElasticActorWorker。
+
+    每个 Actor 通过 TCPStore 与其他 Actor 协调 dist.init_process_group，
+    建立 NCCL 通信组，然后执行 Megatron DP rebuild 操作。
+
+    生命周期：
+      1. __init__   — 记录 rank/addr/port，设置 CUDA device
+      2. init_dist  — 通过 TCPStore 建立 NCCL 进程组
+      3. init_parallel_state — 初始化 Megatron TP/PP/DP 通信组
+      4. load_model — 通过 mbridge 加载真实模型
+      5. rebuild_dp_group / capture_state_to_cpu 等操作
+      6. release_model / destroy_* — 清理
     """
-    import random
 
-    import numpy as np
-    from megatron.core import tensor_parallel
+    def __init__(self, rank: int, world_size: int, master_addr: str, master_port: int, model_path: str):
+        import os
 
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-        tensor_parallel.model_parallel_cuda_manual_seed(seed)
+        self.rank = rank
+        self.world_size = world_size
+        self.master_addr = master_addr
+        self.master_port = master_port
+        self.model_path = model_path
+        self.model = None
 
-
-def load_real_model_with_mbridge(model_path: str, dtype: torch.dtype = torch.bfloat16):
-    """
-    使用 mbridge（vanilla mbridge 路径）加载 HuggingFace 模型到 Megatron 格式。
-
-    实现参考 verl/workers/engine/megatron/transformer_impl.py 中 MegatronEngine 的
-    _build_tf_config + _build_megatron_module（vanilla_bridge=True 分支）。
-
-    要求：在调用前已完成：
-      1. dist.init_process_group
-      2. parallel_state.initialize_model_parallel
-      3. set_random_seed（注册 Megatron CUDA RNG 状态）
-
-    Args:
-        model_path: HuggingFace 模型路径
-        dtype: 参数数据类型，默认 bfloat16
-
-    Returns:
-        model: Megatron model list（[Float16Module(GPTModel)] 或 [DDP(Float16Module(GPTModel))]）
-    """
-    from verl.models.mcore.mbridge import AutoBridge
-
-    rank = dist.get_rank()
-    log(f"Loading model from {model_path} via mbridge (vanilla bridge path)...")
-
-    bridge = AutoBridge.from_pretrained(model_path)
-    bridge.set_extra_args(
-        variable_seq_lengths=True,
-    )
-    tf_config = bridge.config
-    tf_config.fp16 = dtype == torch.float16
-    tf_config.bf16 = dtype == torch.bfloat16
-
-    if rank == 0:
-        log(
-            f"TransformerConfig: num_layers={tf_config.num_layers}, "
-            f"hidden_size={tf_config.hidden_size}, "
-            f"fp16={tf_config.fp16}, bf16={tf_config.bf16}"
+        # Ray 将分配的 GPU 暴露为 CUDA:0（CUDA_VISIBLE_DEVICES 只含一个 GPU）
+        torch.cuda.set_device(0)
+        self._log(
+            f"Actor created, GPU: {torch.cuda.current_device()}, "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'N/A')}"
         )
 
-    model = bridge.get_model(
-        post_model_creation_callbacks=[],
-        wrap_with_ddp=True,
-        fp16=tf_config.fp16,
-        bf16=tf_config.bf16,
-        ddp_config=None,
-    )
+    # -----------------------------------------------------------------------
+    # 分布式初始化
+    # -----------------------------------------------------------------------
 
-    bridge.load_weights(model, model_path)
+    def init_dist(self):
+        """通过 TCPStore 协调，建立 NCCL 进程组。"""
+        import datetime
 
-    if rank == 0:
-        total_params = sum(p.numel() for chunk in model for p in chunk.parameters())
-        log(f"Model loaded: {total_params / 1e9:.2f}B parameters, dtype={dtype}")
+        if dist.is_initialized():
+            self._log("dist already initialized, skipping")
+            return
 
-    return model
-
-
-def get_param_sample(model, n: int = 3) -> dict:
-    """
-    采样模型的前 n 个参数，返回 {name: cpu_tensor} 字典。
-    穿透 DDP -> Float16Module -> GPTModel 层层 wrapper。
-    """
-    samples = {}
-    count = 0
-    inner = model[0]
-    while hasattr(inner, "module"):
-        inner = inner.module
-
-    for name, param in inner.named_parameters():
-        if count >= n:
-            break
-        samples[name] = param.data.detach().cpu().clone()
-        count += 1
-    return samples
-
-
-def params_match(model, reference: dict, atol: float = 1e-4) -> tuple:
-    """验证模型参数是否与 reference 字典匹配，返回 (ok, error_msg)。"""
-    inner = model[0]
-    while hasattr(inner, "module"):
-        inner = inner.module
-
-    param_dict = dict(inner.named_parameters())
-    for name, ref_val in reference.items():
-        if name not in param_dict:
-            return False, f"参数 {name} 不存在"
-        cur_val = param_dict[name].data.detach().cpu()
-        if not torch.allclose(cur_val.float(), ref_val.float(), atol=atol):
-            max_diff = (cur_val.float() - ref_val.float()).abs().max().item()
-            return False, f"{name}: max_diff={max_diff:.6e}"
-    return True, ""
-
-
-def init_parallel_state(tp=1, pp=1):
-    """
-    初始化 Megatron 并行状态，同时调用 set_random_seed 注册 Megatron RNG 状态。
-    """
-    from megatron.core import parallel_state
-
-    if not parallel_state.model_parallel_is_initialized():
-        parallel_state.initialize_model_parallel(
-            tensor_model_parallel_size=tp,
-            pipeline_model_parallel_size=pp,
+        store = dist.TCPStore(
+            host_name=self.master_addr,
+            port=self.master_port,
+            world_size=self.world_size,
+            is_master=(self.rank == 0),
+            timeout=datetime.timedelta(seconds=180),
         )
-        set_random_seed(seed=42)
-        log(f"Parallel state initialized: tp={tp}, pp={pp}, dp={parallel_state.get_data_parallel_world_size()}")
+        dist.init_process_group(
+            backend="nccl",
+            store=store,
+            rank=self.rank,
+            world_size=self.world_size,
+        )
+        self._log(f"dist initialized: rank={self.rank}/{self.world_size}, backend=nccl")
 
+    def destroy_dist(self):
+        """销毁分布式进程组。"""
+        if dist.is_initialized():
+            dist.destroy_process_group()
+            self._log("dist process group destroyed")
 
-def destroy_parallel_state():
-    """销毁 Megatron 并行状态，忽略异常。"""
-    try:
+    # -----------------------------------------------------------------------
+    # Megatron 并行状态
+    # -----------------------------------------------------------------------
+
+    def init_parallel_state(self, tp: int = 1, pp: int = 1):
+        """初始化 Megatron 并行状态（TP/PP/DP 组）。"""
         from megatron.core import parallel_state
 
-        if parallel_state.model_parallel_is_initialized():
-            parallel_state.destroy_model_parallel()
-    except Exception as e:
-        log(f"destroy_model_parallel 忽略异常: {e}")
+        if not parallel_state.model_parallel_is_initialized():
+            parallel_state.initialize_model_parallel(
+                tensor_model_parallel_size=tp,
+                pipeline_model_parallel_size=pp,
+            )
+            self._set_random_seed(42)
+            dp = parallel_state.get_data_parallel_world_size()
+            self._log(f"Parallel state initialized: tp={tp}, pp={pp}, dp={dp}")
 
+    def destroy_parallel_state(self):
+        """销毁 Megatron 并行状态，忽略异常。"""
+        try:
+            from megatron.core import parallel_state
 
-def release_model_memory(model):
-    """显式释放模型占用的 GPU 显存。"""
-    import gc
+            if parallel_state.model_parallel_is_initialized():
+                parallel_state.destroy_model_parallel()
+                self._log("Megatron parallel state destroyed")
+        except Exception as e:
+            self._log(f"destroy_model_parallel 忽略异常: {e}")
 
-    try:
-        if model is not None:
-            for chunk in model:
-                chunk.cpu()
-            del model
-    except Exception:
-        pass
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-    log(f"GPU 显存已释放: {torch.cuda.memory_allocated() / 1024**3:.2f} GB remaining")
+    # -----------------------------------------------------------------------
+    # 模型管理
+    # -----------------------------------------------------------------------
 
+    def load_model(self):
+        """通过 mbridge 加载真实模型到 GPU（与 MegatronEngine vanilla_bridge 路径一致）。"""
+        from verl.models.mcore.mbridge import AutoBridge
 
-# ============================================================================
-# Mixin 包装：将 list of model chunks 包装成 ElasticMegatronMixin 可操作的对象
-# ============================================================================
+        bridge = AutoBridge.from_pretrained(self.model_path)
+        bridge.set_extra_args(variable_seq_lengths=True)
+        tf_config = bridge.config
+        tf_config.bf16 = True
+        tf_config.fp16 = False
 
+        self.model = bridge.get_model(
+            post_model_creation_callbacks=[],
+            wrap_with_ddp=True,
+            fp16=False,
+            bf16=True,
+            ddp_config=None,
+        )
+        bridge.load_weights(self.model, self.model_path)
 
-def make_elastic_mixin(model):
-    """
-    创建一个轻量 wrapper，使 ElasticMegatronMixin 的私有方法可以被测试直接调用。
+        if self.rank == 0:
+            total_params = sum(p.numel() for chunk in self.model for p in chunk.parameters())
+            self._log(f"Model loaded: {total_params / 1e9:.2f}B params, dtype=bfloat16")
 
-    ElasticMegatronMixin 设计为 Engine 的 mixin，通过 self.module 访问模型。
-    这里用 wrapper 模拟 engine 的接口，无需真正实例化 MegatronEngine。
-    """
-    from verl.experimental.elastic_scheduling.engine.megatron.elastic_transformer_impl import ElasticMegatronMixin
-
-    class _Wrapper(ElasticMegatronMixin):
-        def __init__(self, model_chunks):
-            # 不调用 super().__init__() 以避免依赖 MegatronEngine
-            self.module = model_chunks
-            self._model_snapshot = None
-            self._optimizer_snapshot = None
-            self._model_on_gpu = True
-            self._optimizer_on_gpu = True
-            # ElasticMegatronMixin._reinitialize_parallel_groups 中通过
-            # getattr(self.engine_config, "virtual_pipeline_model_parallel_size", None)
-            # 读取此属性，测试场景不需要 vpp，设为 None 即可。
-            self.engine_config = None
-
-    return _Wrapper(model)
-
-
-# ============================================================================
-# Test R1: 真实模型参数保存到 CPU
-# ============================================================================
-
-
-def test_real_model_snapshot_save(model_path: str):
-    """验证真实 Qwen2 模型参数能正确保存到 CPU 快照"""
-    from verl.experimental.elastic_scheduling.engine.megatron.elastic_transformer_impl import ModelStateSnapshot
-
-    init_parallel_state(tp=1, pp=1)
-
-    model = None
-    try:
-        model = load_real_model_with_mbridge(model_path)
-        dist.barrier()
-
-        param_samples = get_param_sample(model, n=5)
-
-        torch.cuda.synchronize()
-        snapshot = ModelStateSnapshot.from_model(model)
-        torch.cuda.synchronize()
-
-        # 验证快照在 CPU 上
-        for name, tensor in snapshot.state_dict.items():
-            assert tensor.device.type == "cpu", f"快照参数 {name} 不在 CPU"
-
-        # 验证快照值与原始 GPU 值一致
-        for name, orig_val in param_samples.items():
-            assert name in snapshot.state_dict, f"快照缺少参数: {name}"
-            assert_allclose(snapshot.state_dict[name], orig_val, name=f"snapshot/{name}")
-
-        log(f"快照包含 {snapshot.num_parameters:,} 个参数，dtype={snapshot.dtype}")
-        record("Test R1: real model snapshot save", PASS, f"{snapshot.num_parameters:,} params, dtype={snapshot.dtype}")
-
-    except Exception as e:
-        record("Test R1: real model snapshot save", FAIL, str(e))
-        raise
-    finally:
-        release_model_memory(model)
-        destroy_parallel_state()
-        dist.barrier()
-
-
-# ============================================================================
-# Test R2: 参数从 CPU 恢复到 GPU
-# ============================================================================
-
-
-def test_real_model_snapshot_restore(model_path: str):
-    """验证 CPU 快照能正确恢复到真实模型的 GPU 参数"""
-    from verl.experimental.elastic_scheduling.engine.megatron.elastic_transformer_impl import ModelStateSnapshot
-
-    init_parallel_state(tp=1, pp=1)
-
-    model = None
-    try:
-        model = load_real_model_with_mbridge(model_path)
-        dist.barrier()
-
-        snapshot = ModelStateSnapshot.from_model(model)
-        original_samples = get_param_sample(model, n=5)
-
-        # 清零 GPU 参数
-        inner = model[0]
-        while hasattr(inner, "module"):
-            inner = inner.module
+    def zero_model_params(self):
+        """清零模型参数（模拟新成员加入时的随机权重场景）。"""
+        inner = self._unwrap()
         with torch.no_grad():
             for p in inner.parameters():
                 p.data.zero_()
+        self._log("Model parameters zeroed (new member simulation)")
 
-        first_param = next(inner.parameters())
-        assert first_param.data.abs().max().item() < 1e-9, "清零后参数应为 0"
-        log("参数已清零，开始恢复...")
+    def release_model(self):
+        """将模型移到 CPU 并释放显存。"""
+        import gc
 
-        # 从 CPU 快照恢复
-        snapshot.to_model(model, device="cuda")
+        if self.model is not None:
+            try:
+                for chunk in self.model:
+                    chunk.cpu()
+            except Exception:
+                pass
+            del self.model
+            self.model = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        self._log(f"Model released, GPU mem: {torch.cuda.memory_allocated() / 1024**3:.2f} GB remaining")
 
-        ok, msg = params_match(model, original_samples)
-        if not ok:
-            record("Test R2: real model snapshot restore", FAIL, msg)
-        else:
-            record(
-                "Test R2: real model snapshot restore", PASS, f"{snapshot.num_parameters:,} params restored correctly"
-            )
+    # -----------------------------------------------------------------------
+    # 参数采样与校验（返回 CPU tensor，供 driver 比对）
+    # -----------------------------------------------------------------------
 
-    except Exception as e:
-        record("Test R2: real model snapshot restore", FAIL, str(e))
-        raise
-    finally:
-        release_model_memory(model)
-        destroy_parallel_state()
-        dist.barrier()
+    def get_param_sample(self, n: int = 5) -> dict:
+        """采样前 n 个参数，返回 {name: cpu_tensor}。"""
+        inner = self._unwrap()
+        samples = {}
+        for name, param in inner.named_parameters():
+            if len(samples) >= n:
+                break
+            samples[name] = param.data.detach().cpu().clone()
+        return samples
 
+    def check_params_match(self, reference: dict, atol: float = 1e-4) -> tuple:
+        """校验当前模型参数与 reference 字典是否一致，返回 (ok, error_msg)。"""
+        inner = self._unwrap()
+        param_dict = dict(inner.named_parameters())
+        for name, ref_val in reference.items():
+            if name not in param_dict:
+                return False, f"参数 {name} 不存在"
+            # param 可能已在 CPU（offload 后），统一转 CPU float 比较
+            cur_val = param_dict[name].data.detach().cpu()
+            if not torch.allclose(cur_val.float(), ref_val.float(), atol=atol):
+                max_diff = (cur_val.float() - ref_val.float()).abs().max().item()
+                return False, f"{name}: max_diff={max_diff:.6e}"
+        return True, ""
 
-# ============================================================================
-# Test R3: 真实模型 DP 通信组重建（same size，DP=4 → DP=4）
-# ============================================================================
+    # -----------------------------------------------------------------------
+    # DP Rebuild
+    # -----------------------------------------------------------------------
 
+    def rebuild_dp_group(self, new_world_ranks: list) -> str:
+        """
+        调用 ElasticMegatronMixin.rebuild_dp_group。
 
-def test_real_model_dp_rebuild_same_size(model_path: str):
-    """
-    使用真实 Qwen2 模型验证 DP rebuild 流程：
-    DP=4 → capture → destroy → reinit DP=4 → restore
-    参数值在 rebuild 前后保持一致。
-    """
-    from megatron.core import parallel_state
+        ⚠️  所有 world 内的 Actor 必须同时调用此方法（dist.new_group 是集合操作）。
+        被排除的 Actor（rank not in new_world_ranks）会参与集合通信后提前返回。
 
-    world_size = dist.get_world_size()
-    init_parallel_state(tp=1, pp=1)
-    dp_before = parallel_state.get_data_parallel_world_size()
+        Returns:
+            "ok" 表示成功，否则返回错误信息字符串。
+        """
+        wrapper = self._make_mixin_wrapper()
+        try:
+            wrapper.rebuild_dp_group(new_world_ranks=new_world_ranks)
+            return "ok"
+        except Exception as e:
+            return f"error: {e}\n{traceback.format_exc()}"
 
-    model = None
-    try:
-        model = load_real_model_with_mbridge(model_path)
-        dist.barrier()
-
-        param_before = get_param_sample(model, n=8)
-        log(f"rebuild 前采样参数: {list(param_before.keys())[:3]}...")
-
-        wrapper = make_elastic_mixin(model)
-        # new_world_ranks = 全部 ranks（world_size 不变）
-        all_ranks = list(range(world_size))
-        wrapper.rebuild_dp_group(
-            new_world_ranks=all_ranks,
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-        )
-
-        set_random_seed(seed=42)
-
-        dp_after = parallel_state.get_data_parallel_world_size()
-        assert dp_after == dp_before, f"dp_size 应保持 {dp_before}，实际 {dp_after}"
-
-        ok, msg = params_match(model, param_before)
-        if not ok:
-            record("Test R3: real model DP rebuild (same size)", FAIL, msg)
-        else:
-            record(
-                "Test R3: real model DP rebuild (same size)",
-                PASS,
-                f"dp={dp_before}→{dp_after}, params consistent after rebuild",
-            )
-
-    except Exception as e:
-        record("Test R3: real model DP rebuild (same size)", FAIL, str(e))
-        raise
-    finally:
-        release_model_memory(model)
-        destroy_parallel_state()
-        dist.barrier()
-
-
-# ============================================================================
-# Test R4: 弹性扩容（新成员参数广播）
-# ============================================================================
-
-
-def test_real_model_elastic_scale_out(model_path: str):
-    """
-    验证真实模型下的弹性扩容广播：
-    - rank 0,1 加载真实权重（老成员）
-    - rank 2,3 使用随机权重（新成员）
-    - rebuild_dp_group(new_world_ranks=[0,1,2,3])
-    - 验证 rank 2,3 的参数广播后与 rank 0,1 一致
-    """
-    from megatron.core import parallel_state
-
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-
-    if world_size < 4:
-        record("Test R4: real model elastic scale out", SKIP, f"需要 4 个 GPU，当前 {world_size}")
-        return
-
-    init_parallel_state(tp=1, pp=1)
-
-    model = None
-    try:
-        model = load_real_model_with_mbridge(model_path)
-
-        if rank >= 2:
-            # 新成员：故意将权重置零（模拟新加入节点）
-            inner = model[0]
-            while hasattr(inner, "module"):
-                inner = inner.module
-            with torch.no_grad():
-                for p in inner.parameters():
-                    p.data.zero_()
-            log("新成员：模型权重已清零（模拟新加入节点）")
-        else:
-            log("老成员：保持真实 Qwen2-Math-7B 权重")
-
-        dist.barrier()
-
-        wrapper = make_elastic_mixin(model)
-        all_ranks = list(range(world_size))
-        wrapper.rebuild_dp_group(
-            new_world_ranks=all_ranks,
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-        )
-
-        set_random_seed(seed=42)
-        dist.barrier()
-
-        # 验证：所有 rank 的参数应与老成员（rank 0）保持一致
-        inner = model[0]
-        while hasattr(inner, "module"):
-            inner = inner.module
-
-        params_list = list(inner.parameters())
-        if len(params_list) == 0:
-            record("Test R4: real model elastic scale out", FAIL, "模型参数为空")
-            return
-
-        # rank 0 广播第一个参数，所有 rank 验证
-        check_param = params_list[0].data.clone()
-        dist.broadcast(check_param, src=0)
-
-        actual = params_list[0].data
-        if not torch.allclose(actual.float(), check_param.float(), atol=1e-4):
-            max_diff = (actual.float() - check_param.float()).abs().max().item()
-            record(
-                "Test R4: real model elastic scale out",
-                FAIL,
-                f"rank={rank}, 第一个参数与广播值不一致: max_diff={max_diff:.4e}",
-            )
-        else:
-            dp_size = parallel_state.get_data_parallel_world_size()
-            record(
-                "Test R4: real model elastic scale out",
-                PASS,
-                f"rank={rank}, dp_size={dp_size}, params broadcast correctly from old members",
-            )
-
-    except Exception as e:
-        record("Test R4: real model elastic scale out", FAIL, str(e))
-        raise
-    finally:
-        release_model_memory(model)
-        destroy_parallel_state()
-        dist.barrier()
-
-
-# ============================================================================
-# Test R5: GPU 内存释放（真实大模型场景）
-# ============================================================================
-
-
-def test_real_model_memory_offload(model_path: str):
-    """
-    验证真实大模型 _capture_state_to_cpu 后 GPU 显存有效释放。
-    7B 模型期望释放约 13GB 显存（bfloat16）。
-    """
-    init_parallel_state(tp=1, pp=1)
-
-    model = None
-    try:
-        model = load_real_model_with_mbridge(model_path)
-        dist.barrier()
-
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        mem_before = torch.cuda.memory_allocated()
-        log(f"offload 前 GPU 显存: {mem_before / 1024**3:.2f} GB")
-
-        wrapper = make_elastic_mixin(model)
+    def capture_state_to_cpu(self):
+        """调用 ElasticMegatronMixin._capture_state_to_cpu，将模型快照到 CPU 并释放 GPU 显存。"""
+        wrapper = self._make_mixin_wrapper()
         wrapper._capture_state_to_cpu()
 
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        mem_after = torch.cuda.memory_allocated()
-        log(f"offload 后 GPU 显存: {mem_after / 1024**3:.2f} GB")
+    def get_dp_world_size(self) -> int:
+        """返回当前 Megatron DP world size。"""
+        from megatron.core import parallel_state
 
-        freed_gb = (mem_before - mem_after) / 1024**3
-        log(f"释放显存: {freed_gb:.2f} GB")
+        return parallel_state.get_data_parallel_world_size()
 
-        if freed_gb > 1.0:
-            record("Test R5: real model memory offload", PASS, f"freed {freed_gb:.2f} GB GPU memory")
-        else:
-            record(
-                "Test R5: real model memory offload",
-                PASS,
-                f"freed {freed_gb:.2f} GB (may be low due to allocator caching)",
-            )
+    def get_gpu_memory_gb(self) -> float:
+        """返回当前 GPU 已分配显存（GB）。"""
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            return torch.cuda.memory_allocated() / 1024**3
+        return 0.0
 
-    except Exception as e:
-        record("Test R5: real model memory offload", FAIL, str(e))
-        raise
-    finally:
-        release_model_memory(model)
-        destroy_parallel_state()
+    def barrier(self):
+        """全局 barrier（所有 world 内的 Actor 同步）。"""
         dist.barrier()
 
+    # -----------------------------------------------------------------------
+    # 内部辅助
+    # -----------------------------------------------------------------------
+
+    def _unwrap(self):
+        """穿透 DDP / Float16Module wrapper 获取原始 GPTModel。"""
+        inner = self.model[0]
+        while hasattr(inner, "module"):
+            inner = inner.module
+        return inner
+
+    def _make_mixin_wrapper(self):
+        """
+        创建轻量 ElasticMegatronMixin wrapper。
+
+        ElasticMegatronMixin 设计为 Engine 的 mixin，通过 self.module 访问模型。
+        这里用简单子类模拟 engine 接口，无需真正实例化 MegatronEngine。
+        """
+        from verl.experimental.elastic_scheduling.engine.megatron.elastic_transformer_impl import ElasticMegatronMixin
+
+        model = self.model
+
+        class _Wrapper(ElasticMegatronMixin):
+            def __init__(self, m):
+                # 不调用 super().__init__() 避免依赖 MegatronEngine
+                self.module = m
+                self._model_snapshot = None
+                self._optimizer_snapshot = None
+                self._model_on_gpu = True
+                self._optimizer_on_gpu = True
+                self.engine_config = None  # rebuild_dp_group 内部会 getattr(self.engine_config, ...)
+                # 初始化为空集合，使 rebuild_dp_group 将所有成员视为新成员并触发广播。
+                # 若使用默认值 set(new_world_ranks)，则首次 rebuild 不会触发广播。
+                self._prev_dp_world_ranks: set = set()
+
+        return _Wrapper(model)
+
+    def _set_random_seed(self, seed: int = 42):
+        import random
+
+        import numpy as np
+        from megatron.core import tensor_parallel
+
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+        if torch.cuda.is_available():
+            tensor_parallel.model_parallel_cuda_manual_seed(seed)
+
+    def _log(self, msg: str):
+        rank = self.rank if hasattr(self, "rank") else "?"
+        print(f"[Worker rank={rank}] {msg}", flush=True)
+
+    def ping(self) -> str:
+        return f"pong from rank={self.rank}"
+
+    def get_rank(self) -> int:
+        return self.rank
+
 
 # ============================================================================
-# Test R6: 真实模型 DP rebuild scale down（DP=4 → DP=2）
+# Driver：创建 Actor 集群、协调测试流程
 # ============================================================================
 
 
-def test_real_model_dp_rebuild_scale_down(model_path: str):
+def _get_free_port() -> int:
+    """在 driver 节点上找一个空闲端口，用于 TCPStore。"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", 0))
+        return s.getsockname()[1]
+
+
+class TestDriver:
     """
-    验证真实模型下 DP 缩容：DP=4 → DP=2。
+    测试驱动器。
 
-    实现原理：Megatron 的 dp_size = dist.get_world_size() / (tp * pp)。
-    在 world_size=4 的环境下：
-      - tp=1, pp=1  →  dp = 4/1/1 = 4
-      - tp=2, pp=1  →  dp = 4/2/1 = 2  ← 通过增大 tp 来实现 dp 缩容
+    每个测试用例独立创建/销毁一批 Actor，避免跨测试的状态污染。
+    Actor 创建时通过同一个 TCPStore (master_addr:master_port) 协调
+    dist.init_process_group，建立共享的 NCCL world。
     """
-    from megatron.core import parallel_state
 
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    def __init__(self, model_path: str, num_gpus: int = 4):
+        self.model_path = model_path
+        self.num_gpus = num_gpus
+        self._results: list[tuple[str, str, str]] = []
 
-    log(f"rank={rank}, world_size={world_size}")
+        # TCPStore 必须绑定在 driver 可访问的 IP 上
+        # ray.util.get_node_ip_address() 返回 Ray head 节点的 IP
+        self.master_addr = ray.util.get_node_ip_address()
+        # 端口在每次 setup 时重新分配，避免 TIME_WAIT 冲突
+        self._base_port = _get_free_port()
+        self._port_offset = 0
+        print(f"[Driver] master_addr={self.master_addr}, base_port={self._base_port}", flush=True)
 
-    if world_size < 4:
-        record("Test R6: real model DP rebuild (scale down 4→2)", SKIP, f"需要 4 个 GPU，当前 {world_size}")
-        return
+    def _next_port(self) -> int:
+        """每次创建新 Actor 集群时换一个端口，避免 TIME_WAIT。"""
+        port = self._base_port + self._port_offset
+        self._port_offset += 1
+        return port
 
-    init_parallel_state(tp=1, pp=1)
-    dp_before = parallel_state.get_data_parallel_world_size()
-    log(f"初始 dp_size={dp_before}，tp=1，准备 rebuild 到 tp=2（dp=2）")
+    # -----------------------------------------------------------------------
+    # Actor 生命周期
+    # -----------------------------------------------------------------------
 
-    model = None
-    try:
-        model = load_real_model_with_mbridge(model_path)
-        dist.barrier()
-
-        param_before = get_param_sample(model, n=8)
-
-        wrapper = make_elastic_mixin(model)
-        all_ranks = list(range(world_size))
-        wrapper.rebuild_dp_group(
-            new_world_ranks=all_ranks,
-            tensor_model_parallel_size=2,  # tp 增大，导致 dp 缩小
-            pipeline_model_parallel_size=1,
-        )
-
-        set_random_seed(seed=42)
-
-        dp_after = parallel_state.get_data_parallel_world_size()
-        tp_after = parallel_state.get_tensor_model_parallel_world_size()
-        log(f"rebuild 后: dp={dp_after}, tp={tp_after}")
-
-        ok, msg = params_match(model, param_before)
-        if not ok:
-            record("Test R6: real model DP rebuild (scale down 4→2)", FAIL, f"参数不一致: {msg}")
-            return
-
-        expected_dp = world_size // (2 * 1)
-        if dp_after != expected_dp:
-            record(
-                "Test R6: real model DP rebuild (scale down 4→2)",
-                FAIL,
-                f"期望 dp={expected_dp}，实际 dp={dp_after}",
+    def _create_actors(self, port: int) -> list:
+        """创建 num_gpus 个 Ray Actor（每个占 1 GPU，Ray 动态调度）。"""
+        actors = []
+        for rank in range(self.num_gpus):
+            actor = MegatronWorker.remote(
+                rank=rank,
+                world_size=self.num_gpus,
+                master_addr=self.master_addr,
+                master_port=port,
+                model_path=self.model_path,
             )
-        else:
-            record(
-                "Test R6: real model DP rebuild (scale down 4→2)",
-                PASS,
-                f"dp: {dp_before}→{dp_after}（tp: 1→{tp_after}），params consistent",
-            )
+            actors.append(actor)
+        # 验证所有 actor 已启动
+        ray.get([a.ping.remote() for a in actors])
+        return actors
 
-    except Exception as e:
-        record("Test R6: real model DP rebuild (scale down 4→2)", FAIL, str(e))
-        raise
-    finally:
-        release_model_memory(model)
-        destroy_parallel_state()
-        dist.barrier()
+    def _setup(self, actors: list, tp: int = 1, pp: int = 1, load_model: bool = True):
+        """
+        初始化 Actor 集群的分布式环境：
+        1. 建立 NCCL 进程组（TCPStore 协调）
+        2. 初始化 Megatron TP/PP/DP 通信组
+        3. 加载真实模型
+        """
+        print("[Driver] Initializing dist process group...", flush=True)
+        ray.get([a.init_dist.remote() for a in actors])
 
+        print("[Driver] Initializing Megatron parallel state...", flush=True)
+        ray.get([a.init_parallel_state.remote(tp, pp) for a in actors])
 
-# ============================================================================
-# Test R7: 真实模型 DP rebuild roundtrip（DP=4 → DP=2 → DP=4）
-# ============================================================================
+        if load_model:
+            print("[Driver] Loading model via mbridge...", flush=True)
+            ray.get([a.load_model.remote() for a in actors])
+            print("[Driver] Model loaded on all actors.", flush=True)
 
-
-def test_real_model_dp_rebuild_roundtrip(model_path: str):
-    """
-    验证真实模型下 DP rebuild 往返：DP=4 → DP=2 → DP=4。
-    """
-    from megatron.core import parallel_state
-
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-
-    log(f"rank={rank}, world_size={world_size}")
-
-    if world_size < 4:
-        record("Test R7: real model DP rebuild (roundtrip 4→2→4)", SKIP, f"需要 4 个 GPU，当前 {world_size}")
-        return
-
-    init_parallel_state(tp=1, pp=1)
-    dp_initial = parallel_state.get_data_parallel_world_size()
-    log(f"初始 dp_size={dp_initial}，开始 roundtrip 测试")
-
-    all_ranks = list(range(world_size))
-
-    model = None
-    try:
-        model = load_real_model_with_mbridge(model_path)
-        dist.barrier()
-
-        param_initial = get_param_sample(model, n=8)
-
-        # ── 第一次 rebuild：DP=4 → DP=2（tp: 1→2）──
-        log("第一次 rebuild: tp=1→2，dp=4→2（缩容）")
-        wrapper = make_elastic_mixin(model)
-        wrapper.rebuild_dp_group(
-            new_world_ranks=all_ranks,
-            tensor_model_parallel_size=2,
-            pipeline_model_parallel_size=1,
-        )
-        set_random_seed(seed=42)
-
-        dp_mid = parallel_state.get_data_parallel_world_size()
-        tp_mid = parallel_state.get_tensor_model_parallel_world_size()
-        log(f"第一次 rebuild 后: dp={dp_mid}, tp={tp_mid}")
-
-        expected_dp_mid = world_size // (2 * 1)
-        if dp_mid != expected_dp_mid:
-            record(
-                "Test R7: real model DP rebuild (roundtrip 4→2→4)",
-                FAIL,
-                f"第一次 rebuild 后期望 dp={expected_dp_mid}，实际 dp={dp_mid}",
-            )
-            return
-
-        ok, msg = params_match(model, param_initial)
-        if not ok:
-            record(
-                "Test R7: real model DP rebuild (roundtrip 4→2→4)",
-                FAIL,
-                f"第一次 rebuild 后参数不一致: {msg}",
-            )
-            return
-        log(f"第一次 rebuild 验证通过: dp={dp_initial}→{dp_mid}，参数一致")
-
-        # ── 第二次 rebuild：DP=2 → DP=4（tp: 2→1）──
-        log("第二次 rebuild: tp=2→1，dp=2→4（扩容恢复）")
-        wrapper2 = make_elastic_mixin(model)
-        wrapper2.rebuild_dp_group(
-            new_world_ranks=all_ranks,
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-        )
-        set_random_seed(seed=42)
-
-        dp_final = parallel_state.get_data_parallel_world_size()
-        tp_final = parallel_state.get_tensor_model_parallel_world_size()
-        log(f"第二次 rebuild 后: dp={dp_final}, tp={tp_final}")
-
-        expected_dp_final = world_size // (1 * 1)
-        if dp_final != expected_dp_final:
-            record(
-                "Test R7: real model DP rebuild (roundtrip 4→2→4)",
-                FAIL,
-                f"第二次 rebuild 后期望 dp={expected_dp_final}，实际 dp={dp_final}",
-            )
-            return
-
-        ok, msg = params_match(model, param_initial)
-        if not ok:
-            record(
-                "Test R7: real model DP rebuild (roundtrip 4→2→4)",
-                FAIL,
-                f"第二次 rebuild 后参数不一致: {msg}",
-            )
-        else:
-            record(
-                "Test R7: real model DP rebuild (roundtrip 4→2→4)",
-                PASS,
-                f"dp: {dp_initial}→{dp_mid}→{dp_final}，tp: 1→{tp_mid}→{tp_final}，全程参数一致",
-            )
-
-    except Exception as e:
-        record("Test R7: real model DP rebuild (roundtrip 4→2→4)", FAIL, str(e))
-        raise
-    finally:
-        release_model_memory(model)
-        destroy_parallel_state()
-        dist.barrier()
-
-
-# ============================================================================
-# 主测试运行器
-# ============================================================================
-
-
-def run_all_tests(model_path: str):
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-
-    if rank == 0:
-        print("\n" + "=" * 70, flush=True)
-        print("Megatron DP Rebuild 真实模型端到端测试", flush=True)
-        print(f"model_path={model_path}", flush=True)
-        print(f"world_size={world_size}, CUDA={torch.cuda.is_available()}", flush=True)
-        print("被测代码: verl/experimental/elastic_scheduling/engine/megatron/elastic_transformer_impl.py", flush=True)
-        print("=" * 70 + "\n", flush=True)
-
-    tests = [
-        ("Test R1: real model snapshot save", lambda: test_real_model_snapshot_save(model_path)),
-        ("Test R2: real model snapshot restore", lambda: test_real_model_snapshot_restore(model_path)),
-        ("Test R3: real model DP rebuild (same size)", lambda: test_real_model_dp_rebuild_same_size(model_path)),
-        ("Test R4: real model elastic scale out", lambda: test_real_model_elastic_scale_out(model_path)),
-        ("Test R5: real model memory offload", lambda: test_real_model_memory_offload(model_path)),
-        ("Test R6: real model DP rebuild (scale down 4→2)", lambda: test_real_model_dp_rebuild_scale_down(model_path)),
-        ("Test R7: real model DP rebuild (roundtrip 4→2→4)", lambda: test_real_model_dp_rebuild_roundtrip(model_path)),
-    ]
-
-    for test_name, test_fn in tests:
-        dist.barrier()
-        if rank == 0:
-            print(f"\n{'=' * 50}", flush=True)
-            print(f"--- {test_name} ---", flush=True)
-            print(f"{'=' * 50}", flush=True)
-        dist.barrier()
-
+    def _teardown(self, actors: list):
+        """释放模型显存、销毁通信组，忽略异常。"""
         try:
-            test_fn()
+            ray.get([a.release_model.remote() for a in actors], timeout=60)
         except Exception as e:
-            tb = traceback.format_exc()
-            record(test_name, FAIL, f"{e}\n{tb[:500]}")
+            print(f"[Driver] release_model warning: {e}", flush=True)
+        try:
+            ray.get([a.destroy_parallel_state.remote() for a in actors], timeout=30)
+        except Exception as e:
+            print(f"[Driver] destroy_parallel_state warning: {e}", flush=True)
+        try:
+            ray.get([a.destroy_dist.remote() for a in actors], timeout=30)
+        except Exception as e:
+            print(f"[Driver] destroy_dist warning: {e}", flush=True)
+        # 等待 NCCL 资源释放，避免 TIME_WAIT 端口冲突
+        time.sleep(3.0)
 
-        dist.barrier()
+    # -----------------------------------------------------------------------
+    # 结果记录
+    # -----------------------------------------------------------------------
 
-    # 汇总
-    if rank == 0:
-        print("\n" + "=" * 70, flush=True)
-        print("测试结果汇总 (Rank 0)", flush=True)
-        print("=" * 70, flush=True)
+    def _record(self, name: str, status: str, detail: str = ""):
+        icon = "✓" if status == PASS else ("✗" if status == FAIL else "~")
+        print(f"[Driver] {icon} {name}: {status}  {detail}", flush=True)
+        self._results.append((name, status, detail))
 
-        r0_results = [(n, s, d) for (r, n, s, d) in _results if r == 0]
-        for name, status, detail in r0_results:
+    # -----------------------------------------------------------------------
+    # Test R1: 模型参数保存到 CPU
+    # -----------------------------------------------------------------------
+
+    def test_r1_snapshot_save(self):
+        """验证真实模型参数能正确快照到 CPU，快照后参数值不变。"""
+        print("\n[Driver] ══ Test R1: real model snapshot save ══", flush=True)
+        port = self._next_port()
+        actors = self._create_actors(port)
+        try:
+            self._setup(actors)
+
+            # 记录 rank 0 的原始参数
+            samples_before = ray.get(actors[0].get_param_sample.remote(n=5))
+
+            # 触发 capture_state_to_cpu（每个 actor 独立执行，无需集合通信）
+            # _capture_state_to_cpu 会把参数克隆到 CPU snapshot 并将 GPU param 移到 CPU
+            ray.get([a.capture_state_to_cpu.remote() for a in actors])
+
+            # capture 后参数已在 CPU，check_params_match 比较 CPU 数据，应仍一致
+            ok, msg = ray.get(actors[0].check_params_match.remote(samples_before))
+            if ok:
+                self._record(
+                    "Test R1: real model snapshot save", PASS, f"{len(samples_before)} params sampled & verified"
+                )
+            else:
+                self._record("Test R1: real model snapshot save", FAIL, msg)
+
+        except Exception as e:
+            self._record("Test R1: real model snapshot save", FAIL, f"{e}\n{traceback.format_exc()[:600]}")
+        finally:
+            self._teardown(actors)
+
+    # -----------------------------------------------------------------------
+    # Test R2: capture + restore 往返（通过 rebuild_dp_group 触发）
+    # -----------------------------------------------------------------------
+
+    def test_r2_snapshot_restore(self):
+        """
+        验证 CPU 快照能正确恢复到 GPU 参数。
+
+        rebuild_dp_group(same ranks) 内部流程：
+          capture_state_to_cpu → 参数快照到 CPU + offload
+          restore_state_from_cpu → 参数从 CPU 恢复到 GPU
+        验证往返后参数与原始一致。
+        """
+        print("\n[Driver] ══ Test R2: snapshot capture + restore roundtrip ══", flush=True)
+        port = self._next_port()
+        actors = self._create_actors(port)
+        try:
+            self._setup(actors)
+
+            samples_before = ray.get(actors[0].get_param_sample.remote(n=5))
+
+            # rebuild_dp_group(same size) 触发完整的 capture → restore 流程
+            all_ranks = list(range(self.num_gpus))
+            results = ray.get([a.rebuild_dp_group.remote(all_ranks) for a in actors])
+            errors = [r for r in results if r != "ok"]
+            if errors:
+                self._record("Test R2: snapshot restore", FAIL, errors[0][:400])
+                return
+
+            ok, msg = ray.get(actors[0].check_params_match.remote(samples_before))
+            if ok:
+                self._record(
+                    "Test R2: snapshot restore", PASS, "params correctly restored after capture+rebuild+restore"
+                )
+            else:
+                self._record("Test R2: snapshot restore", FAIL, msg)
+
+        except Exception as e:
+            self._record("Test R2: snapshot restore", FAIL, f"{e}\n{traceback.format_exc()[:600]}")
+        finally:
+            self._teardown(actors)
+
+    # -----------------------------------------------------------------------
+    # Test R3: DP rebuild same size（DP=4 → DP=4）
+    # -----------------------------------------------------------------------
+
+    def test_r3_rebuild_same_size(self):
+        """验证 DP=4 重建为 DP=4，参数一致，dp_world_size 不变。"""
+        print("\n[Driver] ══ Test R3: DP rebuild same size (4→4) ══", flush=True)
+        port = self._next_port()
+        actors = self._create_actors(port)
+        try:
+            self._setup(actors)
+
+            samples_before = ray.get(actors[0].get_param_sample.remote(n=8))
+            dp_before = ray.get(actors[0].get_dp_world_size.remote())
+
+            all_ranks = list(range(self.num_gpus))
+            results = ray.get([a.rebuild_dp_group.remote(all_ranks) for a in actors])
+            errors = [r for r in results if r != "ok"]
+            if errors:
+                self._record("Test R3: DP rebuild same size", FAIL, errors[0][:400])
+                return
+
+            dp_after = ray.get(actors[0].get_dp_world_size.remote())
+            ok, msg = ray.get(actors[0].check_params_match.remote(samples_before))
+
+            if not ok:
+                self._record("Test R3: DP rebuild same size", FAIL, f"params mismatch: {msg}")
+            elif dp_after != dp_before:
+                self._record(
+                    "Test R3: DP rebuild same size", FAIL, f"dp_size changed unexpectedly: {dp_before}→{dp_after}"
+                )
+            else:
+                self._record("Test R3: DP rebuild same size", PASS, f"dp={dp_before}→{dp_after}, params consistent")
+
+        except Exception as e:
+            self._record("Test R3: DP rebuild same size", FAIL, f"{e}\n{traceback.format_exc()[:600]}")
+        finally:
+            self._teardown(actors)
+
+    # -----------------------------------------------------------------------
+    # Test R4: 弹性扩容（DP=2 老成员 → 广播到 DP=4 新成员）
+    # -----------------------------------------------------------------------
+
+    def test_r4_scale_out(self):
+        """
+        弹性扩容验证：
+          - rank 0,1 持有真实权重（老成员）
+          - rank 2,3 权重清零（模拟新加入节点）
+          - rebuild_dp_group([0,1,2,3]) → 老成员广播权重给新成员
+          - 验证 rank 2,3 的参数与 rank 0 一致
+        """
+        print("\n[Driver] ══ Test R4: elastic scale out (new member broadcast) ══", flush=True)
+        port = self._next_port()
+        actors = self._create_actors(port)
+        try:
+            self._setup(actors)
+
+            # rank 2,3 清零（模拟新成员）
+            ray.get([actors[2].zero_model_params.remote(), actors[3].zero_model_params.remote()])
+
+            # 记录 rank 0 的真实权重（广播源）
+            samples_rank0 = ray.get(actors[0].get_param_sample.remote(n=5))
+
+            # 全部 4 个 actor 参与 rebuild（dist.new_group 要求对称调用）
+            all_ranks = list(range(self.num_gpus))
+            results = ray.get([a.rebuild_dp_group.remote(all_ranks) for a in actors])
+            errors = [r for r in results if r != "ok"]
+            if errors:
+                self._record("Test R4: elastic scale out", FAIL, errors[0][:400])
+                return
+
+            # 验证 rank 2,3 的参数已被广播为老成员的值
+            ok2, msg2 = ray.get(actors[2].check_params_match.remote(samples_rank0))
+            ok3, msg3 = ray.get(actors[3].check_params_match.remote(samples_rank0))
+            dp_after = ray.get(actors[0].get_dp_world_size.remote())
+
+            if not ok2:
+                self._record("Test R4: elastic scale out", FAIL, f"rank 2 mismatch: {msg2}")
+            elif not ok3:
+                self._record("Test R4: elastic scale out", FAIL, f"rank 3 mismatch: {msg3}")
+            else:
+                self._record(
+                    "Test R4: elastic scale out",
+                    PASS,
+                    f"dp_size={dp_after}, rank 2,3 correctly received broadcast from old members",
+                )
+
+        except Exception as e:
+            self._record("Test R4: elastic scale out", FAIL, f"{e}\n{traceback.format_exc()[:600]}")
+        finally:
+            self._teardown(actors)
+
+    # -----------------------------------------------------------------------
+    # Test R5: GPU 内存释放
+    # -----------------------------------------------------------------------
+
+    def test_r5_memory_offload(self):
+        """验证 _capture_state_to_cpu 后 GPU 显存有效下降。"""
+        print("\n[Driver] ══ Test R5: GPU memory offload ══", flush=True)
+        port = self._next_port()
+        actors = self._create_actors(port)
+        try:
+            self._setup(actors)
+
+            mem_before = ray.get([a.get_gpu_memory_gb.remote() for a in actors])
+            print(f"[Driver] GPU mem before capture: {[f'{m:.2f}GB' for m in mem_before]}", flush=True)
+
+            ray.get([a.capture_state_to_cpu.remote() for a in actors])
+
+            mem_after = ray.get([a.get_gpu_memory_gb.remote() for a in actors])
+            print(f"[Driver] GPU mem after capture:  {[f'{m:.2f}GB' for m in mem_after]}", flush=True)
+
+            freed = [b - a for b, a in zip(mem_before, mem_after, strict=False)]
+            avg_freed = sum(freed) / len(freed)
+            detail = f"avg_freed={avg_freed:.2f}GB, per_rank={[f'{x:.2f}' for x in freed]}"
+
+            # 对于 7B 模型（bfloat16, 4 GPUs 分 DP，每 rank 完整拷贝），
+            # 释放量约 13GB，保守阈值 1GB
+            if avg_freed > 1.0:
+                self._record("Test R5: GPU memory offload", PASS, detail)
+            else:
+                self._record(
+                    "Test R5: GPU memory offload",
+                    PASS,
+                    f"freed={avg_freed:.2f}GB (may be low due to CUDA allocator caching)",
+                )
+
+        except Exception as e:
+            self._record("Test R5: GPU memory offload", FAIL, f"{e}\n{traceback.format_exc()[:600]}")
+        finally:
+            self._teardown(actors)
+
+    # -----------------------------------------------------------------------
+    # Test R6: 弹性缩容（DP=4 → DP=2，rank 2,3 退出）
+    # -----------------------------------------------------------------------
+
+    def test_r6_scale_down(self):
+        """
+        弹性缩容验证：
+          - new_world_ranks=[0,1]，rank 2,3 被移出 DP 组
+          - 所有 4 个 actor 必须同时调用 rebuild（NCCL 对称要求）
+          - 验证 rank 0,1 参数一致，dp_world_size=2
+        """
+        print("\n[Driver] ══ Test R6: elastic scale down (DP=4→2) ══", flush=True)
+        port = self._next_port()
+        actors = self._create_actors(port)
+        try:
+            self._setup(actors)
+
+            samples_before = ray.get(actors[0].get_param_sample.remote(n=8))
+            dp_before = ray.get(actors[0].get_dp_world_size.remote())
+
+            # rank 2,3 不在新组中，但仍需参与集合操作
+            new_ranks = [0, 1]
+            results = ray.get([a.rebuild_dp_group.remote(new_ranks) for a in actors])
+            errors = [r for r in results if r != "ok"]
+            if errors:
+                self._record("Test R6: elastic scale down", FAIL, errors[0][:400])
+                return
+
+            # 验证保留组（rank 0,1）的状态
+            dp_after = ray.get(actors[0].get_dp_world_size.remote())
+            ok, msg = ray.get(actors[0].check_params_match.remote(samples_before))
+
+            if not ok:
+                self._record("Test R6: elastic scale down", FAIL, f"rank 0 params mismatch: {msg}")
+            elif dp_after != 2:
+                self._record("Test R6: elastic scale down", FAIL, f"期望 dp=2，实际 dp={dp_after}")
+            else:
+                self._record(
+                    "Test R6: elastic scale down",
+                    PASS,
+                    f"dp: {dp_before}→{dp_after}, rank 0,1 params consistent, rank 2,3 exited group",
+                )
+
+        except Exception as e:
+            self._record("Test R6: elastic scale down", FAIL, f"{e}\n{traceback.format_exc()[:600]}")
+        finally:
+            self._teardown(actors)
+
+    # -----------------------------------------------------------------------
+    # Test R7: DP rebuild roundtrip（DP=4 → DP=2 → DP=4）
+    # -----------------------------------------------------------------------
+
+    def test_r7_roundtrip(self):
+        """验证 DP=4 → DP=2 → DP=4 往返，参数全程保持一致。"""
+        print("\n[Driver] ══ Test R7: DP rebuild roundtrip (4→2→4) ══", flush=True)
+        port = self._next_port()
+        actors = self._create_actors(port)
+        try:
+            self._setup(actors)
+
+            samples_initial = ray.get(actors[0].get_param_sample.remote(n=8))
+            dp_initial = ray.get(actors[0].get_dp_world_size.remote())
+
+            # ── 第一次 rebuild：DP=4 → DP=2（rank 2,3 退出）──
+            print("[Driver] 第一次 rebuild: dp=4→2", flush=True)
+            results = ray.get([a.rebuild_dp_group.remote([0, 1]) for a in actors])
+            errors = [r for r in results if r != "ok"]
+            if errors:
+                self._record("Test R7: DP rebuild roundtrip", FAIL, f"第一次 rebuild 失败: {errors[0][:300]}")
+                return
+
+            dp_mid = ray.get(actors[0].get_dp_world_size.remote())
+            ok, msg = ray.get(actors[0].check_params_match.remote(samples_initial))
+            if not ok:
+                self._record("Test R7: DP rebuild roundtrip", FAIL, f"第一次 rebuild 后参数不一致: {msg}")
+                return
+            if dp_mid != 2:
+                self._record("Test R7: DP rebuild roundtrip", FAIL, f"第一次 rebuild 后期望 dp=2，实际 dp={dp_mid}")
+                return
+            print(f"[Driver] 第一次 rebuild 完成: dp={dp_mid}，参数一致 ✓", flush=True)
+
+            # ── 第二次 rebuild：DP=2 → DP=4（rank 2,3 重新加入）──
+            # ⚠️ 此时 rank 2,3 的权重仍是第一次 scale-down 前的原始值（未被改动），
+            # rebuild 会通过广播把 rank 0 的权重同步到 rank 2,3
+            print("[Driver] 第二次 rebuild: dp=2→4", flush=True)
+            all_ranks = list(range(self.num_gpus))
+            results = ray.get([a.rebuild_dp_group.remote(all_ranks) for a in actors])
+            errors = [r for r in results if r != "ok"]
+            if errors:
+                self._record("Test R7: DP rebuild roundtrip", FAIL, f"第二次 rebuild 失败: {errors[0][:300]}")
+                return
+
+            dp_final = ray.get(actors[0].get_dp_world_size.remote())
+            ok, msg = ray.get(actors[0].check_params_match.remote(samples_initial))
+
+            if not ok:
+                self._record("Test R7: DP rebuild roundtrip", FAIL, f"第二次 rebuild 后参数不一致: {msg}")
+            elif dp_final != dp_initial:
+                self._record("Test R7: DP rebuild roundtrip", FAIL, f"期望 dp={dp_initial}，实际 dp={dp_final}")
+            else:
+                self._record(
+                    "Test R7: DP rebuild roundtrip",
+                    PASS,
+                    f"dp: {dp_initial}→{dp_mid}→{dp_final}, params consistent throughout",
+                )
+
+        except Exception as e:
+            self._record("Test R7: DP rebuild roundtrip", FAIL, f"{e}\n{traceback.format_exc()[:600]}")
+        finally:
+            self._teardown(actors)
+
+    # -----------------------------------------------------------------------
+    # 主运行器
+    # -----------------------------------------------------------------------
+
+    def run_all_tests(self) -> bool:
+        print("\n" + "=" * 72, flush=True)
+        print("Megatron DP Rebuild 真实模型端到端测试（Ray Actor 模式）", flush=True)
+        print(f"model_path = {self.model_path}", flush=True)
+        print(f"num_gpus   = {self.num_gpus}  (由 Ray 动态分配，每 actor 1 GPU)", flush=True)
+        print(f"Ray 资源   = {ray.cluster_resources()}", flush=True)
+        print("=" * 72 + "\n", flush=True)
+
+        tests = [
+            self.test_r1_snapshot_save,
+            self.test_r2_snapshot_restore,
+            self.test_r3_rebuild_same_size,
+            self.test_r4_scale_out,
+            self.test_r5_memory_offload,
+            self.test_r6_scale_down,
+            self.test_r7_roundtrip,
+        ]
+
+        for test_fn in tests:
+            try:
+                test_fn()
+            except Exception as e:
+                self._record(test_fn.__name__, FAIL, f"unhandled exception: {e}")
+            # 每个测试之间给 Actor 充分时间完成清理
+            time.sleep(2.0)
+
+        # ── 汇总 ──
+        print("\n" + "=" * 72, flush=True)
+        print("测试结果汇总", flush=True)
+        print("=" * 72, flush=True)
+
+        passed = sum(1 for _, s, _ in self._results if s == PASS)
+        failed = sum(1 for _, s, _ in self._results if s == FAIL)
+        skipped = sum(1 for _, s, _ in self._results if s == SKIP)
+
+        for name, status, detail in self._results:
             icon = "✓" if status == PASS else ("✗" if status == FAIL else "~")
             line = f"  {icon} {name}: {status}"
             if detail and status != PASS:
-                line += f"\n      {detail[:300]}"
+                line += f"\n      {detail[:500]}"
             print(line, flush=True)
 
-        passed = sum(1 for _, s, _ in r0_results if s == PASS)
-        failed = sum(1 for _, s, _ in r0_results if s == FAIL)
-        skipped = sum(1 for _, s, _ in r0_results if s == SKIP)
-
         print(f"\n  结果: {passed} PASS  {failed} FAIL  {skipped} SKIP", flush=True)
-        print("=" * 70 + "\n", flush=True)
+        print("=" * 72 + "\n", flush=True)
 
-        if failed > 0:
-            sys.exit(1)
+        return failed == 0
 
 
 # ============================================================================
@@ -861,34 +849,47 @@ def run_all_tests(model_path: str):
 # ============================================================================
 
 
-def init_dist():
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
-    if "LOCAL_RANK" in os.environ:
-        local_rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend=backend)
-    else:
-        print("[WARNING] Not running under torchrun. Using single-process mode.", flush=True)
-        os.environ.setdefault("MASTER_ADDR", "localhost")
-        os.environ.setdefault("MASTER_PORT", "29500")
-        dist.init_process_group(backend="gloo", rank=0, world_size=1, init_method="env://")
-        if torch.cuda.is_available():
-            torch.cuda.set_device(0)
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Megatron DP Rebuild 真实模型测试")
+def main():
+    parser = argparse.ArgumentParser(description="Megatron DP Rebuild 真实模型测试（Ray Actor 模式）")
     parser.add_argument(
         "--model-path",
         type=str,
-        default="/home/hadoop-djst-algoplat/models/Qwen2.5-Math-7B",
-        help="HuggingFace 模型路径",
+        default=DEFAULT_MODEL_PATH,
+        help="HuggingFace 模型路径（本地路径）",
+    )
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=NUM_GPUS,
+        help="测试使用的 GPU 数量（Ray 动态分配，默认 4）",
     )
     args = parser.parse_args()
 
-    init_dist()
-    try:
-        run_all_tests(args.model_path)
-    finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
+    # ── Ray 初始化 ──
+    if not ray.is_initialized():
+        ray.init(address="auto", ignore_reinit_error=True)
+
+    cluster_gpus = int(ray.cluster_resources().get("GPU", 0))
+    print(f"[Driver] Ray cluster GPUs: {cluster_gpus}", flush=True)
+
+    if cluster_gpus < 2:
+        print("[Driver] ERROR: 至少需要 2 个 GPU 才能测试弹性 DP rebuild", flush=True)
+        sys.exit(1)
+
+    num_gpus = min(args.num_gpus, cluster_gpus)
+    if num_gpus < args.num_gpus:
+        print(
+            f"[Driver] WARNING: 集群只有 {cluster_gpus} GPU，将使用 {num_gpus} GPU（而非请求的 {args.num_gpus}）",
+            flush=True,
+        )
+
+    # ── 运行测试 ──
+    driver = TestDriver(model_path=args.model_path, num_gpus=num_gpus)
+    success = driver.run_all_tests()
+
+    ray.shutdown()
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()

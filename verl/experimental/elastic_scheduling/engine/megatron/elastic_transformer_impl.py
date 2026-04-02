@@ -33,7 +33,6 @@ from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
-from megatron.core import parallel_state as mpu
 
 from verl.utils.device import get_device_name
 
@@ -76,88 +75,90 @@ class ElasticMegatronMixin:
         expert_tensor_parallel_size: int = 1,
     ) -> None:
         """
-        Rebuild DP group for elastic training.
+        Replace the Megatron DP process group without touching TP/PP/CP groups.
 
-        Procedure:
-        1. Capture model and optimizer state to CPU
-        2. Offload everything to CPU
-        3. Destroy all parallel groups
-        4. Barrier with all ranks (including new ones)
-        5. Reinitialize parallel groups
-        6. Restore state from CPU
-        7. Sync parameters to newly joined ranks
+        Key insight: ``dist.get_world_size()`` always returns the full world size
+        (e.g. 6) even after ``destroy_model_parallel()``.  Calling
+        ``initialize_model_parallel`` afterwards therefore always builds a DP
+        group of size 6 — it cannot produce a 5-rank DP group from a 6-rank
+        world.  The old destroy+reinit approach was fundamentally broken.
+
+        Correct approach — only replace the DP communicator:
+        1. ``dist.new_group(new_world_ranks)`` — one collective, ALL current
+           ranks must call it simultaneously. Removed ranks participate and then
+           return early; retained ranks get the new group handle.
+        2. Patch the relevant ``mpu`` module-level globals so that
+           ``get_data_parallel_group/rank/world_size`` all reflect the new DP
+           membership.  TP/PP/CP groups are left completely untouched.
+        3. (Retained ranks only) restore model state to GPU, broadcast params
+           to any newly added ranks via the new group.
 
         Args:
-            new_world_ranks: List of global ranks in new DP group
-            tensor_model_parallel_size: TP size (usually unchanged)
-            pipeline_model_parallel_size: PP size (usually unchanged)
-            context_parallel_size: CP size
-            expert_model_parallel_size: EP size
-            expert_tensor_parallel_size: Expert TP size
+            new_world_ranks: Sorted list of global ranks in the new DP group.
+            tensor_model_parallel_size: Unused — kept for API compat.
+            pipeline_model_parallel_size: Unused — kept for API compat.
+            context_parallel_size: Unused — kept for API compat.
+            expert_model_parallel_size: Unused — kept for API compat.
+            expert_tensor_parallel_size: Unused — kept for API compat.
         """
         my_rank = dist.get_rank()
 
-        # Check if this rank is in new DP group
+        # Lazy-init mixin state when the class was injected via __class__
+        # assignment (no __init__ call was made).
+        if not hasattr(self, "_model_on_gpu"):
+            self._model_on_gpu = True
+            self._optimizer_on_gpu = True
+            self._model_snapshot = None
+            self._optimizer_snapshot = None
+
         is_in_new_group = my_rank in new_world_ranks
+        new_dp_size = len(new_world_ranks)
 
         logger.info(
             f"[ElasticMegatronMixin rank={my_rank}] rebuild_dp_group called\n"
             f"  new_world_ranks={new_world_ranks}\n"
-            f"  tp={tensor_model_parallel_size}, pp={pipeline_model_parallel_size}\n"
             f"  is_in_new_group={is_in_new_group}"
         )
 
         try:
-            # Step 1: Capture state to CPU
-            self._capture_state_to_cpu()
+            # Step 1: Only retained ranks need a CPU snapshot + restore cycle.
+            # Removed ranks will have their weights offloaded by switch_to_rollout()
+            # right after this call, so capturing state here would be redundant.
+            if is_in_new_group:
+                self._capture_state_to_cpu()
 
-            # Step 2: Destroy old parallel groups
-            self._destroy_parallel_groups()
+            # Step 2: Create the new DP process group.
+            # dist.new_group() is a collective — every rank in the current world
+            # must call it simultaneously, including ranks being removed.
+            new_dp_group = dist.new_group(ranks=new_world_ranks)
 
-            # Step 3: Collective — ALL ranks must participate in new_group and
-            # initialize_model_parallel (both call dist.new_group internally).
-            # We do this BEFORE the early-return so that ranks removed from the
-            # new group still execute the same number of collectives.
-            #
-            # 3a. Pre-create the sync group (used later for param broadcast).
-            #     Every rank participates regardless of is_in_new_group.
-            sync_group = dist.new_group(ranks=new_world_ranks)
+            # Step 3: Global barrier so all ranks have finished the collective
+            # before anyone proceeds.
+            dist.barrier()
 
-            # 3b. Reinitialize Megatron parallel groups (contains dist.new_group
-            #     calls; ranks not in new_world_ranks still need to participate).
-            self._reinitialize_parallel_groups(
-                tensor_model_parallel_size=tensor_model_parallel_size,
-                pipeline_model_parallel_size=pipeline_model_parallel_size,
-                context_parallel_size=context_parallel_size,
-                expert_model_parallel_size=expert_model_parallel_size,
-                expert_tensor_parallel_size=expert_tensor_parallel_size,
-            )
-
-            # Step 4: Global barrier — all ranks synchronize after collectives.
-            if dist.is_initialized():
-                dist.barrier()
-
-            # Step 5: If not in new group, nothing more to do for this rank.
+            # Step 4: Ranks NOT in the new group have fulfilled their collective
+            # obligations and can exit now.
             if not is_in_new_group:
                 logger.info(f"[ElasticMegatronMixin rank={my_rank}] Rank removed from DP group, returning")
                 return
 
-            # Step 6: Restore state from CPU to GPU
+            # Step 5: Patch mpu so all Megatron code sees the new DP group.
+            self._patch_mpu_dp_group(new_dp_group, new_world_ranks)
+
+            # Step 6: Restore model + optimizer back to GPU.
             self._restore_state_from_cpu()
 
-            # Step 7: Broadcast parameters from new_world_ranks[0] to all other
-            #         ranks in the new group (using pre-created sync_group).
-            self._sync_params_to_new_members(new_world_ranks, sync_group=sync_group)
+            # Step 7: Broadcast params to any newly joined ranks.
+            prev_ranks = getattr(self, "_prev_dp_world_ranks", set(new_world_ranks))
+            has_new_members = any(r not in prev_ranks for r in new_world_ranks)
+            if has_new_members:
+                self._sync_params_to_new_members(new_world_ranks, sync_group=new_dp_group)
+            self._prev_dp_world_ranks = set(new_world_ranks)
 
-            # Step 8: Final barrier among the new group members
-            if dist.is_initialized():
-                dist.barrier()
+            # Step 8: Final barrier within the new group.
+            dist.barrier(group=new_dp_group)
 
-            logger.info(
-                f"[ElasticMegatronMixin rank={my_rank}] "
-                f"DP group rebuild complete, new dp_size="
-                f"{len(new_world_ranks) // (tensor_model_parallel_size * pipeline_model_parallel_size)}"
-            )
+            logger.info(f"[ElasticMegatronMixin rank={my_rank}] DP group rebuild complete, new dp_size={new_dp_size}")
 
         except Exception as e:
             logger.exception(f"[ElasticMegatronMixin rank={my_rank}] Failed to rebuild DP group: {e}")
@@ -205,60 +206,78 @@ class ElasticMegatronMixin:
             logger.info(f"[ElasticMegatronMixin rank={my_rank}] Offloading optimizer to CPU...")
 
             if hasattr(self.optimizer, "offload_to_cpu"):
-                self.optimizer.offload_to_cpu()
+                try:
+                    self.optimizer.offload_to_cpu()
+                except NameError:
+                    # Megatron's offload_to_cpu has a bug: `logging` is not
+                    # imported in megatron/core/optimizer/optimizer.py, causing
+                    # NameError inside log_single_rank(). Fall back to manual
+                    # offload which achieves the same effect.
+                    self._manual_offload_optimizer()
             else:
-                # Manual offload for standard optimizers
-                if hasattr(self.optimizer, "state"):
-                    for state in self.optimizer.state.values():
-                        for k, v in state.items():
-                            if isinstance(v, torch.Tensor):
-                                state[k] = v.cpu()
+                self._manual_offload_optimizer()
 
             self._optimizer_on_gpu = False
 
         torch.cuda.empty_cache()
         gc.collect()
 
-    def _destroy_parallel_groups(self) -> None:
-        """Destroy all Megatron parallel groups."""
-        my_rank = dist.get_rank()
-        logger.info(f"[ElasticMegatronMixin rank={my_rank}] Destroying parallel groups...")
+    def _manual_offload_optimizer(self) -> None:
+        """Move optimizer state tensors to CPU manually.
 
-        try:
-            mpu.destroy_model_parallel()
-        except Exception as e:
-            logger.warning(f"[ElasticMegatronMixin rank={my_rank}] Error destroying parallel groups: {e}")
+        Used as a fallback when ``optimizer.offload_to_cpu()`` is unavailable
+        or broken (e.g. Megatron's NameError bug on some versions).
+        Walks the Megatron optimizer wrapper chain to reach the base optimizer
+        and moves every state tensor to CPU in-place.
+        """
+        opt = self.optimizer
+        # Unwrap Megatron optimizer wrappers to reach the base PyTorch optimizer.
+        while hasattr(opt, "optimizer"):
+            opt = opt.optimizer
+        if hasattr(opt, "state"):
+            for state in opt.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.cpu()
 
-    def _reinitialize_parallel_groups(
-        self,
-        tensor_model_parallel_size: int,
-        pipeline_model_parallel_size: int,
-        context_parallel_size: int = 1,
-        expert_model_parallel_size: int = 1,
-        expert_tensor_parallel_size: int = 1,
-    ) -> None:
-        """Reinitialize Megatron parallel groups with new configuration."""
+    def _patch_mpu_dp_group(self, new_dp_group, new_world_ranks: list[int]) -> None:
+        """
+        Patch Megatron's module-level DP group globals so that all subsequent
+        calls to ``mpu.get_data_parallel_group/rank/world_size`` reflect the
+        new DP membership.
+
+        TP / PP / CP groups are left completely untouched — only the four DP
+        globals that matter for gradient all-reduce and DP-size queries are
+        replaced.
+
+        ``mpu.get_data_parallel_world_size()`` checks ``_MPU_DATA_PARALLEL_WORLD_SIZE``
+        first (non-None overrides the group query), so we set it explicitly.
+        Similarly ``_MPU_DATA_PARALLEL_RANK`` overrides the rank query.
+        """
+        import megatron.core.parallel_state as _mpu_mod
+
         my_rank = dist.get_rank()
+        new_dp_size = len(new_world_ranks)
+        new_dp_rank = new_world_ranks.index(my_rank)
+
+        # Replace the primary DP group handle.
+        _mpu_mod._DATA_PARALLEL_GROUP = new_dp_group
+        # _DATA_PARALLEL_GROUP_WITH_CP is used when CP is enabled; for CP=1
+        # it is the same group.  Safe to alias unconditionally.
+        _mpu_mod._DATA_PARALLEL_GROUP_WITH_CP = new_dp_group
+
+        # Override the "on-the-fly" size / rank values so they take priority
+        # over the group-based queries in get_data_parallel_world_size/rank.
+        _mpu_mod._MPU_DATA_PARALLEL_WORLD_SIZE = new_dp_size
+        _mpu_mod._MPU_DATA_PARALLEL_RANK = new_dp_rank
+
+        # Update the global ranks list used by checkpoint / broadcast helpers.
+        _mpu_mod._DATA_PARALLEL_GLOBAL_RANKS = new_world_ranks
+        _mpu_mod._DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = new_world_ranks
 
         logger.info(
-            f"[ElasticMegatronMixin rank={my_rank}] "
-            f"Reinitializing parallel groups: "
-            f"tp={tensor_model_parallel_size}, "
-            f"pp={pipeline_model_parallel_size}, "
-            f"cp={context_parallel_size}"
-        )
-
-        mpu.initialize_model_parallel(
-            tensor_model_parallel_size=tensor_model_parallel_size,
-            pipeline_model_parallel_size=pipeline_model_parallel_size,
-            virtual_pipeline_model_parallel_size=getattr(
-                self.engine_config, "virtual_pipeline_model_parallel_size", None
-            ),
-            use_sharp=False,
-            context_parallel_size=context_parallel_size,
-            expert_model_parallel_size=expert_model_parallel_size,
-            expert_tensor_parallel_size=expert_tensor_parallel_size,
-            nccl_communicator_config_path=None,
+            f"[ElasticMegatronMixin rank={my_rank}] mpu DP group patched: "
+            f"dp_size={new_dp_size}, dp_rank={new_dp_rank}, ranks={new_world_ranks}"
         )
 
     def _restore_state_from_cpu(self) -> None:
