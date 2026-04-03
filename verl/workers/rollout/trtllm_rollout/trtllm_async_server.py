@@ -286,9 +286,11 @@ class TRTLLMHttpServer:
 
     async def wake_up(self):
         if self.rollout_mode == RolloutMode.HYBRID:
-            # In hybrid mode, rollout is wake up in `update_weights`
-            raise ValueError(f"wake_up not support rollout_mode {self.rollout_mode}")
-        if self.rollout_mode == RolloutMode.COLOCATED:
+            # In elastic scheduling, weights are pre-synced via the naive path
+            # (sync_weights_to_rollout_naive) before wake_up() is called.
+            # We only need to resume kv_cache + weights to restore GPU memory.
+            await self.llm.resume(tags=ServerAdapter.get_full_tags())
+        elif self.rollout_mode == RolloutMode.COLOCATED:
             await self.llm.resume(tags=ServerAdapter.get_full_tags())
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip wake_up in standalone mode")
@@ -303,6 +305,26 @@ class TRTLLMHttpServer:
             await self.llm.release(tags=ServerAdapter.get_full_tags())
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
+
+    async def release_kv_cache(self):
+        """Release only kv_cache GPU memory, keeping model weights intact.
+
+        Used in the NCCL weight-sync path (for both STANDALONE and awake HYBRID
+        replicas) to free GPU memory before weight transfer without disturbing
+        model weights.  Call resume_kv_cache() after the transfer completes.
+        """
+        if not self.config.free_cache_engine:
+            return
+        # TRT-LLM: release only kv_cache tag
+        await self.llm.release(tags=["kv_cache"])
+
+    async def resume_kv_cache(self):
+        """Restore kv_cache GPU memory after a weight sync.
+
+        Counterpart to release_kv_cache().
+        """
+        # TRT-LLM: resume only kv_cache tag
+        await self.llm.resume(tags=["kv_cache"])
 
     async def report_device_ids(self) -> list[str]:
         """Report GPU device UUIDs from TRT-LLM workers."""

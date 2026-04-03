@@ -202,6 +202,18 @@ class ServerAdapter(BaseRollout):
                 tags = ["kv_cache", "weights"]
             await self._engine.release_memory_occupation(tags=tags)
 
+    async def release_weights(self):
+        """Release only the weight GPU memory, keeping kv_cache in place.
+
+        Counterpart to ``resume(tags=["weights"])``.  Used in the naive
+        weight-sync path for sleeping hybrid replicas so the weight buffers
+        can be temporarily restored, updated, then released again without
+        waking up the rollout server.
+        """
+        await self._init_server_adapter()
+        if self.device_mesh["infer_tp"].get_local_rank() == 0 and self.config.free_cache_engine:
+            await self._engine.release_memory_occupation(tags=["weights"])
+
     async def update_weights(
         self, weights: Generator[tuple[str, torch.Tensor], None, None], global_steps: int = None, **kwargs
     ):

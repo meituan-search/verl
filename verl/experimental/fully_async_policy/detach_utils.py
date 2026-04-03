@@ -328,9 +328,14 @@ class MetricsAggregator:
         # perf/throughput
         REQUIRED_PERF_KEYS = {"perf/throughput", "perf/total_num_tokens", "perf/time_per_step"}
         if REQUIRED_PERF_KEYS.issubset(aggregated):
-            aggregated["perf/throughput"] = aggregated["perf/total_num_tokens"] / (
-                aggregated["perf/time_per_step"] * self.total_gpus
-            )
+            n_gpus = self.total_gpus
+            time_per_step = aggregated["perf/time_per_step"]
+            if n_gpus > 0 and time_per_step > 0:
+                aggregated["perf/throughput"] = aggregated["perf/total_num_tokens"] / (time_per_step * n_gpus)
+            else:
+                # total_gpus is not yet known (e.g. fully-elastic mode before workers
+                # are registered) or time is zero – skip throughput calculation.
+                aggregated.pop("perf/throughput", None)
 
         # trainer/idle_ratio
         if "timing_s/gen" in aggregated.keys() and "timing_s/step" in aggregated.keys():

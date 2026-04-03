@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .agent_loop import FullyAsyncAgentLoopManager, FullyAsyncAgentLoopWorker
+from verl.experimental.elastic_scheduling.engine.fsdp.elastic_transformer_impl import (
+    ElasticFSDPMixin,
+    FSDPModelStateSnapshot,
+    FSDPOptimizerStateSnapshot,
+)
 
-__all__ = [FullyAsyncAgentLoopManager, FullyAsyncAgentLoopWorker]
+__all__ = [
+    "ElasticFSDPMixin",
+    "FSDPModelStateSnapshot",
+    "FSDPOptimizerStateSnapshot",
+]

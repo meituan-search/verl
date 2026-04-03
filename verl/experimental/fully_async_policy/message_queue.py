@@ -107,6 +107,10 @@ class MessageQueue:
         async with self._lock:
             return len(self.queue)
 
+    async def get_max_queue_size(self) -> int:
+        """Get maximum queue capacity"""
+        return self.max_queue_size
+
     async def get_statistics(self) -> dict[str, Any]:
         """Get queue statistics"""
         async with self._lock:
@@ -203,6 +207,11 @@ class MessageQueueClient:
     async def get_queue_size(self) -> int:
         """Get queue size (async)"""
         future = self.queue_actor.get_queue_size.remote()
+        return await asyncio.wrap_future(future.future())
+
+    async def get_max_queue_size(self) -> int:
+        """Get maximum queue capacity (async)"""
+        future = self.queue_actor.get_max_queue_size.remote()
         return await asyncio.wrap_future(future.future())
 
     async def get_statistics(self) -> dict[str, Any]:

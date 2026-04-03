@@ -139,6 +139,11 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
     def finalize(self):
         """Destroy the NCCL process group if rebuild_group is True."""
+        logger.info(
+            f"[NcclCheckpointEngine] finalize called: "
+            f"rank={getattr(self, 'rank', None)}, group_name='{self.group_name}', "
+            f"rebuild_group={self.rebuild_group}"
+        )
         if self.rebuild_group:
             if self.rank >= 0:
                 collective.destroy_collective_group(self.group_name)
@@ -149,6 +154,37 @@ class NCCLCheckpointEngine(CheckpointEngine):
         self.recv_buf = None
 
         torch.cuda.empty_cache()
+
+    def _kill_stale_store(self):
+        """Kill a stale NCCLUniqueIDStore actor if one exists for this group.
+
+        NCCLUniqueIDStore actors are created with ``lifetime="detached"`` and
+        are NOT automatically removed when a collective group is destroyed.
+        They survive across jobs and must be killed explicitly before the next
+        ``init_collective_group()`` call, otherwise Ray raises
+        ``ActorAlreadyExistsError`` when trying to create a new actor with the
+        same name.
+
+        This method is called by rank-0 only (the rank that creates the store).
+        Non-zero ranks never create the store so they do not need to kill it.
+        """
+        try:
+            from ray.util.collective.const import get_store_name
+
+            store_name = get_store_name(self.group_name)
+            store = ray.get_actor(store_name)
+            ray.kill(store)
+            logger.info(
+                f"[NcclCheckpointEngine] Killed stale NCCLUniqueIDStore "
+                f"(name='{store_name}', group='{self.group_name}')"
+            )
+        except ValueError:
+            # Actor does not exist – nothing to clean up.
+            pass
+        except Exception as e:
+            logger.warning(
+                f"[NcclCheckpointEngine] Failed to kill stale NCCLUniqueIDStore for group '{self.group_name}': {e}"
+            )
 
     @classmethod
     def build_topology(cls, trainer_world_size: int, rollout_world_size: int, metadata: list[dict]):
@@ -204,7 +240,21 @@ class NCCLCheckpointEngine(CheckpointEngine):
             self.world_size = world_size
             return
 
-        if self.rebuild_group or not collective.is_group_initialized(self.group_name):
+        already_init = collective.is_group_initialized(self.group_name)
+        logger.info(
+            f"[NcclCheckpointEngine] init_process_group called: "
+            f"rank={rank}, world_size={world_size}, group_name='{self.group_name}', "
+            f"rebuild_group={self.rebuild_group}, already_initialized={already_init}, "
+            f"self.rank={getattr(self, 'rank', None)}, self.world_size={getattr(self, 'world_size', None)}"
+        )
+
+        if self.rebuild_group or not already_init:
+            # rank=0 is responsible for creating the NCCLUniqueIDStore Ray actor.
+            # A stale store from a previous job or a previous rebuild may still be
+            # alive (lifetime="detached" actors survive across jobs).  Kill it
+            # proactively so that init_collective_group() can create a fresh one.
+            if rank == 0:
+                self._kill_stale_store()
             collective.init_collective_group(world_size, rank, "nccl", self.group_name)
             self.rank = rank
             self.world_size = world_size

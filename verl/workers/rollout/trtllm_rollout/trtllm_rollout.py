@@ -387,6 +387,18 @@ class ServerAdapter(BaseRollout):
             tags = self._WEIGHTS_TAGS + ["kv_cache"]
             await self._adapter.release_memory_occupation(tags=tags)
 
+    async def release_weights(self):
+        """Release only the weight GPU memory, keeping kv_cache in place.
+
+        Counterpart to ``resume(tags=["weights"])``.  Used in the naive
+        weight-sync path for sleeping hybrid replicas so the weight buffers
+        can be temporarily restored, updated, then released again without
+        waking up the rollout server.
+        """
+        if self.is_leader_rank and self.config.free_cache_engine:
+            await self._init_server_adapter()
+            await self._adapter.release_memory_occupation(tags=self._WEIGHTS_TAGS)
+
     async def update_weights_from_ipc_handles(self, device_handles):
         assert self.hybrid_device_mesh is not None, "hybrid_device_mesh is not set"
 

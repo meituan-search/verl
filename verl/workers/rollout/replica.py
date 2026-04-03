@@ -278,6 +278,27 @@ class RolloutReplica(ABC):
         """Sleep each rollout server."""
         await asyncio.gather(*[server.sleep.remote() for server in self.servers])
 
+    async def release_kv_cache(self):
+        """Release only the kv_cache GPU memory, keeping model weights in place.
+
+        Used in the NCCL weight-sync path so that the GPU memory occupied by the
+        kv-cache is freed before the weight transfer, without touching the model
+        weights themselves.  After the transfer, call resume_kv_cache() to
+        restore the kv-cache.
+
+        Unlike sleep() this is safe to call on HYBRID-mode replicas because it
+        does NOT release model weights.
+        """
+        await asyncio.gather(*[server.release_kv_cache.remote() for server in self.servers])
+
+    async def resume_kv_cache(self):
+        """Restore the kv_cache GPU memory after a weight sync.
+
+        Counterpart to release_kv_cache().  Resumes only the kv-cache so the
+        rollout server can continue serving requests.
+        """
+        await asyncio.gather(*[server.resume_kv_cache.remote() for server in self.servers])
+
     async def abort_all_requests(self):
         """Partial rollout: abort and save all unfinished requests in each rollout server."""
         await asyncio.gather(*[server.abort_all_requests.remote() for server in self.servers])

@@ -150,6 +150,21 @@ class ServerAdapter(BaseRollout):
         if self.config.free_cache_engine:
             await self._execute_method("sleep", kwargs={"level": self.sleep_level})
 
+    async def release_weights(self):
+        """Release only the weight GPU memory, keeping kv_cache in place.
+
+        Counterpart to ``resume(tags=["weights"])``.  Used in the naive
+        weight-sync path for sleeping hybrid replicas so the weight buffers
+        can be temporarily restored, updated, then released again without
+        waking up the rollout server.
+
+        For vLLM HYBRID mode: the rollout server is already sleeping so
+        kv_cache is not present on GPU.  Calling sleep(level=2) is therefore
+        equivalent to releasing weights only.
+        """
+        if self.config.free_cache_engine:
+            await self._execute_method("sleep", kwargs={"level": 2})
+
     @torch.no_grad()
     async def update_weights(
         self, weights: Generator[tuple[str, torch.Tensor], None, None], global_steps: int = None, **kwargs

@@ -1,0 +1,126 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_megatron_trainer
+  - _self_
+
+trainer:
+  use_legacy_worker_impl: disable
+
+async_training:
+
+  # Maximum samples staleness threshold
+  staleness_threshold: 0.1
+
+  # Frequency of parameter synchronization between rollouter and trainer, 
+  # One step means trainer obtains a batch of required samples
+  trigger_parameter_sync_step: 4
+  
+  # The number of ppo_mini_batches that the FullyAsyncTrainer obtains once
+  require_batches: 1
+
+  # When synchronizing parameters, Whether to resume generation when rollout is interrupted.
+  # If True, AsyncLLMServerManager auto resume generation, making rollout interruption invisible to the AgentLoop.
+  partial_rollout: True
+
+  # whether to use trainer do_validate
+  use_trainer_do_validate: False
+
+# Rollout config
+rollout:
+
+  # Number of nodes used in the rollout
+  nnodes: 1
+
+  # Number of GPUs per node                     
+  n_gpus_per_node: 8
+
+  # number of responses (i.e. num sample times). > 1 for grpo
+  n: 4
+
+  # total rollout samples # TODO rename to total_rollout_samples
+  total_rollout_steps: 100
+
+data:
+  # Number of samples generated, currently only support 1
+  gen_batch_size: 1
+
+actor_rollout_ref:
+
+  rollout:
+    # Must be enabled! Otherwise, log_probs cannot be calculated.
+    calculate_log_probs: True
+
+    checkpoint_engine:
+      backend: "nccl"
+      # rebuild_group=True is required for elastic scheduling:
+      # Each update_weights() call may involve a different set of replicas
+      # (as hybrid replicas join/leave self.replicas across elastic switches).
+      # With rebuild_group=False the NCCL group is never destroyed, so when
+      # the next init_process_group() call detects is_group_initialized=False
+      # (after a destroy) but the detached NCCLUniqueIDStore Ray actor is still
+      # alive, Ray raises ActorAlreadyExistsError.
+      # rebuild_group=True ensures finalize() fully tears down the group and
+      # its store actor so the next round can create a fresh one safely.
+      engine_kwargs:
+        nccl:
+          rebuild_group: True
+
+  actor:
+    # Must use rollout log probs for training
+    use_rollout_log_probs: True
+
+  model:
+    # To use remove padding (thd)
+    use_remove_padding: True
+
+# Only then will the use of log probs be correct.
+# And it can be used in conjunction with other rollout_correction algorithms.
+algorithm:
+  rollout_correction:
+    bypass_mode: True
+
+# ============================================================================
+# Elastic Scheduling Configuration
+# ============================================================================
+elastic_scheduling:
+  # Queue utilization above this threshold → scale up rollout (add elastic to rollout)
+  rollout_queue_high_watermark: 0.8
+
+  # Queue utilization below this threshold → scale up train (add elastic to train)
+  rollout_queue_low_watermark: 0.3
+
+  # Minimum time between consecutive switches for the same resource (seconds)
+  cooldown_seconds: 30.0
+
+  # ---- Rate monitoring ----
+  # Coordinator polling interval (seconds)
+  check_interval: 2.0
+
+  # EMA smoothing factor for production/consumption rate estimation
+  ema_alpha: 0.3
+
+  # Minimum confidence required to trigger a switch (0-1)
+  confidence_threshold: 0.6
+
+  # ---- Safety constraints ----
+  # Always keep at least this many elastic resources in rollout mode
+  min_rollout_resources: 0
+
+  # Always keep at least this many elastic resources in train mode
+  min_train_resources: 0
+
+  # Maximum number of concurrent role switches
+  max_concurrent_switches: 1
+
+  # ---- Parameter sync ----
+  # Sync every N training steps (also used by ElasticParameterSyncManager)
+  sync_trigger_interval: 4
+
+  # Enable incremental sync for elastic replicas (only changed params)
+  enable_incremental_sync: true
+
+  # ---- Legacy congestion monitor settings (for backward compatibility) ----
+  congestion_window_size: 20
