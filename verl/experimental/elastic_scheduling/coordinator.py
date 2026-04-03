@@ -179,14 +179,19 @@ class ElasticCoordinator:
             "last_action_time": 0.0,
         }
 
-        # [DEBUG] Force a Train→Rollout switch every step to verify the system works.
+        # [DEBUG] Force an alternating Train↔Rollout switch every step to stress-test the system.
         # Set via config key "debug_force_switch_every_step": true.
         # In this mode the normal EMA / watermark logic is bypassed and cooldown is ignored.
+        # Even steps: scale_rollout (Train→Rollout for one unit).
+        # Odd  steps: scale_train   (Rollout→Train for one unit, if any are in rollout).
+        # This ensures every switch type is exercised and workers are always back in train
+        # mode before update_actor is called.
         self._debug_force_switch_every_step: bool = config.get("debug_force_switch_every_step", False)
+        self._debug_switch_phase: int = 0  # 0=scale_rollout, 1=scale_train
         if self._debug_force_switch_every_step:
             logger.warning(
                 "[ElasticCoordinator] *** DEBUG MODE: debug_force_switch_every_step=True ***\n"
-                "  A Train→Rollout switch will be forced at every training boundary.\n"
+                "  Alternating Train↔Rollout switches will be forced at every training boundary.\n"
                 "  This mode is for system sanity-checking ONLY and must NOT be used in production."
             )
 
@@ -256,13 +261,25 @@ class ElasticCoordinator:
         Returns:
             True if a switch was executed, False otherwise.
         """
-        # [DEBUG] Force a Train→Rollout switch every step, bypassing all normal
-        # watermark / EMA / cooldown logic. Used to verify the switch pipeline works.
+        # [DEBUG] Alternate Train→Rollout and Rollout→Train every step.
+        # Phase 0: move one unit to rollout.
+        # Phase 1: move it back to train.
+        # This guarantees workers are always in train mode before update_actor runs.
         if self._debug_force_switch_every_step:
-            logger.warning(
-                f"[ElasticCoordinator][DEBUG] Forcing scale_rollout at step={step} (debug_force_switch_every_step=True)"
-            )
-            await self._switch_train_to_rollout(n=1, ignore_cooldown=True)
+            if self._debug_switch_phase == 0:
+                # Check whether there is at least one unit we can move to rollout
+                # (need ≥2 active training units so training can continue).
+                # Only scale_rollout if there are enough training units
+                logger.warning(
+                    f"[ElasticCoordinator][DEBUG] step={step} phase=0 → scale_rollout (Train→Rollout, 1 unit)"
+                )
+                result = await self._switch_train_to_rollout(n=1, ignore_cooldown=True)
+                if result:
+                    self._debug_switch_phase = 1  # next step: scale back to train
+            else:
+                logger.warning(f"[ElasticCoordinator][DEBUG] step={step} phase=1 → scale_train (Rollout→Train, 1 unit)")
+                result = await self._switch_rollout_to_train(n=1)
+                self._debug_switch_phase = 0  # next step: scale to rollout again
             return True
 
         if self._pending_action is None:

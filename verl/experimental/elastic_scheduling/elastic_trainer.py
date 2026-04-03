@@ -446,6 +446,16 @@ class ElasticTrainer(FullyAsyncTrainer):
         self._elastic_unit_ranks = dict(unit_ranks)
         # Initially all units are in TRAIN mode
         self._elastic_active_units = set(unit_ranks.keys())
+
+        # Initialize _elastic_dp_active_ranks on the worker group so that
+        # the elastic dispatch strategy can route correctly from the start,
+        # before the first rebuild_dp_group call.
+        wg = self._get_elastic_wg()
+        if wg is not None:
+            all_ranks = sorted(set(r for ranks in unit_ranks.values() for r in ranks))
+            wg._elastic_dp_active_ranks = all_ranks
+            logger.info(f"[ElasticTrainer] Initialized _elastic_dp_active_ranks={all_ranks} on elastic_wg")
+
         logger.info(
             f"[ElasticTrainer] Registered {len(unit_ranks)} elastic unit rank mapping(s): , ".join(
                 f"{rid}={ranks}" for rid, ranks in unit_ranks.items()
@@ -639,13 +649,56 @@ class ElasticTrainer(FullyAsyncTrainer):
         worker_group: RayWorkerGroup,
         new_world_ranks: list[int],
     ):
-        """Call rebuild_dp_group on every worker in the group."""
+        """Call rebuild_dp_group on every worker in the group.
+
+        After the rebuild completes ``worker_group._elastic_dp_active_ranks`` is
+        updated to ``new_world_ranks`` so that the elastic DP dispatch strategy
+        (``make_elastic_dp_dispatch_fn``) correctly routes data only to the
+        active ranks on the next dispatch call.
+
+        The elastic dispatch strategy (used by ``compute_log_prob``,
+        ``compute_ref_log_prob``, ``update_actor`` in ElasticActorWorker) reads
+        ``worker_group._elastic_dp_active_ranks`` directly instead of relying on
+        the ``_dispatch_info`` / ``_collect_info`` cache, so no manual cache
+        patching is required here.
+        """
         try:
             futures = worker_group.execute_all("rebuild_dp_group", new_world_ranks=new_world_ranks)
             await asyncio.get_event_loop().run_in_executor(None, lambda: ray.get(futures))
         except Exception as e:
             logger.error(f"[ElasticTrainer] rebuild_dp_group failed: {e}")
             raise
+
+        # Update the elastic DP active ranks on the controller side.
+        # The elastic dispatch strategy reads this attribute to know which
+        # global ranks are currently participating in the DP group.
+        self._update_elastic_dp_active_ranks(worker_group, new_world_ranks)
+
+        logger.info(
+            f"[ElasticTrainer] DP rebuild complete: "
+            f"new_world_ranks={new_world_ranks}, "
+            f"active_dp_size={len(new_world_ranks)}"
+        )
+
+    def _update_elastic_dp_active_ranks(
+        self,
+        worker_group: RayWorkerGroup,
+        new_world_ranks: list[int],
+    ) -> None:
+        """Update ``worker_group._elastic_dp_active_ranks`` after a DP rebuild.
+
+        This attribute is read by the elastic DP dispatch strategy
+        (``dispatch_elastic_dp_dataproto`` in ``decorator.py``) to decide
+        which global ranks receive data shards.  Inactive ranks receive
+        ``None`` and their workers return ``None`` immediately, which is
+        then filtered out by ``collect_elastic_dp_dataproto``.
+
+        Args:
+            worker_group: The RayWorkerGroup whose dispatch attribute to update.
+            new_world_ranks: Sorted list of global ranks now active in the DP group.
+        """
+        worker_group._elastic_dp_active_ranks = list(new_world_ranks)
+        logger.info(f"[ElasticTrainer] _elastic_dp_active_ranks updated: {new_world_ranks}")
 
     # =========================================================================
     # 7.4  Dynamic required_samples (DP-aware)
@@ -705,50 +758,127 @@ class ElasticTrainer(FullyAsyncTrainer):
             sp = getattr(fsdp_cfg, "ulysses_sequence_parallel_size", 1)
             return max(sp, 1)
 
+    def _get_dp_aligned_mini_batch_size(self) -> int:
+        """
+        Return a global ``mini_batch_size`` (in responses) that satisfies all
+        three constraints required by ``train_mini_batch``:
+
+        1. ``mini_batch_size % dp_size == 0``
+           — so ``mini_batch_size_per_gpu = mini_batch_size // dp_size`` is an integer.
+
+        2. ``(total_responses / dp_size) % (mini_batch_size / dp_size) == 0``
+           ⟺ ``total_responses % mini_batch_size == 0``
+           — so the per-rank batch divides evenly into sub-mini-batches.
+
+        3. ``mini_batch_size % rollout_n == 0``
+           — so ``prompts_per_mini_batch = mini_batch_size // rollout_n`` is exact,
+             avoiding floor-division truncation that would break constraint (2).
+
+        We align ``base * rollout_n`` up to the nearest multiple of
+        ``LCM(dp_size, rollout_n)`` which is the tightest unit satisfying (1) and (3).
+
+        Returns:
+            int: Aligned global mini_batch_size (response count).
+        """
+        import math
+
+        base = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+        rollout_n = self.config.actor_rollout_ref.rollout.n
+        dp_size = self._get_current_dp_size()
+        # Align to LCM(dp_size, rollout_n) so the result is divisible by both.
+        lcm = dp_size * rollout_n // math.gcd(dp_size, rollout_n)
+        mini_batch_size = base * rollout_n
+        if mini_batch_size % lcm != 0:
+            mini_batch_size = math.ceil(mini_batch_size / lcm) * lcm
+        return mini_batch_size
+
     def _update_required_samples(self) -> None:
         """
-        Recompute required_samples so that it is always a multiple of both
-        ppo_mini_batch_size and the current DP size.
+        Recompute ``required_samples`` based on the DP-aligned mini_batch_size.
+
+        Terminology
+        -----------
+        * ``required_samples``  — number of **samples** (prompts) to pull from
+          the queue.  Each sample in the queue already contains all ``rollout.n``
+          responses for one prompt, so this is purely a **prompt count**.
+        * ``aligned_mini_batch`` — total number of **responses** that will be
+          handed to ``train_mini_batch``.  ``megatron_workers`` internally
+          multiplies ``ppo_mini_batch_size × rollout_n`` and divides by
+          ``dp_size``, so the assertion it checks is::
+
+              (ppo_mini_batch_size × rollout_n) % dp_size == 0
 
         Formula::
 
-            base_per_dp    = ppo_mini_batch_size × require_batches
-            dp_size        = current number of DP replicas
-            required_samples = ceil(base_per_dp × dp_size)
-                               rounded UP to the nearest multiple of dp_size
+            aligned_mini_batch = ceil(ppo_mini_batch_size × rollout_n / dp_size) × dp_size
+            required_samples   = ceil(aligned_mini_batch / rollout_n / dp_size) × dp_size
+                                 × require_batches
+                                 (prompt count, NOT response count)
 
-        This guarantees that every DP rank receives an equal number of samples,
-        avoiding the assertion ``len(seqlen_list) % k_partitions == 0`` in
-        ``karmarkar_karp``.  We round UP rather than DOWN to ensure sufficient
-        samples for training progress.
+        The double alignment (once for responses, once for prompts) ensures:
+        1. ``aligned_mini_batch % dp_size == 0``          — satisfies ``train_mini_batch`` assertion.
+        2. ``required_samples × rollout_n % dp_size == 0`` — satisfies ``_balance_batch``
+           (``get_seqlen_balanced_partitions`` requires total responses % dp_size == 0).
+
+        Also propagates the new ``required_samples`` to the Rollouter so that
+        its staleness / pause thresholds stay in sync with the Trainer's batch
+        expectations.  The remote call is fire-and-forget (no ``await`` /
+        ``ray.get``); the Rollouter updates atomically under its own lock.
 
         Called automatically at the end of ``_apply_pending_dp_changes()``.
         """
         import math
 
-        mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         require_batches = self.config.async_training.require_batches
+        rollout_n = self.config.actor_rollout_ref.rollout.n
         dp_size = self._get_current_dp_size()
 
-        # Minimum samples needed per DP rank (must be integer)
-        base_per_dp = mini_batch_size * require_batches
+        aligned_mini_batch = self._get_dp_aligned_mini_batch_size()
 
-        # Total samples = base_per_dp * dp_size, but we round UP to ensure
-        # the total is divisible by dp_size for equal partitioning.
-        # Since base_per_dp is already an integer, the formula simplifies to:
-        new_required = base_per_dp * dp_size
-        # Ensure new_required is divisible by dp_size (it always is now).
-        # Also ensure it's a multiple of mini_batch_size for minibatch slicing.
-        if new_required % mini_batch_size != 0:
-            new_required = math.ceil(new_required / mini_batch_size) * mini_batch_size
+        # aligned_mini_batch is the global mini-batch size (responses) that
+        # train_mini_batch will use.  The per-rank batch handed to train_mini_batch
+        # is  total_responses / dp_size, and train_mini_batch further splits it
+        # into sub-mini-batches of size  aligned_mini_batch / dp_size.
+        # For the inner assert to pass we need:
+        #
+        #   (total_responses / dp_size) % (aligned_mini_batch / dp_size) == 0
+        #   ⟺  total_responses % aligned_mini_batch == 0
+        #   ⟺  (required_samples × rollout_n) % aligned_mini_batch == 0
+        #
+        # So required_samples × rollout_n must be a multiple of aligned_mini_batch.
+        # Equivalently, required_samples must be a multiple of
+        #   aligned_mini_batch / rollout_n  (= prompts_per_mini_batch).
+        #
+        # We also need (required_samples × rollout_n) % dp_size == 0 for
+        # _balance_batch (get_seqlen_balanced_partitions).  Both constraints
+        # are satisfied by aligning to LCM(prompts_per_mini_batch, dp_size).
+
+        # prompts_per_mini_batch: how many prompts fill one global mini-batch
+        prompts_per_mini_batch = aligned_mini_batch // rollout_n
+
+        # LCM of prompts_per_mini_batch and dp_size ensures both constraints.
+        alignment_unit = prompts_per_mini_batch * dp_size // math.gcd(prompts_per_mini_batch, dp_size)
+
+        # require_batches mini-batches worth of prompts, rounded up to alignment_unit
+        base_prompts = prompts_per_mini_batch * require_batches
+        aligned_prompts = math.ceil(base_prompts / alignment_unit) * alignment_unit
+        new_required = aligned_prompts
 
         old_required = self.required_samples
         self.required_samples = new_required
         logger.info(
             f"[ElasticTrainer] required_samples updated: {old_required} → {new_required} "
-            f"(dp_size={dp_size}, mini_batch={mini_batch_size}, require_batches={require_batches}, "
-            f"base_per_dp={base_per_dp})"
+            f"(dp_size={dp_size}, aligned_mini_batch={aligned_mini_batch}, "
+            f"require_batches={require_batches})"
         )
+
+        # Propagate to the Rollouter so its staleness/pause thresholds match.
+        # Fire-and-forget: the remote call is non-blocking; the Rollouter will
+        # atomically update max_required_samples and wake any paused coroutines.
+        # Skip during __init__ when rollouter is not yet registered.
+        if hasattr(self, "rollouter") and self.rollouter is not None:
+            self.rollouter.update_required_samples.remote(new_required)
+            logger.info(f"[ElasticTrainer] Notified Rollouter: update_required_samples({new_required})")
 
         # Update metrics_aggregator.total_gpus to reflect the current actual GPU
         # count so that perf/throughput is computed correctly.
@@ -798,12 +928,20 @@ class ElasticTrainer(FullyAsyncTrainer):
         Extended fit_step with elastic role-switch hook at training boundary.
 
         Flow:
-        1. _fit_generate() — collect data (Train GPU idle)
-        2. _elastic_on_before_fit_step() — coordinator executes pending switch
-           (Train GPU still idle; this is where role switches happen)
-        3. _apply_pending_dp_changes() — apply any deferred DP changes
+        1. _elastic_on_before_fit_step() — coordinator executes pending switch
+           (Train GPU idle after previous step; switches happen here FIRST)
+        2. _apply_pending_dp_changes() — DP rebuild + update required_samples
+           (must complete before pulling data so batch size matches new DP)
+        3. _fit_generate() — collect data sized for the NEW DP topology
         4. Training compute (GPU busy)
         5. _fit_update_weights() — parameter sync to rollout replicas
+
+        Why switch BEFORE pulling data (not after):
+        - After a switch the DP size changes, which changes required_samples.
+        - If we pulled data first (old required_samples) then switched, the
+          batch we hand to update_actor would be sized for the OLD DP.
+        - By switching first we guarantee: batch_size == aligned_mini_batch
+          for the current DP, so train_mini_batch's assertion never fires.
         """
         self._is_training_step = False
         self.metrics = {"training/global_step": self.global_steps, "training/epoch": self.epoch}
@@ -814,13 +952,12 @@ class ElasticTrainer(FullyAsyncTrainer):
         self._fit_start_profile()
 
         try:
-            # Phase 1: collect data (Train GPU idle)
-            batch = await self._fit_generate(None)
-
-            # Phase 2: elastic switch hook (Train GPU still idle)
+            # Phase 1: elastic switch hook — Train GPU idle after previous step
             await self._elastic_on_before_fit_step()
 
-            # Phase 3: apply any deferred DP changes
+            # Phase 2: apply any deferred DP changes and update required_samples
+            # MUST happen before _fit_generate() so data is pulled at the
+            # correct size for the new DP topology.
             if self._dp_rebuild_pending:
                 try:
                     await self._apply_pending_dp_changes()
@@ -829,6 +966,9 @@ class ElasticTrainer(FullyAsyncTrainer):
                     self._dp_rebuild_pending = False
                     self._pending_elastic_adds.clear()
                     self._pending_elastic_removes.clear()
+
+            # Phase 3: collect data sized for the current (post-switch) DP
+            batch = await self._fit_generate(None)
 
             # Phase 4: training compute (GPU busy)
             self._is_training_step = True
@@ -963,6 +1103,84 @@ class ElasticTrainer(FullyAsyncTrainer):
         self.checkpoint_manager.add_hybrid_replicas(replicas, actor_wgs=actor_wgs)
 
         logger.info(f"[ElasticTrainer] Registered {len(replicas)} hybrid replica(s) with checkpoint manager")
+
+    def _update_actor(self, batch):
+        """
+        Override to dynamically align ``ppo_mini_batch_size`` with the current
+        DP size before calling ``update_actor``.
+
+        After an elastic DP rebuild the DP size may no longer divide the
+        configured ``ppo_mini_batch_size`` evenly (e.g. mini_batch=768, dp=5).
+        ``engine_workers.train_mini_batch`` asserts::
+
+            mini_batch_size % dp_size == 0
+
+        We round ``ppo_mini_batch_size`` UP to the nearest multiple of
+        ``dp_size`` so that the assertion never fires regardless of the
+        current (dynamic) DP topology.  The adjusted value only affects the
+        per-rank mini-batch granularity; the total number of gradient-update
+        steps per epoch is preserved to within ±1 step.
+
+        Only active in the ``use_legacy_worker_impl == "disable"`` code path;
+        the legacy path is left unchanged.
+        """
+
+        from verl.protocol import DataProto
+        from verl.trainer.distillation.losses import is_distillation_enabled
+        from verl.utils import tensordict_utils as tu
+        from verl.utils.py_functional import rename_dict
+        from verl.workers.utils.padding import left_right_2_no_padding
+
+        rollout_config = self.config.actor_rollout_ref.rollout
+        batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
+        batch.meta_info["temperature"] = rollout_config.temperature
+
+        if self.use_legacy_worker_impl != "disable":
+            # Legacy path – unchanged.
+            actor_output = self.actor_rollout_wg.update_actor(batch)
+            return actor_output
+
+        # ── new-style (tensordict) path ───────────────────────────────────
+        batch_td = batch.to_tensordict()
+        batch_td = left_right_2_no_padding(batch_td)
+
+        calculate_entropy = self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+        distillation_use_topk = (
+            self.distillation_config.distillation_loss.loss_settings.use_topk
+            if is_distillation_enabled(self.config.get("distillation"))
+            else False
+        )
+
+        # Use DP-aligned mini_batch_size so that train_mini_batch's assertion
+        # (mini_batch_size % dp_size == 0) always holds after elastic rebuilds.
+        ppo_mini_batch_size = self._get_dp_aligned_mini_batch_size()
+        logger.info(
+            f"[ElasticTrainer] _update_actor using aligned mini_batch_size={ppo_mini_batch_size} "
+            f"(dp_size={self._get_current_dp_size()})"
+        )
+
+        ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
+        seed = self.config.actor_rollout_ref.actor.data_loader_seed
+        shuffle = self.config.actor_rollout_ref.actor.shuffle
+
+        tu.assign_non_tensor(
+            batch_td,
+            calculate_entropy=calculate_entropy,
+            distillation_use_topk=distillation_use_topk,
+            global_batch_size=ppo_mini_batch_size,
+            mini_batch_size=ppo_mini_batch_size,
+            epochs=ppo_epochs,
+            seed=seed,
+            dataloader_kwargs={"shuffle": shuffle},
+            compute_loss=True,
+        )
+
+        actor_output = self.actor_rollout_wg.update_actor(batch_td)
+        actor_output = tu.get(actor_output, "metrics")
+        actor_output = rename_dict(actor_output, "actor/")
+        actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
+        actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
+        return actor_output
 
     async def _fit_update_weights(self):
         """
@@ -1107,3 +1325,60 @@ class ElasticTrainer(FullyAsyncTrainer):
             "elastic_trainer/consumption_rate_ema": self._consumption_rate_ema or 0.0,
             "elastic_trainer/dp_rebuild_pending": self._dp_rebuild_pending,
         }
+
+    # =========================================================================
+    # Override balance_batch — use elastic DP size
+    # =========================================================================
+
+    def _balance_batch(self, batch, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
+        """Override to use the *current* elastic DP size for sequence-length balancing.
+
+        The parent implementation queries ``actor_rollout_wg._dispatch_info``,
+        which is a **static cache** populated at worker-group creation time.
+        After an elastic DP rebuild the cache still holds the old dp_size (e.g.
+        6) while the actual DP group now has fewer ranks (e.g. 5).  Passing the
+        stale value to ``get_seqlen_balanced_partitions`` causes:
+
+            AssertionError: 12320 % 6 != 0
+
+        We replace the stale lookup with ``_get_current_dp_size()``, which
+        always reflects the live count of active elastic units.
+        """
+        import torch
+
+        from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
+
+        attention_mask = batch.batch["attention_mask"]
+        batch_size = attention_mask.shape[0]
+        global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1)
+        workload_lst = calculate_workload(global_seqlen_lst)
+
+        # Always use the live elastic DP size — never the stale dispatch_info cache.
+        dp_size = self._get_current_dp_size()
+
+        if keep_minibatch:
+            minibatch_size = self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size")
+            minibatch_num = len(workload_lst) // minibatch_size
+            global_partition_lst = [[] for _ in range(dp_size)]
+            for i in range(minibatch_num):
+                rearrange_minibatch_lst = get_seqlen_balanced_partitions(
+                    workload_lst[i * minibatch_size : (i + 1) * minibatch_size],
+                    k_partitions=dp_size,
+                    equal_size=True,
+                )
+                for j, part in enumerate(rearrange_minibatch_lst):
+                    global_partition_lst[j].extend([x + minibatch_size * i for x in part])
+        else:
+            global_partition_lst = get_seqlen_balanced_partitions(workload_lst, k_partitions=dp_size, equal_size=True)
+
+        for idx, partition in enumerate(global_partition_lst):
+            partition.sort(key=lambda x: (workload_lst[x], x))
+            ordered_partition = partition[::2] + partition[1::2][::-1]
+            global_partition_lst[idx] = ordered_partition
+
+        global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
+        batch.reorder(global_idx)
+        global_balance_stats = log_seqlen_unbalance(
+            seqlen_list=global_seqlen_lst.tolist(), partitions=global_partition_lst, prefix=logging_prefix
+        )
+        metrics.update(global_balance_stats)

@@ -124,8 +124,8 @@ class FullyAsyncTaskRunner:
                 config=config,
                 tokenizer=self.components["tokenizer"],
                 role_worker_mapping=None,
-                resource_pool_manager=create_resource_pool_manager(config, roles=[Role.Rollout]),
-                ray_worker_group_cls=self.components["ray_worker_group_cls"],
+                resource_pool_manager=None,
+                ray_worker_group_cls=None,
                 processor=self.components["processor"],
                 device_name=config.trainer.device,
             )

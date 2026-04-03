@@ -219,6 +219,40 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 f"max_concurrent_samples: {self.max_concurrent_samples} "
             )
 
+    async def update_required_samples(self, new_required_samples: int) -> None:
+        """Dynamically update required_samples and recompute derived limits.
+
+        Called by ElasticTrainer whenever the training DP size changes so that
+        the Rollouter's pause thresholds stay consistent with the Trainer's
+        batch expectations.
+
+        Updates:
+            self.required_samples   — new value propagated from ElasticTrainer
+            self.max_required_samples — staleness * trigger_sync_step guard
+            self.max_queue_size     — aligned to new max_required_samples
+        """
+        async with self.lock:
+            old_required = self.required_samples
+            self.required_samples = new_required_samples
+
+            self.max_required_samples = int(
+                self.required_samples
+                * (self.staleness_threshold + 1)
+                * self.config.async_training.trigger_parameter_sync_step
+            )
+            self.max_queue_size = self.max_required_samples
+
+            # Wake any waiting coroutines: the new (larger) max_required_samples
+            # may allow them to resume.
+            self.paused = False
+            self.condition.notify_all()
+
+            print(
+                f"[FullyAsyncRollouter] update_required_samples: {old_required} → {new_required_samples} "
+                f"max_required_samples: {self.max_required_samples} "
+                f"max_queue_size: {self.max_queue_size}"
+            )
+
     def get_rollout_wg(self):
         """Get rollout worker group"""
         return self.rollout_wg

@@ -35,6 +35,7 @@ import torch
 import torch.distributed as dist
 
 from verl.utils.device import get_device_name
+from verl.utils.megatron_utils import load_megatron_model_to_gpu, offload_megatron_model_to_cpu
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -145,6 +146,36 @@ class ElasticMegatronMixin:
             # Step 5: Patch mpu so all Megatron code sees the new DP group.
             self._patch_mpu_dp_group(new_dp_group, new_world_ranks)
 
+            # Step 5b: Sync the VERL dispatch/collect info so the single-controller
+            # dispatch layer sees the new DP rank.  The Worker base class stores
+            # the dp_rank in the name-mangled attribute ``_Worker__dispatch_dp_rank``.
+            # We must update it here because rebuild_dp_group() does not call
+            # ``_register_dispatch_collect_info`` (which guards against re-registration).
+            import megatron.core.parallel_state as _mpu
+
+            # _patch_mpu_dp_group (Step 5) already set _MPU_DATA_PARALLEL_RANK,
+            # so get_data_parallel_rank() now returns the correct post-rebuild value.
+            new_dp_rank = _mpu.get_data_parallel_rank()
+            # is_collect mirrors the logic in megatron_workers.py __init__:
+            # only TP=0, PP=last-stage, CP=0 ranks collect results to controller.
+            new_is_collect = (
+                _mpu.get_tensor_model_parallel_rank() == 0
+                and _mpu.get_pipeline_model_parallel_rank() == _mpu.get_pipeline_model_parallel_world_size() - 1
+                and _mpu.get_context_parallel_rank() == 0
+            )
+            dispatch_map = getattr(self, "_Worker__dispatch_dp_rank", None)
+            collect_map = getattr(self, "_Worker__collect_dp_rank", None)
+            if dispatch_map is not None:
+                for mesh_name in list(dispatch_map.keys()):
+                    dispatch_map[mesh_name] = new_dp_rank
+                logger.info(
+                    f"[ElasticMegatronMixin rank={my_rank}] Updated __dispatch_dp_rank → {new_dp_rank}, "
+                    f"is_collect={new_is_collect}"
+                )
+            if collect_map is not None:
+                for mesh_name in list(collect_map.keys()):
+                    collect_map[mesh_name] = new_is_collect
+
             # Step 6: Restore model + optimizer back to GPU.
             self._restore_state_from_cpu()
 
@@ -169,6 +200,27 @@ class ElasticMegatronMixin:
         my_rank = dist.get_rank()
         logger.info(f"[ElasticMegatronMixin rank={my_rank}] Capturing state to CPU...")
 
+        # Log grad_data state BEFORE offload
+        if hasattr(self, "module") and self.module is not None:
+            modules = self.module if isinstance(self.module, list) else [self.module]
+            for i, m in enumerate(modules):
+                from megatron.core.distributed import DistributedDataParallel as DDP
+
+                if isinstance(m, DDP):
+                    for j, buf in enumerate(m.buffers):
+                        grad_sz = buf.grad_data.storage().size()
+                        param_sz = buf.param_data.storage().size()
+                        has_gds = hasattr(buf, "grad_data_size")
+                        logger.info(
+                            f"[ElasticMegatronMixin rank={my_rank}] PRE-OFFLOAD "
+                            f"chunk={i} buf={j}: param_data.storage.size={param_sz}, "
+                            f"grad_data.storage.size={grad_sz}, "
+                            f"has_grad_data_size={has_gds}"
+                            f"saved_grad_data_size={buf.grad_data_size}"
+                            if has_gds
+                            else ""
+                        )
+
         # Capture model
         if hasattr(self, "module") and self.module is not None:
             self._model_snapshot = ModelStateSnapshot.from_model(self.module)
@@ -180,26 +232,51 @@ class ElasticMegatronMixin:
         # Offload to CPU
         self._offload_to_cpu()
 
+        # Log grad_data state AFTER offload
+        if hasattr(self, "module") and self.module is not None:
+            modules = self.module if isinstance(self.module, list) else [self.module]
+            for i, m in enumerate(modules):
+                from megatron.core.distributed import DistributedDataParallel as DDP
+
+                if isinstance(m, DDP):
+                    for j, buf in enumerate(m.buffers):
+                        grad_sz = buf.grad_data.storage().size()
+                        has_gds = hasattr(buf, "grad_data_size")
+                        logger.info(
+                            f"[ElasticMegatronMixin rank={my_rank}] POST-OFFLOAD "
+                            f"chunk={i} buf={j}: grad_data.storage.size={grad_sz}, "
+                            f"has_grad_data_size={has_gds}"
+                            f"saved_grad_data_size={buf.grad_data_size}"
+                            if has_gds
+                            else ""
+                        )
+
         torch.cuda.empty_cache()
         gc.collect()
 
     def _offload_to_cpu(self) -> None:
-        """Move model and optimizer to CPU, freeing GPU memory."""
+        """Move model and optimizer to CPU, freeing GPU memory.
+
+        Uses ``offload_megatron_model_to_cpu`` for DDP modules so that
+        ``param_and_grad_buffer`` internals (``param_data``, ``grad_data``)
+        are properly handled via ``storage().resize_(0)`` rather than a raw
+        ``param.data = param.data.cpu()`` assignment.  The raw assignment
+        breaks the Megatron DDP buffer layout: ``grad_data`` keeps pointing
+        at the old (now freed) GPU address, causing
+        ``CUDA error: an illegal memory access was encountered`` the next time
+        ``zero_grad_buffer()`` or ``forward_backward_batch`` touches it.
+        """
         my_rank = dist.get_rank()
 
         if self._model_on_gpu and hasattr(self, "module") and self.module is not None:
-            logger.info(f"[ElasticMegatronMixin rank={my_rank}] Offloading model to CPU...")
-
-            for module in self.module if isinstance(self.module, list) else [self.module]:
-                unwrapped = module
-                while hasattr(unwrapped, "module"):
-                    unwrapped = unwrapped.module
-
-                for param in unwrapped.parameters():
-                    param.data = param.data.cpu()
-                    if param.grad is not None:
-                        param.grad = param.grad.cpu()
-
+            logger.info(
+                f"[ElasticMegatronMixin rank={my_rank}] Offloading model to CPU (model_on_gpu={self._model_on_gpu})..."
+            )
+            modules = self.module if isinstance(self.module, list) else [self.module]
+            # offload_megatron_model_to_cpu handles both DDP-wrapped and plain modules:
+            # * DDP: resizes param_data / grad_data storages to 0 (pin-memory copy).
+            # * plain: falls back to param.data = param.data.cpu().
+            offload_megatron_model_to_cpu(modules)
             self._model_on_gpu = False
 
         if self._optimizer_on_gpu and hasattr(self, "optimizer") and self.optimizer is not None:
@@ -281,17 +358,81 @@ class ElasticMegatronMixin:
         )
 
     def _restore_state_from_cpu(self) -> None:
-        """Restore model and optimizer state from CPU memory to GPU."""
+        """Restore model and optimizer state from CPU memory to GPU.
+
+        Uses ``load_megatron_model_to_gpu`` with ``load_grad=True`` to rebuild
+        ``param_data`` and ``grad_data`` storages properly.  The snapshot
+        (CPU copy of param values) is then copied into the restored buffers.
+        """
         my_rank = dist.get_rank()
-        logger.info(f"[ElasticMegatronMixin rank={my_rank}] Restoring state from CPU to GPU...")
+        logger.info(
+            f"[ElasticMegatronMixin rank={my_rank}] Restoring state from CPU to GPU "
+            f"(model_on_gpu={self._model_on_gpu}, "
+            f"has_snapshot={self._model_snapshot is not None})..."
+        )
 
         device = get_device_name()
 
         # Restore model
         if not self._model_on_gpu and self._model_snapshot is not None:
             if hasattr(self, "module") and self.module is not None:
-                self._model_snapshot.to_model(self.module, device=device)
+                modules = self.module if isinstance(self.module, list) else [self.module]
+
+                # Log grad_data state BEFORE load
+                for i, m in enumerate(modules):
+                    from megatron.core.distributed import DistributedDataParallel as DDP
+
+                    if isinstance(m, DDP):
+                        for j, buf in enumerate(m.buffers):
+                            grad_sz = buf.grad_data.storage().size()
+                            has_gds = hasattr(buf, "grad_data_size")
+                            logger.info(
+                                f"[ElasticMegatronMixin rank={my_rank}] PRE-LOAD "
+                                f"chunk={i} buf={j}: grad_data.storage.size={grad_sz}, "
+                                f"has_grad_data_size={has_gds}"
+                                f"saved_grad_data_size={buf.grad_data_size}"
+                                if has_gds
+                                else ""
+                            )
+
+                # ``load_megatron_model_to_gpu`` rebuilds ``param_data`` and
+                # ``grad_data`` GPU storages and restores param values from
+                # ``buffer.param_data.cpu_data`` (saved by offload_megatron_model_to_cpu).
+                # load_grad=True ensures grad_data.storage().resize_(grad_data_size)
+                # so that the next zero_grad_buffer() doesn't hit CUDA illegal access.
+                #
+                # NOTE: We do NOT call snapshot.to_model() here because:
+                # 1. load_megatron_model_to_gpu already restores the correct values
+                #    via buffer.param_data.copy_(buffer.param_data.cpu_data).
+                # 2. snapshot.to_model() does param.data = cpu_tensor which replaces
+                #    param.data with a new tensor, breaking the DDP buffer view that
+                #    load_megatron_model_to_gpu just rebuilt.
+                load_megatron_model_to_gpu(modules, load_grad=True)
+
+                # Log grad_data state AFTER load
+                for i, m in enumerate(modules):
+                    from megatron.core.distributed import DistributedDataParallel as DDP
+
+                    if isinstance(m, DDP):
+                        for j, buf in enumerate(m.buffers):
+                            grad_sz = buf.grad_data.storage().size()
+                            has_gds = hasattr(buf, "grad_data_size")
+                            logger.info(
+                                f"[ElasticMegatronMixin rank={my_rank}] POST-LOAD "
+                                f"chunk={i} buf={j}: grad_data.storage.size={grad_sz}, "
+                                f"has_grad_data_size={has_gds}"
+                                f"saved_grad_data_size={buf.grad_data_size}"
+                                if has_gds
+                                else ""
+                            )
+
                 self._model_on_gpu = True
+        else:
+            logger.warning(
+                f"[ElasticMegatronMixin rank={my_rank}] _restore_state_from_cpu SKIPPED: "
+                f"model_on_gpu={self._model_on_gpu}, "
+                f"has_snapshot={self._model_snapshot is not None}"
+            )
 
         # Restore optimizer
         if not self._optimizer_on_gpu and self._optimizer_snapshot is not None:

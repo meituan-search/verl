@@ -53,7 +53,7 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 
-from verl.single_controller.base.decorator import Dispatch, register
+from verl.single_controller.base.decorator import Dispatch, make_elastic_dp_dispatch_fn, register
 from verl.workers.engine_workers import ActorRolloutRefWorker
 
 logger = logging.getLogger(__name__)
@@ -213,8 +213,14 @@ class ElasticActorWorker(ActorRolloutRefWorker):
         try:
             # Step 1: Load actor model to GPU (rollout server already sleeping)
             self._load_actor_to_gpu()
-            # Step 2: Rebuild DP group
-            self._rebuild_dp_group(new_train_world_ranks)
+            # NOTE: DP group rebuild is NOT done here.
+            # The caller (ElasticTrainer.switch_elastic_to_train) handles it by
+            # invoking add_elastic_actor() → _apply_pending_dp_changes() →
+            # actor_rollout_wg.rebuild_dp_group(new_world_ranks) which is
+            # dispatched ONE_TO_ALL so every rank participates in dist.new_group().
+            # Calling _rebuild_dp_group() here (which does NOT exist) would cause
+            # AttributeError, and even if it did exist, calling it on only this
+            # one rank while others are not called would hang on the collective.
 
             self._elastic_state.train_world_ranks = new_train_world_ranks
             self._elastic_state.param_version = param_version
@@ -373,6 +379,89 @@ class ElasticActorWorker(ActorRolloutRefWorker):
         self.actor.engine.rebuild_dp_group(new_world_ranks)
 
     # -------------------------------------------------------------------------
+    # Elastic DP compute methods (override parent to use elastic dispatch)
+    # -------------------------------------------------------------------------
+    # The parent class (ActorRolloutRefWorker) decorates these methods with
+    # ``make_nd_compute_dataproto_dispatch_fn(mesh_name=…)`` which relies on
+    # the ``_dispatch_info`` cache keyed by mesh name.  After an elastic DP
+    # rebuild that cache must be manually patched and removed ranks still
+    # occupy slots in the mapping (leading to subtle bugs).
+    #
+    # We override the three compute methods here with
+    # ``make_elastic_dp_dispatch_fn()``, which reads
+    # ``worker_group._elastic_dp_active_ranks`` instead.  The controller
+    # (ElasticTrainer) updates that attribute immediately after every
+    # ``rebuild_dp_group`` call, so inactive ranks simply receive ``None``
+    # and are skipped — no manual cache patching required.
+    #
+    # The worker-side implementation below mirrors the parent exactly; the only
+    # change is the ``@register`` dispatch_mode.
+    # -------------------------------------------------------------------------
+
+    @register(dispatch_mode=make_elastic_dp_dispatch_fn())
+    def compute_ref_log_prob(self, data):
+        """Compute reference log probabilities (elastic DP dispatch).
+
+        Inactive DP ranks (those currently in rollout mode) receive ``data=None``
+        and return ``None`` immediately so the controller can filter them out.
+        """
+        if data is None:
+            return None
+        return super().compute_ref_log_prob(data)
+
+    @register(dispatch_mode=make_elastic_dp_dispatch_fn())
+    def compute_log_prob(self, data):
+        """Compute actor log probabilities (elastic DP dispatch).
+
+        Inactive DP ranks receive ``data=None`` and return ``None``.
+        """
+        if data is None:
+            return None
+        return super().compute_log_prob(data)
+
+    @register(dispatch_mode=make_elastic_dp_dispatch_fn())
+    def update_actor(self, data):
+        """Update actor parameters (elastic DP dispatch).
+
+        Inactive DP ranks receive ``data=None`` and return ``None``.
+        """
+        if data is None:
+            return None
+        return super().update_actor(data)
+
+    # -------------------------------------------------------------------------
+    # Private diagnostic helpers
+    # -------------------------------------------------------------------------
+
+    def _log_grad_data_state(self, tag: str) -> None:
+        """Log grad_data storage size for every DDP buffer — used to trace CUDA illegal access."""
+        try:
+            from megatron.core.distributed import DistributedDataParallel as DDP
+
+            engine = self.actor.engine
+            modules = getattr(engine, "module", None)
+            if modules is None:
+                return
+            if not isinstance(modules, list):
+                modules = [modules]
+            rank = dist.get_rank()
+            for ci, m in enumerate(modules):
+                if isinstance(m, DDP):
+                    for bi, buf in enumerate(m.buffers):
+                        grad_sz = buf.grad_data.storage().size()
+                        has_gds = hasattr(buf, "grad_data_size")
+                        logger.info(
+                            f"[ElasticActorWorker rank={rank}] [{tag}] "
+                            f"chunk={ci} buf={bi}: grad_data.storage.size={grad_sz}, "
+                            f"has_grad_data_size={has_gds} "
+                            f"saved={buf.grad_data_size}"
+                            if has_gds
+                            else ""
+                        )
+        except Exception as e:
+            logger.debug(f"[ElasticActorWorker] _log_grad_data_state({tag}) failed: {e}")
+
+    # -------------------------------------------------------------------------
     # State introspection
     # -------------------------------------------------------------------------
 
@@ -408,6 +497,8 @@ class ElasticActorWorker(ActorRolloutRefWorker):
         """
         if not (hasattr(self, "actor") and self.actor is not None):
             return
+        # Log grad_data state before offload
+        self._log_grad_data_state("PRE switch_to_rollout offload")
         if callable(getattr(self.actor.engine, "to", None)):
             self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
         else:
@@ -419,6 +510,8 @@ class ElasticActorWorker(ActorRolloutRefWorker):
         import gc
 
         gc.collect()
+        # Log grad_data state after offload
+        self._log_grad_data_state("POST switch_to_rollout offload")
         logger.info(f"[ElasticActorWorker rank={dist.get_rank()}] Actor model offloaded to CPU")
 
     def _load_actor_to_gpu(self) -> None:
@@ -427,14 +520,26 @@ class ElasticActorWorker(ActorRolloutRefWorker):
 
         The rollout server on this resource must already be sleeping before
         this is called so that GPU memory is available.
+
+        ``grad=True`` is required: ``switch_to_rollout`` calls
+        ``offload_megatron_model_to_cpu`` which sets
+        ``buffer.grad_data.storage().resize_(0)`` (releasing GPU memory).
+        If we restore with ``grad=False`` the grad_data storage remains at
+        size=0, and the very first ``optimizer_zero_grad()`` call will execute
+        ``self.grad_data.zero_()`` on a zero-size storage, triggering
+        ``CUDA error: an illegal memory access was encountered``.
         """
         if not (hasattr(self, "actor") and self.actor is not None):
             return
+        # Log grad_data state before load
+        self._log_grad_data_state("PRE switch_to_train load")
         if callable(getattr(self.actor.engine, "to", None)):
-            self.actor.engine.to("device", model=True, optimizer=False, grad=False)
+            self.actor.engine.to("device", model=True, optimizer=False, grad=True)
         else:
             engine = self.actor.engine
             if hasattr(engine, "module") and engine.module is not None:
                 device = torch.cuda.current_device()
                 engine.module.to(device)
+        # Log grad_data state after load
+        self._log_grad_data_state("POST switch_to_train load")
         logger.info(f"[ElasticActorWorker rank={dist.get_rank()}] Actor model loaded back to GPU")

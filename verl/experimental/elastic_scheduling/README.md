@@ -103,10 +103,8 @@ sequenceDiagram
         EC->>EC: 评估拥塞，写 _pending_action flag
     end
     
-    Note over ET: Phase 1 — _fit_generate()
-    ET->>MQ: 等待收满 required_samples（Train GPU 空闲）
-
-    Note over ET: Phase 2 — _elastic_on_before_fit_step()
+    Note over ET: Phase 1 — _elastic_on_before_fit_step()
+    Note over ET: Train GPU 在上一步训练后处于空闲
     ET->>EC: on_before_fit_step()
     EC->>EC: 检查 _pending_action（含冷却时间校验）
 
@@ -114,7 +112,7 @@ sequenceDiagram
         EC->>ET: switch_elastic_to_rollout(resource_id)
         ET->>ET: remove_elastic_actor() — DP rebuild 排除此 ranks
         ET->>EW: switch_to_rollout() — offload actor 到 CPU
-        ET->>ER: add_elastic_replica() — wake_up server，注册 LB
+        ET->>ER: add_elastic_replica() — wake_up server，同步句柄，注册 LB
     else scale_train（队列过满，消费跟不上生产）
         EC->>ET: switch_elastic_to_train(resource_id)
         ET->>ER: remove_elastic_replica() — sleep server，abort in-flight
@@ -122,9 +120,14 @@ sequenceDiagram
         ET->>ET: add_elastic_actor() — DP rebuild 纳入此 ranks
     end
         
-    Note over ET: Phase 3 — _apply_pending_dp_changes()
+    Note over ET: Phase 2 — _apply_pending_dp_changes()
     ET->>ET: rebuild_dp_group(new_world_ranks)
     ET->>ET: _update_required_samples()
+    Note over ET: required_samples 已按新 DP size 对齐
+
+    Note over ET: Phase 3 — _fit_generate()
+    ET->>MQ: 按新 required_samples 拉取数据
+    Note over ET: batch 大小与当前 DP size 匹配
 
     Note over ET: Phase 4 — 训练计算（GPU 繁忙）
     ET->>ET: compute_reward / update_actor / ...
@@ -133,6 +136,8 @@ sequenceDiagram
     ET->>ET: checkpoint_manager.update_weights()
 ```
         
+> **为什么切换必须在拉数据之前**：弹性切换改变 DP size，进而改变 `required_samples` 和 `mini_batch_size`。若先拉数据（按旧 DP size），再切换，当次训练的 batch 大小与新 DP size 不匹配，触发 `train_mini_batch` 的 `assert mini_batch_size % dp_size == 0`。将切换提前到 `_fit_generate()` 之前，保证每次拉到的 batch 天然满足当前 DP 的整除约束。
+
 ---
     
 ## 2. 核心组件
@@ -260,7 +265,10 @@ graph TB
 **弹性副本预注册机制**：
 - 启动时，所有弹性 `RolloutReplica` 通过 `init_hybrid()` 初始化后立即 `sleep()`
 - 注册进 `_registered_elastic_replicas` 但不加入 LB 池
-- `add_elastic_replica()` 时 `wake_up()` + 加入 LB；`remove_elastic_replica()` 时触发 abort + `sleep()`
+- `add_elastic_replica()` 时：`wake_up()` → 同步 Worker 句柄（await）→ 注册 LB（严格有序，消除竞态）
+- `remove_elastic_replica()` 时：LB 标记删除 → 同步删除 Worker 句柄（await）→ abort in-flight → `sleep()`
+
+> **HYBRID 模式 `wake_up` 实现**：弹性 Rollout Server 以 `RolloutMode.HYBRID` 运行（与训练引擎共享 GPU）。`wake_up()` 调用 `ResumeMemoryOccupationReqInput(tags=["kv_cache", "weights"])` 恢复显存占用，而非 Standalone 模式的 `ResumeMemoryOccupationReqInput(tags=["kv_cache"])`。
 
 **ElasticGlobalRequestLoadBalancer** 在基础 LB 之上增加了 `_removed_servers` 集合，支持标记删除语义（mark-for-removal），使新请求不再路由到即将被移除的 server，同时存量请求继续正常完成。
 
@@ -348,9 +356,9 @@ remove_hybrid_replicas() → 从当前所在集合移除
 
 ```
 fit_step:
-  Phase 1: _fit_generate()          ← 从队列拉取样本（rollout 并行生成中）
-  Phase 2: _elastic_on_before_fit_step()  ← 弹性切换（GPU 空闲）
-  Phase 3: _apply_pending_dp_changes()    ← DP rebuild + _update_required_samples()
+  Phase 1: _elastic_on_before_fit_step()  ← 弹性切换（GPU 空闲，在拉数据之前）
+  Phase 2: _apply_pending_dp_changes()    ← DP rebuild + _update_required_samples()
+  Phase 3: _fit_generate()          ← 按新 required_samples 拉取样本（DP 已确定）
   Phase 4: 训练计算（GPU 繁忙）
     └─ _fit_update_actor()          ← actor 参数更新
     └─ _fit_update_weights()        ← 参数同步（每 trigger_parameter_sync_step 步触发）
@@ -358,7 +366,7 @@ fit_step:
           └─ Path B: _sleep_hybrid_replicas（休眠 hybrid）    → naive 进程内
 ```
 
-弹性切换（Phase 2）发生在参数同步（Phase 4）之前，保证切换前已完成最新参数的下发。
+弹性切换（Phase 1）发生在拉取数据（Phase 3）之前，确保 `required_samples` 和 `mini_batch_size` 已按新 DP size 对齐，batch 大小与训练时 DP 拓扑完全一致。参数同步（Phase 4）在切换之后，保证切换后的副本持有最新参数。
 
 ---
 
@@ -520,7 +528,27 @@ Step 3  构建 ElasticGlobalRequestLoadBalancer（只含固定 replica 的地址
 
 `replica_rank` 直接决定 Ray named actor 名称（`sglang_server_{replica_rank}_{node_rank}`），全局唯一即可避免 `ActorAlreadyExistsError`。
 
-#### 3.2.2 Server 删除执行顺序
+#### 3.2.2 Server 增加执行顺序
+
+`add_elastic_replica()` 严格按如下顺序执行，**Worker 句柄同步必须先于 LB 注册**：
+
+```mermaid
+sequenceDiagram
+    participant MGR as ElasticAgentLoopManager
+    participant ENG as vLLM / SGLang Engine
+    participant W as AgentLoopWorker × N
+    participant LB as ElasticGlobalRequestLoadBalancer
+
+    MGR->>ENG: Step 1: replica.wake_up()\n恢复 kv_cache + weights，启动推理服务
+    Note over ENG: HYBRID 模式下 wake_up 调用\nResumeMemoryOccupationReqInput\n恢复显存占用
+    MGR->>W: Step 2: notify_workers_server_added(addr, handle)\nawait 所有 worker ack\n_server_id_to_handle[addr] = handle
+    Note over W: 此 await 保证 handle 写入完成\n再开放路由，消除竞态
+    MGR->>LB: Step 3: add_server(server_id=addr)\n加入路由池，新请求可路由到此
+```
+
+> **关键时序约束**：若先注册 LB（Step 3）再同步句柄（Step 2），Worker 可能在 `_server_id_to_handle` 尚未写入时收到路由请求，导致 `RuntimeError: Unknown server_id`。必须保证所有 Worker 确认持有句柄后，再开放 LB 路由。
+
+#### 3.2.3 Server 删除执行顺序
 
 `remove_elastic_replica()` 严格按如下顺序执行：
 
@@ -544,7 +572,7 @@ sequenceDiagram
     MGR->>ENG: Step 5: replica.sleep()\n释放显存，GPU 归还 Training Engine
 ```
 
-#### 3.2.3 并发安全性分析
+#### 3.2.4 并发安全性分析
 
 | 场景 | 是否安全 | 原因 |
 |------|---------|------|
@@ -553,8 +581,9 @@ sequenceDiagram
 | sticky session 重试时 LB 仍返回被删 server A | ✅ 安全 | `acquire_server` 检查 `_removed_servers`，A 已在其中，重新路由到 B |
 | `_release_server(A)` (fire-and-forget) 与 `cleanup_removed_server(A)` 并发 | ✅ 安全 | `ElasticGlobalRequestLoadBalancer.release_server` 对不存在的 key 静默返回，不抛异常 |
 | 并发调用 `remove_elastic_replica` 两次（同时修改 `server_addresses` list） | ⚠️ 理论不安全 | Python list `pop` 非原子；但 `ElasticCoordinator` 通过 `_switch_lock` 保证串行调度，实践中不会并发 |
+| `add_elastic_replica` 后新请求在 Worker 句柄写入前到达 | ✅ 已修复 | `notify_workers_server_added()` await 所有 Worker ack 后，才调用 `LB.add_server()`，彻底消除竞态 |
 
-#### 3.2.4 `partial_rollout` 重试机制
+#### 3.2.5 `partial_rollout` 重试机制
 
 `FullyAsyncLLMServerManager.generate()` 对 AgentLoop 透明地完成断点续推：
 
@@ -572,6 +601,10 @@ flowchart TD
 
 重试时拼接 `prompt_ids + final_output.token_ids`，新 server 从断点位置续推，上层 AgentLoop 无感知。
 
+**Q: `add_elastic_replica` 执行期间，新请求在 Worker 句柄写入前就被路由过来，会出现 `Unknown server_id` 吗？**
+
+不会发生。`notify_workers_server_added()` 使用 `await asyncio.gather` 阻塞到所有 Worker 确认写入 `_server_id_to_handle` 后，才调用 `LB.add_server()` 开放路由。因此路由池开放时，所有 Worker 的句柄映射已完全就绪。
+
 **Q: `remove_elastic_replica` 执行期间，正在 `generate()` 的请求会丢失吗？**
 
 不会。依赖三层保障：
@@ -581,11 +614,12 @@ flowchart TD
 
 ### 3.3 弹性触发时机及过程
 
-#### 3.3.1 为什么选择训练前边界触发切换
+#### 3.3.1 为什么切换必须在拉数据（_fit_generate）之前
 
-- **Train GPU 完全空闲**：`_fit_generate()` 期间 Train Workers 仅等待队列数据，GPU 零占用，切换成本为零
+- **Train GPU 完全空闲**：上一步训练结束后、拉取下一批数据之前，Train Workers GPU 零占用，是执行 offload / load 最低成本的窗口
+- **batch 大小与 DP 必须对齐**：切换改变 DP size → `required_samples` 和 `mini_batch_size` 随之更新。若先拉数据再切换，当次 batch 按旧 DP 大小拉取，与新 DP size 不整除，触发 `assert mini_batch_size % dp_size == 0`；切换前置后，`_fit_generate()` 按最新 `required_samples` 拉取，天然对齐
 - **监控与执行解耦**：后台监控循环只写 `_pending_action` flag，实际切换在安全窗口由 `on_before_fit_step()` 触发，避免异步竞争
-- **自然对齐**：`_fit_generate()` 等待越久 = 生产越不足，与 `scale_rollout` 决策方向天然一致
+- **自然对齐**：等待数据越久 = 生产越不足，与 `scale_rollout` 决策方向一致；切换完成后再进入等待，可让新的 Rollout 副本立即开始产出样本，缩短等待时间
 
 #### 3.3.2 弹性切换完整过程
 
@@ -599,8 +633,9 @@ Train → Rollout (switch_elastic_to_rollout)
 ② worker.switch_to_rollout()
     → actor.offload_to_cpu()  [释放 GPU 显存]
 ③ rollouter.add_elastic_replica()
-    → rollout.wake_up()        [加载权重 + resume kv_cache]
-    → 注册到 LB 池
+    → rollout.wake_up()                       [恢复 kv_cache + weights，启动推理服务]
+    → notify_workers_server_added() [await]   [所有 Worker 确认持有句柄后再继续]
+    → LB.add_server()                         [开放路由，新请求可路由到此副本]
     → checkpoint_manager.mark_hybrid_awake()  [切换同步路径 → NCCL]
 
 Rollout → Train (switch_elastic_to_train)
@@ -625,16 +660,36 @@ DP Rebuild（在下一个 Phase 3 执行）
     → _update_required_samples()  [按新 DP 大小重新计算]
 ```
 
-#### 3.3.3 required_samples 动态更新
+#### 3.3.3 required_samples 与 mini_batch_size 动态对齐
 
-弹性切换改变 DP 大小后，`_update_required_samples()` 重新计算每步样本数：
+弹性切换改变 DP 大小后，`engine_workers.train_mini_batch` 会做如下断言：
+
+```python
+assert mini_batch_size % dp_size == 0
+```
+
+当 `ppo_mini_batch_size × rollout_n` 不能被新 DP size 整除时（例如 768 % 5 ≠ 0），会抛出 `AssertionError`。为此引入统一的对齐方法 `_get_dp_aligned_mini_batch_size()`：
 
 ```
-base_per_dp      = ppo_mini_batch_size × require_batches
-required_samples = base_per_dp × current_dp_size
+aligned_mini_batch = ceil(ppo_mini_batch_size × rollout_n / dp_size) × dp_size
+required_samples   = aligned_mini_batch × require_batches
 ```
 
-其中 `current_dp_size` = 固定 actor_wg 大小（若存在）＋所有处于 TRAIN 状态的弹性 actor_wg 大小之和。在 `_apply_pending_dp_changes()` 末尾调用，保证下一次 `_fit_generate()` 使用更新后的值。
+两处均调用同一方法，保证一致性：
+
+| 调用位置 | 作用 |
+|---------|------|
+| `_update_required_samples()` | 确定从队列拉取的样本总量，同时满足 `required_samples % dp_size == 0` |
+| `_update_actor()` | 传给 `train_mini_batch` 的 `mini_batch_size`，满足 `mini_batch_size % dp_size == 0` |
+
+**示例**（`ppo_mini_batch_size=48, rollout_n=16, dp_size=5`）：
+```
+base          = 48 × 16 = 768
+aligned       = ceil(768 / 5) × 5 = 154 × 5 = 770
+required_samples = 770 × require_batches
+```
+
+在 `_apply_pending_dp_changes()` 末尾调用，保证下一次 `_fit_generate()` 拉取对齐后的样本数，`_update_actor()` 使用同样对齐的 `mini_batch_size`。
 
 #### 3.3.4 样本 Staleness 处理
 

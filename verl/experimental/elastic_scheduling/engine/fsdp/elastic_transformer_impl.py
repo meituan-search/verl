@@ -284,6 +284,22 @@ class ElasticFSDPMixin:
                 logger.info(f"[ElasticFSDPMixin rank={my_rank}] Rank removed from DP group, returning")
                 return
 
+            # Step 5b: Update the VERL dispatch/collect info so the single-controller
+            # dispatch layer sees the new DP rank after the rebuild.
+            # The dp_rank within the new group = position of my_rank in new_world_ranks.
+            new_dp_rank = new_world_ranks.index(my_rank)
+            # is_collect: rank 0 of the new DP group collects results.
+            new_is_collect = new_dp_rank == 0
+            dispatch_map = getattr(self, "_Worker__dispatch_dp_rank", None)
+            collect_map = getattr(self, "_Worker__collect_dp_rank", None)
+            if dispatch_map is not None:
+                for mesh_name in list(dispatch_map.keys()):
+                    dispatch_map[mesh_name] = new_dp_rank
+                logger.info(f"[ElasticFSDPMixin rank={my_rank}] Updated __dispatch_dp_rank → {new_dp_rank}")
+            if collect_map is not None:
+                for mesh_name in list(collect_map.keys()):
+                    collect_map[mesh_name] = new_is_collect
+
             # Step 6: Restore state from CPU
             # Each rank restores its own shard from the per-rank snapshot.
             # This is sufficient for same-size and scale-down rebuilds where
