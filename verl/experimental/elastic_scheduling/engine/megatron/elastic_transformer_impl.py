@@ -115,35 +115,62 @@ class ElasticMegatronMixin:
         is_in_new_group = my_rank in new_world_ranks
         new_dp_size = len(new_world_ranks)
 
-        logger.info(
+        # Check if this rank is already in ROLLOUT mode (model on CPU)
+        # This can happen when multiple elastic switches occur in sequence
+        is_in_rollout_mode = False
+        if hasattr(self, "_elastic_state") and self._elastic_state is not None:
+            # Import here to avoid circular dependency
+            from verl.experimental.elastic_scheduling.elastic_engine_workers import ElasticMode
+
+            is_in_rollout_mode = self._elastic_state.current_mode == ElasticMode.ROLLOUT
+
+        print(
             f"[ElasticMegatronMixin rank={my_rank}] rebuild_dp_group called\n"
             f"  new_world_ranks={new_world_ranks}\n"
-            f"  is_in_new_group={is_in_new_group}"
+            f"  is_in_new_group={is_in_new_group}\n"
+            f"  is_in_rollout_mode={is_in_rollout_mode}"
         )
 
         try:
-            # Step 1: Only retained ranks need a CPU snapshot + restore cycle.
+            # Step 1: Only retained ranks that are NOT in ROLLOUT mode need capture.
+            # Ranks in ROLLOUT mode already have model on CPU (offloaded by switch_to_rollout).
             # Removed ranks will have their weights offloaded by switch_to_rollout()
             # right after this call, so capturing state here would be redundant.
-            if is_in_new_group:
+            if is_in_new_group and not is_in_rollout_mode:
+                print(f"[ElasticMegatronMixin rank={my_rank}] Step 1: Capturing state to CPU...")
                 self._capture_state_to_cpu()
+                print(
+                    f"[ElasticMegatronMixin rank={my_rank}] Step 1: State captured, _model_on_gpu={self._model_on_gpu}"
+                )
+            elif is_in_rollout_mode:
+                print(
+                    f"[ElasticMegatronMixin rank={my_rank}] Step 1: "
+                    f"SKIPPED (rank is in ROLLOUT mode, model already on CPU)"
+                )
+            else:
+                print(f"[ElasticMegatronMixin rank={my_rank}] Step 1: SKIPPED (not in new group)")
 
             # Step 2: Create the new DP process group.
             # dist.new_group() is a collective — every rank in the current world
             # must call it simultaneously, including ranks being removed.
+            print(f"[ElasticMegatronMixin rank={my_rank}] Step 2: Creating new DP group...")
             new_dp_group = dist.new_group(ranks=new_world_ranks)
+            print(f"[ElasticMegatronMixin rank={my_rank}] Step 2: New DP group created")
 
             # Step 3: Global barrier so all ranks have finished the collective
             # before anyone proceeds.
+            print(f"[ElasticMegatronMixin rank={my_rank}] Step 3: Global barrier...")
             dist.barrier()
+            print(f"[ElasticMegatronMixin rank={my_rank}] Step 3: Barrier passed")
 
             # Step 4: Ranks NOT in the new group have fulfilled their collective
             # obligations and can exit now.
             if not is_in_new_group:
-                logger.info(f"[ElasticMegatronMixin rank={my_rank}] Rank removed from DP group, returning")
+                print(f"[ElasticMegatronMixin rank={my_rank}] Step 4: Rank removed from DP group, returning")
                 return
 
             # Step 5: Patch mpu so all Megatron code sees the new DP group.
+            print(f"[ElasticMegatronMixin rank={my_rank}] Step 5: Patching mpu DP group...")
             self._patch_mpu_dp_group(new_dp_group, new_world_ranks)
 
             # Step 5b: Sync the VERL dispatch/collect info so the single-controller
@@ -168,7 +195,7 @@ class ElasticMegatronMixin:
             if dispatch_map is not None:
                 for mesh_name in list(dispatch_map.keys()):
                     dispatch_map[mesh_name] = new_dp_rank
-                logger.info(
+                print(
                     f"[ElasticMegatronMixin rank={my_rank}] Updated __dispatch_dp_rank → {new_dp_rank}, "
                     f"is_collect={new_is_collect}"
                 )
@@ -177,28 +204,46 @@ class ElasticMegatronMixin:
                     collect_map[mesh_name] = new_is_collect
 
             # Step 6: Restore model + optimizer back to GPU.
-            self._restore_state_from_cpu()
+            # Skip restore if rank is in ROLLOUT mode (model should stay on CPU).
+            if not is_in_rollout_mode:
+                print(f"[ElasticMegatronMixin rank={my_rank}] Step 6: Restoring state from CPU...")
+                self._restore_state_from_cpu()
+                print(
+                    f"[ElasticMegatronMixin rank={my_rank}] Step 6: State restored, _model_on_gpu={self._model_on_gpu}"
+                )
+            else:
+                print(
+                    f"[ElasticMegatronMixin rank={my_rank}] Step 6: "
+                    f"SKIPPED (rank is in ROLLOUT mode, model stays on CPU)"
+                )
 
             # Step 7: Broadcast params to any newly joined ranks.
             prev_ranks = getattr(self, "_prev_dp_world_ranks", set(new_world_ranks))
             has_new_members = any(r not in prev_ranks for r in new_world_ranks)
+            print(
+                f"[ElasticMegatronMixin rank={my_rank}] Step 7: "
+                f"Checking for new members... has_new_members={has_new_members}"
+            )
             if has_new_members:
+                print(f"[ElasticMegatronMixin rank={my_rank}] Step 7: Syncing params to new members...")
                 self._sync_params_to_new_members(new_world_ranks, sync_group=new_dp_group)
             self._prev_dp_world_ranks = set(new_world_ranks)
+            print(f"[ElasticMegatronMixin rank={my_rank}] Step 7: Done")
 
             # Step 8: Final barrier within the new group.
+            print(f"[ElasticMegatronMixin rank={my_rank}] Step 8: Final barrier in new group...")
             dist.barrier(group=new_dp_group)
 
-            logger.info(f"[ElasticMegatronMixin rank={my_rank}] DP group rebuild complete, new dp_size={new_dp_size}")
+            print(f"[ElasticMegatronMixin rank={my_rank}] DP group rebuild complete, new dp_size={new_dp_size}")
 
         except Exception as e:
-            logger.exception(f"[ElasticMegatronMixin rank={my_rank}] Failed to rebuild DP group: {e}")
+            print(f"[ElasticMegatronMixin rank={my_rank}] Failed to rebuild DP group: {e}")
             raise
 
     def _capture_state_to_cpu(self) -> None:
         """Capture model and optimizer state to CPU memory."""
         my_rank = dist.get_rank()
-        logger.info(f"[ElasticMegatronMixin rank={my_rank}] Capturing state to CPU...")
+        print(f"[ElasticMegatronMixin rank={my_rank}] Capturing state to CPU...")
 
         # Log grad_data state BEFORE offload
         if hasattr(self, "module") and self.module is not None:
@@ -211,7 +256,7 @@ class ElasticMegatronMixin:
                         grad_sz = buf.grad_data.storage().size()
                         param_sz = buf.param_data.storage().size()
                         has_gds = hasattr(buf, "grad_data_size")
-                        logger.info(
+                        print(
                             f"[ElasticMegatronMixin rank={my_rank}] PRE-OFFLOAD "
                             f"chunk={i} buf={j}: param_data.storage.size={param_sz}, "
                             f"grad_data.storage.size={grad_sz}, "
@@ -242,7 +287,7 @@ class ElasticMegatronMixin:
                     for j, buf in enumerate(m.buffers):
                         grad_sz = buf.grad_data.storage().size()
                         has_gds = hasattr(buf, "grad_data_size")
-                        logger.info(
+                        print(
                             f"[ElasticMegatronMixin rank={my_rank}] POST-OFFLOAD "
                             f"chunk={i} buf={j}: grad_data.storage.size={grad_sz}, "
                             f"has_grad_data_size={has_gds}"
@@ -269,7 +314,7 @@ class ElasticMegatronMixin:
         my_rank = dist.get_rank()
 
         if self._model_on_gpu and hasattr(self, "module") and self.module is not None:
-            logger.info(
+            print(
                 f"[ElasticMegatronMixin rank={my_rank}] Offloading model to CPU (model_on_gpu={self._model_on_gpu})..."
             )
             modules = self.module if isinstance(self.module, list) else [self.module]
@@ -280,7 +325,7 @@ class ElasticMegatronMixin:
             self._model_on_gpu = False
 
         if self._optimizer_on_gpu and hasattr(self, "optimizer") and self.optimizer is not None:
-            logger.info(f"[ElasticMegatronMixin rank={my_rank}] Offloading optimizer to CPU...")
+            print(f"[ElasticMegatronMixin rank={my_rank}] Offloading optimizer to CPU...")
 
             if hasattr(self.optimizer, "offload_to_cpu"):
                 try:
@@ -352,7 +397,7 @@ class ElasticMegatronMixin:
         _mpu_mod._DATA_PARALLEL_GLOBAL_RANKS = new_world_ranks
         _mpu_mod._DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = new_world_ranks
 
-        logger.info(
+        print(
             f"[ElasticMegatronMixin rank={my_rank}] mpu DP group patched: "
             f"dp_size={new_dp_size}, dp_rank={new_dp_rank}, ranks={new_world_ranks}"
         )
@@ -365,7 +410,7 @@ class ElasticMegatronMixin:
         (CPU copy of param values) is then copied into the restored buffers.
         """
         my_rank = dist.get_rank()
-        logger.info(
+        print(
             f"[ElasticMegatronMixin rank={my_rank}] Restoring state from CPU to GPU "
             f"(model_on_gpu={self._model_on_gpu}, "
             f"has_snapshot={self._model_snapshot is not None})..."
@@ -386,7 +431,7 @@ class ElasticMegatronMixin:
                         for j, buf in enumerate(m.buffers):
                             grad_sz = buf.grad_data.storage().size()
                             has_gds = hasattr(buf, "grad_data_size")
-                            logger.info(
+                            print(
                                 f"[ElasticMegatronMixin rank={my_rank}] PRE-LOAD "
                                 f"chunk={i} buf={j}: grad_data.storage.size={grad_sz}, "
                                 f"has_grad_data_size={has_gds}"
@@ -417,7 +462,7 @@ class ElasticMegatronMixin:
                         for j, buf in enumerate(m.buffers):
                             grad_sz = buf.grad_data.storage().size()
                             has_gds = hasattr(buf, "grad_data_size")
-                            logger.info(
+                            print(
                                 f"[ElasticMegatronMixin rank={my_rank}] POST-LOAD "
                                 f"chunk={i} buf={j}: grad_data.storage.size={grad_sz}, "
                                 f"has_grad_data_size={has_gds}"
@@ -428,7 +473,7 @@ class ElasticMegatronMixin:
 
                 self._model_on_gpu = True
         else:
-            logger.warning(
+            print(
                 f"[ElasticMegatronMixin rank={my_rank}] _restore_state_from_cpu SKIPPED: "
                 f"model_on_gpu={self._model_on_gpu}, "
                 f"has_snapshot={self._model_snapshot is not None}"
@@ -458,9 +503,7 @@ class ElasticMegatronMixin:
         if not hasattr(self, "module") or self.module is None:
             return
 
-        logger.info(
-            f"[ElasticMegatronMixin rank={my_rank}] Syncing params via broadcast from rank {new_world_ranks[0]}"
-        )
+        print(f"[ElasticMegatronMixin rank={my_rank}] Syncing params via broadcast from rank {new_world_ranks[0]}")
 
         src_rank = new_world_ranks[0]
 
@@ -519,7 +562,7 @@ class ModelStateSnapshot:
                 snapshot.state_dict[f"{name}.buffer"] = buffer.data.detach().cpu().clone()
 
         if torch.distributed.get_rank() == 0:
-            logger.info(f"Model snapshot captured: {snapshot.num_parameters} parameters, dtype={snapshot.dtype}")
+            print(f"Model snapshot captured: {snapshot.num_parameters} parameters, dtype={snapshot.dtype}")
 
         return snapshot
 
@@ -599,7 +642,7 @@ class OptimizerStateSnapshot:
                 snapshot.param_groups_data[pg_key] = {k: v for k, v in pg.items() if not isinstance(v, list | dict)}
 
         if torch.distributed.get_rank() == 0:
-            logger.info(f"Optimizer snapshot captured: {len(snapshot.state_dict)} state dicts")
+            print(f"Optimizer snapshot captured: {len(snapshot.state_dict)} state dicts")
 
         return snapshot
 

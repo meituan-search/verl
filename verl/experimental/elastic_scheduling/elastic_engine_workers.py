@@ -425,8 +425,24 @@ class ElasticActorWorker(ActorRolloutRefWorker):
 
         Inactive DP ranks receive ``data=None`` and return ``None``.
         """
+        logger.warning(
+            f"[ElasticActorWorker rank={dist.get_rank()}] update_actor called: "
+            f"data_is_none={data is None}, "
+            f"elastic_state={self._elastic_state.current_mode if self._elastic_state else 'N/A'}"
+        )
         if data is None:
+            logger.warning(f"[ElasticActorWorker rank={dist.get_rank()}] update_actor returning None (inactive rank)")
             return None
+        # Check data content before passing to parent
+        if hasattr(data, "keys"):
+            logger.warning(
+                f"[ElasticActorWorker rank={dist.get_rank()}] update_actor data keys={list(data.keys())}, "
+                f"data type={type(data)}"
+            )
+        if hasattr(data, "batch_size"):
+            logger.warning(
+                f"[ElasticActorWorker rank={dist.get_rank()}] update_actor data batch_size={data.batch_size}"
+            )
         return super().update_actor(data)
 
     # -------------------------------------------------------------------------
@@ -496,10 +512,22 @@ class ElasticActorWorker(ActorRolloutRefWorker):
         rollout mode) unless the engine's ``to()`` helper handles it.
         """
         if not (hasattr(self, "actor") and self.actor is not None):
+            logger.warning(
+                f"[ElasticActorWorker rank={dist.get_rank()}] _offload_actor_to_cpu: actor not found, skipping"
+            )
             return
         # Log grad_data state before offload
+        logger.warning(
+            f"[ElasticActorWorker rank={dist.get_rank()}] _offload_actor_to_cpu START: "
+            f"engine_type={type(self.actor.engine).__name__}, "
+            f"has_to_method={callable(getattr(self.actor.engine, 'to', None))}"
+        )
         self._log_grad_data_state("PRE switch_to_rollout offload")
         if callable(getattr(self.actor.engine, "to", None)):
+            logger.warning(
+                f"[ElasticActorWorker rank={dist.get_rank()}] "
+                f"Calling engine.to('cpu', model=True, optimizer=False, grad=False)"
+            )
             self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
         else:
             # Fallback: move module parameters manually
@@ -530,10 +558,20 @@ class ElasticActorWorker(ActorRolloutRefWorker):
         ``CUDA error: an illegal memory access was encountered``.
         """
         if not (hasattr(self, "actor") and self.actor is not None):
+            logger.warning(f"[ElasticActorWorker rank={dist.get_rank()}] _load_actor_to_gpu: actor not found, skipping")
             return
         # Log grad_data state before load
+        logger.warning(
+            f"[ElasticActorWorker rank={dist.get_rank()}] _load_actor_to_gpu START: "
+            f"engine_type={type(self.actor.engine).__name__}, "
+            f"has_to_method={callable(getattr(self.actor.engine, 'to', None))}"
+        )
         self._log_grad_data_state("PRE switch_to_train load")
         if callable(getattr(self.actor.engine, "to", None)):
+            logger.warning(
+                f"[ElasticActorWorker rank={dist.get_rank()}] "
+                f"Calling engine.to('device', model=True, optimizer=False, grad=True)"
+            )
             self.actor.engine.to("device", model=True, optimizer=False, grad=True)
         else:
             engine = self.actor.engine

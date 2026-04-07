@@ -84,7 +84,7 @@ class FSDPModelStateSnapshot:
             snapshot.state_dict[f"{name}.__buffer__"] = local_buf.detach().cpu().clone()
 
         if torch.distributed.get_rank() == 0:
-            logger.info(f"FSDP Model snapshot captured: {snapshot.num_parameters} parameters, dtype={snapshot.dtype}")
+            print(f"FSDP Model snapshot captured: {snapshot.num_parameters} parameters, dtype={snapshot.dtype}")
 
         return snapshot
 
@@ -153,10 +153,10 @@ class FSDPOptimizerStateSnapshot:
                                     snapshot.dtype = v.dtype
                                     break
         except Exception as e:
-            logger.warning(f"Failed to capture optimizer state: {e}")
+            print(f"Failed to capture optimizer state: {e}")
 
         if torch.distributed.get_rank() == 0:
-            logger.info(f"Optimizer snapshot captured: {len(snapshot.state_dict)} state dicts")
+            print(f"Optimizer snapshot captured: {len(snapshot.state_dict)} state dicts")
 
         return snapshot
 
@@ -187,7 +187,7 @@ class FSDPOptimizerStateSnapshot:
                     # the in-place changes to the nested dicts take effect.
                     optimizer.load_state_dict(opt_state_dict)
         except Exception as e:
-            logger.warning(f"Failed to restore optimizer state: {e}")
+            print(f"Failed to restore optimizer state: {e}")
 
 
 class ElasticFSDPMixin:
@@ -250,15 +250,31 @@ class ElasticFSDPMixin:
         # Check if this rank is in new DP group
         is_in_new_group = my_rank in new_world_ranks
 
-        logger.info(
+        # Check if this rank is already in ROLLOUT mode (model on CPU)
+        # This can happen when multiple elastic switches occur in sequence
+        is_in_rollout_mode = False
+        if hasattr(self, "_elastic_state") and self._elastic_state is not None:
+            # Import here to avoid circular dependency
+            from verl.experimental.elastic_scheduling.elastic_engine_workers import ElasticMode
+
+            is_in_rollout_mode = self._elastic_state.current_mode == ElasticMode.ROLLOUT
+
+        print(
             f"[ElasticFSDPMixin rank={my_rank}] rebuild_dp_group called\n"
             f"  new_world_ranks={new_world_ranks}\n"
-            f"  is_in_new_group={is_in_new_group}"
+            f"  is_in_new_group={is_in_new_group}\n"
+            f"  is_in_rollout_mode={is_in_rollout_mode}"
         )
 
         try:
             # Step 1: Capture state to CPU
-            self._capture_state_to_cpu()
+            # Skip capture if rank is in ROLLOUT mode (model already on CPU)
+            if not is_in_rollout_mode:
+                self._capture_state_to_cpu()
+            else:
+                print(
+                    f"[ElasticFSDPMixin rank={my_rank}] Step 1: SKIPPED (rank is in ROLLOUT mode, model already on CPU)"
+                )
 
             # Step 2: Barrier with all current ranks (everyone must reach here)
             if dist.is_initialized():
@@ -281,7 +297,7 @@ class ElasticFSDPMixin:
             # need to participate.  The global barrier in step 4 is the last one
             # that requires all-rank participation.
             if not is_in_new_group:
-                logger.info(f"[ElasticFSDPMixin rank={my_rank}] Rank removed from DP group, returning")
+                print(f"[ElasticFSDPMixin rank={my_rank}] Rank removed from DP group, returning")
                 return
 
             # Step 5b: Update the VERL dispatch/collect info so the single-controller
@@ -295,7 +311,7 @@ class ElasticFSDPMixin:
             if dispatch_map is not None:
                 for mesh_name in list(dispatch_map.keys()):
                     dispatch_map[mesh_name] = new_dp_rank
-                logger.info(f"[ElasticFSDPMixin rank={my_rank}] Updated __dispatch_dp_rank → {new_dp_rank}")
+                print(f"[ElasticFSDPMixin rank={my_rank}] Updated __dispatch_dp_rank → {new_dp_rank}")
             if collect_map is not None:
                 for mesh_name in list(collect_map.keys()):
                     collect_map[mesh_name] = new_is_collect
@@ -304,7 +320,13 @@ class ElasticFSDPMixin:
             # Each rank restores its own shard from the per-rank snapshot.
             # This is sufficient for same-size and scale-down rebuilds where
             # every participating rank already held a valid state snapshot.
-            self._restore_state_from_cpu()
+            # Skip restore if rank is in ROLLOUT mode (model should stay on CPU).
+            if not is_in_rollout_mode:
+                self._restore_state_from_cpu()
+            else:
+                print(
+                    f"[ElasticFSDPMixin rank={my_rank}] Step 6: SKIPPED (rank is in ROLLOUT mode, model stays on CPU)"
+                )
 
             # Step 7: Sync parameters to newly joined ranks (scale-out only).
             # Only broadcast when some ranks have zero/invalid parameters
@@ -320,18 +342,16 @@ class ElasticFSDPMixin:
             # Remember current group membership for future rebuild calls.
             self._prev_world_ranks = set(new_world_ranks)
 
-            logger.info(
-                f"[ElasticFSDPMixin rank={my_rank}] DP group rebuild complete with {len(new_world_ranks)} ranks"
-            )
+            print(f"[ElasticFSDPMixin rank={my_rank}] DP group rebuild complete with {len(new_world_ranks)} ranks")
 
         except Exception as e:
-            logger.exception(f"[ElasticFSDPMixin rank={my_rank}] Failed to rebuild DP group: {e}")
+            print(f"[ElasticFSDPMixin rank={my_rank}] Failed to rebuild DP group: {e}")
             raise
 
     def _capture_state_to_cpu(self) -> None:
         """Capture model and optimizer state to CPU memory."""
         my_rank = dist.get_rank()
-        logger.info(f"[ElasticFSDPMixin rank={my_rank}] Capturing state to CPU...")
+        print(f"[ElasticFSDPMixin rank={my_rank}] Capturing state to CPU...")
 
         # Capture model
         if hasattr(self, "module") and self.module is not None:
@@ -352,14 +372,14 @@ class ElasticFSDPMixin:
         my_rank = dist.get_rank()
 
         if self._model_on_gpu and hasattr(self, "module") and self.module is not None:
-            logger.info(f"[ElasticFSDPMixin rank={my_rank}] Offloading model to CPU...")
+            print(f"[ElasticFSDPMixin rank={my_rank}] Offloading model to CPU...")
 
             try:
                 from verl.utils.fsdp_utils import offload_fsdp_model_to_cpu
 
                 offload_fsdp_model_to_cpu(self.module)
             except Exception as e:
-                logger.warning(f"Failed to use offload_fsdp_model_to_cpu: {e}, trying manual offload")
+                print(f"Failed to use offload_fsdp_model_to_cpu: {e}, trying manual offload")
 
                 unwrapped = self.module
                 while hasattr(unwrapped, "module"):
@@ -373,14 +393,14 @@ class ElasticFSDPMixin:
             self._model_on_gpu = False
 
         if self._optimizer_on_gpu and hasattr(self, "optimizer") and self.optimizer is not None:
-            logger.info(f"[ElasticFSDPMixin rank={my_rank}] Offloading optimizer to CPU...")
+            print(f"[ElasticFSDPMixin rank={my_rank}] Offloading optimizer to CPU...")
 
             try:
                 from verl.utils.fsdp_utils import offload_fsdp_optimizer
 
                 offload_fsdp_optimizer(self.optimizer)
             except Exception as e:
-                logger.warning(f"Failed to use offload_fsdp_optimizer: {e}, trying manual offload")
+                print(f"Failed to use offload_fsdp_optimizer: {e}, trying manual offload")
 
             self._optimizer_on_gpu = False
 
@@ -403,16 +423,16 @@ class ElasticFSDPMixin:
         collective.
         """
         my_rank = dist.get_rank()
-        logger.info(f"[ElasticFSDPMixin rank={my_rank}] Rebuilding FSDP groups for {len(new_world_ranks)} ranks")
+        print(f"[ElasticFSDPMixin rank={my_rank}] Rebuilding FSDP groups for {len(new_world_ranks)} ranks")
 
         # Step 1: collective – every current rank participates.
         try:
             new_group = dist.new_group(ranks=new_world_ranks)
             # Cache for reuse in _sync_params_to_new_members.
             self._new_dp_group = new_group
-            logger.info(f"[ElasticFSDPMixin rank={my_rank}] Created new process group for {len(new_world_ranks)} ranks")
+            print(f"[ElasticFSDPMixin rank={my_rank}] Created new process group for {len(new_world_ranks)} ranks")
         except Exception as e:
-            logger.warning(f"[ElasticFSDPMixin rank={my_rank}] Error creating process group: {e}")
+            print(f"[ElasticFSDPMixin rank={my_rank}] Error creating process group: {e}")
             return
 
         # Step 2: patch device_mesh so FSDP collectives use the new group.
@@ -425,23 +445,21 @@ class ElasticFSDPMixin:
         if mesh is not None:
             try:
                 mesh._dim_group_infos[0] = (new_group, new_world_ranks)
-                logger.info(
-                    f"[ElasticFSDPMixin rank={my_rank}] device_mesh patched (new dp_size={len(new_world_ranks)})"
-                )
+                print(f"[ElasticFSDPMixin rank={my_rank}] device_mesh patched (new dp_size={len(new_world_ranks)})")
             except Exception as exc:
-                logger.warning(
+                print(
                     f"[ElasticFSDPMixin rank={my_rank}] Could not patch device_mesh: {exc}. "
                     "New group was created but mesh was not updated."
                 )
         else:
-            logger.warning(
+            print(
                 f"[ElasticFSDPMixin rank={my_rank}] No device_mesh found; FSDP collectives may still use the old group."
             )
 
     def _restore_state_from_cpu(self) -> None:
         """Restore model and optimizer state from CPU memory to GPU."""
         my_rank = dist.get_rank()
-        logger.info(f"[ElasticFSDPMixin rank={my_rank}] Restoring state from CPU to GPU...")
+        print(f"[ElasticFSDPMixin rank={my_rank}] Restoring state from CPU to GPU...")
 
         device = get_device_name()
 
@@ -470,7 +488,7 @@ class ElasticFSDPMixin:
         joined ranks receive fresh weights without disk I/O.
         """
         my_rank = dist.get_rank()
-        logger.info(f"[ElasticFSDPMixin rank={my_rank}] Syncing params to {len(new_world_ranks)} ranks")
+        print(f"[ElasticFSDPMixin rank={my_rank}] Syncing params to {len(new_world_ranks)} ranks")
 
         if not (hasattr(self, "module") and self.module is not None):
             return
@@ -479,9 +497,7 @@ class ElasticFSDPMixin:
         # collective only if the cached handle is missing (shouldn't happen).
         new_group = getattr(self, "_new_dp_group", None)
         if new_group is None:
-            logger.warning(
-                f"[ElasticFSDPMixin rank={my_rank}] _new_dp_group not set; creating a new group (extra collective)"
-            )
+            print(f"[ElasticFSDPMixin rank={my_rank}] _new_dp_group not set; creating a new group (extra collective)")
             new_group = dist.new_group(ranks=new_world_ranks)
 
         unwrapped = self.module
@@ -511,4 +527,4 @@ class ElasticFSDPMixin:
 
         # Clean up cached handle.
         self._new_dp_group = None
-        logger.info(f"[ElasticFSDPMixin rank={my_rank}] Param sync complete")
+        print(f"[ElasticFSDPMixin rank={my_rank}] Param sync complete")

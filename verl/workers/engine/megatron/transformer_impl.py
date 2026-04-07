@@ -475,6 +475,15 @@ class MegatronEngine(BaseEngine):
             model: If True, move the model.
             optimizer: If True, move the optimizer states.
         """
+        import logging as _logging
+
+        _debug_logger = _logging.getLogger(__name__)
+        _debug_logger.warning(
+            f"[MegatronEngine.to DEBUG] "
+            f"rank={torch.distributed.get_rank() if torch.distributed.is_initialized() else 'N/A'} "
+            f"device={device}, model={model}, optimizer={optimizer}, grad={grad}"
+        )
+
         super().to(device=device, model=model, optimizer=optimizer, grad=grad)
 
         device_name = get_device_name()
@@ -482,11 +491,18 @@ class MegatronEngine(BaseEngine):
         assert device in (device_name, "cpu")
         if device == device_name:
             if model:
+                _debug_logger.warning(
+                    f"[MegatronEngine.to DEBUG] Calling load_megatron_model_to_gpu with load_grad={grad}"
+                )
                 load_megatron_model_to_gpu(self.module, load_grad=grad)
             if optimizer and self.optimizer is not None:
                 load_megatron_optimizer(self.optimizer)
         elif device == "cpu":
             if model:
+                _debug_logger.warning(
+                    f"[MegatronEngine.to DEBUG] Calling offload_megatron_model_to_cpu "
+                    f"(grad will be offloaded regardless of grad={grad})"
+                )
                 offload_megatron_model_to_cpu(self.module)
             if optimizer and self.optimizer is not None:
                 offload_megatron_optimizer(self.optimizer)
@@ -558,6 +574,25 @@ class MegatronEngine(BaseEngine):
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> Any:
         tu.assign_non_tensor(data, sp_size=self.engine_config.context_parallel_size)
+
+        # DEBUG: Check data and loss_mask before accessing
+        import logging as _logging
+
+        _debug_logger = _logging.getLogger(__name__)
+        _debug_logger.warning(
+            f"[forward_backward_batch DEBUG] "
+            f"rank={torch.distributed.get_rank() if torch.distributed.is_initialized() else 'N/A'} "
+            f"data type={type(data)}, keys={list(data.keys()) if hasattr(data, 'keys') else 'N/A'}"
+        )
+        if "loss_mask" in data:
+            loss_mask = data["loss_mask"]
+            _debug_logger.warning(
+                f"[forward_backward_batch DEBUG] loss_mask shape={loss_mask.shape}, "
+                f"dtype={loss_mask.dtype}, device={loss_mask.device}, "
+                f"storage_size={loss_mask.storage().size() if loss_mask.is_cuda else 'N/A'}"
+            )
+        else:
+            _debug_logger.error("[forward_backward_batch DEBUG] loss_mask NOT FOUND in data!")
 
         # compute num_tokens in global batch for loss normalization
         batch_num_tokens = data["loss_mask"].sum().to(get_device_id())

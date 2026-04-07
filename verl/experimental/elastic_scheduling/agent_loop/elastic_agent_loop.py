@@ -117,9 +117,7 @@ class ElasticGlobalRequestLoadBalancer:
         """Get list of all active server IDs."""
         return [sid for sid in self._inflight_requests if sid not in self._removed_servers]
 
-    # ---- test helpers ----
-
-    def set_inflight_for_test(self, server_id: str, count: int) -> None:
+    def set_inflight(self, server_id: str, count: int) -> None:
         """Directly set in-flight count for a server (test use only)."""
         self._inflight_requests[server_id] = count
 
@@ -687,26 +685,3 @@ class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
                 *[asyncio.wrap_future(f.future()) for f in futures],
                 return_exceptions=True,
             )
-
-    async def _drain_server(self, server_address: str, timeout: float = 30.0) -> None:
-        """Wait for in-flight requests to drain from a server (optional helper)."""
-        start = time.time()
-        last_log = start
-        while time.time() - start < timeout:
-            try:
-                inflight = ray.get(self.global_load_balancer.get_inflight_count.remote(server_id=server_address))
-                if inflight == 0:
-                    logger.info(
-                        f"[ElasticAgentLoopManager] Server {server_address} drained in {time.time() - start:.1f}s"
-                    )
-                    return
-                if time.time() - last_log > 5.0:
-                    logger.info(
-                        f"[ElasticAgentLoopManager] Waiting for {inflight} in-flight requests on {server_address}..."
-                    )
-                    last_log = time.time()
-            except Exception as e:
-                logger.warning(f"[ElasticAgentLoopManager] Error checking inflight: {e}")
-                break
-            await asyncio.sleep(0.5)
-        logger.warning(f"[ElasticAgentLoopManager] Drain timeout for {server_address} after {timeout}s")

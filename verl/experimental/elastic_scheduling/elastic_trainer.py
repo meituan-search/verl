@@ -194,34 +194,9 @@ class ElasticTrainer(FullyAsyncTrainer):
         Critic / ref-policy / reward-model are still initialised as usual if present.
         actor_wg / actor_rollout_wg will be set later when the first elastic wg is registered.
         """
-        if self._is_fully_elastic():
-            logger.info("[ElasticTrainer] Fully-elastic mode: skipping fixed actor_wg init_model")
-            # Only initialise non-actor worker groups
-            if self.use_critic:
-                from verl.trainer.ppo.utils import Role as _Role
-
-                self.critic_wg = self.all_wg[str(_Role.Critic)]
-                self.critic_wg.init_model()
-
-            if self.use_reference_policy and not self.ref_in_actor:
-                from verl.trainer.ppo.utils import Role as _Role
-
-                self.ref_policy_wg = self.all_wg[str(_Role.RefPolicy)]
-                self.ref_policy_wg.init_model()
-
-            if self.use_rm:
-                from verl.trainer.ppo.utils import Role as _Role
-
-                self.rm_wg = self.all_wg[str(_Role.RewardModel)]
-                self.rm_wg.init_model()
-
-            # actor_wg / actor_rollout_wg will be set to the first elastic wg
-            # in register_elastic_worker_group() once elastic wgs are created.
-            self.actor_wg = None
-            self.actor_rollout_wg = None
-            return
-
-        super()._init_models()
+        logger.info("[ElasticTrainer] Fully-elastic mode: skipping fixed actor_wg init_model")
+        self.actor_wg = None
+        self.actor_rollout_wg = None
 
     # =========================================================================
     # Complete Switch Sequences (called by ElasticCoordinator)
@@ -592,6 +567,14 @@ class ElasticTrainer(FullyAsyncTrainer):
                     new_world_ranks.extend(self._elastic_unit_ranks.get(rid, []))
                 new_world_ranks = sorted(set(new_world_ranks))
 
+                logger.warning(
+                    f"[ElasticTrainer] _apply_pending_dp_changes: "
+                    f"active_units={self._elastic_active_units}, "
+                    f"pending_removes={self._pending_elastic_removes}, "
+                    f"active_after={active_after}, "
+                    f"new_world_ranks={new_world_ranks}"
+                )
+
                 await self._coordinate_dp_rebuild(new_world_ranks=new_world_ranks)
 
                 # Finalise removals: remove from active set
@@ -663,8 +646,13 @@ class ElasticTrainer(FullyAsyncTrainer):
         patching is required here.
         """
         try:
+            logger.warning(
+                f"[ElasticTrainer] Calling rebuild_dp_group on worker_group with new_world_ranks={new_world_ranks}"
+            )
             futures = worker_group.execute_all("rebuild_dp_group", new_world_ranks=new_world_ranks)
+            logger.warning("[ElasticTrainer] Waiting for rebuild_dp_group futures...")
             await asyncio.get_event_loop().run_in_executor(None, lambda: ray.get(futures))
+            logger.warning("[ElasticTrainer] rebuild_dp_group futures completed successfully")
         except Exception as e:
             logger.error(f"[ElasticTrainer] rebuild_dp_group failed: {e}")
             raise
@@ -672,9 +660,10 @@ class ElasticTrainer(FullyAsyncTrainer):
         # Update the elastic DP active ranks on the controller side.
         # The elastic dispatch strategy reads this attribute to know which
         # global ranks are currently participating in the DP group.
+        logger.warning(f"[ElasticTrainer] Updating _elastic_dp_active_ranks to {new_world_ranks}")
         self._update_elastic_dp_active_ranks(worker_group, new_world_ranks)
 
-        logger.info(
+        logger.warning(
             f"[ElasticTrainer] DP rebuild complete: "
             f"new_world_ranks={new_world_ranks}, "
             f"active_dp_size={len(new_world_ranks)}"
