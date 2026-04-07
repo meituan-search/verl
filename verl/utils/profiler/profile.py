@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import inspect
 from typing import Callable, Optional
 
 from ..memory_utils import MemorySnapshotSampler, enable_memory_visualize
@@ -161,30 +162,57 @@ class DistProfiler:
         **kwargs_outer,
     ) -> Callable:
         def decorator(func):
-            @functools.wraps(func)
-            def wrapper(self_instance, *args, **kwargs_inner):
-                profiler = getattr(self_instance, "profiler", None)
-                if (
-                    not profiler
-                    or not profiler.check_enable()
-                    or not profiler.check_this_step()
-                    or not profiler.check_this_rank()
-                ):
+            if inspect.iscoroutinefunction(func):
+
+                @functools.wraps(func)
+                async def async_wrapper(self_instance, *args, **kwargs_inner):
+                    profiler = getattr(self_instance, "profiler", None)
+                    if (
+                        not profiler
+                        or not profiler.check_enable()
+                        or not profiler.check_this_step()
+                        or not profiler.check_this_rank()
+                    ):
+                        return await func(self_instance, *args, **kwargs_inner)
+
+                    impl = profiler._impl
+                    if hasattr(impl, "annotate"):
+                        try:
+                            actual_decorator = impl.annotate(
+                                message=message, color=color, domain=domain, category=category, **kwargs_outer
+                            )
+                            return await actual_decorator(func)(self_instance, *args, **kwargs_inner)
+                        except Exception:
+                            return await func(self_instance, *args, **kwargs_inner)
+                    return await func(self_instance, *args, **kwargs_inner)
+
+                return async_wrapper
+            else:
+
+                @functools.wraps(func)
+                def wrapper(self_instance, *args, **kwargs_inner):
+                    profiler = getattr(self_instance, "profiler", None)
+                    if (
+                        not profiler
+                        or not profiler.check_enable()
+                        or not profiler.check_this_step()
+                        or not profiler.check_this_rank()
+                    ):
+                        return func(self_instance, *args, **kwargs_inner)
+
+                    impl = profiler._impl
+                    if hasattr(impl, "annotate"):
+                        try:
+                            actual_decorator = impl.annotate(
+                                message=message, color=color, domain=domain, category=category, **kwargs_outer
+                            )
+
+                            return actual_decorator(func)(self_instance, *args, **kwargs_inner)
+                        except Exception:
+                            return func(self_instance, *args, **kwargs_inner)
                     return func(self_instance, *args, **kwargs_inner)
 
-                impl = profiler._impl
-                if hasattr(impl, "annotate"):
-                    try:
-                        actual_decorator = impl.annotate(
-                            message=message, color=color, domain=domain, category=category, **kwargs_outer
-                        )
-
-                        return actual_decorator(func)(self_instance, *args, **kwargs_inner)
-                    except Exception:
-                        return func(self_instance, *args, **kwargs_inner)
-                return func(self_instance, *args, **kwargs_inner)
-
-            return wrapper
+                return wrapper
 
         return decorator
 

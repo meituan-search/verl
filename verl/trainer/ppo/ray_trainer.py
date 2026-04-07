@@ -1136,15 +1136,26 @@ class RayPPOTrainer:
             # step 3: add meta info
             tu.assign_non_tensor(batch_td, calculate_entropy=True, compute_loss=False)
             output = self.actor_rollout_wg.compute_log_prob(batch_td)
+            # old_log_probs_gp = self.old_log_prob_server_wg.compute_log_prob(batch_td)
             # gather output
             entropy = tu.get(output, "entropy")
             log_probs = tu.get(output, "log_probs")
+            # old_log_probs_gp = tu.get(old_log_probs_gp, "log_probs")
             old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
             # step 4. No padding to padding
             entropy = no_padding_2_padding(entropy, batch_td)
             log_probs = no_padding_2_padding(log_probs, batch_td)
+            # old_log_probs_gp = no_padding_2_padding(old_log_probs_gp, batch_td)
             # step 5: rebuild a tensordict and convert to dataproto
             old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
+
+            # old_log_prob = tu.get_tensordict(
+            #     {
+            #         "old_log_probs": log_probs.float(),
+            #         "entropys": entropy.float(),
+            #         "old_log_probs_gp": old_log_probs_gp.float(),
+            #     }
+            # )
             old_log_prob = DataProto.from_tensordict(old_log_prob)
         else:
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)

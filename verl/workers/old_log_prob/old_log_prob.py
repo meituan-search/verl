@@ -51,6 +51,7 @@ class OldLogProbWorker(Worker, DistProfilerExtension):
         self.training_worker_config: TrainingWorkerConfig = None
         self.enable_routing_replay = False
         self._staged_state_dict = None
+        self._gpu_lock: asyncio.Lock | None = None
 
         omega_profiler_config = self.config.old_log_prob.get("profiler", {})
         profiler_config = omega_conf_to_dataclass(omega_profiler_config, dataclass_type=ProfilerConfig)
@@ -80,6 +81,8 @@ class OldLogProbWorker(Worker, DistProfilerExtension):
             self.config.old_log_prob.pop("enable_standalone", None)
             self.config.old_log_prob.pop("nnodes", None)
             self.config.old_log_prob.pop("n_gpus_per_node", None)
+            self.config.old_log_prob.pop("batch_size", None)
+            self.config.old_log_prob.pop("timeout", None)
 
             self.config.old_log_prob.ppo_mini_batch_size = self.config.old_log_prob.micro_batch_size_per_gpu
             self.config.old_log_prob.ppo_micro_batch_size_per_gpu = self.config.old_log_prob.pop(
@@ -134,6 +137,12 @@ class OldLogProbWorker(Worker, DistProfilerExtension):
         # Free cached GPU memory
         aggressive_empty_cache(force_sync=True)
 
+    def _get_gpu_lock(self) -> asyncio.Lock:
+        """Return the per-actor GPU lock, creating it lazily inside the event loop."""
+        if self._gpu_lock is None:
+            self._gpu_lock = asyncio.Lock()
+        return self._gpu_lock
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self):
         """
@@ -141,15 +150,17 @@ class OldLogProbWorker(Worker, DistProfilerExtension):
         """
         if self.checkpoint_engine is None:
             return
+        print(f"[OldLogProbWorker] update_weights")
         # Receive weights and stage to CPU
-        staged = {}
-        async for name, tensor in self.checkpoint_engine.receive_weights():
-            staged[name] = tensor.clone().to("cpu", non_blocking=True)
-            logger.debug(f"[OldLogProbWorker] update_weights, {name=}, shape={tensor.shape}")
+        async with self._get_gpu_lock():
+            staged = {}
+            async for name, tensor in self.checkpoint_engine.receive_weights():
+                staged[name] = tensor.clone().to("cpu", non_blocking=False)
+                logger.info(f"[OldLogProbWorker] update_weights, {name=}, shape={tensor.shape}")
 
-        torch.cuda.synchronize()
-        self._staged_state_dict = staged
-        logger.info(f"[OldLogProbWorker] Rank {self.rank}: staged {len(staged)} params to CPU")
+            torch.cuda.synchronize()
+            self._staged_state_dict = staged
+            logger.info(f"[OldLogProbWorker] Rank {self.rank}: staged {len(staged)} params to CPU")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_staged_weights(self):
@@ -172,13 +183,14 @@ class OldLogProbWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="old_log_prob"), blocking=True)
     @DistProfiler.annotate(color="blue", role="old_log_prob_compute")
     @_with_routing_replay_flag(enabled=True)
-    def compute_log_prob(self, data: TensorDict) -> TensorDict:
+    async def compute_log_prob(self, data: TensorDict) -> TensorDict:
         """Compute log probabilities through TrainingWorker."""
         if self.old_log_prob is None:
             raise RuntimeError("OldLogProbWorker.init_model() must be called before compute_log_prob().")
 
-        output = self.old_log_prob.infer_batch(data)
-        return output.cpu() if output is not None else None
+        async with self._get_gpu_lock():
+            output = self.old_log_prob.infer_batch(data)
+            return output.cpu() if output is not None else None
 
 
 @ray.remote

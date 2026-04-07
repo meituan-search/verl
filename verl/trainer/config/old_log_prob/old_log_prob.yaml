@@ -7,6 +7,16 @@ nnodes: null
 # Number of GPUs per node for old_log_prob workers
 n_gpus_per_node: null
 
+# Number of requests to collect before dispatching a batch to the worker group.
+# Must be a multiple of (dp_size * micro_batch_size_per_gpu) when use_dynamic_bsz=False,
+# or a multiple of dp_size when use_dynamic_bsz=True.
+batch_size: 64
+
+# Maximum time (in seconds) to wait for a full batch before dispatching whatever
+# requests have been collected so far. When the batch is filled before the timeout
+# expires, it is dispatched immediately without waiting for the remaining time.
+timeout: 10.0
+
 # Number of rollouts per update (mirrors actor rollout_n)
 rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
 

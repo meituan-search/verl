@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import functools
+import inspect
 import logging
 import os
 from contextlib import nullcontext
@@ -54,13 +55,24 @@ def _with_routing_replay_flag(enabled: bool):
     """Decorator to set 'enable_routing_replay' flag on the data TensorDict."""
 
     def decorator(func):
-        @functools.wraps(func)
-        def wrapper(self, data: TensorDict, *args, **kwargs):
-            if self.enable_routing_replay:
-                tu.assign_non_tensor_data(data, "enable_routing_replay", enabled)
-            return func(self, data, *args, **kwargs)
+        if inspect.iscoroutinefunction(func):
 
-        return wrapper
+            @functools.wraps(func)
+            async def async_wrapper(self, data: TensorDict, *args, **kwargs):
+                if self.enable_routing_replay:
+                    tu.assign_non_tensor_data(data, "enable_routing_replay", enabled)
+                return await func(self, data, *args, **kwargs)
+
+            return async_wrapper
+        else:
+
+            @functools.wraps(func)
+            def wrapper(self, data: TensorDict, *args, **kwargs):
+                if self.enable_routing_replay:
+                    tu.assign_non_tensor_data(data, "enable_routing_replay", enabled)
+                return func(self, data, *args, **kwargs)
+
+            return wrapper
 
     return decorator
 
