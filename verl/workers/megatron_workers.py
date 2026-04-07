@@ -159,8 +159,14 @@ class MegatronWorker(Worker):
             assert megatron_config.use_mbridge, "MTP requires use_mbridge to be True"
             override_transformer_config["mtp_loss_scaling_factor"] = self.config.model.mtp.mtp_loss_scaling_factor
         else:
+            # DeepSeek-style MTP field
             if hasattr(hf_config, "num_nextn_predict_layers"):
                 hf_config.num_nextn_predict_layers = 0
+            # Qwen3.5-style MTP field: mtp_num_hidden_layers
+            if hasattr(hf_config, "mtp_num_hidden_layers"):
+                hf_config.mtp_num_hidden_layers = 0
+            if hasattr(hf_config, "text_config") and hasattr(hf_config.text_config, "mtp_num_hidden_layers"):
+                hf_config.text_config.mtp_num_hidden_layers = 0
 
         self.enable_mtp = enable_mtp
 
