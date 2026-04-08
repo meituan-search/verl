@@ -3,7 +3,7 @@
 #
 # Requirements:
 #     pip install --upgrade transformers==5.3.0
-#     mbridge: https://github.com/ISEEKYAN/mbridge
+#     mbridge: make sure https://github.com/ISEEKYAN/mbridge/pull/98 this pr has merged
 #
 # MTP (Multi-Token Prediction) notes:
 #   - actor_rollout_ref.model.mtp.enable=True        enables MTP module
@@ -11,8 +11,7 @@
 #   - actor_rollout_ref.model.mtp.enable_rollout=True enables speculative decoding in SGLang
 #
 # Example parallelism configs for Qwen3.5-35B-A3B:
-#   8 GPUs  (1 node):  train_tp=4  train_pp=2  EP=4  gen_tp=8
-#   16 GPUs (2 nodes): train_tp=4  train_pp=4  EP=4  gen_tp=8
+#   16 GPUs (2 nodes): train_tp=4  train_pp=2  EP=4  gen_tp=8
 #
 # Run:
 #     NNODES_TRAIN=1 NNODES_ROLLOUT=1 bash grpo_qwen35_35b_megatron_async.sh
@@ -115,7 +114,7 @@ fi
 
 CHECKPOINT_CONTENTS=['model','hf_model','extra']
 
-python -X faulthandler -m verl.experimental.fully_async_policy.fully_async_main \
+python -m verl.experimental.fully_async_policy.fully_async_main \
     --config-path=config \
     --config-name='fully_async_ppo_megatron_trainer.yaml' \
     data.train_files="${TRAIN_FILE}" \
@@ -224,8 +223,6 @@ python -X faulthandler -m verl.experimental.fully_async_policy.fully_async_main 
     actor_rollout_ref.rollout.multi_turn.max_tool_response_length=${max_prompt_length} \
     actor_rollout_ref.rollout.agent.num_workers=2 \
     actor_rollout_ref.rollout.disable_log_stats=False \
-    actor_rollout_ref.rollout.prometheus.enable=True \
-    actor_rollout_ref.rollout.prometheus.port=44398 \
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=1024 \
     +actor_rollout_ref.rollout.engine_kwargs.sglang.mamba_scheduler_strategy=no_buffer \
     +actor_rollout_ref.rollout.engine_kwargs.sglang.disable_radix_cache=True \
