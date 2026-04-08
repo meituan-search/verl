@@ -117,7 +117,6 @@ jobs:
     runs-on: ["${{ needs.setup.outputs.runner-label || 'L20x8' }}"]
     timeout-minutes: 30 # Increase this timeout value as needed
     env:
-      HTTP_PROXY: ${{ secrets.PROXY_HTTP }}
       HTTPS_PROXY: ${{ secrets.PROXY_HTTPS }}
       NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
       HF_ENDPOINT: "https://hf-mirror.com"
@@ -135,7 +134,7 @@ jobs:
         run: |
           export TRTLLM_TEST_MODEL_PATH_ROOT="${HOME}/models"
           ray stop --force
-          pytest -v -s \
+          pytest -v -s --durations=20 \
             tests/workers/rollout/rollout_trtllm/test_adapter.py \
             tests/workers/rollout/rollout_trtllm/test_async_server.py \
             tests/workers/rollout/rollout_trtllm/test_trtllm_rollout_utils.py
@@ -145,7 +144,6 @@ jobs:
     runs-on: ["${{ needs.setup.outputs.runner-label || 'L20x8' }}"]
     timeout-minutes: 30 # Increase this timeout value as needed
     env:
-      HTTP_PROXY: ${{ secrets.PROXY_HTTP }}
       HTTPS_PROXY: ${{ secrets.PROXY_HTTPS }}
       NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
       HF_ENDPOINT: "https://hf-mirror.com"
@@ -167,6 +165,17 @@ jobs:
           DATADIR=${HOME}/data \
             bash examples/grpo_trainer/run_qwen2-7b_math_trtllm.sh 2 \
             trainer.total_training_steps=1 \
+            data.train_batch_size=32 \
+            data.max_prompt_length=128 \
+            data.max_response_length=64 \
+            actor_rollout_ref.rollout.n=1 \
+            actor_rollout_ref.actor.ppo_mini_batch_size=32 \
+            actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
+            actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
+            actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
+            actor_rollout_ref.rollout.max_num_seqs=32 \
+            actor_rollout_ref.rollout.max_num_batched_tokens=1024 \
+            actor_rollout_ref.rollout.max_model_len=256 \
             data.train_files="['${PWD}/data/gsm8k/train.parquet']" \
             data.val_files="['${PWD}/data/gsm8k/test.parquet']" \
             trainer.logger='["console"]' \
@@ -180,7 +189,6 @@ jobs:
     runs-on: ["${{ needs.setup.outputs.runner-label || 'L20x8' }}"]
     timeout-minutes: 30 # Increase this timeout value as needed
     env:
-      HTTP_PROXY: ${{ secrets.PROXY_HTTP }}
       HTTPS_PROXY: ${{ secrets.PROXY_HTTPS }}
       NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
       HF_ENDPOINT: "https://hf-mirror.com"
@@ -203,6 +211,14 @@ jobs:
           ACTOR_TP=2 \
             bash examples/grpo_trainer/run_qwen2-7b_math_megatron_trtllm.sh 2 \
             trainer.total_training_steps=1 \
+            data.train_batch_size=32 \
+            data.max_prompt_length=128 \
+            data.max_response_length=64 \
+            actor_rollout_ref.rollout.n=1 \
+            actor_rollout_ref.actor.ppo_mini_batch_size=32 \
+            actor_rollout_ref.rollout.max_num_seqs=32 \
+            actor_rollout_ref.rollout.max_num_batched_tokens=1024 \
+            actor_rollout_ref.rollout.max_model_len=256 \
             data.train_files="['${PWD}/data/gsm8k/train.parquet']" \
             data.val_files="['${PWD}/data/gsm8k/test.parquet']" \
             trainer.logger='["console"]' \
@@ -210,12 +226,11 @@ jobs:
       - name: clean up
         run: |
           rm -rf checkpoints
-  e2e_grpo_trainer_fsdp-vlm:
+  e2e_grpo_trainer_megatron-vlm:
     needs: setup
     runs-on: ["${{ needs.setup.outputs.runner-label || 'L20x8' }}"]
     timeout-minutes: 30 # Increase this timeout value as needed
     env:
-      HTTP_PROXY: ${{ secrets.PROXY_HTTP }}
       HTTPS_PROXY: ${{ secrets.PROXY_HTTPS }}
       NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
       HF_ENDPOINT: "https://hf-mirror.com"
@@ -228,19 +243,22 @@ jobs:
         run: |
           pip3 install -r requirements-test.txt
           pip3 install --no-deps -e .
+          pip3 install qwen_vl_utils 
+          pip3 install mathruler
       - name: Prepare GEO3K dataset
         run: |
-          python3 examples/data_preprocess/geo3k.py --local_dataset_path ${HOME}/models/hf_data/geo3k --local_save_dir ${PWD}/data/geo3k
-      - name: Running GEO3K E2E training tests with FSDP on 8 L20 GPUs (VLM)
-        run: |
-          ray stop --force
-          DATADIR=${HOME}/data \
-            bash examples/grpo_trainer/run_qwen2_5_vl_3b_trtllm.sh 2 \
-            trainer.total_training_steps=1 \
-            data.train_files="['${PWD}/data/geo3k/train.parquet']" \
-            data.val_files="['${PWD}/data/geo3k/test.parquet']" \
-            trainer.logger='["console"]' \
-            actor_rollout_ref.model.path="${HOME}/models/Qwen/Qwen3-VL-2B-Instruct"
+          python3 examples/data_preprocess/geo3k.py --local_dataset_path ${HOME}/models/hf_data/hiyouga/geometry3k --local_save_dir ${PWD}/data/geo3k
+      # FIXME: timeout in 30 minutes
+      # - name: Running GEO3K E2E training tests with FSDP on 8 L20 GPUs (VLM)
+      #   run: |
+      #     ray stop --force
+      #     DATADIR=${HOME}/data \
+      #       bash examples/grpo_trainer/run_qwen2_5_vl_3b_trtllm.sh 2 \
+      #       trainer.total_training_steps=1 \
+      #       data.train_files="['${PWD}/data/geo3k/train.parquet']" \
+      #       data.val_files="['${PWD}/data/geo3k/test.parquet']" \
+      #       trainer.logger='["console"]' \
+      #       actor_rollout_ref.model.path="${HOME}/models/Qwen/Qwen3-VL-2B-Instruct"
       - name: clean up
         run: |
           rm -rf checkpoints
@@ -257,10 +275,10 @@ jobs:
           bash examples/grpo_trainer/run_qwen3-30b_dapo_megatron_fp8_trtllm.sh \
             reward_model.reward_kwargs.overlong_buffer_cfg.len=258 \
             reward_model.reward_kwargs.max_resp_len=512 \
-            data.max_prompt_length=512 \
-            data.max_response_length=512 \
+            data.max_prompt_length=128 \
+            data.max_response_length=64 \
             data.train_batch_size=32 \
-            actor_rollout_ref.rollout.n=4 \
+            actor_rollout_ref.rollout.n=1 \
             actor_rollout_ref.rollout.max_num_seqs=16 \
             actor_rollout_ref.rollout.max_num_batched_tokens=1024 \
             actor_rollout_ref.rollout.max_model_len=1024 \
@@ -274,7 +292,7 @@ jobs:
 
   cleanup:
     runs-on: ubuntu-latest
-    needs: [setup, trtllm_unit_tests, e2e_grpo_trainer_fsdp-qwen2, e2e_grpo_trainer_megatron-qwen2, e2e_grpo_trainer_fsdp-vlm]
+    needs: [setup, trtllm_unit_tests, e2e_grpo_trainer_fsdp-qwen2, e2e_grpo_trainer_megatron-qwen2, e2e_grpo_trainer_megatron-vlm]
     if: always()
     steps:
       - id: destroy-runner

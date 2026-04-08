@@ -18,6 +18,7 @@ from enum import Enum
 from omegaconf import DictConfig
 
 from verl.single_controller.base import Worker
+from verl.trainer.distillation import is_distillation_enabled
 from verl.trainer.ppo.core_algos import AdvantageEstimator
 
 WorkerType = type[Worker]
@@ -36,7 +37,7 @@ class Role(Enum):
     RewardModel = 5
     ActorRolloutRef = 6
     Env = 7
-    OldLogProb = 8
+    TeacherModel = 8
 
     def __str__(self):
         return self._get_role_string()
@@ -50,7 +51,7 @@ class Role(Enum):
             Role.RefPolicy: "ref",
             Role.RewardModel: "rm",
             Role.ActorRolloutRef: "actor_rollout_ref",
-            Role.OldLogProb: "old_log_prob",
+            Role.TeacherModel: "teacher",
         }
         return role_mapping.get(self, self.name.lower())
 
@@ -64,7 +65,6 @@ class Role(Enum):
             "ref": cls.RefPolicy,
             "rm": cls.RewardModel,
             "actor_rollout_ref": cls.ActorRolloutRef,
-            "old_log_prob": cls.OldLogProb,
         }
         role = string_mapping.get(name.lower())
         if role is None:
@@ -77,6 +77,13 @@ def need_reference_policy(
 ) -> bool:
     """Given the config, do we need ref policy."""
     return config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss
+
+
+def need_teacher_policy(
+    config: DictConfig,
+) -> bool:
+    """Given the config, do we need distillation policy."""
+    return is_distillation_enabled(config.get("distillation"))
 
 
 def need_reward_model(
@@ -98,8 +105,3 @@ def need_critic(config: DictConfig) -> bool:
             stacklevel=2,
         )
         return False
-
-
-def need_old_log_prob_server(config: DictConfig) -> bool:
-    """Given a config, do we need old log prob server."""
-    return config.old_log_prob.enable_standalone
