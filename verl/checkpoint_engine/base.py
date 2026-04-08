@@ -399,7 +399,7 @@ class CheckpointEngineManager:
         await asyncio.gather(*[r.sleep() for r in self.replicas])
 
     @auto_await
-    async def update_weights(self, global_steps: int = None, post_finalize_callback=None):
+    async def update_weights(self, global_steps: int = None):
         """Update weights from trainer to rollout replicas.
 
         Args:
