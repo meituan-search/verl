@@ -400,6 +400,25 @@ class CheckpointEngineManager:
         """Resume all rollout replicas: recover kv_cache and weights device memory."""
         await asyncio.gather(*[r.wake_up() for r in self.replicas])
 
+
+    @auto_await
+    async def release_kv_cache_replicas(self):
+        """Release kv_cache of all rollout replicas before NCCL weight sync.
+
+        Unlike sleep_replicas(), this only frees the kv_cache and leaves model
+        weights untouched, so the NCCL transfer can write directly into the
+        existing weight buffers.  Call resume_kv_cache_replicas() after sync.
+        """
+        await asyncio.gather(*[r.release_kv_cache() for r in self.replicas])
+
+    @auto_await
+    async def resume_kv_cache_replicas(self):
+        """Restore kv_cache of all rollout replicas after NCCL weight sync.
+
+        Counterpart to release_kv_cache_replicas().
+        """
+        await asyncio.gather(*[r.resume_kv_cache() for r in self.replicas])
+
     @auto_await
     async def update_weights(self, global_steps: int = None):
         """Update weights from trainer to rollout replicas.
@@ -423,8 +442,8 @@ class CheckpointEngineManager:
         rollout = RayWorkerGroup(worker_handles=workers, ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls))
         trainer = self.trainer
 
-        # 3. sleep replicas to free kv_cache before weight sync (if free_cache_engine is enabled)
-        await self.sleep_replicas()
+        # 3. release kv_cache before weight sync (weights stay in place)
+        await self.release_kv_cache_replicas()
 
         # 4. build process group
         self.build_process_group(rollout)
@@ -438,8 +457,8 @@ class CheckpointEngineManager:
             + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
         )
 
-        # 7. resume replicas to recover kv_cache (for free_cache_engine scenarios)
-        await self.wake_up_replicas()
+        # 7. restore kv_cache after weight sync
+        await self.resume_kv_cache_replicas()
 
         # 8. resume all unfinished requests for partial rollout
         await asyncio.gather(*[r.resume_generation() for r in self.replicas])
