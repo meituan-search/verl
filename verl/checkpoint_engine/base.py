@@ -13,7 +13,7 @@
 # limitations under the License.
 import asyncio
 from abc import ABC, abstractmethod
-from typing import Any, Generator, Optional, TypedDict
+from typing import Any, Generator, TypedDict
 
 import ray
 import torch
@@ -114,33 +114,22 @@ class CheckpointEngine(ABC):
     @classmethod
     @abstractmethod
     def build_topology(
-        cls,
-        trainer_world_size: int,
-        rollout_world_size: int,
-        metadata: list[dict],
-        extra_groups_world_size_list: Optional[list[int]] = None,
-    ) -> (
-        tuple[dict[str, list[Any]], dict[str, list[Any]]]
-        | tuple[dict[str, list[Any]], dict[str, list[Any]], list[dict[str, list[Any]]]]
-    ):
+        cls, trainer_world_size: int, rollout_world_size: int, metadata: list[dict]
+    ) -> tuple[dict[str, list[Any]], dict[str, list[Any]]]:
         """Build communication topology between all workers.
 
         Args:
             trainer_world_size: The world size of the trainer worker group.
             rollout_world_size: The world size of the rollout replica.
             metadata: A list of metadata `prepare` from all workers.
-            extra_groups_world_size_list: The world size of the extra groups, optional.
 
         Returns:
-            A tuple of two or three elements:
-            - A dictionary that contains the communication topology for trainer worker group.
-            - A dictionary that contains the communication topology for rollout worker group.
-            - Optional: a list of dictionaries that contains the communication topology for extra groups.
+            A tuple of two dictionaries that contains the communication topology for trainer and rollout worker group.
             Each dict value should be a list argument equal to the world size of the worker group to dispatch to
             `init_process_group`.
 
             ```
-            world_size = rollout.world_size + trainer.world_size + sum(extra_groups_world_size_list)
+            world_size = rollout.world_size + trainer.world_size
             kwargs = {
                 "rank": list(range(world_size)),
                 "world_size": [world_size] * world_size,
@@ -343,7 +332,6 @@ class CheckpointEngineManager:
         config: The checkpoint engine config.
         trainer: The trainer worker group.
         replicas: The list of rollout replicas.
-        extra_groups: Optional extra worker groups that should join weight sync.
     """
 
     def __init__(
@@ -351,84 +339,39 @@ class CheckpointEngineManager:
         config: CheckpointEngineConfig,
         trainer: RayWorkerGroup,
         replicas: list[RolloutReplica],
-        extra_groups: Optional[list[RayWorkerGroup]] = None,
     ) -> None:
         self.config = config
         self.backend = config.backend
         self.backend_cls = CheckpointEngineRegistry.get(config.backend)
         self.trainer = trainer
         self.replicas = replicas
-        self.extra_groups = list(extra_groups) if extra_groups else []
-        # Keep references to background tasks
-        self._background_tasks: set[asyncio.Task] = set()
 
     def build_process_group(self, rollout: RayWorkerGroup):
         """Build process group for trainer and rollout replicas."""
         trainer = self.trainer
 
         # 1. prepare all workers
-        prepare_refs = trainer.execute_checkpoint_engine(
-            ["prepare"] * trainer.world_size
-        ) + rollout.execute_checkpoint_engine(["prepare"] * rollout.world_size)
-        for wg in self.extra_groups:
-            prepare_refs += wg.execute_checkpoint_engine(["prepare"] * wg.world_size)
-        metadata = ray.get(prepare_refs)
+        metadata = ray.get(
+            trainer.execute_checkpoint_engine(["prepare"] * trainer.world_size)
+            + rollout.execute_checkpoint_engine(["prepare"] * rollout.world_size)
+        )
 
         # 2. build communication topology between all workers
-        if self.extra_groups:
-            try:
-                topology = self.backend_cls.build_topology(
-                    trainer.world_size,
-                    rollout.world_size,
-                    metadata,
-                    extra_groups_world_size_list=[wg.world_size for wg in self.extra_groups],
-                )
-            except TypeError as e:
-                if "extra_groups_world_size_list" not in str(e):
-                    raise
-                raise TypeError(
-                    f"Checkpoint engine backend `{self.backend}` does not support extra_groups topology."
-                ) from e
-        else:
-            topology = self.backend_cls.build_topology(trainer.world_size, rollout.world_size, metadata)
-
-        if len(topology) == 2:
-            trainer_kwargs, rollout_kwargs = topology
-            extra_groups_kwargs_list = []
-        elif len(topology) == 3:
-            trainer_kwargs, rollout_kwargs, extra_groups_kwargs_list = topology
-            extra_groups_kwargs_list = extra_groups_kwargs_list or []
-        else:
-            raise ValueError("build_topology must return 2 or 3 values")
-
-        if len(extra_groups_kwargs_list) != len(self.extra_groups):
-            raise ValueError(
-                "build_topology extra_groups kwargs size mismatch: "
-                f"expect {len(self.extra_groups)}, got {len(extra_groups_kwargs_list)}"
-            )
-
+        trainer_kwargs, rollout_kwargs = self.backend_cls.build_topology(
+            trainer.world_size, rollout.world_size, metadata
+        )
         for k, v in trainer_kwargs.items():
             assert len(v) == trainer.world_size, f"trainer_kwargs[{k}] must have length of {trainer.world_size}"
         for k, v in rollout_kwargs.items():
             assert len(v) == rollout.world_size, f"rollout_kwargs[{k}] must have length of {rollout.world_size}"
-        for i, extra_groups_kwargs in enumerate(extra_groups_kwargs_list):
-            for k, v in extra_groups_kwargs.items():
-                assert len(v) == self.extra_groups[i].world_size, (
-                    f"extra_groups_kwargs[{k}] must have length of {self.extra_groups[i].world_size}"
-                )
 
         trainer_kwargs["method"] = ["init_process_group"] * trainer.world_size
         rollout_kwargs["method"] = ["init_process_group"] * rollout.world_size
-        for i, extra_groups_kwargs in enumerate(extra_groups_kwargs_list):
-            extra_groups_kwargs["method"] = ["init_process_group"] * self.extra_groups[i].world_size
 
         # 3. init process group between all workers
-        init_refs = trainer.execute_checkpoint_engine(**trainer_kwargs) + rollout.execute_checkpoint_engine(
-            **rollout_kwargs
+        ray.get(
+            trainer.execute_checkpoint_engine(**trainer_kwargs) + rollout.execute_checkpoint_engine(**rollout_kwargs)
         )
-        for wg, extra_groups_kwargs in zip(self.extra_groups, extra_groups_kwargs_list, strict=True):
-            init_refs += wg.execute_checkpoint_engine(**extra_groups_kwargs)
-        ray.get(init_refs)
 
     def add_replicas(self, replicas: list[RolloutReplica]):
         """Add rollout replicas to the manager for elastic scale up, will rebuild process group.
@@ -461,7 +404,6 @@ class CheckpointEngineManager:
 
         Args:
             global_steps: The global steps of the trainer.
-            post_finalize_callback: An optional async callable function.
         """
 
         # 0. update weights for sync training with colocated trainer and rollout
@@ -482,32 +424,14 @@ class CheckpointEngineManager:
         # 3. build process group
         self.build_process_group(rollout)
 
-        # + 3.5 wait for any background tasks from the previous update_weights call
-        # (e.g. drain_and_load_weights for old_log_prob_server) to complete before
-        # transferring new weights.
-        if self._background_tasks:
-            await asyncio.gather(*self._background_tasks)
-
         # 4. update weights of all workers
-        update_refs = trainer.update_weights(global_steps=global_steps) + rollout.update_weights(
-            global_steps=global_steps
-        )
-        for wg in self.extra_groups:
-            update_refs += wg.update_weights()
-        ray.get(update_refs)
+        ray.get(trainer.update_weights(global_steps=global_steps) + rollout.update_weights(global_steps=global_steps))
 
         # 5. finalize all workers
-        finalize_refs = trainer.execute_checkpoint_engine(
-            ["finalize"] * trainer.world_size
-        ) + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
-        for wg in self.extra_groups:
-            finalize_refs += wg.execute_checkpoint_engine(["finalize"] * wg.world_size)
-        ray.get(finalize_refs)
-
-        # + 5.5 fire post-finalize callback, without awaiting it
-        # (e.g. drain_and_load_weights for old_log_prob_server)
-        if post_finalize_callback is not None:
-            self._background_tasks.add(asyncio.create_task(post_finalize_callback()))
+        ray.get(
+            trainer.execute_checkpoint_engine(["finalize"] * trainer.world_size)
+            + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
+        )
 
         # 6. resume all unfinished requests for partial rollout
         await asyncio.gather(*[r.resume_generation() for r in self.replicas])
