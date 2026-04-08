@@ -61,7 +61,6 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 DEFAULT_ROUTING_CACHE_SIZE = 10000
 
 
-@ray.remote
 class GlobalRequestLoadBalancer:
     """Global sticky-session + in-flight load balancer shared by all AgentLoopWorkers."""
 
@@ -1053,7 +1052,7 @@ class AgentLoopManager:
         await instance._init_agent_loop_workers()
         return instance
 
-    async def _initialize_llm_servers(self):
+    async def _initialize_llm_servers(self, start_rank: int = 0):
         rollout_world_size = (
             self.rollout_config.tensor_model_parallel_size
             * self.rollout_config.data_parallel_size
@@ -1068,12 +1067,12 @@ class AgentLoopManager:
 
         self.rollout_replicas = [
             self.rollout_replica_class(
-                replica_rank=replica_rank,
+                replica_rank=start_rank + i,
                 config=self.rollout_config,
                 model_config=self.model_config,
                 gpus_per_node=self.rollout_config.n_gpus_per_node,
             )
-            for replica_rank in range(num_replicas)
+            for i in range(num_replicas)
         ]
 
         if self.worker_group and self.rollout_config.name != "trtllm":
@@ -1136,7 +1135,7 @@ class AgentLoopManager:
             )
 
     async def _init_global_load_balancer(self) -> None:
-        self.global_load_balancer = GlobalRequestLoadBalancer.remote(
+        self.global_load_balancer = ray.remote(GlobalRequestLoadBalancer).remote(
             server_actor_ids=self.server_addresses,
             max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
         )

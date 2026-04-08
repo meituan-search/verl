@@ -400,7 +400,6 @@ class CheckpointEngineManager:
         """Resume all rollout replicas: recover kv_cache and weights device memory."""
         await asyncio.gather(*[r.wake_up() for r in self.replicas])
 
-
     @auto_await
     async def release_kv_cache_replicas(self):
         """Release kv_cache of all rollout replicas before NCCL weight sync.

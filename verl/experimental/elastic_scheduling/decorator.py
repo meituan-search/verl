@@ -42,15 +42,15 @@
 
 
 import os
-from verl.utils.ray_utils import parallel_put
-from verl.protocol import BatchData
 
+from verl.protocol import BatchData
 from verl.single_controller.base.decorator import (
     DISPATCH_MODE_FN_REGISTRY,
     Dispatch,
     _concat_data_proto_or_future,
     _split_args_kwargs_data_proto,
 )
+from verl.utils.ray_utils import parallel_put
 
 
 def dispatch_elastic_dp_data_proto(worker_group, *args, **kwargs):
