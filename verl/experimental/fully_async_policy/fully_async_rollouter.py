@@ -74,7 +74,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = False
-        self.use_old_log_prob_server = False
 
         self.use_rm = False
 
@@ -141,7 +140,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Worker groups: rollout_wg is same to actor_rollout_wg
         self.rollout_wg = None
         self.actor_rollout_wg = None
-        self.old_log_prob_server_handle = None
         self.async_rollout_manager = None
 
         # Config
@@ -358,10 +356,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self._init_reward_loop()
         await self._init_async_rollout_manager()
 
-    def set_old_log_prob_server(self, old_log_prob_server_handle: ray.actor.ActorHandle):
-        """Set old_log_prob_server handle"""
-        self.old_log_prob_server_handle = old_log_prob_server_handle
-
     def _create_actor_rollout_classes(self):
         # Skip rollout creation and let agentloop handle it
         pass
@@ -399,7 +393,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             config=self.config,
             worker_group=self.rollout_wg,
             reward_loop_worker_handles=reward_loop_worker_handles,
-            old_log_prob_server_handle=self.old_log_prob_server_handle,
         )
 
     # Add samples to the pending_queue
@@ -614,6 +607,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
             # Wait for the task to complete
             await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
+
+            # Shut down OldLogProbServer (if any) — it lives on the Rollouter side.
+            if self.async_rollout_manager is not None:
+                await self.async_rollout_manager.shutdown()
 
         print("[FullyAsyncRollouter] Rollouter fit completed")
 

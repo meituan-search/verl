@@ -30,8 +30,8 @@ defaults:
   - critic@critic: ${model_engine}_critic
   - model@critic.model: hf_model
 
-  # old_log_prob model config
-  - old_log_prob@old_log_prob: ${model_engine}_old_log_prob
+  # old_log_prob model config(currently, only support megatron)
+  - old_log_prob@old_log_prob: megatron_old_log_prob
 
   # legacy reward impl config, for backward compatibility
   - legacy_reward_impl

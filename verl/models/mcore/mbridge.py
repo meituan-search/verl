@@ -24,7 +24,9 @@ except ImportError:
     print("mbridge package not found. Please install mbridge with `pip install verl[mcore]` or `pip install mbridge`")
     raise
 
+import asyncio
 import torch
+from typing import AsyncGenerator as AsyncGen
 
 
 class AutoBridge(AB):  # type: ignore
@@ -43,6 +45,7 @@ class AutoBridge(AB):  # type: ignore
         # mbridge factories may return architecture-specific classes such as Qwen2Bridge.
         # Inject this API onto the concrete class so engine.set_param works for all of them.
         bridge_cls.load_weights_from_state_dict = cls.load_weights_from_state_dict
+        bridge_cls.load_weights_from_async_generator = cls.load_weights_from_async_generator
 
     def load_weights_from_state_dict(
         self,
@@ -149,6 +152,40 @@ class AutoBridge(AB):  # type: ignore
                     )
                 # load
                 param.copy_(param_to_load)
+
+    async def load_weights_from_async_generator(
+        self,
+        models: list[torch.nn.Module],
+        weight_generator: AsyncGen[tuple[str, torch.Tensor], None],
+    ) -> None:
+        """
+        Load weights from an async (name, tensor) generator into a Megatron-Core model.
+        """
+        if not hasattr(self, "_needed_hf_keys"):
+            needed: set[str] = set()
+            for model in models:
+                local_to_global_map = self._weight_name_mapping_mcore_local_to_global(model)
+                for local_name, global_name in local_to_global_map.items():
+                    if "_extra_state" in local_name:
+                        continue
+                    hf_names = self._weight_name_mapping_mcore_to_hf(global_name)
+                    if ".mlp.experts.linear_fc" in local_name:
+                        if self.mpu.etp_rank == 0:
+                            needed.update(hf_names)
+                    else:
+                        if self.mpu.tp_rank == 0:
+                            needed.update(hf_names)
+                        elif "lm_head.weight" in hf_names:
+                            needed.update(hf_names)
+            self._needed_hf_keys: set[str] = needed
+
+        hf_state_dict: dict[str, torch.Tensor] = {}
+        async for hf_name, tensor in weight_generator:
+            if hf_name in self._needed_hf_keys:
+                hf_state_dict[hf_name] = tensor.clone()
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.load_weights_from_state_dict, models, hf_state_dict)
 
 
 __all__ = ["AutoBridge", "make_value_model", "freeze_moe_router"]

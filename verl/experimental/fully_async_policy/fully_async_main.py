@@ -90,8 +90,6 @@ class FullyAsyncTaskRunner:
         ray.get(self.components["trainer"].set_total_train_steps.remote(total_train_steps))
 
         ray.get(self.components["trainer"].init_workers.remote())
-        old_log_prob_server_handle = ray.get(self.components["trainer"].get_old_log_prob_server_handle.remote())
-        ray.get(self.components["rollouter"].set_old_log_prob_server.remote(old_log_prob_server_handle))
         ray.get(self.components["rollouter"].init_workers.remote())
         ray.get(self.components["rollouter"].set_max_required_samples.remote())
 

@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .old_log_prob import OldLogProbServer, OldLogProbWorker
+from .old_log_prob import OldLogProbReplica, OldLogProbServer, OldLogProbServerAdapter, OldLogProbWorker
 
-__all__ = ["OldLogProbWorker", "OldLogProbServer"]
+__all__ = ["OldLogProbServerAdapter", "OldLogProbWorker", "OldLogProbServer", "OldLogProbReplica"]

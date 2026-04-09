@@ -15,45 +15,207 @@
 import asyncio
 import logging
 import os
+from typing import Generator
 
 import ray
 import torch
 from omegaconf import DictConfig, open_dict
 from tensordict import TensorDict
 
-from verl.checkpoint_engine import CheckpointEngineRegistry
+from verl.checkpoint_engine.base import CheckpointEngineWorker
 from verl.protocol import DataProtoFuture
-from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
-from verl.single_controller.ray.base import RayWorkerGroup
+from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.device import get_torch_device, is_torch_npu_available
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig
 from verl.utils.profiler.performance import log_gpu_memory_usage
 from verl.workers.config import HFModelConfig, TrainingWorkerConfig
 from verl.workers.engine_workers import TrainingWorker, _with_routing_replay_flag
+from verl.workers.rollout.base import BaseRollout
+from verl.workers.rollout.replica import RolloutMode, RolloutReplica
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
-class OldLogProbWorker(Worker, DistProfilerExtension):
+class OldLogProbServerAdapter(BaseRollout):
+    """BaseRollout adapter that wraps a TrainingWorker for old log probability computation.
+
+    This adapter follows the same interface contract as vLLM/SGLang ServerAdapters:
+    - ``update_weights(weights_generator)``: receives weights from the checkpoint engine
+      and stages them to CPU (deferred load, because TrainingWorker.set_param requires
+      the full state dict to be present before loading).
+    - ``resume(tags)``: loads the staged CPU weights into the TrainingWorker engine.
+    - ``release()``: frees GPU memory.
+
+    The two-step load (stage → resume) mirrors the abort/resume protocol used by
+    CheckpointEngineManager so that no inference runs with mixed weights.
+    """
+
+    def __init__(
+        self,
+        full_config: DictConfig,
+        **kwargs,
+    ):
+        self.config = None
+        self.model_config = None
+        self.device_mesh = None
+
+        self._full_config = full_config
+        self._training_worker: TrainingWorker = None
+
+        rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        # replica_rank and is_leader_rank are consumed by CheckpointEngineWorker
+        self.replica_rank = rank // world_size
+        self.is_leader_rank = rank % world_size == 0
+
+        self.enable_routing_replay = (
+            self._full_config.old_log_prob.strategy == "megatron"
+            and self._full_config.old_log_prob.router_replay.mode != "disabled"
+        )
+
+    def init_model(self):
+        """Initialize the internal TrainingWorker and register dispatch info."""
+        assert self._full_config is not None, "full_config must be provided to init_model()"
+
+        model_config: HFModelConfig = omega_conf_to_dataclass(self._full_config.actor_rollout_ref.model)
+
+        # Remap old_log_prob-specific config keys to ppo-compatible names expected
+        # by TrainingWorkerConfig / EngineConfig.
+        with open_dict(self._full_config.old_log_prob):
+            self._full_config.old_log_prob.pop("enable_standalone", None)
+            self._full_config.old_log_prob.pop("nnodes", None)
+            self._full_config.old_log_prob.pop("n_gpus_per_node", None)
+            self._full_config.old_log_prob.pop("batch_size", None)
+            self._full_config.old_log_prob.pop("timeout", None)
+
+            self._full_config.old_log_prob.ppo_mini_batch_size = self._full_config.old_log_prob.micro_batch_size_per_gpu
+            self._full_config.old_log_prob.ppo_micro_batch_size_per_gpu = self._full_config.old_log_prob.pop(
+                "micro_batch_size_per_gpu", None
+            )
+            self._full_config.old_log_prob.ppo_max_token_len_per_gpu = self._full_config.old_log_prob.pop(
+                "max_token_len_per_gpu", None
+            )
+
+        old_log_prob_config = omega_conf_to_dataclass(self._full_config.old_log_prob)
+        old_log_prob_config.model_config = model_config
+
+        training_worker_config = TrainingWorkerConfig(
+            model_type="language_model",
+            model_config=old_log_prob_config.model_config,
+            engine_config=old_log_prob_config.engine,
+        )
+
+        training_worker_config.engine_config.use_dynamic_bsz = self._full_config.old_log_prob.use_dynamic_bsz
+        training_worker_config.engine_config.infer_max_token_len_per_gpu = (
+            self._full_config.old_log_prob.ppo_max_token_len_per_gpu,
+        )
+        training_worker_config.engine_config.infer_micro_batch_size_per_gpu = (
+            self._full_config.old_log_prob.ppo_micro_batch_size_per_gpu
+        )
+        training_worker_config.engine_config.max_token_len_per_gpu = (
+            self._full_config.old_log_prob.ppo_max_token_len_per_gpu
+        )
+        training_worker_config.engine_config.micro_batch_size_per_gpu = (
+            self._full_config.old_log_prob.ppo_micro_batch_size_per_gpu
+        )
+        training_worker_config.engine_config.use_remove_padding = model_config.use_remove_padding
+        if self._full_config.old_log_prob.use_dynamic_bsz:
+            assert self._full_config.old_log_prob.ppo_max_token_len_per_gpu is not None
+        else:
+            assert self._full_config.old_log_prob.ppo_micro_batch_size_per_gpu is not None
+
+        self._training_worker = TrainingWorker(config=training_worker_config)
+        self._training_worker.reset()
+        log_gpu_memory_usage("[OldLogProbServerAdapter] After init model", logger=logger)
+        aggressive_empty_cache(force_sync=True)
+
+    # ------------------------------------------------------------------
+    # BaseRollout interface
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    async def update_weights(
+        self,
+        weights: Generator[tuple[str, torch.Tensor], None, None],
+        global_steps: int = None,
+        **kwargs,
+    ):
+        """Receive weights from the checkpoint engine"""
+        if self._training_worker is None:
+            return
+        await self._training_worker.engine.set_param_from_async_generator(weights)
+        get_torch_device().empty_cache()
+        logger.info("[OldLogProbServerAdapter] loaded weights into engine")
+
+    def load_staged_weights(self):
+        """Load staged CPU weights into the TrainingWorker engine (sync).
+
+        Called by OldLogProbWorker.load_staged_weights() after the NCCL weight
+        transfer and finalize steps have completed.
+        """
+        if self._staged_state_dict is None or self._training_worker is None:
+            return
+        self._training_worker.engine.set_param(self._staged_state_dict)
+        self._staged_state_dict = None
+        get_torch_device().empty_cache()
+        logger.info("[OldLogProbServerAdapter] loaded staged weights into engine")
+
+    async def resume(self, tags: list[str]):
+        """BaseRollout.resume() — delegates to load_staged_weights()."""
+        self.load_staged_weights()
+
+    async def release(self):
+        """Release GPU memory (no-op for TrainingWorker; override if needed)."""
+        get_torch_device().empty_cache()
+
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
+
+    @_with_routing_replay_flag(enabled=True)
+    def compute_log_prob(self, data: TensorDict) -> TensorDict:
+        """Run a forward pass through the TrainingWorker engine."""
+        if self._training_worker is None:
+            raise RuntimeError("OldLogProbServerAdapter.init_model() must be called first.")
+        output = self._training_worker.infer_batch(data)
+        return output.cpu() if output is not None else None
+
+    def get_dispatch_collect(self):
+        """Expose the dispatch/collect info from the underlying TrainingWorker."""
+        return self._training_worker.get_dispatch_collect()
+
+
+class OldLogProbWorker(CheckpointEngineWorker, DistProfilerExtension):
     """Worker for computing old log probabilities."""
 
     def __init__(self, config: DictConfig, role: str = "old_log_prob"):
-        Worker.__init__(self)
+        rollout_config = config.actor_rollout_ref.rollout
+        model_config = config.actor_rollout_ref.model
+
+        from verl.utils.distributed import initialize_global_process_group_ray
+
+        initialize_global_process_group_ray(timeout_second=None)  # default: gloo+nccl
+
+        server_adapter = OldLogProbServerAdapter(full_config=config)
+
+        CheckpointEngineWorker.__init__(
+            self,
+            rollout_config=rollout_config,
+            model_config=model_config,
+            server_adapter=server_adapter,
+        )
+
         self.config = config
         self.role = role
 
-        self.old_log_prob: TrainingWorker = None
-        self.training_worker_config: TrainingWorkerConfig = None
-        self.enable_routing_replay = False
-        self._staged_state_dict = None
-        self._gpu_lock: asyncio.Lock | None = None
-
-        omega_profiler_config = self.config.old_log_prob.get("profiler", {})
+        # Profiler setup
+        omega_profiler_config = config.old_log_prob.get("profiler", {})
         profiler_config = omega_conf_to_dataclass(omega_profiler_config, dataclass_type=ProfilerConfig)
         if omega_profiler_config.get("tool", None) in ["npu", "nsys", "torch", "torch_memory"]:
             tool_config = omega_conf_to_dataclass(
@@ -62,139 +224,43 @@ class OldLogProbWorker(Worker, DistProfilerExtension):
         else:
             tool_config = None
 
-        self.enable_routing_replay = (
-            self.config.old_log_prob.strategy == "megatron"
-            and self.config.old_log_prob.megatron.router_replay.mode != "disabled"
-        )
-
         DistProfilerExtension.__init__(
             self,
             DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config),
         )
 
+    @property
+    def _server_adapter(self) -> OldLogProbServerAdapter:
+        return self.server_adapter  # type: ignore[return-value]
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
-        """Initialize internal TrainingWorker and register dispatch info."""
-
-        model_config: HFModelConfig = omega_conf_to_dataclass(self.config.actor_rollout_ref.model)
-        with open_dict(self.config.old_log_prob):
-            self.config.old_log_prob.pop("enable_standalone", None)
-            self.config.old_log_prob.pop("nnodes", None)
-            self.config.old_log_prob.pop("n_gpus_per_node", None)
-            self.config.old_log_prob.pop("batch_size", None)
-            self.config.old_log_prob.pop("timeout", None)
-
-            self.config.old_log_prob.ppo_mini_batch_size = self.config.old_log_prob.micro_batch_size_per_gpu
-            self.config.old_log_prob.ppo_micro_batch_size_per_gpu = self.config.old_log_prob.pop(
-                "micro_batch_size_per_gpu", None
-            )
-            self.config.old_log_prob.ppo_max_token_len_per_gpu = self.config.old_log_prob.pop(
-                "max_token_len_per_gpu", None
-            )
-
-        old_log_prob_config = omega_conf_to_dataclass(self.config.old_log_prob)
-        old_log_prob_config.model_config = model_config
-
-        # construct TrainingWorkerConfig
-        training_worker_config = TrainingWorkerConfig(
-            model_type="language_model",
-            model_config=old_log_prob_config.model_config,
-            engine_config=old_log_prob_config.engine,
-        )
-
-        # assign engine configs
-        training_worker_config.engine_config.use_dynamic_bsz = self.config.old_log_prob.use_dynamic_bsz
-        training_worker_config.engine_config.infer_max_token_len_per_gpu = (
-            self.config.old_log_prob.ppo_max_token_len_per_gpu,
-        )
-        training_worker_config.engine_config.infer_micro_batch_size_per_gpu = (
-            self.config.old_log_prob.ppo_micro_batch_size_per_gpu
-        )
-        training_worker_config.engine_config.max_token_len_per_gpu = self.config.old_log_prob.ppo_max_token_len_per_gpu
-        training_worker_config.engine_config.micro_batch_size_per_gpu = (
-            self.config.old_log_prob.ppo_micro_batch_size_per_gpu
-        )
-        training_worker_config.engine_config.use_remove_padding = model_config.use_remove_padding
-        if self.config.old_log_prob.use_dynamic_bsz:
-            assert self.config.old_log_prob.ppo_max_token_len_per_gpu is not None
-        else:
-            assert self.config.old_log_prob.ppo_micro_batch_size_per_gpu is not None
-
-        self.old_log_prob = TrainingWorker(config=training_worker_config)
-        self.old_log_prob.reset()
-        log_gpu_memory_usage("[Old_log_prob] After init model", logger=logger)
-        self.set_dispatch_collect(mesh_name="old_log_prob", **self.old_log_prob.get_dispatch_collect())
-
-        # Build checkpoint engine (as receiver, is_master=False)
-        checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
-        backend = checkpoint_engine_config.backend
-        bucket_size = checkpoint_engine_config.update_weights_bucket_megabytes << 20
-        engine_kwargs = checkpoint_engine_config.engine_kwargs.get(backend, {})
-        self.checkpoint_engine = CheckpointEngineRegistry.new(
-            backend, is_master=False, bucket_size=bucket_size, **engine_kwargs
-        )
-
-        # Free cached GPU memory
-        aggressive_empty_cache(force_sync=True)
-
-    def _get_gpu_lock(self) -> asyncio.Lock:
-        """Return the per-actor GPU lock, creating it lazily inside the event loop."""
-        if self._gpu_lock is None:
-            self._gpu_lock = asyncio.Lock()
-        return self._gpu_lock
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    async def update_weights(self):
-        """
-        Receive weights from trainer via checkpoint engine and stage to CPU.
-        """
-        if self.checkpoint_engine is None:
-            return
-        print(f"[OldLogProbWorker] update_weights")
-        # Receive weights and stage to CPU
-        async with self._get_gpu_lock():
-            staged = {}
-            async for name, tensor in self.checkpoint_engine.receive_weights():
-                staged[name] = tensor.clone().to("cpu", non_blocking=False)
-                logger.info(f"[OldLogProbWorker] update_weights, {name=}, shape={tensor.shape}")
-
-            torch.cuda.synchronize()
-            self._staged_state_dict = staged
-            logger.info(f"[OldLogProbWorker] Rank {self.rank}: staged {len(staged)} params to CPU")
+        """Initialise the TrainingWorker inside the server adapter and register dispatch info."""
+        self._server_adapter.init_model()
+        self.set_dispatch_collect(mesh_name="old_log_prob", **self._server_adapter.get_dispatch_collect())
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_staged_weights(self):
-        """
-        Load staged CPU weights into the model engine.
-        """
-        if self._staged_state_dict is None or self.old_log_prob is None:
-            return
-        self.old_log_prob.engine.set_param(self._staged_state_dict)
+        """Load the CPU-staged weights into the TrainingWorker engine."""
+        self._server_adapter.load_staged_weights()
 
-        self._staged_state_dict = None
-        torch.cuda.empty_cache()
-        logger.info(f"[OldLogProbWorker] Rank {self.rank}: loaded staged weights into engine")
-
-    @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
-    def execute_checkpoint_engine(self, method: str, *args, **kwargs):
-        """Proxy method for CheckpointEngineManager to call prepare/init_process_group/finalize."""
-        return getattr(self.checkpoint_engine, method)(*args, **kwargs)
-
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="old_log_prob"), blocking=True)
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="old_log_prob"))
     @DistProfiler.annotate(color="blue", role="old_log_prob_compute")
-    @_with_routing_replay_flag(enabled=True)
-    async def compute_log_prob(self, data: TensorDict) -> TensorDict:
-        """Compute log probabilities through TrainingWorker."""
-        if self.old_log_prob is None:
-            raise RuntimeError("OldLogProbWorker.init_model() must be called before compute_log_prob().")
-
-        async with self._get_gpu_lock():
-            output = self.old_log_prob.infer_batch(data)
-            return output.cpu() if output is not None else None
+    def compute_log_prob(self, data: TensorDict) -> TensorDict:
+        """Compute log probabilities through the TrainingWorker engine."""
+        return self._server_adapter.compute_log_prob(data)
 
 
 @ray.remote
 class OldLogProbServer:
+    """Server for computing old log probabilities.
+
+    Responsibilities:
+    - Collect individual inference requests into batches.
+    - Dispatch batches to OldLogProbWorker via the worker group.
+    - Gate new requests during weight updates (drain → NCCL → load → resume).
+    """
+
     _REQUIRED_REQUEST_KEYS = (
         "input_ids",
         "attention_mask",
@@ -205,28 +271,11 @@ class OldLogProbServer:
         "temperature",
     )
 
-    """Server for computing old log probabilities.
-
-    Implements batch control: collects individual requests and batches them
-    together before calling infer_batch. When batch_size requests are collected,
-    or when a timeout is reached, the batch is dispatched for inference.
-    """
-
     def __init__(
         self,
         old_log_prob_worker_group: RayWorkerGroup,
         old_log_prob_cfg: DictConfig,
     ):
-        """Initialize the OldLogProbServer.
-
-        Args:
-            old_log_prob_worker_group: The worker group for computing log probabilities.
-            old_log_prob_cfg: Configuration containing:
-                - batch_size: Number of requests to collect before dispatching.
-                  Must be a multiple of dp_size * micro_batch_size_per_gpu.
-                - timeout: Maximum time (seconds) to wait for a full batch.
-                - micro_batch_size_per_gpu: Micro-batch size per GPU for inference.
-        """
         self.old_log_prob_worker_group = old_log_prob_worker_group
         self.batch_size = old_log_prob_cfg.get("batch_size", 8)
         self.timeout = old_log_prob_cfg.get("timeout", 10.0)
@@ -246,40 +295,43 @@ class OldLogProbServer:
             self._min_dispatch_unit = dp_size * self.micro_batch_size_per_gpu
         self._dp_size = dp_size
         if self.batch_size % self._min_dispatch_unit != 0:
-            raise RuntimeError(f"OldLogProbServer {self.batch_size=} is not a multiple of {self._min_dispatch_unit=}. ")
+            raise RuntimeError(f"OldLogProbServer {self.batch_size=} is not a multiple of {self._min_dispatch_unit=}.")
 
         self._request_queue: asyncio.Queue = asyncio.Queue()
         self._consumer_task: asyncio.Task | None = None
-        # Inference lock to serialize worker_group calls
         self._infer_lock = asyncio.Lock()
         self._shutdown = False
-        self._drain_done = asyncio.Event()
+        self._drain_done: asyncio.Event = asyncio.Event()
         self._drain_done.set()  # Initially open (not draining)
+        self._resume_event: asyncio.Event = asyncio.Event()
+        self._lock_holder_task: asyncio.Task | None = None
 
         self._start_consumer()
 
+    # ------------------------------------------------------------------
+    # Internal batch consumer
+    # ------------------------------------------------------------------
+
     def _start_consumer(self):
-        """Start the background batch consumer task."""
         if self._consumer_task is None or self._consumer_task.done():
             self._consumer_task = asyncio.create_task(self._batch_consumer())
-            logger.info("OldLogProbServer: Started batch consumer task")
+            logger.info("OldLogProbServer: started batch consumer task")
 
     async def _batch_consumer(self):
-        """
-        Background task that continuously collects and dispatches batches.
+        """Continuously collect requests and dispatch them as batches.
 
-        1. Wait until the drain gate is open (not in a drain/weight-load window)
-        2. Try to collect batch_size requests within the timeout window;
-        3. If timeout expires dispatch whatever is available
+        Algorithm:
+        1. Wait until the drain gate is open.
+        2. Collect up to ``batch_size`` requests within the timeout window.
+        3. On timeout or full batch, dispatch immediately.
+        4. If a drain starts mid-collection, put items back and wait.
         """
         while not self._shutdown:
             batch_requests = []
             batch_futures = []
 
-            # 1. Wait until drain gate is open before starting a new collection round.
             await self._drain_done.wait()
             try:
-                # 2: Collect up to batch_size requests with timeout window
                 deadline = asyncio.get_event_loop().time() + self.timeout
                 drain_triggered = False
 
@@ -289,12 +341,10 @@ class OldLogProbServer:
                         break
 
                     try:
-                        # Wait for next request with remaining timeout
                         item = await asyncio.wait_for(self._request_queue.get(), timeout=remaining_time)
 
-                        # After every await, check whether a drain has started.
                         if not self._drain_done.is_set():
-                            # Put back items
+                            # Drain started mid-collection — put everything back.
                             for req, fut in zip(batch_requests, batch_futures, strict=False):
                                 await self._request_queue.put((req, fut))
                             await self._request_queue.put(item)
@@ -306,58 +356,50 @@ class OldLogProbServer:
                         batch_requests.append(item[0])
                         batch_futures.append(item[1])
 
-                        # Batch is full — dispatch immediately without waiting for timeout
                         if len(batch_requests) >= self.batch_size:
                             break
 
                     except asyncio.TimeoutError:
-                        # Timeout window expired; dispatch whatever we have
                         break
 
                 if drain_triggered:
-                    # Wait for the drain to finish before retrying.
                     await self._drain_done.wait()
                     continue
 
-                # 3. Dispatch the collected batch.
                 if batch_requests:
                     await self._execute_batch(batch_requests, batch_futures)
 
             except Exception as e:
-                logger.exception(f"OldLogProbServer: Error in batch consumer: {e}")
+                logger.exception(f"OldLogProbServer: error in batch consumer: {e}")
                 raise
 
     async def _execute_batch(self, requests: list[TensorDict], futures: list[asyncio.Future]):
-        """
-        Execute inference for a batch of requests and resolve futures.
-        """
         n_real = len(requests)
         if n_real != self.batch_size:
-            logger.debug(f"OldLogProbServer: Dispatching partial batch {n_real=} (target={self.batch_size})")
+            logger.debug(f"OldLogProbServer: dispatching partial batch {n_real=} (target={self.batch_size})")
 
         batched_data = TensorDict.cat(requests, dim=0)
-
         try:
             loop = asyncio.get_event_loop()
-            # Use _infer_lock to serialize inference calls
             async with self._infer_lock:
                 batched_output = await loop.run_in_executor(None, self.infer_batch, batched_data)
 
-            # Resolve all futures with their corresponding results
             for i, future in enumerate(futures):
                 if not future.done():
-                    individual_result = batched_output[i : i + 1]
-                    future.set_result(individual_result)
+                    future.set_result(batched_output[i : i + 1])
 
         except Exception as e:
-            logger.exception(f"OldLogProbServer: Batch inference failed: {e}")
-            # Propagate error to all futures in this batch
+            logger.exception(f"OldLogProbServer: batch inference failed: {e}")
             for future in futures:
                 if not future.done():
                     future.set_exception(e)
 
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     async def compute_old_log_prob(self, data: TensorDict) -> TensorDict:
-        """Compute old log probabilities for a single data item."""
+        """Enqueue a single request and wait for its result."""
         if self._shutdown:
             raise RuntimeError("OldLogProbServer is shutting down, cannot accept new requests")
         assert data.batch_size[0] == 1, "OldLogProbServer only supports batch size 1"
@@ -365,63 +407,87 @@ class OldLogProbServer:
         if missing_keys:
             raise KeyError(f"OldLogProbServer request missing required keys: {missing_keys}")
 
-        # Wait until any in-progress drain/weight-load has finished before enqueuing.
         await self._drain_done.wait()
 
         loop = asyncio.get_event_loop()
         future = loop.create_future()
         await self._request_queue.put((data, future))
-
         return await future
 
-    async def drain_and_load_weights(self):
-        """Flush requests already in the queue with the current weights, load new weights."""
-        logger.info("OldLogProbServer: Starting drain for weight update")
+    # ------------------------------------------------------------------
+    # Partial-rollout protocol (mirrors RolloutReplica / vLLM server)
+    # ------------------------------------------------------------------
 
-        # _drain_done.wait() will block
+    async def drain_and_lock(self):
+        """Flush queued requests with current weights and acquire _infer_lock."""
+        logger.info("OldLogProbServer: drain_and_lock — starting drain")
+
+        # Block new requests from entering the queue.
         self._drain_done.clear()
 
-        async with self._infer_lock:
-            # flush requests already in the queue with the old weights.
-            pre_drain_requests = []
-            pre_drain_futures = []
-            while not self._request_queue.empty():
-                try:
-                    item = self._request_queue.get_nowait()
-                    pre_drain_requests.append(item[0])
-                    pre_drain_futures.append(item[1])
-                except asyncio.QueueEmpty:
-                    break
+        # Acquire _infer_lock and keep it held across the abort/resume boundary
+        # via a background holder task that waits for _resume_event.
+        await self._infer_lock.acquire()
+        self._resume_event.clear()
+        loop = asyncio.get_event_loop()
+        self._lock_holder_task = loop.create_task(self._hold_infer_lock_until_resume())
 
-            if pre_drain_requests:
-                logger.info(
-                    f"OldLogProbServer: Flushing {len(pre_drain_requests)} pre-drain requests with current weights"
-                )
-                loop = asyncio.get_event_loop()
-                batched_data = TensorDict.cat(pre_drain_requests, dim=0)
-                try:
-                    batched_output = await loop.run_in_executor(None, self.infer_batch, batched_data)
-                    for i, future in enumerate(pre_drain_futures):
-                        if not future.done():
-                            future.set_result(batched_output[i : i + 1])
-                except Exception as e:
-                    logger.exception("OldLogProbServer: pre-drain flush failed")
-                    for future in pre_drain_futures:
-                        if not future.done():
-                            future.set_exception(e)
+        # Flush requests already sitting in the queue using current (old) weights.
+        pre_drain_requests = []
+        pre_drain_futures = []
+        while not self._request_queue.empty():
+            try:
+                item = self._request_queue.get_nowait()
+                pre_drain_requests.append(item[0])
+                pre_drain_futures.append(item[1])
+            except asyncio.QueueEmpty:
+                break
 
-            # Step 4: load new weights with the lock still held.
-            self.old_log_prob_worker_group.load_staged_weights()
-            logger.info("OldLogProbServer: Weights loaded successfully")
+        if pre_drain_requests:
+            logger.info(f"OldLogProbServer: flushing {len(pre_drain_requests)} pre-drain requests with current weights")
+            batched_data = TensorDict.cat(pre_drain_requests, dim=0)
+            try:
+                batched_output = await asyncio.get_event_loop().run_in_executor(None, self.infer_batch, batched_data)
+                for i, future in enumerate(pre_drain_futures):
+                    if not future.done():
+                        future.set_result(batched_output[i : i + 1])
+            except Exception as e:
+                logger.exception("OldLogProbServer: pre-drain flush failed")
+                for future in pre_drain_futures:
+                    if not future.done():
+                        future.set_exception(e)
+
+        logger.info("OldLogProbServer: drain_and_lock done; lock held until resume_generation()")
+
+    async def _hold_infer_lock_until_resume(self):
+        """Background task: keep ``_infer_lock`` held until ``_resume_event`` fires."""
+        try:
+            await self._resume_event.wait()
+        finally:
+            self._infer_lock.release()
+
+    async def load_weights_and_unlock(self):
+        """Load staged weights, release _infer_lock, and re-open the request gate."""
+        logger.info("OldLogProbServer: load_weights_and_unlock — loading staged weights")
+
+        # Signal the lock-holder task to release _infer_lock.
+        self._resume_event.set()
+        if self._lock_holder_task is not None:
+            await self._lock_holder_task
+            self._lock_holder_task = None
+
+        # Load weights that were staged to CPU during update_weights().
+        # self.old_log_prob_worker_group.load_staged_weights()
+        # logger.info("OldLogProbServer: weights loaded successfully")
+
         self._drain_done.set()
-        logger.info("OldLogProbServer: Drain complete, consumer resuming normal operation")
+        logger.info("OldLogProbServer: load_weights_and_unlock done, consumer resuming")
 
     async def shutdown(self):
-        """Shutdown the server."""
-        logger.info("OldLogProbServer: Shutting down")
+        """Shut down the server."""
+        logger.info("OldLogProbServer: shutting down")
         self._shutdown = True
 
-        # Cancel consumer task
         if self._consumer_task and not self._consumer_task.done():
             self._consumer_task.cancel()
             try:
@@ -429,7 +495,6 @@ class OldLogProbServer:
             except asyncio.CancelledError:
                 pass
 
-        # Fail any remaining requests in queue
         while not self._request_queue.empty():
             try:
                 _, future = self._request_queue.get_nowait()
@@ -438,12 +503,15 @@ class OldLogProbServer:
             except asyncio.QueueEmpty:
                 break
 
-        logger.info("OldLogProbServer: Shutdown complete")
+        logger.info("OldLogProbServer: shutdown complete")
+
+    # ------------------------------------------------------------------
+    # Batch inference
+    # ------------------------------------------------------------------
 
     def infer_batch(self, data: TensorDict) -> TensorDict:
-        """Call the worker group to compute log probabilities for a batch."""
+        """Pad the batch to a multiple of ``_min_dispatch_unit`` and call the worker group."""
         n_real = len(data)
-        # Pad batch up to the nearest multiple of _min_dispatch_unit.
         remainder = n_real % self._min_dispatch_unit
         if remainder != 0:
             n_pad = self._min_dispatch_unit - remainder
@@ -453,11 +521,7 @@ class OldLogProbServer:
         global_token_num = torch.sum(data["attention_mask"], dim=-1).tolist()
         tu.assign_non_tensor(data, global_token_num=global_token_num)
         data = left_right_2_no_padding(data)
-        tu.assign_non_tensor(
-            data,
-            calculate_entropy=True,
-            compute_loss=False,
-        )
+        tu.assign_non_tensor(data, calculate_entropy=True, compute_loss=False)
 
         output = self.old_log_prob_worker_group.compute_log_prob(data)
         if isinstance(output, DataProtoFuture):
@@ -472,8 +536,115 @@ class OldLogProbServer:
         if entropy is not None:
             entropy = no_padding_2_padding(entropy, data).float()
 
-        # Discard dummy padding rows; keep only the real results.
+        # Discard dummy padding rows.
         log_probs = log_probs[:n_real]
 
-        recovered_td = tu.get_tensordict({"log_probs": log_probs.float()})
-        return recovered_td
+        return tu.get_tensordict({"log_probs": log_probs.float()})
+
+
+class OldLogProbReplica(RolloutReplica):
+    """RolloutReplica implementation for the old log probability inference server."""
+
+    def __init__(
+        self,
+        replica_rank: int,
+        full_config: DictConfig,
+        worker_cls,
+    ):
+        # old_log_prob uses a plain DP training engine (no TP/PP), so world_size is
+        # simply n_gpus_per_node * nnodes.  We bypass RolloutReplica.__init__'s
+        # world_size formula (which reads rollout TP/PP) and set the fields directly.
+        self.replica_rank = replica_rank
+        self.config = None  # not used by OldLogProbReplica
+        self.model_config = None  # not used by OldLogProbReplica
+
+        old_log_prob_cfg = full_config.old_log_prob
+        n_gpus_per_node = int(old_log_prob_cfg.n_gpus_per_node)
+        nnodes = int(old_log_prob_cfg.nnodes)
+        self.world_size = n_gpus_per_node * nnodes
+        self.gpus_per_node = n_gpus_per_node
+        self.gpus_per_replica_node = n_gpus_per_node
+        self.nnodes = nnodes
+        self.is_reward_model = False
+
+        self.rollout_mode = None
+        self.workers = []
+        self.resource_pool = None
+        self.bundle_indices = []
+        self.servers = []
+        self._server_address = None
+        self._server_handle = None
+
+        self._full_config = full_config
+        self._worker_cls = worker_cls
+        self._worker_group: RayWorkerGroup = None
+
+    # ------------------------------------------------------------------
+    # RolloutReplica interface
+    # ------------------------------------------------------------------
+
+    def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
+        """Return the Ray actor class for OldLogProbWorker."""
+        return RayClassWithInitArgs(
+            cls=ray.remote(self._worker_cls),
+            config=self._full_config,
+            role="old_log_prob",
+        )
+
+    async def init_standalone(self):
+        """Self-allocate a resource pool, spawn workers, init model, and create server."""
+        self.rollout_mode = RolloutMode.STANDALONE
+
+        # 1. Create an independent Ray resource pool for this replica.
+        resource_pool_name = f"old_log_prob_pool_{self.replica_rank}"
+        resource_pool_spec = {resource_pool_name: [self.gpus_per_replica_node] * self.nnodes}
+        resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=None)
+        resource_pool_manager.create_resource_pool()
+        self.resource_pool = resource_pool_manager.resource_pool_dict[resource_pool_name]
+
+        # 2. OldLogProbWorker RayWorkerGroup.
+        self._worker_group = RayWorkerGroup(
+            resource_pool=self.resource_pool,
+            ray_cls_with_init=self.get_ray_class_with_init_args(),
+            bin_pack=False,
+            name_prefix=f"old_log_prob_standalone_{self.replica_rank}",
+            device_name="cuda" if not is_torch_npu_available(check_device=False) else "npu",
+        )
+        self.workers = self._worker_group.workers
+
+        # 3. init_model + create OldLogProbServer.
+        await self.launch_servers()
+
+    async def launch_servers(self):
+        """Call init_model on every worker, then create the OldLogProbServer actor."""
+        self._worker_group.init_model()
+
+        server = OldLogProbServer.remote(
+            old_log_prob_worker_group=self._worker_group,
+            old_log_prob_cfg=self._full_config.old_log_prob,
+        )
+        self.servers = [server]
+
+    async def abort_all_requests(self):
+        """No-op for OldLogProbReplica."""
+        pass
+
+    async def resume_generation(self):
+        """No-op for OldLogProbReplica."""
+        pass
+
+    async def sleep(self):
+        """Drain queued requests with current weights and acquire _infer_lock."""
+        if self.servers:
+            await self.servers[0].drain_and_lock.remote()
+
+    async def wake_up(self):
+        """Load staged weights, release _infer_lock, and re-open the request gate."""
+        if self.servers:
+            await self.servers[0].load_weights_and_unlock.remote()
+
+    async def shutdown(self):
+        """Gracefully shut down the OldLogProbServer."""
+        if self.servers:
+            await self.servers[0].shutdown.remote()
+            self.servers = []

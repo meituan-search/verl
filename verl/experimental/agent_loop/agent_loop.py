@@ -115,7 +115,6 @@ class AsyncLLMServerManager:
         config: DictConfig,
         servers: list[tuple[str, ray.actor.ActorHandle]],
         load_balancer_handle: ray.actor.ActorHandle,
-        old_log_prob_server_handle: ray.actor.ActorHandle,
     ):
         """Initialize the AsyncLLMServerManager.
 
@@ -126,7 +125,7 @@ class AsyncLLMServerManager:
         """
         self.config = config
         self._load_balancer = load_balancer_handle
-        self.old_log_prob_server_handle = old_log_prob_server_handle
+        self.old_log_prob_server_handle = None
         self._server_id_to_handle: dict[str, ray.actor.ActorHandle] = dict(servers)
 
     async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
@@ -428,7 +427,6 @@ class AgentLoopWorker:
         teacher_servers: list[tuple[str, ray.actor.ActorHandle]] = None,
         teacher_load_balancer_handle: ray.actor.ActorHandle = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
-        old_log_prob_server_handle: ray.actor.ActorHandle = None,
     ):
         """Initialize agent loop manager.
         Args:
@@ -475,7 +473,6 @@ class AgentLoopWorker:
                 config,
                 servers,
                 load_balancer_handle=load_balancer_handle,
-                old_log_prob_server_handle=old_log_prob_server_handle,
             )
 
         self.dataset_cls = get_dataset_class(config.data)
@@ -1028,14 +1025,13 @@ class AgentLoopManager:
         rollout_resource_pool: RayResourcePool = None,
         teacher_model_manager: TeacherModelManager = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
-        old_log_prob_server_handle: ray.actor.ActorHandle = None,
     ):
         self.config = config
         self.rollout_config, self.model_config = _get_rollout_and_model_config(config)
         self.worker_group = worker_group
         self.rollout_resource_pool = rollout_resource_pool
         self.reward_loop_worker_handles = reward_loop_worker_handles
-        self.old_log_prob_server_handle = old_log_prob_server_handle
+        self.old_log_prob_server_handle = None
 
         self.teacher_model_manager = teacher_model_manager
         self.distillation_enabled = is_distillation_enabled(self.config.get("distillation", None))
@@ -1064,13 +1060,10 @@ class AgentLoopManager:
         worker_group: RayWorkerGroup = None,
         rollout_resource_pool: RayResourcePool = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
-        old_log_prob_server_handle: ray.actor.ActorHandle = None,
         teacher_model_manager: TeacherModelManager = None,
     ):
         """Create agent loop manager."""
-        instance = cls(
-            config, worker_group, rollout_resource_pool, teacher_model_manager, reward_loop_worker_handles, old_log_prob_server_handle
-        )
+        instance = cls(config, worker_group, rollout_resource_pool, teacher_model_manager, reward_loop_worker_handles)
         await instance._initialize_llm_servers()
         await instance._init_global_load_balancer()
         await instance._init_agent_loop_workers()

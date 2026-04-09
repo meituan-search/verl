@@ -170,7 +170,11 @@ python -X faulthandler -m verl.experimental.fully_async_policy.fully_async_main 
     actor_rollout_ref.rollout.checkpoint_engine.backend='nccl' \
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
     algorithm.rollout_correction.bypass_mode=False \
-    old_log_prob.enable_standalone=False \
+    old_log_prob.enable_standalone=True \
     old_log_prob.nnodes="${NNODES_LOG_PROB}" \
     old_log_prob.n_gpus_per_node="${NGPUS_PER_NODE}" \
-    old_log_prob.use_dynamic_bsz=${use_dynamic_bsz}
+    old_log_prob.use_dynamic_bsz=${use_dynamic_bsz} \
+    old_log_prob.megatron.pipeline_model_parallel_size=1 \
+    old_log_prob.megatron.tensor_model_parallel_size=1 \
+    old_log_prob.batch_size=64 \
+    old_log_prob.timeout=5

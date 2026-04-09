@@ -55,12 +55,7 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         old_log_prob_server_handle: ray.actor.ActorHandle = None,
         tokenizer: Any = None,
     ):
-        super().__init__(
-            config=config,
-            servers=servers,
-            load_balancer_handle=load_balancer_handle,
-            old_log_prob_server_handle=old_log_prob_server_handle,
-        )
+        super().__init__(config=config, servers=servers, load_balancer_handle=load_balancer_handle)
         self.old_log_prob_server_handle = old_log_prob_server_handle
         self.tokenizer = tokenizer
 
@@ -289,7 +284,6 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         rollout_resource_pool: RayResourcePool = None,
         teacher_model_manager: TeacherModelManager = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
-        old_log_prob_server_handle: ray.actor.ActorHandle = None,
     ):
         self.agent_loop_workers_class = FullyAsyncAgentLoopWorker
         super().__init__(
@@ -298,10 +292,44 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             rollout_resource_pool,
             teacher_model_manager,
             reward_loop_worker_handles,
-            old_log_prob_server_handle,
         )
         if self.distillation_enabled:
             raise NotImplementedError("Distillation is not implemented in FullyAsyncAgentLoopManager yet.")
+
+    async def _initialize_llm_servers(self):
+        """Extend base class to also create OldLogProbReplica when configured."""
+        await super()._initialize_llm_servers()
+        if self.config.old_log_prob.enable_standalone:
+            await self._init_old_log_prob_replica()
+
+    async def _init_old_log_prob_replica(self):
+        """Create OldLogProbReplica, call init_standalone, and append to rollout_replicas.
+
+        OldLogProbReplica.init_standalone() self-allocates a Ray resource pool,
+        spawns OldLogProbWorker actors, calls init_model(), and creates the
+        OldLogProbServer — all in one call, exactly like vLLM/SGLang replicas.
+
+        After this, self.old_log_prob_server_handle is set so that
+        _init_agent_loop_workers() passes it to every FullyAsyncAgentLoopWorker.
+        """
+        from verl.workers.old_log_prob import OldLogProbReplica, OldLogProbWorker
+
+        replica = OldLogProbReplica(
+            replica_rank=len(self.rollout_replicas),
+            full_config=self.config,
+            worker_cls=OldLogProbWorker,
+        )
+        await replica.init_standalone()
+        self.rollout_replicas.append(replica)
+
+        # Expose the server handle so _init_agent_loop_workers passes it to workers.
+        self.old_log_prob_server_handle = replica.servers[0]
+
+    async def shutdown(self):
+        """Shut down OldLogProbServer if one was created."""
+        for replica in self.rollout_replicas:
+            if hasattr(replica, "shutdown"):
+                await replica.shutdown()
 
     @auto_await
     async def generate_sequences_single(self, prompts: DataProto) -> DataProto:

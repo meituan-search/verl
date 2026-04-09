@@ -3,6 +3,7 @@ set -xeuo pipefail
 
 project_name='DAPO'
 exp_name='dapo_qwen2-7B-math_28k_megatron_fully-async_16-16'
+pwd
 
 # Paths
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
@@ -39,7 +40,7 @@ clip_ratio_high=0.28
 
 # Response length parameters
 max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 28))
+max_response_length=$((1024 * 8))
 enable_overlong_buffer=True
 overlong_buffer_len=$((1024 * 4))
 overlong_penalty_factor=1.0
@@ -63,20 +64,20 @@ train_tp=4
 train_pp=2
 
 # Fully async specific parameters
-NNODES_ROLLOUT=${NNODES_ROLLOUT:-2}
-NNODES_TRAIN=${NNODES_TRAIN:-2}
+NNODES_ROLLOUT=${NNODES_ROLLOUT:-1}
+NNODES_TRAIN=${NNODES_TRAIN:-1}
 NNODES_LOG_PROB=${NNODES_LOG_PROB:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
 train_prompt_bsz=0
 gen_prompt_bsz=1
-n_resp_per_prompt=16
-train_prompt_mini_bsz=32
+n_resp_per_prompt=8
+train_prompt_mini_bsz=4
 total_rollout_steps=$(((512*400)))
 test_freq=20
-staleness_threshold=0.5
-trigger_parameter_sync_step=4
-require_batches=4
+staleness_threshold=0
+trigger_parameter_sync_step=2
+require_batches=1
 partial_rollout=True
 
 python -X faulthandler -m verl.experimental.fully_async_policy.fully_async_main \
@@ -123,6 +124,7 @@ python -X faulthandler -m verl.experimental.fully_async_policy.fully_async_main 
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${train_tp} \
     actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=${train_pp} \
     actor_rollout_ref.ref.megatron.tensor_model_parallel_size=${train_tp} \
+    actor_rollout_ref.actor.megatron.sequence_parallel=False \
     actor_rollout_ref.actor.megatron.use_mbridge=True \
     actor_rollout_ref.actor.megatron.param_offload=False \
     actor_rollout_ref.actor.megatron.optimizer_offload=False \
@@ -152,7 +154,7 @@ python -X faulthandler -m verl.experimental.fully_async_policy.fully_async_main 
     trainer.logger=['console','tensorboard'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.save_freq=-1 \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.resume_mode=auto \
@@ -170,7 +172,7 @@ python -X faulthandler -m verl.experimental.fully_async_policy.fully_async_main 
     actor_rollout_ref.rollout.checkpoint_engine.backend='nccl' \
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
     algorithm.rollout_correction.bypass_mode=False \
-    old_log_prob.enable_standalone=False \
+    old_log_prob.enable_standalone=True \
     old_log_prob.nnodes="${NNODES_LOG_PROB}" \
     old_log_prob.n_gpus_per_node="${NGPUS_PER_NODE}" \
     old_log_prob.use_dynamic_bsz=${use_dynamic_bsz}

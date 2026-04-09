@@ -51,11 +51,6 @@ def create_resource_pool_manager(config, roles: list) -> ResourcePoolManager:
         assert config.rollout.n_gpus_per_node > 0, "config.rollout.n_gpus_per_node must be greater than 0"
         assert config.rollout.nnodes > 0, "config.rollout.nnodes must be greater than 0"
 
-    if config.old_log_prob.enable_standalone:
-        mapping[Role.OldLogProb] = "old_log_prob_pool"
-        old_log_prob_pool = [config.old_log_prob.n_gpus_per_node] * config.old_log_prob.nnodes
-        resource_pool_spec["old_log_prob_pool"] = old_log_prob_pool
-
     return ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
 
@@ -93,14 +88,5 @@ def create_role_worker_mapping(config):
     # Add reference policy (if KL loss or reward is required)
     if need_reference_policy(config):
         role_worker_mapping[Role.RefPolicy] = ray.remote(DetachActorWorker)
-
-    if config.old_log_prob.enable_standalone:
-        use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
-        if use_legacy_worker_impl == "disable":
-            from verl.workers.old_log_prob import OldLogProbWorker
-
-            role_worker_mapping[Role.OldLogProb] = ray.remote(OldLogProbWorker)
-        else:
-            raise NotImplementedError("Standalone old_log_prob only suport model engine")
 
     return role_worker_mapping, ray_worker_group_cls

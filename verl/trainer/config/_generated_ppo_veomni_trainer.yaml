@@ -564,6 +564,95 @@ critic:
       freeze_vision_model: true
       freeze_vision_projection: true
       freeze_language_model: true
+old_log_prob:
+  enable_standalone: false
+  nnodes: null
+  n_gpus_per_node: null
+  batch_size: 64
+  timeout: 10.0
+  rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
+  strategy: megatron
+  use_torch_compile: ${oc.select:actor_rollout_ref.actor.use_torch_compile,true}
+  micro_batch_size_per_gpu: ${oc.select:actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu,
+    1}
+  use_dynamic_bsz: ${oc.select:actor_rollout_ref.rollout.log_prob_use_dynamic_bsz,false}
+  max_token_len_per_gpu: ${oc.select:actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu,16384}
+  profiler:
+    _target_: verl.utils.profiler.ProfilerConfig
+    tool: ${oc.select:global_profiler.tool,null}
+    enable: false
+    all_ranks: false
+    ranks: []
+    save_path: ${oc.select:global_profiler.save_path,null}
+    tool_config:
+      nsys:
+        _target_: verl.utils.profiler.config.NsightToolConfig
+        discrete: ${oc.select:global_profiler.global_tool_config.nsys.discrete}
+      npu:
+        _target_: verl.utils.profiler.config.NPUToolConfig
+        contents: []
+        level: level0
+        analysis: true
+        discrete: false
+      torch:
+        _target_: verl.utils.profiler.config.TorchProfilerToolConfig
+        contents: []
+        discrete: false
+      torch_memory:
+        _target_: verl.utils.profiler.config.TorchMemoryToolConfig
+        trace_alloc_max_entries: ${oc.select:global_profiler.global_tool_config.torch_memory.trace_alloc_max_entries,100000}
+        stack_depth: ${oc.select:global_profiler.global_tool_config.torch_memory.stack_depth,32}
+  router_replay:
+    _target_: verl.workers.config.RouterReplayConfig
+    mode: disabled
+    record_file: null
+    replay_file: null
+  megatron:
+    _target_: verl.workers.config.McoreEngineConfig
+    param_offload: false
+    grad_offload: false
+    optimizer_offload: false
+    tensor_model_parallel_size: ${oc.select:actor_rollout_ref.actor.megatron.tensor_model_parallel_size,1}
+    expert_model_parallel_size: ${oc.select:actor_rollout_ref.actor.megatron.expert_model_parallel_size,1}
+    expert_tensor_parallel_size: ${oc.select:actor_rollout_ref.actor.megatron.expert_tensor_parallel_size,null}
+    pipeline_model_parallel_size: ${oc.select:actor_rollout_ref.actor.megatron.pipeline_model_parallel_size,1}
+    virtual_pipeline_model_parallel_size: ${oc.select:actor_rollout_ref.actor.megatron.virtual_pipeline_model_parallel_size,null}
+    context_parallel_size: ${oc.select:actor_rollout_ref.actor.megatron.context_parallel_size,1}
+    sequence_parallel: true
+    use_distributed_optimizer: true
+    use_dist_checkpointing: false
+    dist_checkpointing_path: null
+    dynamic_context_parallel: false
+    max_seqlen_per_dp_cp_rank: null
+    dist_checkpointing_prefix: ''
+    dist_ckpt_optim_fully_reshardable: false
+    distrib_optim_fully_reshardable_mem_efficient: false
+    seed: ${oc.select:actor_rollout_ref.actor.megatron.seed,42}
+    override_ddp_config: {}
+    override_transformer_config: ${oc.select:actor_rollout_ref.actor.megatron.override_transformer_config,{}}
+    override_mcore_model_config: {}
+    use_mbridge: ${oc.select:actor_rollout_ref.actor.megatron.use_mbridge,False}
+    vanilla_mbridge: ${oc.select:actor_rollout_ref.actor.megatron.vanilla_mbridge,True}
+    use_remove_padding: ${oc.select:actor_rollout_ref.actor.megatron.use_remove_padding,True}
+    forward_only: true
+    dtype: bfloat16
+    router_replay:
+      _target_: verl.workers.config.EngineRouterReplayConfig
+      mode: disabled
+      record_file: null
+      replay_file: null
+    qat:
+      _target_: verl.workers.config.QATEngineConfig
+      enable: false
+      mode: w4a16
+      group_size: 16
+      ignore_patterns:
+      - lm_head
+      - '*mlp.gate'
+      activation_observer: null
+      quantization_config_path: null
+  _target_: verl.workers.config.McoreActorConfig
+  load_weight: true
 custom_reward_function:
   path: null
   name: null

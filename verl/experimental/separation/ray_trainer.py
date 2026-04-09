@@ -44,7 +44,7 @@ from verl.trainer.ppo.metric_utils import (
 )
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, apply_kl_penalty, compute_advantage, compute_response_mask
 from verl.trainer.ppo.reward import extract_reward
-from verl.trainer.ppo.utils import Role, WorkerType, need_old_log_prob_server
+from verl.trainer.ppo.utils import Role, WorkerType
 from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
@@ -104,7 +104,6 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         self.reward_tensor = None
         self.reward_extra_infos_dict = {}
         self.checkpoint_manager = None
-        self.use_old_log_prob_server = need_old_log_prob_server(self.config)
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -135,7 +134,6 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         self._create_critic_class()
         self._create_reference_policy_class()
         self._create_reward_model_class()
-        self._create_old_log_prob_class()
 
     def _create_actor_rollout_classes(self):
         raise NotImplementedError
@@ -169,21 +167,6 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
 
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
             self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
-
-    def _create_old_log_prob_class(self):
-        # create old_log_prob if needed
-        if self.use_old_log_prob_server and Role.OldLogProb in self.role_worker_mapping:
-            if self.use_legacy_worker_impl == "disable":
-                resource_pool = self.resource_pool_manager.get_resource_pool(Role.OldLogProb)
-
-                old_log_prob_cls = RayClassWithInitArgs(
-                    self.role_worker_mapping[Role.OldLogProb],
-                    config=self.config,
-                    role=str(Role.OldLogProb),
-                )
-                self.resource_pool_to_cls[resource_pool][str(Role.OldLogProb)] = old_log_prob_cls
-            else:
-                raise NotImplementedError("Old log prob server is only supported in model engine")
 
     def _create_reference_policy_class(self):
         # create reference policy if needed
@@ -259,20 +242,6 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         if self.use_reference_policy and not self.ref_in_actor:
             self.ref_policy_wg = self.all_wg[str(Role.RefPolicy)]
             self.ref_policy_wg.init_model()
-
-        if self.use_old_log_prob_server:
-            self.old_log_prob_server_wg = self.all_wg[str(Role.OldLogProb)]
-            self.old_log_prob_server_wg.init_model()
-
-            # Create OldLogProbServer Ray actor for batched inference + deferred weight loading
-            from verl.workers.old_log_prob import OldLogProbServer
-
-            self.old_log_prob_server = OldLogProbServer.remote(
-                old_log_prob_worker_group=self.old_log_prob_server_wg,
-                old_log_prob_cfg=self.config.old_log_prob,
-            )
-        else:
-            self.old_log_prob_server = None
 
         if self.use_rm:
             self.rm_wg = self.all_wg[str(Role.RewardModel)]
@@ -532,6 +501,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         else:  # Recompute old_log_probs
             with marked_timer("old_log_prob", timing_raw, color="blue"):
                 if "server_old_log_probs" in batch.batch:
+                    # if False:
                     batch.batch["old_log_probs"] = batch.batch["server_old_log_probs"]
                 else:
                     old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
