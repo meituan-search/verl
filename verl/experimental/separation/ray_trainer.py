@@ -501,7 +501,6 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         else:  # Recompute old_log_probs
             with marked_timer("old_log_prob", timing_raw, color="blue"):
                 if "server_old_log_probs" in batch.batch:
-                    # if False:
                     batch.batch["old_log_probs"] = batch.batch["server_old_log_probs"]
                 else:
                     old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
