@@ -102,7 +102,7 @@ class OldLogProbServerAdapter(BaseRollout):
 
         training_worker_config.engine_config.use_dynamic_bsz = self._full_config.old_log_prob.use_dynamic_bsz
         training_worker_config.engine_config.infer_max_token_len_per_gpu = (
-            self._full_config.old_log_prob.ppo_max_token_len_per_gpu,
+            self._full_config.old_log_prob.ppo_max_token_len_per_gpu
         )
         training_worker_config.engine_config.infer_micro_batch_size_per_gpu = (
             self._full_config.old_log_prob.ppo_micro_batch_size_per_gpu
@@ -556,7 +556,9 @@ class OldLogProbReplica(RolloutReplica):
         """Call init_model on every worker, then create the OldLogProbServer actor."""
         self._worker_group.init_model()
 
-        server = OldLogProbServer.remote(
+        server = OldLogProbServer.options(
+            name=f"old_log_prob_server_{self.replica_rank}",
+        ).remote(
             old_log_prob_worker_group=self._worker_group,
             old_log_prob_cfg=self._full_config.old_log_prob,
         )
