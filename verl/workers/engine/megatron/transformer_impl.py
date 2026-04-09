@@ -748,7 +748,7 @@ class MegatronEngine(BaseEngine):
             offload_megatron_model_to_cpu(self.module)
 
     async def set_param_from_async_generator(self, weight_generator) -> None:
-        """Load weights without CPU staging."""
+        """Load weights from an async generator."""
         if not self.vanilla_bridge:
             raise NotImplementedError("set_param_from_async_generator is only supported for vanilla mbridge")
         load_megatron_model_to_gpu(self.module, load_grad=False)

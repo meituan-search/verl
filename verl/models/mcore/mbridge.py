@@ -24,8 +24,8 @@ except ImportError:
     print("mbridge package not found. Please install mbridge with `pip install verl[mcore]` or `pip install mbridge`")
     raise
 
-import asyncio
-from typing import AsyncGenerator as AsyncGen
+from collections import defaultdict
+from typing import AsyncGenerator
 
 import torch
 
@@ -157,36 +157,98 @@ class AutoBridge(AB):  # type: ignore
     async def load_weights_from_async_generator(
         self,
         models: list[torch.nn.Module],
-        weight_generator: AsyncGen[tuple[str, torch.Tensor], None],
+        hf_weight_generator: AsyncGenerator[tuple[str, torch.Tensor], None],
     ) -> None:
         """
-        Load weights from an async (name, tensor) generator into a Megatron-Core model.
+        Load weights from a per-tensor generator into Megatron-Core models.
         """
-        if not hasattr(self, "_needed_hf_keys"):
-            needed: set[str] = set()
+        # Phase 1: build per-model mappings and a global reverse index.
+        if not hasattr(self, "_generator_per_model_meta"):
+            per_model_meta: list[tuple[dict, torch.nn.Module]] = []
             for model in models:
                 local_to_global_map = self._weight_name_mapping_mcore_local_to_global(model)
-                for local_name, global_name in local_to_global_map.items():
-                    if "_extra_state" in local_name:
-                        continue
-                    hf_names = self._weight_name_mapping_mcore_to_hf(global_name)
-                    if ".mlp.experts.linear_fc" in local_name:
-                        if self.mpu.etp_rank == 0:
-                            needed.update(hf_names)
-                    else:
-                        if self.mpu.tp_rank == 0:
-                            needed.update(hf_names)
-                        elif "lm_head.weight" in hf_names:
-                            needed.update(hf_names)
-            self._needed_hf_keys: set[str] = needed
+                local_to_hf_map = {
+                    k: self._weight_name_mapping_mcore_to_hf(v)
+                    for k, v in local_to_global_map.items()
+                    if "_extra_state" not in k
+                }
+                per_model_meta.append((local_to_hf_map, model))
 
-        hf_state_dict: dict[str, torch.Tensor] = {}
-        async for hf_name, tensor in weight_generator:
-            if hf_name in self._needed_hf_keys:
-                hf_state_dict[hf_name] = tensor.clone()
+            hf_key_to_targets: dict[str, list[tuple[int, str]]] = defaultdict(list)
+            for model_idx, (local_to_hf_map, _) in enumerate(per_model_meta):
+                for local_name, hf_names in local_to_hf_map.items():
+                    for hf_key in hf_names:
+                        hf_key_to_targets[hf_key].append((model_idx, local_name))
 
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self.load_weights_from_state_dict, models, hf_state_dict)
+            self._generator_per_model_meta = per_model_meta
+            self._generator_hf_key_to_targets = hf_key_to_targets
+        else:
+            per_model_meta = self._generator_per_model_meta
+            hf_key_to_targets = self._generator_hf_key_to_targets
+
+        # hf_key → list of (model_idx, local_name)
+        hf_key_to_targets: dict[str, list[tuple[int, str]]] = defaultdict(list)
+        for model_idx, (local_to_hf_map, _) in enumerate(per_model_meta):
+            for local_name, hf_names in local_to_hf_map.items():
+                for hf_key in hf_names:
+                    hf_key_to_targets[hf_key].append((model_idx, local_name))
+
+        # Phase 2: flush helper (identical to the sync version)
+        def _flush(
+            model_idx: int,
+            local_name: str,
+            hf_names: list[str],
+            buffer: dict[str, torch.Tensor],
+        ) -> None:
+            """Convert buffered HF tensors → mcore format → slice own TP shard → copy."""
+            _, model = per_model_meta[model_idx]
+            param = model.state_dict()[local_name]
+
+            hf_weights = [buffer[x] for x in hf_names]
+            mcore_weight = self._weight_to_mcore_format(local_name, hf_weights)
+
+            # skip lm_head / embed_tokens for value models (shape[0] == 1)
+            if hf_names[0] in {"lm_head.weight", "model.embed_tokens.weight"}:
+                if param.shape[0] == 1 and mcore_weight.shape[0] != 1:
+                    return
+
+            # Each rank independently slices its own shard — no communication needed.
+            if ".mlp.experts.linear_fc" in local_name:
+                shards = list(self._weight_split_across_tp(local_name, mcore_weight, param, self.mpu.etp_size))
+                shard = shards[self.mpu.etp_rank]
+            else:
+                shards = list(self._weight_split_across_tp(local_name, mcore_weight, param, self.mpu.tp_size))
+                shard = shards[self.mpu.tp_rank]
+
+            param.copy_(shard.to(param.device, dtype=param.dtype).contiguous())
+
+        # Phase 3: stream the async generator, buffer multi-key params
+        # pending[(model_idx, local_name)] = {hf_key: tensor}
+        pending: dict[tuple[int, str], dict[str, torch.Tensor]] = defaultdict(dict)
+
+        async for hf_key, tensor in hf_weight_generator:
+            targets = hf_key_to_targets.get(hf_key)
+            if targets is None:
+                continue  # key not needed by this model — discard immediately
+
+            for model_idx, local_name in targets:
+                local_to_hf_map = per_model_meta[model_idx][0]
+                hf_names = local_to_hf_map[local_name]
+
+                slot = pending[(model_idx, local_name)]
+                slot[hf_key] = tensor
+
+                # flush as soon as every HF key for this param has arrived
+                if all(k in slot for k in hf_names):
+                    _flush(model_idx, local_name, hf_names, slot)
+                    del pending[(model_idx, local_name)]
+
+        if pending:
+            missing_params = [f"{per_model_meta[mi][1].__class__.__name__}:{ln}" for mi, ln in pending]
+            raise KeyError(
+                f"load_weights_from_async_generator: generator ended before all required "
+                f"HF keys were yielded. Incomplete params: {missing_params}"
+            )
 
 
 __all__ = ["AutoBridge", "make_value_model", "freeze_moe_router"]
