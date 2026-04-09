@@ -112,22 +112,6 @@ def calculate_debug_metrics(data: DataProto) -> dict:
 
     pearson_corrcoef = pearson_correlation_coefficient(actor_probs, rollout_probs, response_mask_bool)
     rollout_probs_diff = calculate_log_prob_diff(actor_probs, rollout_probs, response_mask_bool)
-    print(f"rollout_probs_diff_sum: {rollout_probs_diff.abs().sum()}")
-    if "server_old_log_probs" in data.batch.keys():
-        server_old_log_probs = torch.exp(data.batch["server_old_log_probs"])
-        old_log_probs_diff = calculate_log_prob_diff(actor_probs, server_old_log_probs, response_mask_bool)
-        print(f"server_old_log_probs_diff: {old_log_probs_diff.abs().sum()}")
-    else:
-        print('"server_old_log_probs" not found in batch, skip server diff metrics')
-
-    if "old_log_probs_gp" in data.batch.keys():
-        old_log_probs_gp = torch.exp(data.batch["old_log_probs_gp"])
-        server_old_log_probs_diff = calculate_log_prob_diff(actor_probs, old_log_probs_gp, response_mask_bool)
-        print(f"old_log_probs_gp_diff: {server_old_log_probs_diff.abs().sum()}")
-    else:
-        print('"old_log_probs_gp" not found in batch, skip server diff metrics')
-
-    print(f"num sum token: {response_mask.abs().sum()}")
     return {
         "training/rollout_probs_diff_valid": 1,
         "training/rollout_probs_diff_max": torch.max(rollout_probs_diff).detach().item(),
