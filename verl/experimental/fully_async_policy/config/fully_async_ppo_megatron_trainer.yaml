@@ -1,9 +1,13 @@
 hydra:
   searchpath:
     - file://verl/trainer/config
+    - file://verl/experimental/fully_async_policy/config
 
 defaults:
   - ppo_megatron_trainer
+
+  - old_log_prob@old_log_prob: megatron_old_log_prob
+
   - _self_
 
 trainer:

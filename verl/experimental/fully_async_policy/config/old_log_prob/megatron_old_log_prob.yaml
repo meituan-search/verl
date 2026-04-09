@@ -1,8 +1,8 @@
-# megatron old_log_prob config, inheriting from trainer/config/old_log_prob/old_log_prob.yaml
+# megatron old_log_prob config, inheriting from fully_async_policy/config/old_log_prob/old_log_prob.yaml
 defaults:
   - old_log_prob
 
-  # megatron engine config
+  # megatron engine config: ../engine resolves to verl/trainer/config/engine/ via searchpath
   - ../engine@megatron: megatron
 
   # load the reference default config, then apply the fields in the current yaml

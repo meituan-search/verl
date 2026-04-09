@@ -312,7 +312,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         After this, self.old_log_prob_server_handle is set so that
         _init_agent_loop_workers() passes it to every FullyAsyncAgentLoopWorker.
         """
-        from verl.workers.old_log_prob import OldLogProbReplica, OldLogProbWorker
+        from verl.experimental.fully_async_policy.old_log_prob import OldLogProbReplica, OldLogProbWorker
 
         replica = OldLogProbReplica(
             replica_rank=len(self.rollout_replicas),

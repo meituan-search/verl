@@ -25,8 +25,9 @@ except ImportError:
     raise
 
 import asyncio
-import torch
 from typing import AsyncGenerator as AsyncGen
+
+import torch
 
 
 class AutoBridge(AB):  # type: ignore
