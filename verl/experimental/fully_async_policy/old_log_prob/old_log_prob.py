@@ -43,18 +43,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 class OldLogProbServerAdapter(BaseRollout):
-    """BaseRollout adapter that wraps a TrainingWorker for old log probability computation.
-
-    This adapter follows the same interface contract as vLLM/SGLang ServerAdapters:
-    - ``update_weights(weights_generator)``: receives weights from the checkpoint engine
-      and stages them to CPU (deferred load, because TrainingWorker.set_param requires
-      the full state dict to be present before loading).
-    - ``resume(tags)``: loads the staged CPU weights into the TrainingWorker engine.
-    - ``release()``: frees GPU memory.
-
-    The two-step load (stage → resume) mirrors the abort/resume protocol used by
-    CheckpointEngineManager so that no inference runs with mixed weights.
-    """
+    """BaseRollout adapter that wraps a TrainingWorker for old log probability computation."""
 
     def __init__(
         self,
@@ -153,22 +142,9 @@ class OldLogProbServerAdapter(BaseRollout):
         get_torch_device().empty_cache()
         logger.info("[OldLogProbServerAdapter] loaded weights into engine")
 
-    def load_staged_weights(self):
-        """Load staged CPU weights into the TrainingWorker engine (sync).
-
-        Called by OldLogProbWorker.load_staged_weights() after the NCCL weight
-        transfer and finalize steps have completed.
-        """
-        if self._staged_state_dict is None or self._training_worker is None:
-            return
-        self._training_worker.engine.set_param(self._staged_state_dict)
-        self._staged_state_dict = None
-        get_torch_device().empty_cache()
-        logger.info("[OldLogProbServerAdapter] loaded staged weights into engine")
-
     async def resume(self, tags: list[str]):
-        """BaseRollout.resume() — delegates to load_staged_weights()."""
-        self.load_staged_weights()
+        """No-op for OldLogProbServerAdapter."""
+        pass
 
     async def release(self):
         """Release GPU memory (no-op for TrainingWorker; override if needed)."""
@@ -239,11 +215,6 @@ class OldLogProbWorker(CheckpointEngineWorker, DistProfilerExtension):
         self._server_adapter.init_model()
         self.set_dispatch_collect(mesh_name="old_log_prob", **self._server_adapter.get_dispatch_collect())
 
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def load_staged_weights(self):
-        """Load the CPU-staged weights into the TrainingWorker engine."""
-        self._server_adapter.load_staged_weights()
-
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="old_log_prob"))
     @DistProfiler.annotate(color="blue", role="old_log_prob_compute")
     def compute_log_prob(self, data: TensorDict) -> TensorDict:
@@ -301,10 +272,8 @@ class OldLogProbServer:
         self._consumer_task: asyncio.Task | None = None
         self._infer_lock = asyncio.Lock()
         self._shutdown = False
-        self._drain_done: asyncio.Event = asyncio.Event()
-        self._drain_done.set()  # Initially open (not draining)
-        self._resume_event: asyncio.Event = asyncio.Event()
-        self._lock_holder_task: asyncio.Task | None = None
+        self._serving: asyncio.Event = asyncio.Event()
+        self._serving.set()  # Initially serving (not draining)
 
         self._start_consumer()
 
@@ -321,7 +290,7 @@ class OldLogProbServer:
         """Continuously collect requests and dispatch them as batches.
 
         Algorithm:
-        1. Wait until the drain gate is open.
+        1. Wait until the _serving gate is open.
         2. Collect up to ``batch_size`` requests within the timeout window.
         3. On timeout or full batch, dispatch immediately.
         4. If a drain starts mid-collection, put items back and wait.
@@ -330,7 +299,7 @@ class OldLogProbServer:
             batch_requests = []
             batch_futures = []
 
-            await self._drain_done.wait()
+            await self._serving.wait()
             try:
                 deadline = asyncio.get_event_loop().time() + self.timeout
                 drain_triggered = False
@@ -343,7 +312,7 @@ class OldLogProbServer:
                     try:
                         item = await asyncio.wait_for(self._request_queue.get(), timeout=remaining_time)
 
-                        if not self._drain_done.is_set():
+                        if not self._serving.is_set():
                             # Drain started mid-collection — put everything back.
                             for req, fut in zip(batch_requests, batch_futures, strict=False):
                                 await self._request_queue.put((req, fut))
@@ -363,7 +332,7 @@ class OldLogProbServer:
                         break
 
                 if drain_triggered:
-                    await self._drain_done.wait()
+                    await self._serving.wait()
                     continue
 
                 if batch_requests:
@@ -394,6 +363,38 @@ class OldLogProbServer:
                 if not future.done():
                     future.set_exception(e)
 
+    def infer_batch(self, data: TensorDict) -> TensorDict:
+        """Pad the batch to a multiple of ``_min_dispatch_unit`` and call the worker group."""
+        n_real = len(data)
+        remainder = n_real % self._min_dispatch_unit
+        if remainder != 0:
+            n_pad = self._min_dispatch_unit - remainder
+            dummy = TensorDict.cat([data[0:1]] * n_pad, dim=0)
+            data = TensorDict.cat([data, dummy], dim=0)
+
+        global_token_num = torch.sum(data["attention_mask"], dim=-1).tolist()
+        tu.assign_non_tensor(data, global_token_num=global_token_num)
+        data = left_right_2_no_padding(data)
+        tu.assign_non_tensor(data, calculate_entropy=False, compute_loss=False)
+
+        output = self.old_log_prob_worker_group.compute_log_prob(data)
+        if isinstance(output, DataProtoFuture):
+            output = output.get()
+        if output is None:
+            raise RuntimeError("OldLogProbWorkerGroup.compute_log_prob returned None.")
+
+        if "log_probs" not in output.keys():
+            raise KeyError(f"Expected 'log_probs' in old_log_prob output, got keys: {list(output.keys())}")
+        log_probs = no_padding_2_padding(tu.get(output, "log_probs"), data).float()
+        entropy = tu.get(output, "entropy", default=None)
+        if entropy is not None:
+            entropy = no_padding_2_padding(entropy, data).float()
+
+        # Discard dummy padding rows.
+        log_probs = log_probs[:n_real]
+
+        return tu.get_tensordict({"log_probs": log_probs.float()})
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -407,7 +408,7 @@ class OldLogProbServer:
         if missing_keys:
             raise KeyError(f"OldLogProbServer request missing required keys: {missing_keys}")
 
-        await self._drain_done.wait()
+        await self._serving.wait()
 
         loop = asyncio.get_event_loop()
         future = loop.create_future()
@@ -418,19 +419,20 @@ class OldLogProbServer:
     # Partial-rollout protocol (mirrors RolloutReplica / vLLM server)
     # ------------------------------------------------------------------
 
-    async def drain_and_lock(self):
-        """Flush queued requests with current weights and acquire _infer_lock."""
-        logger.info("OldLogProbServer: drain_and_lock — starting drain")
+    async def pause_serving(self):
+        """
+        Stop accepting new requests, wait for any in-flight inference to finish,
+        then flush queued requests with current weights.
+        """
+        logger.info("OldLogProbServer: pause_serving — starting drain")
 
-        # Block new requests from entering the queue.
-        self._drain_done.clear()
+        # Block new requests from entering the queue and prevent _batch_consumer
+        # from starting a new _execute_batch after the current one finishes.
+        self._serving.clear()
 
-        # Acquire _infer_lock and keep it held across the abort/resume boundary
-        # via a background holder task that waits for _resume_event.
-        await self._infer_lock.acquire()
-        self._resume_event.clear()
-        loop = asyncio.get_event_loop()
-        self._lock_holder_task = loop.create_task(self._hold_infer_lock_until_resume())
+        # Wait for any in-flight _execute_batch to complete.
+        async with self._infer_lock:
+            pass
 
         # Flush requests already sitting in the queue using current (old) weights.
         pre_drain_requests = []
@@ -445,43 +447,14 @@ class OldLogProbServer:
 
         if pre_drain_requests:
             logger.info(f"OldLogProbServer: flushing {len(pre_drain_requests)} pre-drain requests with current weights")
-            batched_data = TensorDict.cat(pre_drain_requests, dim=0)
-            try:
-                batched_output = await asyncio.get_event_loop().run_in_executor(None, self.infer_batch, batched_data)
-                for i, future in enumerate(pre_drain_futures):
-                    if not future.done():
-                        future.set_result(batched_output[i : i + 1])
-            except Exception as e:
-                logger.exception("OldLogProbServer: pre-drain flush failed")
-                for future in pre_drain_futures:
-                    if not future.done():
-                        future.set_exception(e)
+            await self._execute_batch(pre_drain_requests, pre_drain_futures)
 
-        logger.info("OldLogProbServer: drain_and_lock done; lock held until resume_generation()")
+        logger.info("OldLogProbServer: pause_serving done")
 
-    async def _hold_infer_lock_until_resume(self):
-        """Background task: keep ``_infer_lock`` held until ``_resume_event`` fires."""
-        try:
-            await self._resume_event.wait()
-        finally:
-            self._infer_lock.release()
-
-    async def load_weights_and_unlock(self):
-        """Load staged weights, release _infer_lock, and re-open the request gate."""
-        logger.info("OldLogProbServer: load_weights_and_unlock — loading staged weights")
-
-        # Signal the lock-holder task to release _infer_lock.
-        self._resume_event.set()
-        if self._lock_holder_task is not None:
-            await self._lock_holder_task
-            self._lock_holder_task = None
-
-        # Load weights that were staged to CPU during update_weights().
-        # self.old_log_prob_worker_group.load_staged_weights()
-        # logger.info("OldLogProbServer: weights loaded successfully")
-
-        self._drain_done.set()
-        logger.info("OldLogProbServer: load_weights_and_unlock done, consumer resuming")
+    async def resume_serving(self):
+        """Re-open the request gate after new weights have been loaded."""
+        self._serving.set()
+        logger.info("OldLogProbServer: resume_serving done, consumer resuming")
 
     async def shutdown(self):
         """Shut down the server."""
@@ -504,42 +477,6 @@ class OldLogProbServer:
                 break
 
         logger.info("OldLogProbServer: shutdown complete")
-
-    # ------------------------------------------------------------------
-    # Batch inference
-    # ------------------------------------------------------------------
-
-    def infer_batch(self, data: TensorDict) -> TensorDict:
-        """Pad the batch to a multiple of ``_min_dispatch_unit`` and call the worker group."""
-        n_real = len(data)
-        remainder = n_real % self._min_dispatch_unit
-        if remainder != 0:
-            n_pad = self._min_dispatch_unit - remainder
-            dummy = TensorDict.cat([data[0:1]] * n_pad, dim=0)
-            data = TensorDict.cat([data, dummy], dim=0)
-
-        global_token_num = torch.sum(data["attention_mask"], dim=-1).tolist()
-        tu.assign_non_tensor(data, global_token_num=global_token_num)
-        data = left_right_2_no_padding(data)
-        tu.assign_non_tensor(data, calculate_entropy=True, compute_loss=False)
-
-        output = self.old_log_prob_worker_group.compute_log_prob(data)
-        if isinstance(output, DataProtoFuture):
-            output = output.get()
-        if output is None:
-            raise RuntimeError("OldLogProbWorkerGroup.compute_log_prob returned None.")
-
-        if "log_probs" not in output.keys():
-            raise KeyError(f"Expected 'log_probs' in old_log_prob output, got keys: {list(output.keys())}")
-        log_probs = no_padding_2_padding(tu.get(output, "log_probs"), data).float()
-        entropy = tu.get(output, "entropy", default=None)
-        if entropy is not None:
-            entropy = no_padding_2_padding(entropy, data).float()
-
-        # Discard dummy padding rows.
-        log_probs = log_probs[:n_real]
-
-        return tu.get_tensordict({"log_probs": log_probs.float()})
 
 
 class OldLogProbReplica(RolloutReplica):
@@ -634,14 +571,14 @@ class OldLogProbReplica(RolloutReplica):
         pass
 
     async def sleep(self):
-        """Drain queued requests with current weights and acquire _infer_lock."""
+        """Pause serving: stop accepting new requests and flush queued ones with current weights."""
         if self.servers:
-            await self.servers[0].drain_and_lock.remote()
+            await self.servers[0].pause_serving.remote()
 
     async def wake_up(self):
-        """Load staged weights, release _infer_lock, and re-open the request gate."""
+        """Re-open the request gate after new weights have been loaded."""
         if self.servers:
-            await self.servers[0].load_weights_and_unlock.remote()
+            await self.servers[0].resume_serving.remote()
 
     async def shutdown(self):
         """Gracefully shut down the OldLogProbServer."""
