@@ -416,7 +416,7 @@ class OldLogProbServer:
         return await future
 
     # ------------------------------------------------------------------
-    # Partial-rollout protocol (mirrors RolloutReplica / vLLM server)
+    # Weight-update protocol: called by OldLogProbReplica.sleep/wake_up
     # ------------------------------------------------------------------
 
     async def pause_serving(self):
