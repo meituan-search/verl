@@ -17,9 +17,6 @@ batch_size: 64
 # expires, it is dispatched immediately without waiting for the remaining time.
 timeout: 10.0
 
-# If True, stage received weights on CPU during weight synchronization to reduce peak GPU memory.
-stage_weights_on_cpu: False
-
 # Number of rollouts per update (mirrors actor rollout_n)
 rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
 
