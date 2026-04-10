@@ -186,13 +186,6 @@ class AutoBridge(AB):  # type: ignore
             per_model_meta = self._generator_per_model_meta
             hf_key_to_targets = self._generator_hf_key_to_targets
 
-        # hf_key → list of (model_idx, local_name)
-        hf_key_to_targets: dict[str, list[tuple[int, str]]] = defaultdict(list)
-        for model_idx, (local_to_hf_map, _) in enumerate(per_model_meta):
-            for local_name, hf_names in local_to_hf_map.items():
-                for hf_key in hf_names:
-                    hf_key_to_targets[hf_key].append((model_idx, local_name))
-
         # Phase 2: flush helper (identical to the sync version)
         def _flush(
             model_idx: int,
@@ -208,7 +201,7 @@ class AutoBridge(AB):  # type: ignore
             mcore_weight = self._weight_to_mcore_format(local_name, hf_weights)
 
             # skip lm_head / embed_tokens for value models (shape[0] == 1)
-            if hf_names[0] in {"lm_head.weight", "model.embed_tokens.weight"}:
+            if hf_names[0] in {"lm_head.weight", "model.embed_tokens.weight", "model.language_model.embed_tokens.weight"}:
                 if param.shape[0] == 1 and mcore_weight.shape[0] != 1:
                     return
 
@@ -223,10 +216,14 @@ class AutoBridge(AB):  # type: ignore
             param.copy_(shard.to(param.device, dtype=param.dtype).contiguous())
 
         # Phase 3: stream the async generator, buffer multi-key params
-        # pending[(model_idx, local_name)] = {hf_key: tensor}
+        expected_hf_keys: set[str] = set(hf_key_to_targets.keys())
+        received_hf_keys: set[str] = set()
         pending: dict[tuple[int, str], dict[str, torch.Tensor]] = defaultdict(dict)
 
         async for hf_key, tensor in hf_weight_generator:
+            if hf_key in expected_hf_keys:
+                received_hf_keys.add(hf_key)
+
             targets = hf_key_to_targets.get(hf_key)
             if targets is None:
                 continue  # key not needed by this model — discard immediately
@@ -236,18 +233,18 @@ class AutoBridge(AB):  # type: ignore
                 hf_names = local_to_hf_map[local_name]
 
                 slot = pending[(model_idx, local_name)]
-                slot[hf_key] = tensor
+                slot[hf_key] = tensor.clone()
 
                 # flush as soon as every HF key for this param has arrived
                 if all(k in slot for k in hf_names):
                     _flush(model_idx, local_name, hf_names, slot)
                     del pending[(model_idx, local_name)]
 
-        if pending:
-            missing_params = [f"{per_model_meta[mi][1].__class__.__name__}:{ln}" for mi, ln in pending]
+        missing_keys = expected_hf_keys - received_hf_keys
+        if missing_keys:
             raise KeyError(
-                f"load_weights_from_async_generator: generator ended before all required "
-                f"HF keys were yielded. Incomplete params: {missing_params}"
+                f"load_weights_from_async_generator: the following HuggingFace keys are "
+                f"required but were never yielded by the generator: {missing_keys}"
             )
 
 
