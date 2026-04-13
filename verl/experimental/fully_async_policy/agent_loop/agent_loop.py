@@ -312,7 +312,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         After this, self.model_engine_server_handle is set so that
         _init_agent_loop_workers() passes it to every FullyAsyncAgentLoopWorker.
         """
-        from verl.experimental.fully_async_policy.model_engine_server import ModelEngineReplica, ModelEngineWorker
+        from verl.workers.rollout.model_engine_server import ModelEngineReplica, ModelEngineWorker
 
         replica = ModelEngineReplica(
             replica_rank=len(self.rollout_replicas),
