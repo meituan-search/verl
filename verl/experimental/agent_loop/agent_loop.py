@@ -125,7 +125,7 @@ class AsyncLLMServerManager:
         """
         self.config = config
         self._load_balancer = load_balancer_handle
-        self.old_log_prob_server_handle = None
+        self.model_engine_server_handle = None
         self._server_id_to_handle: dict[str, ray.actor.ActorHandle] = dict(servers)
 
     async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
@@ -1031,7 +1031,7 @@ class AgentLoopManager:
         self.worker_group = worker_group
         self.rollout_resource_pool = rollout_resource_pool
         self.reward_loop_worker_handles = reward_loop_worker_handles
-        self.old_log_prob_server_handle = None
+        self.model_engine_server_handle = None
 
         self.teacher_model_manager = teacher_model_manager
         self.distillation_enabled = is_distillation_enabled(self.config.get("distillation", None))
@@ -1148,7 +1148,7 @@ class AgentLoopManager:
                     teacher_servers,
                     teacher_load_balancer_handle,
                     self.reward_loop_worker_handles,
-                    self.old_log_prob_server_handle,
+                    self.model_engine_server_handle,
                 )
             )
 
