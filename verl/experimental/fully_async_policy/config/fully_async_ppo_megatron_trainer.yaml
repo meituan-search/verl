@@ -6,7 +6,7 @@ hydra:
 defaults:
   - ppo_megatron_trainer
 
-  - old_log_prob@old_log_prob: megatron_old_log_prob
+  - model_engine_server@model_engine_server: megatron_model_engine_server
 
   - _self_
 

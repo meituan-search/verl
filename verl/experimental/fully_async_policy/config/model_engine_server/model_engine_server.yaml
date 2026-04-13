@@ -1,10 +1,10 @@
-# Whether enable standalone old_log_prob server base on model engine
+# Whether enable standalone model engine server
 enable_standalone: False
 
-# Number of nodes for standalone old_log_prob workers
+# Number of nodes for standalone model engine workers
 nnodes: null
 
-# Number of GPUs per node for old_log_prob workers
+# Number of GPUs per node for model engine workers
 n_gpus_per_node: null
 
 # Number of requests to collect before dispatching a batch to the worker group.
@@ -38,7 +38,7 @@ use_dynamic_bsz: ${oc.select:actor_rollout_ref.rollout.log_prob_use_dynamic_bsz,
 # same as actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu if it exists, otherwise 16384
 max_token_len_per_gpu: ${oc.select:actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu,16384}
 
-# profile the old_log_prob model in `compute_log_prob`
+# profile the model engine server in `compute_log_prob`
 profiler:
 
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
@@ -47,7 +47,7 @@ profiler:
   # choices: nsys, npu, torch, torch_memory
   tool: ${oc.select:global_profiler.tool,null}
 
-  # whether enable profile on old_log_prob
+  # whether enable profile on model engine server
   enable: False
 
   # Whether to profile all ranks.

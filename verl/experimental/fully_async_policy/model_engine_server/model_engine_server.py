@@ -42,7 +42,7 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
-class OldLogProbServerAdapter(BaseRollout):
+class ModelEngineServerAdapter(BaseRollout):
     """BaseRollout adapter that wraps a TrainingWorker for old log probability computation."""
 
     def __init__(
@@ -64,8 +64,8 @@ class OldLogProbServerAdapter(BaseRollout):
         self.is_leader_rank = rank % world_size == 0
 
         self.enable_routing_replay = (
-            self._full_config.old_log_prob.strategy == "megatron"
-            and self._full_config.old_log_prob.router_replay.mode != "disabled"
+            self._full_config.model_engine_server.strategy == "megatron"
+            and self._full_config.model_engine_server.router_replay.mode != "disabled"
         )
 
     def init_model(self):
@@ -74,54 +74,54 @@ class OldLogProbServerAdapter(BaseRollout):
 
         model_config: HFModelConfig = omega_conf_to_dataclass(self._full_config.actor_rollout_ref.model)
 
-        # Remap old_log_prob-specific config keys to ppo-compatible names expected
+        # Remap model_engine_server-specific config keys to ppo-compatible names expected
         # by TrainingWorkerConfig / EngineConfig.
-        with open_dict(self._full_config.old_log_prob):
-            self._full_config.old_log_prob.pop("enable_standalone", None)
-            self._full_config.old_log_prob.pop("nnodes", None)
-            self._full_config.old_log_prob.pop("n_gpus_per_node", None)
-            self._full_config.old_log_prob.pop("batch_size", None)
-            self._full_config.old_log_prob.pop("timeout", None)
+        with open_dict(self._full_config.model_engine_server):
+            self._full_config.model_engine_server.pop("enable_standalone", None)
+            self._full_config.model_engine_server.pop("nnodes", None)
+            self._full_config.model_engine_server.pop("n_gpus_per_node", None)
+            self._full_config.model_engine_server.pop("batch_size", None)
+            self._full_config.model_engine_server.pop("timeout", None)
 
-            self._full_config.old_log_prob.ppo_mini_batch_size = self._full_config.old_log_prob.micro_batch_size_per_gpu
-            self._full_config.old_log_prob.ppo_micro_batch_size_per_gpu = self._full_config.old_log_prob.pop(
+            self._full_config.model_engine_server.ppo_mini_batch_size = self._full_config.model_engine_server.micro_batch_size_per_gpu
+            self._full_config.model_engine_server.ppo_micro_batch_size_per_gpu = self._full_config.model_engine_server.pop(
                 "micro_batch_size_per_gpu", None
             )
-            self._full_config.old_log_prob.ppo_max_token_len_per_gpu = self._full_config.old_log_prob.pop(
+            self._full_config.model_engine_server.ppo_max_token_len_per_gpu = self._full_config.model_engine_server.pop(
                 "max_token_len_per_gpu", None
             )
 
-        old_log_prob_config = omega_conf_to_dataclass(self._full_config.old_log_prob)
-        old_log_prob_config.model_config = model_config
+        model_engine_config = omega_conf_to_dataclass(self._full_config.model_engine_server)
+        model_engine_config.model_config = model_config
 
         training_worker_config = TrainingWorkerConfig(
             model_type="language_model",
-            model_config=old_log_prob_config.model_config,
-            engine_config=old_log_prob_config.engine,
+            model_config=model_engine_config.model_config,
+            engine_config=model_engine_config.engine,
         )
 
-        training_worker_config.engine_config.use_dynamic_bsz = self._full_config.old_log_prob.use_dynamic_bsz
+        training_worker_config.engine_config.use_dynamic_bsz = self._full_config.model_engine_server.use_dynamic_bsz
         training_worker_config.engine_config.infer_max_token_len_per_gpu = (
-            self._full_config.old_log_prob.ppo_max_token_len_per_gpu
+            self._full_config.model_engine_server.ppo_max_token_len_per_gpu
         )
         training_worker_config.engine_config.infer_micro_batch_size_per_gpu = (
-            self._full_config.old_log_prob.ppo_micro_batch_size_per_gpu
+            self._full_config.model_engine_server.ppo_micro_batch_size_per_gpu
         )
         training_worker_config.engine_config.max_token_len_per_gpu = (
-            self._full_config.old_log_prob.ppo_max_token_len_per_gpu
+            self._full_config.model_engine_server.ppo_max_token_len_per_gpu
         )
         training_worker_config.engine_config.micro_batch_size_per_gpu = (
-            self._full_config.old_log_prob.ppo_micro_batch_size_per_gpu
+            self._full_config.model_engine_server.ppo_micro_batch_size_per_gpu
         )
         training_worker_config.engine_config.use_remove_padding = model_config.use_remove_padding
-        if self._full_config.old_log_prob.use_dynamic_bsz:
-            assert self._full_config.old_log_prob.ppo_max_token_len_per_gpu is not None
+        if self._full_config.model_engine_server.use_dynamic_bsz:
+            assert self._full_config.model_engine_server.ppo_max_token_len_per_gpu is not None
         else:
-            assert self._full_config.old_log_prob.ppo_micro_batch_size_per_gpu is not None
+            assert self._full_config.model_engine_server.ppo_micro_batch_size_per_gpu is not None
 
         self._training_worker = TrainingWorker(config=training_worker_config)
         self._training_worker.reset()
-        log_gpu_memory_usage("[OldLogProbServerAdapter] After init model", logger=logger)
+        log_gpu_memory_usage("[ModelEngineServerAdapter] After init model", logger=logger)
         aggressive_empty_cache(force_sync=True)
 
     # ------------------------------------------------------------------
@@ -140,10 +140,10 @@ class OldLogProbServerAdapter(BaseRollout):
             return
         await self._training_worker.engine.set_param_from_async_generator(weights)
         get_torch_device().empty_cache()
-        logger.info("[OldLogProbServerAdapter] loaded weights into engine")
+        logger.info("[ModelEngineServerAdapter] loaded weights into engine")
 
     async def resume(self, tags: list[str]):
-        """No-op for OldLogProbServerAdapter."""
+        """No-op for ModelEngineServerAdapter."""
         pass
 
     async def release(self):
@@ -158,7 +158,7 @@ class OldLogProbServerAdapter(BaseRollout):
     def compute_log_prob(self, data: TensorDict) -> TensorDict:
         """Run a forward pass through the TrainingWorker engine."""
         if self._training_worker is None:
-            raise RuntimeError("OldLogProbServerAdapter.init_model() must be called first.")
+            raise RuntimeError("ModelEngineServerAdapter.init_model() must be called first.")
         output = self._training_worker.infer_batch(data)
         return output.cpu() if output is not None else None
 
@@ -167,10 +167,10 @@ class OldLogProbServerAdapter(BaseRollout):
         return self._training_worker.get_dispatch_collect()
 
 
-class OldLogProbWorker(CheckpointEngineWorker, DistProfilerExtension):
+class ModelEngineWorker(CheckpointEngineWorker, DistProfilerExtension):
     """Worker for computing old log probabilities."""
 
-    def __init__(self, config: DictConfig, role: str = "old_log_prob"):
+    def __init__(self, config: DictConfig, role: str = "model_engine_server"):
         rollout_config = config.actor_rollout_ref.rollout
         model_config = config.actor_rollout_ref.model
 
@@ -178,7 +178,7 @@ class OldLogProbWorker(CheckpointEngineWorker, DistProfilerExtension):
 
         initialize_global_process_group_ray(timeout_second=None)  # default: gloo+nccl
 
-        server_adapter = OldLogProbServerAdapter(full_config=config)
+        server_adapter = ModelEngineServerAdapter(full_config=config)
 
         CheckpointEngineWorker.__init__(
             self,
@@ -191,7 +191,7 @@ class OldLogProbWorker(CheckpointEngineWorker, DistProfilerExtension):
         self.role = role
 
         # Profiler setup
-        omega_profiler_config = config.old_log_prob.get("profiler", {})
+        omega_profiler_config = config.model_engine_server.get("profiler", {})
         profiler_config = omega_conf_to_dataclass(omega_profiler_config, dataclass_type=ProfilerConfig)
         if omega_profiler_config.get("tool", None) in ["npu", "nsys", "torch", "torch_memory"]:
             tool_config = omega_conf_to_dataclass(
@@ -206,29 +206,29 @@ class OldLogProbWorker(CheckpointEngineWorker, DistProfilerExtension):
         )
 
     @property
-    def _server_adapter(self) -> OldLogProbServerAdapter:
+    def _server_adapter(self) -> ModelEngineServerAdapter:
         return self.server_adapter  # type: ignore[return-value]
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         """Initialise the TrainingWorker inside the server adapter and register dispatch info."""
         self._server_adapter.init_model()
-        self.set_dispatch_collect(mesh_name="old_log_prob", **self._server_adapter.get_dispatch_collect())
+        self.set_dispatch_collect(mesh_name="model_engine_server", **self._server_adapter.get_dispatch_collect())
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="old_log_prob"))
-    @DistProfiler.annotate(color="blue", role="old_log_prob_compute")
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="model_engine_server"))
+    @DistProfiler.annotate(color="blue", role="model_engine_server_compute")
     def compute_log_prob(self, data: TensorDict) -> TensorDict:
         """Compute log probabilities through the TrainingWorker engine."""
         return self._server_adapter.compute_log_prob(data)
 
 
 @ray.remote
-class OldLogProbServer:
+class ModelEngineServer:
     """Server for computing old log probabilities.
 
     Responsibilities:
     - Collect individual inference requests into batches.
-    - Dispatch batches to OldLogProbWorker via the worker group.
+    - Dispatch batches to ModelEngineWorker via the worker group.
     - Gate new requests during weight updates (drain → NCCL → load → resume).
     """
 
@@ -244,20 +244,20 @@ class OldLogProbServer:
 
     def __init__(
         self,
-        old_log_prob_worker_group: RayWorkerGroup,
-        old_log_prob_cfg: DictConfig,
+        model_engine_worker_group: RayWorkerGroup,
+        model_engine_cfg: DictConfig,
     ):
-        self.old_log_prob_worker_group = old_log_prob_worker_group
-        self.batch_size = old_log_prob_cfg.get("batch_size", 8)
-        self.timeout = old_log_prob_cfg.get("timeout", 10.0)
-        self.micro_batch_size_per_gpu = old_log_prob_cfg.get("micro_batch_size_per_gpu", 1)
-        self.use_dynamic_bsz = old_log_prob_cfg.get("use_dynamic_bsz", False)
+        self.model_engine_worker_group = model_engine_worker_group
+        self.batch_size = model_engine_cfg.get("batch_size", 8)
+        self.timeout = model_engine_cfg.get("timeout", 10.0)
+        self.micro_batch_size_per_gpu = model_engine_cfg.get("micro_batch_size_per_gpu", 1)
+        self.use_dynamic_bsz = model_engine_cfg.get("use_dynamic_bsz", False)
 
-        if "old_log_prob" not in old_log_prob_worker_group._dispatch_info:
-            old_log_prob_worker_group._dispatch_info["old_log_prob"] = old_log_prob_worker_group._query_dispatch_info(
-                "old_log_prob"
+        if "model_engine_server" not in model_engine_worker_group._dispatch_info:
+            model_engine_worker_group._dispatch_info["model_engine_server"] = model_engine_worker_group._query_dispatch_info(
+                "model_engine_server"
             )
-        dp_rank_mapping = old_log_prob_worker_group._dispatch_info["old_log_prob"]
+        dp_rank_mapping = model_engine_worker_group._dispatch_info["model_engine_server"]
         dp_size = max(dp_rank_mapping) + 1
 
         if self.use_dynamic_bsz:
@@ -266,7 +266,7 @@ class OldLogProbServer:
             self._min_dispatch_unit = dp_size * self.micro_batch_size_per_gpu
         self._dp_size = dp_size
         if self.batch_size % self._min_dispatch_unit != 0:
-            raise RuntimeError(f"OldLogProbServer {self.batch_size=} is not a multiple of {self._min_dispatch_unit=}.")
+            raise RuntimeError(f"ModelEngineServer {self.batch_size=} is not a multiple of {self._min_dispatch_unit=}.")
 
         self._request_queue: asyncio.Queue = asyncio.Queue()
         self._consumer_task: asyncio.Task | None = None
@@ -284,7 +284,7 @@ class OldLogProbServer:
     def _start_consumer(self):
         if self._consumer_task is None or self._consumer_task.done():
             self._consumer_task = asyncio.create_task(self._batch_consumer())
-            logger.info("OldLogProbServer: started batch consumer task")
+            logger.info("ModelEngineServer: started batch consumer task")
 
     async def _batch_consumer(self):
         """Continuously collect requests and dispatch them as batches.
@@ -339,13 +339,13 @@ class OldLogProbServer:
                     await self._execute_batch(batch_requests, batch_futures)
 
             except Exception as e:
-                logger.exception(f"OldLogProbServer: error in batch consumer: {e}")
+                logger.exception(f"ModelEngineServer: error in batch consumer: {e}")
                 raise
 
     async def _execute_batch(self, requests: list[TensorDict], futures: list[asyncio.Future]):
         n_real = len(requests)
         if n_real != self.batch_size:
-            logger.debug(f"OldLogProbServer: dispatching partial batch {n_real=} (target={self.batch_size})")
+            logger.debug(f"ModelEngineServer: dispatching partial batch {n_real=} (target={self.batch_size})")
 
         batched_data = TensorDict.cat(requests, dim=0)
         try:
@@ -358,7 +358,7 @@ class OldLogProbServer:
                     future.set_result(batched_output[i : i + 1])
 
         except Exception as e:
-            logger.exception(f"OldLogProbServer: batch inference failed: {e}")
+            logger.exception(f"ModelEngineServer: batch inference failed: {e}")
             for future in futures:
                 if not future.done():
                     future.set_exception(e)
@@ -377,14 +377,14 @@ class OldLogProbServer:
         data = left_right_2_no_padding(data)
         tu.assign_non_tensor(data, calculate_entropy=False, compute_loss=False)
 
-        output = self.old_log_prob_worker_group.compute_log_prob(data)
+        output = self.model_engine_worker_group.compute_log_prob(data)
         if isinstance(output, DataProtoFuture):
             output = output.get()
         if output is None:
-            raise RuntimeError("OldLogProbWorkerGroup.compute_log_prob returned None.")
+            raise RuntimeError("ModelEngineWorkerGroup.compute_log_prob returned None.")
 
         if "log_probs" not in output.keys():
-            raise KeyError(f"Expected 'log_probs' in old_log_prob output, got keys: {list(output.keys())}")
+            raise KeyError(f"Expected 'log_probs' in model_engine_server output, got keys: {list(output.keys())}")
         log_probs = no_padding_2_padding(tu.get(output, "log_probs"), data).float()
         entropy = tu.get(output, "entropy", default=None)
         if entropy is not None:
@@ -399,14 +399,14 @@ class OldLogProbServer:
     # Public API
     # ------------------------------------------------------------------
 
-    async def compute_old_log_prob(self, data: TensorDict) -> TensorDict:
+    async def compute_log_prob(self, data: TensorDict) -> TensorDict:
         """Enqueue a single request and wait for its result."""
         if self._shutdown:
-            raise RuntimeError("OldLogProbServer is shutting down, cannot accept new requests")
-        assert data.batch_size[0] == 1, "OldLogProbServer only supports batch size 1"
+            raise RuntimeError("ModelEngineServer is shutting down, cannot accept new requests")
+        assert data.batch_size[0] == 1, "ModelEngineServer only supports batch size 1"
         missing_keys = [key for key in self._REQUIRED_REQUEST_KEYS if key not in data.keys()]
         if missing_keys:
-            raise KeyError(f"OldLogProbServer request missing required keys: {missing_keys}")
+            raise KeyError(f"ModelEngineServer request missing required keys: {missing_keys}")
 
         await self._serving.wait()
 
@@ -416,7 +416,7 @@ class OldLogProbServer:
         return await future
 
     # ------------------------------------------------------------------
-    # Weight-update protocol: called by OldLogProbReplica.sleep/wake_up
+    # Weight-update protocol: called by ModelEngineReplica.sleep/wake_up
     # ------------------------------------------------------------------
 
     async def pause_serving(self):
@@ -424,7 +424,7 @@ class OldLogProbServer:
         Stop accepting new requests, wait for any in-flight inference to finish,
         then flush queued requests with current weights.
         """
-        logger.info("OldLogProbServer: pause_serving — starting drain")
+        logger.info("ModelEngineServer: pause_serving — starting drain")
 
         # Block new requests from entering the queue and prevent _batch_consumer
         # from starting a new _execute_batch after the current one finishes.
@@ -446,19 +446,19 @@ class OldLogProbServer:
                 break
 
         if pre_drain_requests:
-            logger.info(f"OldLogProbServer: flushing {len(pre_drain_requests)} pre-drain requests with current weights")
+            logger.info(f"ModelEngineServer: flushing {len(pre_drain_requests)} pre-drain requests with current weights")
             await self._execute_batch(pre_drain_requests, pre_drain_futures)
 
-        logger.info("OldLogProbServer: pause_serving done")
+        logger.info("ModelEngineServer: pause_serving done")
 
     async def resume_serving(self):
         """Re-open the request gate after new weights have been loaded."""
         self._serving.set()
-        logger.info("OldLogProbServer: resume_serving done, consumer resuming")
+        logger.info("ModelEngineServer: resume_serving done, consumer resuming")
 
     async def shutdown(self):
         """Shut down the server."""
-        logger.info("OldLogProbServer: shutting down")
+        logger.info("ModelEngineServer: shutting down")
         self._shutdown = True
 
         if self._consumer_task and not self._consumer_task.done():
@@ -476,10 +476,10 @@ class OldLogProbServer:
             except asyncio.QueueEmpty:
                 break
 
-        logger.info("OldLogProbServer: shutdown complete")
+        logger.info("ModelEngineServer: shutdown complete")
 
 
-class OldLogProbReplica(RolloutReplica):
+class ModelEngineReplica(RolloutReplica):
     """RolloutReplica implementation for the old log probability inference server."""
 
     def __init__(
@@ -488,16 +488,16 @@ class OldLogProbReplica(RolloutReplica):
         full_config: DictConfig,
         worker_cls,
     ):
-        # old_log_prob uses a plain DP training engine (no TP/PP), so world_size is
+        # model_engine_server uses a plain DP training engine (no TP/PP), so world_size is
         # simply n_gpus_per_node * nnodes.  We bypass RolloutReplica.__init__'s
         # world_size formula (which reads rollout TP/PP) and set the fields directly.
         self.replica_rank = replica_rank
-        self.config = None  # not used by OldLogProbReplica
-        self.model_config = None  # not used by OldLogProbReplica
+        self.config = None  # not used by ModelEngineReplica
+        self.model_config = None  # not used by ModelEngineReplica
 
-        old_log_prob_cfg = full_config.old_log_prob
-        n_gpus_per_node = int(old_log_prob_cfg.n_gpus_per_node)
-        nnodes = int(old_log_prob_cfg.nnodes)
+        model_engine_cfg = full_config.model_engine_server
+        n_gpus_per_node = int(model_engine_cfg.n_gpus_per_node)
+        nnodes = int(model_engine_cfg.nnodes)
         self.world_size = n_gpus_per_node * nnodes
         self.gpus_per_node = n_gpus_per_node
         self.gpus_per_replica_node = n_gpus_per_node
@@ -521,11 +521,11 @@ class OldLogProbReplica(RolloutReplica):
     # ------------------------------------------------------------------
 
     def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
-        """Return the Ray actor class for OldLogProbWorker."""
+        """Return the Ray actor class for ModelEngineWorker."""
         return RayClassWithInitArgs(
             cls=ray.remote(self._worker_cls),
             config=self._full_config,
-            role="old_log_prob",
+            role="model_engine_server",
         )
 
     async def init_standalone(self):
@@ -533,43 +533,43 @@ class OldLogProbReplica(RolloutReplica):
         self.rollout_mode = RolloutMode.STANDALONE
 
         # 1. Create an independent Ray resource pool for this replica.
-        resource_pool_name = f"old_log_prob_pool_{self.replica_rank}"
+        resource_pool_name = f"model_engine_pool_{self.replica_rank}"
         resource_pool_spec = {resource_pool_name: [self.gpus_per_replica_node] * self.nnodes}
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=None)
         resource_pool_manager.create_resource_pool()
         self.resource_pool = resource_pool_manager.resource_pool_dict[resource_pool_name]
 
-        # 2. OldLogProbWorker RayWorkerGroup.
+        # 2. ModelEngineWorker RayWorkerGroup.
         self._worker_group = RayWorkerGroup(
             resource_pool=self.resource_pool,
             ray_cls_with_init=self.get_ray_class_with_init_args(),
             bin_pack=False,
-            name_prefix=f"old_log_prob_standalone_{self.replica_rank}",
+            name_prefix=f"model_engine_standalone_{self.replica_rank}",
             device_name="cuda" if not is_torch_npu_available(check_device=False) else "npu",
         )
         self.workers = self._worker_group.workers
 
-        # 3. init_model + create OldLogProbServer.
+        # 3. init_model + create ModelEngineServer.
         await self.launch_servers()
 
     async def launch_servers(self):
-        """Call init_model on every worker, then create the OldLogProbServer actor."""
+        """Call init_model on every worker, then create the ModelEngineServer actor."""
         self._worker_group.init_model()
 
-        server = OldLogProbServer.options(
-            name=f"old_log_prob_server_{self.replica_rank}",
+        server = ModelEngineServer.options(
+            name=f"model_engine_server_{self.replica_rank}",
         ).remote(
-            old_log_prob_worker_group=self._worker_group,
-            old_log_prob_cfg=self._full_config.old_log_prob,
+            model_engine_worker_group=self._worker_group,
+            model_engine_cfg=self._full_config.model_engine_server,
         )
         self.servers = [server]
 
     async def abort_all_requests(self):
-        """No-op for OldLogProbReplica."""
+        """No-op for ModelEngineReplica."""
         pass
 
     async def resume_generation(self):
-        """No-op for OldLogProbReplica."""
+        """No-op for ModelEngineReplica."""
         pass
 
     async def sleep(self):
@@ -583,7 +583,7 @@ class OldLogProbReplica(RolloutReplica):
             await self.servers[0].resume_serving.remote()
 
     async def shutdown(self):
-        """Gracefully shut down the OldLogProbServer."""
+        """Gracefully shut down the ModelEngineServer."""
         if self.servers:
             await self.servers[0].shutdown.remote()
             self.servers = []

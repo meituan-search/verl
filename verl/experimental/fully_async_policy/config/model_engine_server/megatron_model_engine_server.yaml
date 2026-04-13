@@ -1,6 +1,6 @@
-# megatron old_log_prob config, inheriting from fully_async_policy/config/old_log_prob/old_log_prob.yaml
+# megatron model_engine_server config, inheriting from fully_async_policy/config/model_engine_server/model_engine_server.yaml
 defaults:
-  - old_log_prob
+  - model_engine_server
 
   # megatron engine config: ../engine resolves to verl/trainer/config/engine/ via searchpath
   - ../engine@megatron: megatron

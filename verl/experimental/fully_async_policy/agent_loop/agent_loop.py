@@ -52,11 +52,11 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         config: DictConfig,
         servers: list[tuple[str, ray.actor.ActorHandle]],
         load_balancer_handle: ray.actor.ActorHandle,
-        old_log_prob_server_handle: ray.actor.ActorHandle = None,
+        model_engine_server_handle: ray.actor.ActorHandle = None,
         tokenizer: Any = None,
     ):
         super().__init__(config=config, servers=servers, load_balancer_handle=load_balancer_handle)
-        self.old_log_prob_server_handle = old_log_prob_server_handle
+        self.model_engine_server_handle = model_engine_server_handle
         self.tokenizer = tokenizer
 
     @rollout_trace_op
@@ -112,7 +112,7 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
             current_temperature = sampling_params.get("temperature", 1.0)
             # Skip old log prob computation during validation
             if not validate:
-                output = await self._recompute_old_log_prob(output, current_prompt_ids, current_temperature)
+                output = await self._compute_old_log_prob(output, current_prompt_ids, current_temperature)
             # 2. merge output into final_output
             final_output.token_ids.extend(output.token_ids)
             if output.log_probs is not None:
@@ -151,8 +151,8 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         final_output.extra_fields["max_global_steps"] = max_global_steps
         return final_output
 
-    async def _recompute_old_log_prob(self, output: TokenOutput, context_prompt_ids, temperature: float):
-        if self.old_log_prob_server_handle is None:
+    async def _compute_old_log_prob(self, output: TokenOutput, context_prompt_ids, temperature: float):
+        if self.model_engine_server_handle is None:
             return output
         # Convert TokenOutput -> fixed-shape TensorDict for OldLogProbServer.
         if self.config.get("actor_rollout_ref"):
@@ -239,7 +239,7 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
             temperature=temperature,
             max_response_len=max_response_len,
         )
-        result_td = await self.old_log_prob_server_handle.compute_old_log_prob.remote(data_td)
+        result_td = await self.model_engine_server_handle.compute_log_prob.remote(data_td)
 
         # Keep only valid response tokens; drop right-padding region.
         log_probs_tensor = tu.get(result_td, "log_probs")
@@ -257,7 +257,7 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
         teacher_servers: list[tuple[str, ray.actor.ActorHandle]] = None,
         teacher_load_balancer_handle: ray.actor.ActorHandle = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
-        old_log_prob_server_handle: ray.actor.ActorHandle = None,
+        model_engine_server_handle: ray.actor.ActorHandle = None,
     ):
         super().__init__(
             config,
@@ -271,7 +271,7 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
             config,
             servers,
             load_balancer_handle,
-            old_log_prob_server_handle,
+            model_engine_server_handle,
             tokenizer=self.tokenizer,
         )
 
@@ -297,33 +297,33 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             raise NotImplementedError("Distillation is not implemented in FullyAsyncAgentLoopManager yet.")
 
     async def _initialize_llm_servers(self):
-        """Extend base class to also create OldLogProbReplica when configured."""
+        """Extend base class to also create ModelEngineReplica when configured."""
         await super()._initialize_llm_servers()
-        if self.config.old_log_prob.enable_standalone:
-            await self._init_old_log_prob_replica()
+        if self.config.model_engine_server.enable_standalone:
+            await self._init_model_engine_replica()
 
-    async def _init_old_log_prob_replica(self):
-        """Create OldLogProbReplica, call init_standalone, and append to rollout_replicas.
+    async def _init_model_engine_replica(self):
+        """Create ModelEngineReplica, call init_standalone, and append to rollout_replicas.
 
-        OldLogProbReplica.init_standalone() self-allocates a Ray resource pool,
-        spawns OldLogProbWorker actors, calls init_model(), and creates the
+        ModelEngineReplica.init_standalone() self-allocates a Ray resource pool,
+        spawns ModelEngineWorker actors, calls init_model(), and creates the
         OldLogProbServer — all in one call, exactly like vLLM/SGLang replicas.
 
-        After this, self.old_log_prob_server_handle is set so that
+        After this, self.model_engine_server_handle is set so that
         _init_agent_loop_workers() passes it to every FullyAsyncAgentLoopWorker.
         """
-        from verl.experimental.fully_async_policy.old_log_prob import OldLogProbReplica, OldLogProbWorker
+        from verl.experimental.fully_async_policy.model_engine_server import ModelEngineReplica, ModelEngineWorker
 
-        replica = OldLogProbReplica(
+        replica = ModelEngineReplica(
             replica_rank=len(self.rollout_replicas),
             full_config=self.config,
-            worker_cls=OldLogProbWorker,
+            worker_cls=ModelEngineWorker,
         )
         await replica.init_standalone()
         self.rollout_replicas.append(replica)
 
         # Expose the server handle so _init_agent_loop_workers passes it to workers.
-        self.old_log_prob_server_handle = replica.servers[0]
+        self.model_engine_server_handle = replica.servers[0]
 
     async def shutdown(self):
         """Shut down OldLogProbServer if one was created."""
