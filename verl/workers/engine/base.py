@@ -157,12 +157,11 @@ class BaseEngine:
         """
         raise NotImplementedError
 
-    async def set_param_from_async_generator(self, weight_generator, stage_on_cpu: bool = False) -> None:
+    async def set_param_from_async_generator(self, weight_generator) -> None:
         """Load weights from an async (name, tensor) generator into the model.
 
         Args:
             weight_generator: Async generator yielding (name, tensor) pairs.
-            stage_on_cpu: If True, stage received tensors on CPU to reduce peak GPU memory.
         """
         raise NotImplementedError
 
