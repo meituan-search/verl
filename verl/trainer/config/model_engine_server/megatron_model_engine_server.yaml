@@ -1,4 +1,4 @@
-# megatron model_engine_server config, inheriting from fully_async_policy/config/model_engine_server/model_engine_server.yaml
+# megatron model_engine_server config, inheriting from verl/trainer/config/model_engine_server/model_engine_server.yaml
 defaults:
   - model_engine_server
 
