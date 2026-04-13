@@ -83,9 +83,11 @@ class ModelEngineServerAdapter(BaseRollout):
             self._full_config.model_engine_server.pop("batch_size", None)
             self._full_config.model_engine_server.pop("timeout", None)
 
-            self._full_config.model_engine_server.ppo_mini_batch_size = self._full_config.model_engine_server.micro_batch_size_per_gpu
-            self._full_config.model_engine_server.ppo_micro_batch_size_per_gpu = self._full_config.model_engine_server.pop(
-                "micro_batch_size_per_gpu", None
+            self._full_config.model_engine_server.ppo_mini_batch_size = (
+                self._full_config.model_engine_server.micro_batch_size_per_gpu
+            )
+            self._full_config.model_engine_server.ppo_micro_batch_size_per_gpu = (
+                self._full_config.model_engine_server.pop("micro_batch_size_per_gpu", None)
             )
             self._full_config.model_engine_server.ppo_max_token_len_per_gpu = self._full_config.model_engine_server.pop(
                 "max_token_len_per_gpu", None
@@ -254,8 +256,8 @@ class ModelEngineServer:
         self.use_dynamic_bsz = model_engine_cfg.get("use_dynamic_bsz", False)
 
         if "model_engine_server" not in model_engine_worker_group._dispatch_info:
-            model_engine_worker_group._dispatch_info["model_engine_server"] = model_engine_worker_group._query_dispatch_info(
-                "model_engine_server"
+            model_engine_worker_group._dispatch_info["model_engine_server"] = (
+                model_engine_worker_group._query_dispatch_info("model_engine_server")
             )
         dp_rank_mapping = model_engine_worker_group._dispatch_info["model_engine_server"]
         dp_size = max(dp_rank_mapping) + 1
@@ -446,7 +448,9 @@ class ModelEngineServer:
                 break
 
         if pre_drain_requests:
-            logger.info(f"ModelEngineServer: flushing {len(pre_drain_requests)} pre-drain requests with current weights")
+            logger.info(
+                f"ModelEngineServer: flushing {len(pre_drain_requests)} pre-drain requests with current weights"
+            )
             await self._execute_batch(pre_drain_requests, pre_drain_futures)
 
         logger.info("ModelEngineServer: pause_serving done")

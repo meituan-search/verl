@@ -201,7 +201,11 @@ class AutoBridge(AB):  # type: ignore
             mcore_weight = self._weight_to_mcore_format(local_name, hf_weights)
 
             # skip lm_head / embed_tokens for value models (shape[0] == 1)
-            if hf_names[0] in {"lm_head.weight", "model.embed_tokens.weight", "model.language_model.embed_tokens.weight"}:
+            if hf_names[0] in {
+                "lm_head.weight",
+                "model.embed_tokens.weight",
+                "model.language_model.embed_tokens.weight",
+            }:
                 if param.shape[0] == 1 and mcore_weight.shape[0] != 1:
                     return
 
