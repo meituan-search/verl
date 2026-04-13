@@ -157,13 +157,12 @@ class BaseEngine:
         """
         raise NotImplementedError
 
-    def set_param(self, state_dict: dict[str, torch.Tensor]):
-        """
-        Load full state_dict into the (possibly sharded) model.
-        This is the inverse of get_per_tensor_param.
+    async def set_param_from_async_generator(self, weight_generator, stage_on_cpu: bool = False) -> None:
+        """Load weights from an async (name, tensor) generator into the model.
 
         Args:
-            state_dict: A dictionary mapping parameter names and tensors.
+            weight_generator: Async generator yielding (name, tensor) pairs.
+            stage_on_cpu: If True, stage received tensors on CPU to reduce peak GPU memory.
         """
         raise NotImplementedError
 

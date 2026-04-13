@@ -730,23 +730,6 @@ class MegatronEngine(BaseEngine):
 
         return per_tensor_param, peft_config
 
-    def set_param(self, state_dict: dict[str, torch.Tensor]):
-        """Load full HF-format state_dict into Megatron sharded model.
-
-        This is the inverse of get_per_tensor_param. It uses the bridge to load
-        HF-format weights into the Megatron model with proper TP/PP resharding.
-
-        Args:
-            state_dict: A dictionary mapping HF-format parameter names to full (unsharded) tensors.
-        """
-        load_megatron_model_to_gpu(self.module, load_grad=False)
-        if self.vanilla_bridge:
-            self.bridge.load_weights_from_state_dict(self.module, state_dict)
-        else:
-            raise NotImplementedError("set_per_tensor_param is only supported for vanilla mbridge")
-        if self._is_offload_param:
-            offload_megatron_model_to_cpu(self.module)
-
     async def set_param_from_async_generator(self, weight_generator) -> None:
         """Load weights from an async generator."""
         if not self.vanilla_bridge:
