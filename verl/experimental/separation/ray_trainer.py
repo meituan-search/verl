@@ -500,32 +500,29 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             )
         else:  # Recompute old_log_probs
             with marked_timer("old_log_prob", timing_raw, color="blue"):
-                if "server_old_log_probs" in batch.batch:
-                    batch.batch["old_log_probs"] = batch.batch["server_old_log_probs"]
-                else:
-                    old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
-                    entropys = old_log_prob.batch["entropys"]
-                    response_masks = batch.batch["response_mask"]
-                    actor_config = self.config.actor_rollout_ref.actor
-                    entropy_agg = agg_loss(
-                        loss_mat=entropys,
-                        loss_mask=response_masks,
-                        loss_agg_mode=actor_config.loss_agg_mode,
-                        loss_scale_factor=actor_config.loss_scale_factor,
-                    )
-                    old_log_prob_metrics = {
-                        "actor/entropy": entropy_agg.detach().item(),
-                        "perf/mfu/actor_infer": old_log_prob_mfu,
-                    }
-                    metrics.update(old_log_prob_metrics)
-                    old_log_prob.batch.pop("entropys")
-                    if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
-                        router_mode = getattr(self.config.actor_rollout_ref.actor.router_replay, "mode", "disabled")
-                        if router_mode == "R2":
-                            batch.batch.pop("routed_experts")
-                        else:
-                            old_log_prob.batch.pop("routed_experts")
-                    batch = batch.union(old_log_prob)
+                old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                entropys = old_log_prob.batch["entropys"]
+                response_masks = batch.batch["response_mask"]
+                actor_config = self.config.actor_rollout_ref.actor
+                entropy_agg = agg_loss(
+                    loss_mat=entropys,
+                    loss_mask=response_masks,
+                    loss_agg_mode=actor_config.loss_agg_mode,
+                    loss_scale_factor=actor_config.loss_scale_factor,
+                )
+                old_log_prob_metrics = {
+                    "actor/entropy": entropy_agg.detach().item(),
+                    "perf/mfu/actor_infer": old_log_prob_mfu,
+                }
+                metrics.update(old_log_prob_metrics)
+                old_log_prob.batch.pop("entropys")
+                if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
+                    router_mode = getattr(self.config.actor_rollout_ref.actor.router_replay, "mode", "disabled")
+                    if router_mode == "R2":
+                        batch.batch.pop("routed_experts")
+                    else:
+                        old_log_prob.batch.pop("routed_experts")
+                batch = batch.union(old_log_prob)
                 if "rollout_log_probs" in batch.batch.keys():
                     # TODO: we may want to add diff of probs too.
                     from verl.utils.debug.metrics import calculate_debug_metrics

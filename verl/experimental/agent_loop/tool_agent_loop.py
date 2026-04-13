@@ -79,6 +79,7 @@ class AgentData:
         self.response_mask: list[int] = []
         self.response_logprobs: list[float] = []
         self.response_oldlogprobs: list[float] = []
+        self.response_engine_server_entropys: list[float] = []
         self.turn_scores: list[float] = []
         self.tool_rewards: list[float] = []
         self.user_turns = 0
@@ -196,6 +197,9 @@ class ToolAgentLoop(AgentLoopBase):
             response_oldlogprobs=agent_data.response_oldlogprobs[: self.response_length]
             if agent_data.response_oldlogprobs
             else None,
+            response_engine_server_entropys=agent_data.response_engine_server_entropys[: self.response_length]
+            if agent_data.response_engine_server_entropys
+            else None,
             num_turns=agent_data.user_turns + agent_data.assistant_turns + 1,
             metrics=agent_data.metrics,
             routed_experts=agent_data.routed_experts,
@@ -252,6 +256,8 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.response_logprobs += output.log_probs
         if output.old_log_probs:
             agent_data.response_oldlogprobs += output.old_log_probs
+        if output.entropys:
+            agent_data.response_engine_server_entropys += output.entropys
         if output.routed_experts is not None:
             agent_data.routed_experts = output.routed_experts
 
@@ -385,6 +391,8 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.response_logprobs += [0.0] * len(response_ids)
         if agent_data.response_oldlogprobs:
             agent_data.response_oldlogprobs += [0.0] * len(response_ids)
+        if agent_data.response_engine_server_entropys:
+            agent_data.response_engine_server_entropys += [0.0] * len(response_ids)
         agent_data.user_turns += 1
         return AgentState.GENERATING
 
@@ -419,6 +427,8 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.response_logprobs += [0.0] * len(response_ids)
         if agent_data.response_oldlogprobs:
             agent_data.response_oldlogprobs += [0.0] * len(response_ids)
+        if agent_data.response_engine_server_entropys:
+            agent_data.response_engine_server_entropys += [0.0] * len(response_ids)
 
         # double check prompt
         # Check termination condition

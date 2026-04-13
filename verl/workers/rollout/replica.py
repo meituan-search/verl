@@ -43,6 +43,8 @@ class TokenOutput(BaseModel):
     """logprobs of response token ids"""
     old_log_probs: Optional[list[float]] = None
     """oldlogprobs of response token ids"""
+    entropys: Optional[list[float]] = None
+    """per-token entropy, computed by ModelEngineServer"""
     routed_experts: Optional[Any] = None
     """routed experts of response token ids"""
     stop_reason: Optional[str] = None

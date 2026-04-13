@@ -19,7 +19,6 @@ from typing import Any, Optional
 import ray
 import torch
 from omegaconf import DictConfig
-from tensordict import TensorDict
 
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopManager,
@@ -30,8 +29,6 @@ from verl.experimental.agent_loop.agent_loop import (
 from verl.experimental.teacher_loop import TeacherModelManager
 from verl.protocol import DataProto
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup
-from verl.utils import tensordict_utils as tu
-from verl.utils.model import compute_position_id_with_mask
 from verl.utils.ray_utils import auto_await
 from verl.utils.rollout_trace import (
     rollout_trace_op,
@@ -53,11 +50,9 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         servers: list[tuple[str, ray.actor.ActorHandle]],
         load_balancer_handle: ray.actor.ActorHandle,
         model_engine_server_handle: ray.actor.ActorHandle = None,
-        tokenizer: Any = None,
     ):
         super().__init__(config=config, servers=servers, load_balancer_handle=load_balancer_handle)
         self.model_engine_server_handle = model_engine_server_handle
-        self.tokenizer = tokenizer
 
     @rollout_trace_op
     async def generate(
@@ -95,6 +90,7 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
             token_ids=[],
             log_probs=[],
             old_log_probs=[],
+            entropys=[],
             num_preempted=0,
         )
         min_global_steps, max_global_steps = None, None
@@ -119,6 +115,8 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
                 final_output.log_probs.extend(output.log_probs)
             if output.old_log_probs is not None:
                 final_output.old_log_probs.extend(output.old_log_probs)
+            if output.entropys is not None:
+                final_output.entropys.extend(output.entropys)
             if output.routed_experts is not None:
                 if final_output.routed_experts is None:
                     final_output.routed_experts = output.routed_experts
@@ -154,96 +152,18 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
     async def _compute_old_log_prob(self, output: TokenOutput, context_prompt_ids, temperature: float):
         if self.model_engine_server_handle is None:
             return output
-        # Convert TokenOutput -> fixed-shape TensorDict for OldLogProbServer.
-        if self.config.get("actor_rollout_ref"):
-            rollout_config = self.config.actor_rollout_ref.rollout
-        else:
-            rollout_config = self.config.rollout
-
-        # Prompt grows during partial-rollout/multi-turn. Reserve prompt slots for
-        # [original prompt + at most full response length] to keep shapes static.
-        max_prompt_len = int(rollout_config.prompt_length) + int(rollout_config.response_length)
-        max_response_len = int(rollout_config.response_length)
 
         # Only recompute old_log_probs for newly generated tokens in this turn.
         if len(output.token_ids) == 0:
             output.old_log_probs = []
+            output.entropys = []
             return output
 
-        prompt_len = len(context_prompt_ids)
-        response_len = len(output.token_ids)
-
-        if prompt_len > max_prompt_len:
-            raise ValueError(
-                f"prompt length {prompt_len} exceeds padded prompt length {max_prompt_len} "
-                "for old_log_prob recomputation"
-            )
-        if response_len > max_response_len:
-            print(
-                f"response length {response_len} exceeds padded response length {max_response_len} "
-                "for old_log_prob recomputation"
-            )
-            output.token_ids = output.token_ids[:max_response_len]
-            response_len = max_response_len
-
-        tokenizer = self.tokenizer
-        if tokenizer is None:
-            raise RuntimeError("tokenizer is required for old_log_prob recomputation padding")
-
-        original_padding_side = tokenizer.padding_side
-        tokenizer.padding_side = "left"
-        prompt_output = tokenizer.pad(
-            {"input_ids": context_prompt_ids},
-            padding="max_length",
-            max_length=max_prompt_len,
-            return_tensors="pt",
-            return_attention_mask=True,
+        result = await self.model_engine_server_handle.compute_log_prob.remote(
+            context_prompt_ids, output.token_ids, temperature
         )
-        if prompt_output["input_ids"].dim() == 1:
-            prompt_output["input_ids"] = prompt_output["input_ids"].unsqueeze(0)
-            prompt_output["attention_mask"] = prompt_output["attention_mask"].unsqueeze(0)
-
-        tokenizer.padding_side = "right"
-        response_output = tokenizer.pad(
-            {"input_ids": output.token_ids},
-            padding="max_length",
-            max_length=max_response_len,
-            return_tensors="pt",
-            return_attention_mask=True,
-        )
-        if response_output["input_ids"].dim() == 1:
-            response_output["input_ids"] = response_output["input_ids"].unsqueeze(0)
-            response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
-        tokenizer.padding_side = original_padding_side
-
-        input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
-        attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
-        position_ids = compute_position_id_with_mask(attention_mask)
-        response_mask = response_output["attention_mask"]
-
-        data_td = TensorDict(
-            {
-                "prompts": prompt_output["input_ids"],
-                "responses": response_output["input_ids"],
-                "input_ids": input_ids,
-                "position_ids": position_ids,
-                "response_mask": response_mask,
-                "attention_mask": attention_mask,
-                "loss_mask": response_mask,
-            },
-            batch_size=[1],
-        )
-
-        tu.assign_non_tensor(
-            data_td,
-            temperature=temperature,
-            max_response_len=max_response_len,
-        )
-        result_td = await self.model_engine_server_handle.compute_log_prob.remote(data_td)
-
-        # Keep only valid response tokens; drop right-padding region.
-        log_probs_tensor = tu.get(result_td, "log_probs")
-        output.old_log_probs = log_probs_tensor[0, :response_len].tolist()
+        output.old_log_probs = result["log_probs"]
+        output.entropys = result["entropy"]
         return output
 
 
@@ -259,6 +179,12 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
         model_engine_server_handle: ray.actor.ActorHandle = None,
     ):
+        self.server_manager = FullyAsyncLLMServerManager(
+            config,
+            servers,
+            load_balancer_handle,
+            model_engine_server_handle,
+        )
         super().__init__(
             config,
             servers,
@@ -266,13 +192,6 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
             teacher_servers,
             teacher_load_balancer_handle,
             reward_loop_worker_handles,
-        )
-        self.server_manager = FullyAsyncLLMServerManager(
-            config,
-            servers,
-            load_balancer_handle,
-            model_engine_server_handle,
-            tokenizer=self.tokenizer,
         )
 
 
@@ -286,13 +205,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
     ):
         self.agent_loop_workers_class = FullyAsyncAgentLoopWorker
-        super().__init__(
-            config,
-            worker_group,
-            rollout_resource_pool,
-            teacher_model_manager,
-            reward_loop_worker_handles,
-        )
+        super().__init__(config, worker_group, rollout_resource_pool, teacher_model_manager, reward_loop_worker_handles)
         if self.distillation_enabled:
             raise NotImplementedError("Distillation is not implemented in FullyAsyncAgentLoopManager yet.")
 
@@ -318,6 +231,8 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             replica_rank=len(self.rollout_replicas),
             full_config=self.config,
             worker_cls=ModelEngineWorker,
+            tokenizer=self.tokenizer,
+            rollout_config=self.rollout_config,
         )
         await replica.init_standalone()
         self.rollout_replicas.append(replica)

@@ -125,7 +125,6 @@ class AsyncLLMServerManager:
         """
         self.config = config
         self._load_balancer = load_balancer_handle
-        self.model_engine_server_handle = None
         self._server_id_to_handle: dict[str, ray.actor.ActorHandle] = dict(servers)
 
     async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
@@ -197,6 +196,8 @@ class AgentLoopOutput(BaseModel):
     """Log probabilities for the response tokens."""
     response_oldlogprobs: Optional[list[float]] = None
     """Log probabilities calculated by standalone server for the response tokens."""
+    response_engine_server_entropys: Optional[list[float]] = None
+    """Per-token entropy, computed by ModelEngineServer."""
     routed_experts: Optional[Any] = None
     """Routed experts for the total tokens."""
     multi_modal_data: Optional[dict[str, Any]] = None
@@ -236,6 +237,8 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded token ids corresponding to the teacher log probabilities."""
     response_oldlogprobs: Optional[torch.Tensor] = None
     """Padded old log probabilities for the response tokens."""
+    response_engine_server_entropys: Optional[torch.Tensor] = None
+    """Padded per-token entropy, computed by ModelEngineServer."""
     routed_experts: Optional[torch.Tensor] = None
     """Padded routed experts for the total tokens."""
     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
@@ -685,6 +688,12 @@ class AgentLoopWorker:
         if output.response_oldlogprobs is not None:
             pad_size = self.rollout_config.response_length - len(output.response_oldlogprobs)
             response_oldlogprobs = torch.tensor(output.response_oldlogprobs + [0.0] * pad_size).unsqueeze(0)
+        response_engine_server_entropys = None
+        if output.response_engine_server_entropys is not None:
+            pad_size = self.rollout_config.response_length - len(output.response_engine_server_entropys)
+            response_engine_server_entropys = torch.tensor(
+                output.response_engine_server_entropys + [0.0] * pad_size
+            ).unsqueeze(0)
 
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
@@ -761,6 +770,7 @@ class AgentLoopWorker:
             attention_mask=attention_mask,
             response_logprobs=response_logprobs,
             response_oldlogprobs=response_oldlogprobs,
+            response_engine_server_entropys=response_engine_server_entropys,
             routed_experts=routed_experts,
             multi_modal_inputs=multi_modal_inputs,
             multi_modal_data=output.multi_modal_data,
@@ -899,6 +909,10 @@ class AgentLoopWorker:
             optional_outputs["server_old_log_probs"] = torch.cat(
                 [input.response_oldlogprobs for input in inputs], dim=0
             )
+        if inputs[0].response_engine_server_entropys is not None:
+            optional_outputs["engine_server_entropys"] = torch.cat(
+                [input.response_engine_server_entropys for input in inputs], dim=0
+            )
         if inputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
@@ -1031,7 +1045,6 @@ class AgentLoopManager:
         self.worker_group = worker_group
         self.rollout_resource_pool = rollout_resource_pool
         self.reward_loop_worker_handles = reward_loop_worker_handles
-        self.model_engine_server_handle = None
 
         self.teacher_model_manager = teacher_model_manager
         self.distillation_enabled = is_distillation_enabled(self.config.get("distillation", None))

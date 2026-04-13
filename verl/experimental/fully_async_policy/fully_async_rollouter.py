@@ -390,9 +390,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         self.async_rollout_mode = True
         self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
-            config=self.config,
-            worker_group=self.rollout_wg,
-            reward_loop_worker_handles=reward_loop_worker_handles,
+            config=self.config, worker_group=self.rollout_wg, reward_loop_worker_handles=reward_loop_worker_handles
         )
 
     # Add samples to the pending_queue

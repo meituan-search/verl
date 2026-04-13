@@ -30,6 +30,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_torch_device, is_torch_npu_available
 from verl.utils.memory_utils import aggressive_empty_cache
+from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig
 from verl.utils.profiler.performance import log_gpu_memory_usage
 from verl.workers.config import HFModelConfig, TrainingWorkerConfig
@@ -234,22 +235,16 @@ class ModelEngineServer:
     - Gate new requests during weight updates (drain → NCCL → load → resume).
     """
 
-    _REQUIRED_REQUEST_KEYS = (
-        "input_ids",
-        "attention_mask",
-        "response_mask",
-        "position_ids",
-        "prompts",
-        "responses",
-        "temperature",
-    )
-
     def __init__(
         self,
         model_engine_worker_group: RayWorkerGroup,
         model_engine_cfg: DictConfig,
+        tokenizer=None,
+        rollout_config=None,
     ):
         self.model_engine_worker_group = model_engine_worker_group
+        self.tokenizer = tokenizer
+        self.rollout_config = rollout_config
         self.batch_size = model_engine_cfg.get("batch_size", 8)
         self.timeout = model_engine_cfg.get("timeout", 10.0)
         self.micro_batch_size_per_gpu = model_engine_cfg.get("micro_batch_size_per_gpu", 1)
@@ -377,7 +372,7 @@ class ModelEngineServer:
         global_token_num = torch.sum(data["attention_mask"], dim=-1).tolist()
         tu.assign_non_tensor(data, global_token_num=global_token_num)
         data = left_right_2_no_padding(data)
-        tu.assign_non_tensor(data, calculate_entropy=False, compute_loss=False)
+        tu.assign_non_tensor(data, calculate_entropy=True, compute_loss=False)
 
         output = self.model_engine_worker_group.compute_log_prob(data)
         if isinstance(output, DataProtoFuture):
@@ -395,38 +390,115 @@ class ModelEngineServer:
         # Discard dummy padding rows.
         log_probs = log_probs[:n_real]
 
-        return tu.get_tensordict({"log_probs": log_probs.float()})
+        result = {"log_probs": log_probs.float()}
+        if entropy is not None:
+            result["entropy"] = entropy[:n_real].float()
+        return tu.get_tensordict(result)
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    async def compute_log_prob(self, data: TensorDict) -> TensorDict:
-        """Enqueue a single request and wait for its result."""
+    def _build_request(
+        self,
+        prompt_ids: list[int],
+        response_ids: list[int],
+        temperature: float,
+    ) -> TensorDict:
+        """Pad prompt/response ids and construct a batch-size-1 TensorDict for inference."""
+        assert self.tokenizer is not None, "tokenizer must be provided to ModelEngineServer"
+        assert self.rollout_config is not None, "rollout_config must be provided to ModelEngineServer"
+
+        max_prompt_len = int(self.rollout_config.prompt_length) + int(self.rollout_config.response_length)
+        max_response_len = int(self.rollout_config.response_length)
+
+        if len(response_ids) > max_response_len:
+            response_ids = response_ids[:max_response_len]
+
+        tokenizer = self.tokenizer
+        original_padding_side = tokenizer.padding_side
+
+        tokenizer.padding_side = "left"
+        prompt_output = tokenizer.pad(
+            {"input_ids": prompt_ids},
+            padding="max_length",
+            max_length=max_prompt_len,
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
+        if prompt_output["input_ids"].dim() == 1:
+            prompt_output["input_ids"] = prompt_output["input_ids"].unsqueeze(0)
+            prompt_output["attention_mask"] = prompt_output["attention_mask"].unsqueeze(0)
+
+        tokenizer.padding_side = "right"
+        response_output = tokenizer.pad(
+            {"input_ids": response_ids},
+            padding="max_length",
+            max_length=max_response_len,
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
+        if response_output["input_ids"].dim() == 1:
+            response_output["input_ids"] = response_output["input_ids"].unsqueeze(0)
+            response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
+
+        tokenizer.padding_side = original_padding_side
+
+        input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
+        attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
+        position_ids = compute_position_id_with_mask(attention_mask)
+        response_mask = response_output["attention_mask"]
+
+        data_td = TensorDict(
+            {
+                "prompts": prompt_output["input_ids"],
+                "responses": response_output["input_ids"],
+                "input_ids": input_ids,
+                "position_ids": position_ids,
+                "response_mask": response_mask,
+                "attention_mask": attention_mask,
+                "loss_mask": response_mask,
+            },
+            batch_size=[1],
+        )
+        tu.assign_non_tensor(data_td, temperature=temperature, max_response_len=max_response_len)
+        return data_td
+
+    async def compute_log_prob(
+        self,
+        prompt_ids: list[int],
+        response_ids: list[int],
+        temperature: float,
+    ) -> dict:
+        """Enqueue a single request and return log_probs and entropy for valid response tokens."""
         if self._shutdown:
             raise RuntimeError("ModelEngineServer is shutting down, cannot accept new requests")
-        assert data.batch_size[0] == 1, "ModelEngineServer only supports batch size 1"
-        missing_keys = [key for key in self._REQUIRED_REQUEST_KEYS if key not in data.keys()]
-        if missing_keys:
-            raise KeyError(f"ModelEngineServer request missing required keys: {missing_keys}")
+
+        response_len = min(len(response_ids), int(self.rollout_config.response_length))
 
         await self._serving.wait()
 
+        data_td = self._build_request(prompt_ids, response_ids, temperature)
         loop = asyncio.get_event_loop()
         future = loop.create_future()
-        await self._request_queue.put((data, future))
-        return await future
+        await self._request_queue.put((data_td, future))
+        result_td = await future
+
+        log_probs = tu.get(result_td, "log_probs")[0, :response_len].tolist()
+        entropy_tensor = tu.get(result_td, "entropy", default=None)
+        entropy = entropy_tensor[0, :response_len].tolist() if entropy_tensor is not None else None
+        return {"log_probs": log_probs, "entropy": entropy}
 
     # ------------------------------------------------------------------
     # Weight-update protocol: called by ModelEngineReplica.sleep/wake_up
     # ------------------------------------------------------------------
 
-    async def pause_serving(self):
+    async def sleep(self):
         """
         Stop accepting new requests, wait for any in-flight inference to finish,
         then flush queued requests with current weights.
         """
-        logger.info("ModelEngineServer: pause_serving — starting drain")
+        logger.info("ModelEngineServer: sleep — starting drain")
 
         # Block new requests from entering the queue and prevent _batch_consumer
         # from starting a new _execute_batch after the current one finishes.
@@ -453,12 +525,12 @@ class ModelEngineServer:
             )
             await self._execute_batch(pre_drain_requests, pre_drain_futures)
 
-        logger.info("ModelEngineServer: pause_serving done")
+        logger.info("ModelEngineServer: sleep done")
 
-    async def resume_serving(self):
+    async def wake_up(self):
         """Re-open the request gate after new weights have been loaded."""
         self._serving.set()
-        logger.info("ModelEngineServer: resume_serving done, consumer resuming")
+        logger.info("ModelEngineServer: wake_up done, consumer resuming")
 
     async def shutdown(self):
         """Shut down the server."""
@@ -491,6 +563,8 @@ class ModelEngineReplica(RolloutReplica):
         replica_rank: int,
         full_config: DictConfig,
         worker_cls,
+        tokenizer=None,
+        rollout_config=None,
     ):
         # model_engine_server uses a plain DP training engine (no TP/PP), so world_size is
         # simply n_gpus_per_node * nnodes.  We bypass RolloutReplica.__init__'s
@@ -498,6 +572,8 @@ class ModelEngineReplica(RolloutReplica):
         self.replica_rank = replica_rank
         self.config = None  # not used by ModelEngineReplica
         self.model_config = None  # not used by ModelEngineReplica
+        self._tokenizer = tokenizer
+        self._rollout_config = rollout_config
 
         model_engine_cfg = full_config.model_engine_server
         n_gpus_per_node = int(model_engine_cfg.n_gpus_per_node)
@@ -565,6 +641,8 @@ class ModelEngineReplica(RolloutReplica):
         ).remote(
             model_engine_worker_group=self._worker_group,
             model_engine_cfg=self._full_config.model_engine_server,
+            tokenizer=self._tokenizer,
+            rollout_config=self._rollout_config,
         )
         self.servers = [server]
 
@@ -575,16 +653,6 @@ class ModelEngineReplica(RolloutReplica):
     async def resume_generation(self):
         """No-op for ModelEngineReplica."""
         pass
-
-    async def sleep(self):
-        """Pause serving: stop accepting new requests and flush queued ones with current weights."""
-        if self.servers:
-            await self.servers[0].pause_serving.remote()
-
-    async def wake_up(self):
-        """Re-open the request gate after new weights have been loaded."""
-        if self.servers:
-            await self.servers[0].resume_serving.remote()
 
     async def shutdown(self):
         """Gracefully shut down the ModelEngineServer."""

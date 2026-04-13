@@ -481,6 +481,14 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         If local_trigger_step == 2, 3, ..., restore the parameters of version 1 to calculate the old_log_prob,
         then restore the parameters of the current version.
         """
+        if "server_old_log_probs" in batch.batch:
+            batch_dict = {
+                "old_log_probs": batch.batch.pop("server_old_log_probs"),
+                "entropys": batch.batch.pop("engine_server_entropys"),
+            }
+            old_log_prob = DataProto.from_dict(batch_dict)
+            return old_log_prob, 0.0
+
         if self.local_trigger_step == 1:
             self.actor_rollout_wg.save_model_to_cpu(1)
             old_log_prob, old_log_prob_mfu = super()._compute_old_log_prob(batch)
@@ -511,9 +519,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             return
 
         with marked_timer("timing_s/param_sync", self.timing_raw):
-            await self.checkpoint_manager.update_weights(
-                global_steps=self.current_param_version,
-            )
+            await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
         print(
             f"[FullyAsyncTrainer] _fit_update_weights, "
             f"timing_s/param_sync: {self.timing_raw['timing_s/param_sync']:.4f} seconds "
