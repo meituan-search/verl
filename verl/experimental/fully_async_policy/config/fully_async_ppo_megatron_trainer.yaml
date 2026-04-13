@@ -1,7 +1,6 @@
 hydra:
   searchpath:
     - file://verl/trainer/config
-    - file://verl/experimental/fully_async_policy/config
 
 defaults:
   - ppo_megatron_trainer
