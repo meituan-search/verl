@@ -33,6 +33,7 @@ from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig
 from verl.utils.profiler.performance import log_gpu_memory_usage
+from verl.utils.tokenizer import hf_tokenizer
 from verl.workers.config import HFModelConfig, TrainingWorkerConfig
 from verl.workers.engine_workers import TrainingWorker, _with_routing_replay_flag
 from verl.workers.rollout.base import BaseRollout
@@ -239,11 +240,11 @@ class ModelEngineServer:
         self,
         model_engine_worker_group: RayWorkerGroup,
         model_engine_cfg: DictConfig,
-        tokenizer=None,
+        model_path: str,
         rollout_config=None,
     ):
         self.model_engine_worker_group = model_engine_worker_group
-        self.tokenizer = tokenizer
+        self.tokenizer = hf_tokenizer(model_path)
         self.rollout_config = rollout_config
         self.batch_size = model_engine_cfg.get("batch_size", 8)
         self.timeout = model_engine_cfg.get("timeout", 10.0)
@@ -563,7 +564,6 @@ class ModelEngineReplica(RolloutReplica):
         replica_rank: int,
         full_config: DictConfig,
         worker_cls,
-        tokenizer=None,
         rollout_config=None,
     ):
         # model_engine_server uses a plain DP training engine (no TP/PP), so world_size is
@@ -572,7 +572,6 @@ class ModelEngineReplica(RolloutReplica):
         self.replica_rank = replica_rank
         self.config = None  # not used by ModelEngineReplica
         self.model_config = None  # not used by ModelEngineReplica
-        self._tokenizer = tokenizer
         self._rollout_config = rollout_config
 
         model_engine_cfg = full_config.model_engine_server
@@ -641,7 +640,7 @@ class ModelEngineReplica(RolloutReplica):
         ).remote(
             model_engine_worker_group=self._worker_group,
             model_engine_cfg=self._full_config.model_engine_server,
-            tokenizer=self._tokenizer,
+            model_path=self._full_config.actor_rollout_ref.model.path,
             rollout_config=self._rollout_config,
         )
         self.servers = [server]

@@ -481,9 +481,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         If local_trigger_step == 2, 3, ..., restore the parameters of version 1 to calculate the old_log_prob,
         then restore the parameters of the current version.
         """
-        if "server_old_log_probs" in batch.batch:
+        if "engine_server_logprobs" in batch.batch:
             batch_dict = {
-                "old_log_probs": batch.batch.pop("server_old_log_probs"),
+                "old_log_probs": batch.batch.pop("engine_server_logprobs"),
                 "entropys": batch.batch.pop("engine_server_entropys"),
             }
             old_log_prob = DataProto.from_dict(batch_dict)

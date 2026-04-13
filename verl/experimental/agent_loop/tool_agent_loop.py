@@ -78,7 +78,7 @@ class AgentData:
         self.response_ids: list[int] = []
         self.response_mask: list[int] = []
         self.response_logprobs: list[float] = []
-        self.response_oldlogprobs: list[float] = []
+        self.response_engine_server_logprobs: list[float] = []
         self.response_engine_server_entropys: list[float] = []
         self.turn_scores: list[float] = []
         self.tool_rewards: list[float] = []
@@ -194,8 +194,8 @@ class ToolAgentLoop(AgentLoopBase):
             response_logprobs=agent_data.response_logprobs[: self.response_length]
             if agent_data.response_logprobs
             else None,
-            response_oldlogprobs=agent_data.response_oldlogprobs[: self.response_length]
-            if agent_data.response_oldlogprobs
+            response_engine_server_logprobs=agent_data.response_engine_server_logprobs[: self.response_length]
+            if agent_data.response_engine_server_logprobs
             else None,
             response_engine_server_entropys=agent_data.response_engine_server_entropys[: self.response_length]
             if agent_data.response_engine_server_entropys
@@ -254,10 +254,10 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.response_mask += [1] * len(agent_data.response_ids)
         if output.log_probs:
             agent_data.response_logprobs += output.log_probs
-        if output.old_log_probs:
-            agent_data.response_oldlogprobs += output.old_log_probs
-        if output.entropys:
-            agent_data.response_engine_server_entropys += output.entropys
+        if output.engine_server_logprobs:
+            agent_data.response_engine_server_logprobs += output.engine_server_logprobs
+        if output.engine_server_entropys:
+            agent_data.response_engine_server_entropys += output.engine_server_entropys
         if output.routed_experts is not None:
             agent_data.routed_experts = output.routed_experts
 
@@ -389,8 +389,8 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.response_mask += [0] * len(response_ids)
         if agent_data.response_logprobs:
             agent_data.response_logprobs += [0.0] * len(response_ids)
-        if agent_data.response_oldlogprobs:
-            agent_data.response_oldlogprobs += [0.0] * len(response_ids)
+        if agent_data.response_engine_server_logprobs:
+            agent_data.response_engine_server_logprobs += [0.0] * len(response_ids)
         if agent_data.response_engine_server_entropys:
             agent_data.response_engine_server_entropys += [0.0] * len(response_ids)
         agent_data.user_turns += 1
@@ -425,8 +425,8 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.response_mask += [0] * len(response_ids)
         if agent_data.response_logprobs:
             agent_data.response_logprobs += [0.0] * len(response_ids)
-        if agent_data.response_oldlogprobs:
-            agent_data.response_oldlogprobs += [0.0] * len(response_ids)
+        if agent_data.response_engine_server_logprobs:
+            agent_data.response_engine_server_logprobs += [0.0] * len(response_ids)
         if agent_data.response_engine_server_entropys:
             agent_data.response_engine_server_entropys += [0.0] * len(response_ids)
 

@@ -89,8 +89,8 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         final_output = TokenOutput(
             token_ids=[],
             log_probs=[],
-            old_log_probs=[],
-            entropys=[],
+            engine_server_logprobs=[],
+            engine_server_entropys=[],
             num_preempted=0,
         )
         min_global_steps, max_global_steps = None, None
@@ -113,10 +113,10 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
             final_output.token_ids.extend(output.token_ids)
             if output.log_probs is not None:
                 final_output.log_probs.extend(output.log_probs)
-            if output.old_log_probs is not None:
-                final_output.old_log_probs.extend(output.old_log_probs)
-            if output.entropys is not None:
-                final_output.entropys.extend(output.entropys)
+            if output.engine_server_logprobs is not None:
+                final_output.engine_server_logprobs.extend(output.engine_server_logprobs)
+            if output.engine_server_entropys is not None:
+                final_output.engine_server_entropys.extend(output.engine_server_entropys)
             if output.routed_experts is not None:
                 if final_output.routed_experts is None:
                     final_output.routed_experts = output.routed_experts
@@ -155,15 +155,15 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
 
         # Only recompute old_log_probs for newly generated tokens in this turn.
         if len(output.token_ids) == 0:
-            output.old_log_probs = []
-            output.entropys = []
+            output.engine_server_logprobs = []
+            output.engine_server_entropys = []
             return output
 
         result = await self.model_engine_server_handle.compute_log_prob.remote(
             context_prompt_ids, output.token_ids, temperature
         )
-        output.old_log_probs = result["log_probs"]
-        output.entropys = result["entropy"]
+        output.engine_server_logprobs = result["log_probs"]
+        output.engine_server_entropys = result["entropy"]
         return output
 
 
@@ -231,7 +231,6 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             replica_rank=len(self.rollout_replicas),
             full_config=self.config,
             worker_cls=ModelEngineWorker,
-            tokenizer=self.tokenizer,
             rollout_config=self.rollout_config,
         )
         await replica.init_standalone()
