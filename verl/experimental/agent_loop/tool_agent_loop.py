@@ -251,7 +251,7 @@ class ToolAgentLoop(AgentLoopBase):
         if output.log_probs:
             agent_data.response_logprobs += output.log_probs
         if output.old_log_probs:
-            agent_data.response_logprobs += output.old_log_probs
+            agent_data.response_oldlogprobs += output.old_log_probs
         if output.routed_experts is not None:
             agent_data.routed_experts = output.routed_experts
 
