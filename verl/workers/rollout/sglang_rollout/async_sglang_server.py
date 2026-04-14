@@ -322,8 +322,12 @@ class SGLangHttpServer:
             return
 
         if self.rollout_mode == RolloutMode.HYBRID:
-            # In hybrid mode, rollout is wake up in `update_weights`
-            raise ValueError(f"wake_up not support rollout_mode {self.rollout_mode}")
+            # In elastic scheduling, weights are pre-synced via the naive path
+            # (sync_weights_to_rollout_naive) before wake_up() is called.
+            # We only need to resume kv_cache + weights to restore GPU memory.
+            obj = ResumeMemoryOccupationReqInput(tags=["kv_cache", "weights"])
+            await self.tokenizer_manager.resume_memory_occupation(obj, None)
+            await self.tokenizer_manager.flush_cache()
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
             obj = ResumeMemoryOccupationReqInput(tags=["kv_cache", "weights"])
@@ -363,6 +367,29 @@ class SGLangHttpServer:
             # In standalone mode, resume kv_cache if free_cache_engine is enabled
             obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
             await self.tokenizer_manager.release_memory_occupation(obj, None)
+
+    async def release_kv_cache(self):
+        """Release only kv_cache GPU memory, keeping model weights intact.
+
+        Used in the NCCL weight-sync path (for both STANDALONE and awake HYBRID
+        replicas) to free GPU memory before weight transfer without disturbing
+        model weights.  Call resume_kv_cache() after the transfer completes.
+        """
+        if self.node_rank != 0 or not self.config.free_cache_engine:
+            return
+        obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
+        await self.tokenizer_manager.release_memory_occupation(obj, None)
+
+    async def resume_kv_cache(self):
+        """Restore kv_cache GPU memory after a weight sync.
+
+        Counterpart to release_kv_cache().
+        """
+        if self.node_rank != 0:
+            return
+        obj = ResumeMemoryOccupationReqInput(tags=["kv_cache"])
+        await self.tokenizer_manager.resume_memory_occupation(obj, None)
+        await self.tokenizer_manager.flush_cache()
 
     async def clear_kv_cache(self):
         if self.node_rank == 0:

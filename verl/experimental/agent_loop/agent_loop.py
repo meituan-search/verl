@@ -1078,7 +1078,16 @@ class AgentLoopManager:
         await instance._init_agent_loop_workers()
         return instance
 
-    async def _initialize_llm_servers(self):
+    async def _initialize_llm_servers(self, start_rank: int = 0):
+        """
+        Initialise fixed rollout replicas (standalone or hybrid).
+
+        Args:
+            start_rank: The first ``replica_rank`` to assign.  Defaults to 0.
+                ElasticAgentLoopManager passes ``num_elastic`` here so that
+                replica_rank values are globally unique across elastic and fixed
+                replicas, avoiding Ray named-actor name collisions.
+        """
         rollout_world_size = (
             self.rollout_config.tensor_model_parallel_size
             * self.rollout_config.data_parallel_size
@@ -1093,12 +1102,12 @@ class AgentLoopManager:
 
         self.rollout_replicas = [
             self.rollout_replica_class(
-                replica_rank=replica_rank,
+                replica_rank=start_rank + i,
                 config=self.rollout_config,
                 model_config=self.model_config,
                 gpus_per_node=self.rollout_config.n_gpus_per_node,
             )
-            for replica_rank in range(num_replicas)
+            for i in range(num_replicas)
         ]
 
         if self.worker_group and self.rollout_config.name != "trtllm":

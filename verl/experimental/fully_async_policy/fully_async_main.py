@@ -117,14 +117,18 @@ class FullyAsyncTaskRunner:
 
     def _create_rollouter(self, config) -> None:
         print("[ASYNC MAIN] Starting create rollouter...")
-        rollouter = FullyAsyncRollouter.remote(
-            config=config,
-            tokenizer=self.components["tokenizer"],
-            role_worker_mapping=None,
-            resource_pool_manager=create_resource_pool_manager(config, roles=[Role.Rollout]),
-            ray_worker_group_cls=self.components["ray_worker_group_cls"],
-            processor=self.components["processor"],
-            device_name=config.trainer.device,
+        rollouter = (
+            ray.remote(FullyAsyncRollouter)
+            .options(num_cpus=10, max_concurrency=100)
+            .remote(
+                config=config,
+                tokenizer=self.components["tokenizer"],
+                role_worker_mapping=None,
+                resource_pool_manager=None,
+                ray_worker_group_cls=None,
+                processor=self.components["processor"],
+                device_name=config.trainer.device,
+            )
         )
 
         ray.get(rollouter.init_workers.remote())
@@ -141,14 +145,18 @@ class FullyAsyncTaskRunner:
             if role != Role.Rollout
         }
 
-        trainer = FullyAsyncTrainer.remote(
-            config=config,
-            tokenizer=self.components["tokenizer"],
-            role_worker_mapping=trainer_role_mapping,
-            resource_pool_manager=create_resource_pool_manager(config, roles=list(trainer_role_mapping.keys())),
-            ray_worker_group_cls=self.components["ray_worker_group_cls"],
-            processor=self.components["processor"],
-            device_name=config.trainer.device,
+        trainer = (
+            ray.remote(FullyAsyncTrainer)
+            .options(num_cpus=10)
+            .remote(
+                config=config,
+                tokenizer=self.components["tokenizer"],
+                role_worker_mapping=trainer_role_mapping,
+                resource_pool_manager=create_resource_pool_manager(config, roles=list(trainer_role_mapping.keys())),
+                ray_worker_group_cls=self.components["ray_worker_group_cls"],
+                processor=self.components["processor"],
+                device_name=config.trainer.device,
+            )
         )
 
         ray.get(trainer.init_workers.remote())

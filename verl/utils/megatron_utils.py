@@ -484,11 +484,15 @@ def offload_megatron_model_to_cpu(models):
     - fp32 main_parameter chunked in model and dp group
     - fp32 optimizer state chunked in model and dp group
     """
-    for model_chunk in models:
+    import logging as _logging
+
+    _util_logger = _logging.getLogger(__name__)
+
+    for ci, model_chunk in enumerate(models):
         if isinstance(model_chunk, DDP):
             model_chunk_all_buffers = [model_chunk.buffers, model_chunk.expert_parallel_buffers]
             for buffers in model_chunk_all_buffers:
-                for buffer in buffers:
+                for bi, buffer in enumerate(buffers):
                     # offload parameters
                     if buffer.param_data.storage().size() > 0:
                         buffer.param_data.cpu_data = buffer.param_data.data.cpu().pin_memory()
@@ -497,10 +501,24 @@ def offload_megatron_model_to_cpu(models):
 
                     assert buffer.param_data_size == buffer.param_data.cpu_data.storage().size()
 
-                    if buffer.grad_data.storage().size() > 0:
+                    grad_sz_before = buffer.grad_data.storage().size()
+                    if grad_sz_before > 0:
                         # if the grad_data size is already zero, we assume that it is already offloaded
                         buffer.grad_data_size = buffer.grad_data.storage().size()
                         buffer.grad_data.storage().resize_(0)
+                        _util_logger.info(
+                            f"[offload_megatron_model_to_cpu] chunk={ci} buf={bi}: "
+                            f"grad_data {grad_sz_before}→0, saved grad_data_size={buffer.grad_data_size}"
+                        )
+                    else:
+                        _util_logger.warning(
+                            f"[offload_megatron_model_to_cpu] chunk={ci} buf={bi}: "
+                            f"grad_data.storage already 0, skipping resize. "
+                            f"has_grad_data_size={hasattr(buffer, 'grad_data_size')}"
+                            f"saved_grad_data_size={buffer.grad_data_size}"
+                            if hasattr(buffer, "grad_data_size")
+                            else ""
+                        )
             # Offload frozen parameters not in DDP buffers (e.g. base model in LoRA/PEFT)
             # DDP buffers only contain requires_grad=True params, so frozen params must be offloaded separately.
             for param in model_chunk.module.parameters():
@@ -525,22 +543,44 @@ def load_megatron_model_to_gpu(models, load_grad=True, load_frozen_params=True):
         load_grad: Whether to load gradients.
         load_frozen_params: Whether to load frozen parameters.
     """
-    for model_chunk in models:
+    import logging as _logging
+
+    _util_logger = _logging.getLogger(__name__)
+
+    for ci, model_chunk in enumerate(models):
         if isinstance(model_chunk, DDP):
             model_chunk_all_buffers = [model_chunk.buffers, model_chunk.expert_parallel_buffers]
             for buffers in model_chunk_all_buffers:
-                for buffer in buffers:
+                for bi, buffer in enumerate(buffers):
                     # sometimes, we don't want to load grad for pure inference
+                    grad_sz_before = buffer.grad_data.storage().size()
                     if load_grad and hasattr(buffer, "grad_data_size"):
                         current_storage_size = buffer.grad_data.storage().size()
                         if current_storage_size == 0 or current_storage_size == buffer.grad_data_size:
                             buffer.grad_data.storage().resize_(buffer.grad_data_size)
                             buffer.grad_data.zero_()
+                            _util_logger.info(
+                                f"[load_megatron_model_to_gpu] chunk={ci} buf={bi}: "
+                                f"grad_data {grad_sz_before}→{buffer.grad_data_size} (restored)"
+                            )
                         else:
                             # Non-standard layers (e.g. GatedDeltaNet) may have grad
                             # buffers with mismatched storage size; skip resize and
                             # zero in-place with current storage.
                             buffer.grad_data.zero_()
+                            _util_logger.info(
+                                f"[load_megatron_model_to_gpu] chunk={ci} buf={bi}: "
+                                f"grad_data size mismatch (current={current_storage_size}, "
+                                f"saved={buffer.grad_data_size}), zeroed in-place"
+                            )
+                    elif load_grad:
+                        _util_logger.warning(
+                            f"[load_megatron_model_to_gpu] chunk={ci} buf={bi}: "
+                            f"load_grad=True but no grad_data_size attr — SKIPPING grad restore! "
+                            f"grad_data.storage.size={grad_sz_before}. "
+                            "This means offload_megatron_model_to_cpu was never called or "
+                            "grad_data was already 0 at offload time."
+                        )
 
                     if buffer.param_data.storage().size() == 0:
                         buffer.param_data.storage().resize_(buffer.param_data_size)

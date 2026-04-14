@@ -68,6 +68,17 @@ class BaseRollout(ABC):
         """Release weights and kv cache in GPU memory."""
         pass
 
+    @abstractmethod
+    async def release_weights(self):
+        """Release only the weight GPU memory, keeping kv_cache in place.
+
+        Used in the naive weight-sync path for sleeping hybrid replicas:
+          resume_weights() → update_weights() → release_weights()
+        The rollout server stays asleep throughout; only the weight buffers
+        are temporarily restored so the latest actor params can be written in.
+        """
+        pass
+
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Batch generate sequences in sync mode.
 

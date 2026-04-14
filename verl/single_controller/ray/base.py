@@ -831,6 +831,35 @@ class RayWorkerGroup(WorkerGroup):
         """
         return self.execute_rank_zero_async(method_name, *args, **kwargs)
 
+    def execute_rank_method(self, ranks: list[int], method_name: str, *args, **kwargs):
+        """Execute a method on specific workers by their global ranks.
+
+        This is used for elastic scheduling to target specific elastic units
+        (e.g., switch_to_rollout for only the ranks being converted).
+
+        Args:
+            ranks: List of global ranks (0-indexed) to execute the method on.
+            method_name: Name of the method to execute
+            *args: Positional arguments for the method
+            **kwargs: Keyword arguments for the method
+
+        Returns:
+            List of remote object references for the specified ranks.
+            Returns empty list if ranks is empty.
+
+        Raises:
+            ValueError: If any rank in ranks is out of bounds.
+        """
+        if not ranks:
+            return []
+
+        # Validate ranks
+        for rank in ranks:
+            if rank < 0 or rank >= len(self._workers):
+                raise ValueError(f"Rank {rank} out of bounds. Must be in [0, {len(self._workers)}).")
+
+        return [self._execute_remote_single_worker(self._workers[rank], method_name, *args, **kwargs) for rank in ranks]
+
     def execute_all(self, method_name: str, *args, **kwargs):
         """Alias for execute_all_async.
 

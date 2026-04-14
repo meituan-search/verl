@@ -11,7 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from verl.experimental.elastic_scheduling.engine.megatron.elastic_transformer_impl import (
+    ElasticMegatronMixin,
+    ModelStateSnapshot,
+    OptimizerStateSnapshot,
+)
 
-from .agent_loop import FullyAsyncAgentLoopManager, FullyAsyncAgentLoopWorker
-
-__all__ = [FullyAsyncAgentLoopManager, FullyAsyncAgentLoopWorker]
+__all__ = [
+    "ElasticMegatronMixin",
+    "ModelStateSnapshot",
+    "OptimizerStateSnapshot",
+]

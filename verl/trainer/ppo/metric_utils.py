@@ -299,11 +299,16 @@ def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n
     # estimated_flops, promised_flops = flops_function.estimate_flops(num_tokens, time)
     # f'Actual TFLOPs/s/GPU​': estimated_flops/(n_gpus),
     # f'Theoretical TFLOPs/s/GPU​': promised_flops,
-    return {
+    metrics = {
         "perf/total_num_tokens": total_num_tokens,
         "perf/time_per_step": time,
-        "perf/throughput": total_num_tokens / (time * n_gpus),
     }
+    # n_gpus may be 0 in fully-elastic mode where the static resource pool
+    # spec reports no GPUs (they are registered dynamically at runtime).
+    # Similarly guard against time == 0 to avoid ZeroDivisionError.
+    if n_gpus > 0 and time > 0:
+        metrics["perf/throughput"] = total_num_tokens / (time * n_gpus)
+    return metrics
 
 
 def compute_variance_proxy_metrics(batch: DataProto, gradient_norm: float = None) -> dict[str, float]:

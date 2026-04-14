@@ -46,7 +46,7 @@ def create_resource_pool_manager(config, roles: list) -> ResourcePoolManager:
             if role in roles:
                 mapping[role] = "trainer_pool"
 
-    # Rollout resource pool
+    # Rollout resource pool (standalone Rollout role)
     if Role.Rollout in roles:
         assert config.rollout.n_gpus_per_node > 0, "config.rollout.n_gpus_per_node must be greater than 0"
         assert config.rollout.nnodes > 0, "config.rollout.nnodes must be greater than 0"
@@ -77,7 +77,7 @@ def create_role_worker_mapping(config):
     ray_worker_group_cls = RayWorkerGroup
 
     train_role = Role.Actor
-    if config.get("async_training", {}).get("use_trainer_do_validate", False):
+    if config.get("elastic_scheduling", {}):
         train_role = Role.ActorRollout
 
     role_worker_mapping = {

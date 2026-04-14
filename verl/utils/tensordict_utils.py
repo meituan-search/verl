@@ -337,13 +337,20 @@ def chunk_tensordict(td: TensorDict, chunks: int) -> list[TensorDict]:
             for i, chunk_td in enumerate(tds):
                 chunk_lengths = lengths[i * chunk_size : (i + 1) * chunk_size]
                 chunk_tensors = [padded_chunks[i][j, :seq_len] for j, seq_len in enumerate(chunk_lengths)]
-                chunk_td[key] = torch.nested.as_nested_tensor(chunk_tensors, layout=torch.jagged)
+                # Use clone() to ensure each chunk owns its storage independently.
+                # as_nested_tensor may share _values with the source tensor; after
+                # the source is GC-collected the shared CUDA buffer is freed, causing
+                # "CUDA illegal memory access" in the remote worker.
+                chunk_td[key] = torch.nested.as_nested_tensor(chunk_tensors, layout=torch.jagged).clone()
             continue
 
         for i, chunk_td in enumerate(tds):
+            # clone() gives each chunk an independent _values buffer so that the
+            # original nested tensor (and its storage) can be safely released
+            # before the remote worker accesses its shard.
             chunk_td[key] = torch.nested.as_nested_tensor(
                 tensors[i * chunk_size : (i + 1) * chunk_size], layout=torch.jagged
-            )
+            ).clone()
 
     return tds
 
@@ -467,9 +474,14 @@ def index_select_tensor_dict(batch: TensorDict, indices: torch.Tensor | list[int
                 data_dict[key] = tensor[indices]
             elif isinstance(tensor, torch.Tensor) and tensor.is_nested:
                 tensor_lst = tensor.unbind()  # for performance
+                # clone() ensures the resulting nested tensor owns its _values
+                # storage independently from the source.  Without clone(), the
+                # shard is a view of the original buffer; if that buffer is freed
+                # (e.g. source TensorDict GC'd after Ray puts the shard into the
+                # object store) the worker will hit "CUDA illegal memory access".
                 data_dict[key] = torch.nested.as_nested_tensor(
                     [tensor_lst[idx] for idx in indices], layout=torch.jagged
-                )
+                ).clone()
             else:
                 # This handles NonTensorStack (indexable by batch dim) and NonTensorData (scalar metadata).
                 if tensor.shape:
