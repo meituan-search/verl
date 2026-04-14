@@ -27,7 +27,6 @@ from verl import DataProto
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.fully_async_policy.detach_utils import (
     MetricsAggregator,
-    ValidateMetrics,
     assemble_batch_from_rollout_samples,
 )
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
@@ -149,42 +148,15 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         )
         self.metrics_aggregator = MetricsAggregator(total_gpus=total_gpus)
 
-        # use trainer to do validation
-        if self.config.async_training.use_trainer_do_validate:
-            from verl.trainer.main_ppo import create_rl_dataset
-            from verl.utils.dataset.rl_dataset import collate_fn
-
-            val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
-            rollout_gpus = config.rollout.nnodes * config.rollout.n_gpus_per_node
-            print(f"[FullyAsyncTrainer] split before val_dataset total len: {len(val_dataset)}")
-            split_dataset = val_dataset.split(total_gpus)
-            rollout_val_dataset0 = split_dataset[rollout_gpus:]
-            from torch.utils.data import ConcatDataset
-
-            val_dataset = ConcatDataset(rollout_val_dataset0)
-            print(f"[FullyAsyncTrainer] split after val_dataset total len: {len(val_dataset)}")
-            self.val_dataset = val_dataset
-            # update val_dataloader
-            val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
-            if val_batch_size is None:
-                val_batch_size = len(val_dataset)
-            from torchdata.stateful_dataloader import StatefulDataLoader
-
-            print(f"[FullyAsyncTrainer] create val_dataloader with batch_size: {val_batch_size}")
-            self.val_dataloader = StatefulDataLoader(
-                dataset=val_dataset,
-                batch_size=val_batch_size,
-                num_workers=self.config.data["dataloader_num_workers"],
-                shuffle=self.config.data.get("validation_shuffle", True),
-                drop_last=False,
-                collate_fn=collate_fn,
-            )
         # Reference to rollouter for parameter synchronization
         self.rollouter = None
         self.checkpoint_manager = None
 
-        # when use_trainer_do_validate == Ture, use colocate_checkpoint_manager to sync params
-        self.colocate_checkpoint_manager = None
+        # Hybrid checkpoint manager for trainer-side validation (use_trainer_do_validate)
+        # Uses naive backend to sync weights from trainer to elastic rollout replicas.
+        # Initialized in _setup_hybrid_checkpoint_manager() after models are loaded.
+        self.hybrid_checkpoint_manager = None
+
 
     def _setup_checkpoint_manager(self, rollouter):
         """Setup checkpoint manager after rollouter is initialized"""
@@ -194,6 +166,40 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             config=checkpoint_engine_config, trainer=self.actor_wg, replicas=replicas
         )
         print("[FullyAsyncTrainer] Checkpoint manager initialized")
+
+    async def _setup_hybrid_checkpoint_manager(self):
+        """Setup hybrid checkpoint manager for trainer-side validation.
+
+        When use_trainer_do_validate is enabled, creates a CheckpointEngineManager
+        with naive backend that syncs weights from the trainer's actor worker group
+        to the elastic rollout replicas (managed by Rollouter's FullyAsyncAgentLoopManager).
+        Must be called after init_workers() so that actor_rollout_wg is initialized.
+        """
+        if not self.config.async_training.use_trainer_do_validate:
+            return
+
+        print("[FullyAsyncTrainer] Setting up hybrid checkpoint manager (naive backend)")
+
+        # Create hybrid CheckpointEngineManager with naive backend.
+        # Replicas start as empty list; elastic replicas from rollouter's ALM
+        # are added dynamically during validation before weight sync.
+        checkpoint_engine_cfg = self.config.actor_rollout_ref.rollout.checkpoint_engine
+        original_backend = checkpoint_engine_cfg.backend
+        with open_dict(checkpoint_engine_cfg):
+            checkpoint_engine_cfg.backend = "naive"
+        checkpoint_engine_config = omega_conf_to_dataclass(checkpoint_engine_cfg)
+
+        self.hybrid_checkpoint_manager = CheckpointEngineManager(
+            config=checkpoint_engine_config,
+            trainer=self.actor_rollout_wg,
+            replicas=[],  # Start empty; elastic replicas added during validate
+        )
+
+        # Restore original backend value
+        with open_dict(checkpoint_engine_cfg):
+            checkpoint_engine_cfg.backend = original_backend
+
+        print("[FullyAsyncTrainer] Hybrid checkpoint manager initialized (naive backend, empty replicas)")
 
     def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         """Set message queue client"""
@@ -284,7 +290,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         return 0, batch
 
     def _create_actor_rollout_classes(self):
-        # create actor
+        # create actor — always use Role.Actor (not ActorRollout) even when
+        # use_trainer_do_validate is enabled. Rollout capability on trainer GPUs
+        # is handled by ElasticAgentLoopManager's hybrid replicas.
         for role in [self.train_role]:
             resource_pool = self.resource_pool_manager.get_resource_pool(role)
             role_cls = RayClassWithInitArgs(
@@ -321,70 +329,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._create_worker_classes()
         self._init_worker_groups()
         self._init_models()
-        self._init_reward_loop()
-        await self._init_async_rollout_manager()
-
-    def _init_reward_loop(self):
-        if self.config.async_training.use_trainer_do_validate:
-            print("[FullyAsyncTrainer] Init reward loop")
-            super()._init_reward_loop()
-
-    async def _init_async_rollout_manager(self):
-        # use async rollout do validate
-        print(f"[FullyAsyncTrainer] use_trainer_do_validate: {self.config.async_training.use_trainer_do_validate}")
-        if self.config.async_training.use_trainer_do_validate:
-            print("[FullyAsyncTrainer] Init async rollout manager")
-
-            # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
-            # agent_reward_loop: streaming reward computation with actor rollout
-            # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
-            enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
-
-            # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
-            # to stream reward computation with actor rollout
-            reward_loop_worker_handles = (
-                self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
-            )
-
-            # create async rollout manager and request scheduler
-            assert self.config.actor_rollout_ref.rollout.mode == "async"
-
-            self.async_rollout_mode = True
-            from verl.experimental.agent_loop import AgentLoopManager
-
-            self.async_rollout_manager = await AgentLoopManager.create(
-                config=self.config,
-                worker_group=self.actor_rollout_wg,
-                reward_loop_worker_handles=reward_loop_worker_handles,
-            )
-            print("[FullyAsyncTrainer] async_rollout_manager initialized")
-
-            # Modify checkpoint_engine config to use naive backend
-            checkpoint_engine_cfg = self.config.actor_rollout_ref.rollout.checkpoint_engine
-            original_backend = checkpoint_engine_cfg.backend
-            with open_dict(checkpoint_engine_cfg):
-                checkpoint_engine_cfg.backend = "naive"
-            checkpoint_engine_config = omega_conf_to_dataclass(checkpoint_engine_cfg)
-
-            print(f"[FullyAsyncTrainer] checkpoint_engine_config: {checkpoint_engine_config}")
-
-            self.colocate_checkpoint_manager = CheckpointEngineManager(
-                config=checkpoint_engine_config,
-                trainer=self.actor_rollout_wg,
-                replicas=self.async_rollout_manager.rollout_replicas,
-            )
-
-            # sleep all replicas to load checkpoint
-            await self.colocate_checkpoint_manager.sleep_replicas()
-
-            # Restore original backend value
-            with open_dict(checkpoint_engine_cfg):
-                checkpoint_engine_cfg.backend = original_backend
-
-            print("[FullyAsyncTrainer] colocate_checkpoint_manager initialized")
-
-        else:
-            print("[FullyAsyncTrainer] Skip async rollout manager (use_trainer_do_validate=False)")
+        # Setup hybrid CP manager and elastic ALM after models are loaded
+        await self._setup_hybrid_checkpoint_manager()
 
     async def fit(self):
         """
@@ -532,29 +478,6 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         )
         self.metrics_aggregator.reset()
 
-    async def _validate_process(self):
-        """Run trainer-side validation using async rollout manager"""
-        if self.config.async_training.use_trainer_do_validate:
-            print("[FullyAsyncTrainer] _validate_process")
-            from verl.utils.profiler import marked_timer
-
-            # Wake up rollouter replicas and sync weights
-            print("[FullyAsyncTrainer] wake up replicas before validation")
-            await self.colocate_checkpoint_manager.update_weights(global_steps=self.current_param_version)
-
-            with marked_timer("trainer/validate_time", self.timing_raw):
-                train_val_metrics = self._validate(True)
-
-            # Sleep rollouter replicas to free GPU memory for validation
-            print("[FullyAsyncTrainer] sleep replicas after validation")
-            await self.colocate_checkpoint_manager.sleep_replicas()
-
-            print(f"[FullyAsyncTrainer] validate timing: {self.timing_raw['trainer/validate_time']}")
-            return train_val_metrics
-        else:
-            print("[FullyAsyncTrainer] _validate_process without async_rollout_manager")
-            return None
-
     async def _fit_validate(self, val_before_train=False):
         if self.local_trigger_step != 1:
             return
@@ -569,32 +492,127 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         if not need_validate and not val_before_train:
             return
 
-        # Trigger rollouter validation and get future
-        val_future = self.rollouter.do_validate.remote()
-
-        # Run trainer-side validation
-        train_val_metrics = await self._validate_process()
-
-        # Wait for rollouter validation result and log
-        val_metrics: ValidateMetrics = ray.get(val_future)
-        if train_val_metrics:
-            # Merge trainer and rollouter validation results
-            with marked_timer("timing_s/merge_val", self.timing_raw):
-                new_metrics = self._merge_validation_results(train_val_metrics, val_metrics.metrics)
-            if new_metrics:
-                self.logger.log(data=new_metrics, step=self.current_param_version)
-                pprint(
-                    f"[FullyAsyncTrainer] parameter version: {self.current_param_version} "
-                    f"Validation metrics: {new_metrics}, timing: {self.timing_raw['timing_s/merge_val']}"
-                )
+        # ================================================================
+        # Trainer-side validation (use_trainer_do_validate)
+        # Flow: switch_to_rollout → CP sync → wake_up + add to ALM
+        #       → do_validate via RPC → remove from ALM + sleep → switch_to_train
+        #
+        # When use_trainer_do_validate is enabled, _trainer_side_validate()
+        # handles the full validation cycle including the RPC to rollouter's
+        # do_validate(), so we skip the separate rollouter validation below.
+        # ================================================================
+        if self.config.async_training.use_trainer_do_validate and self.rollouter is not None:
+            await self._trainer_side_validate()
         else:
-            if val_metrics.metrics:
-                self.logger.log(data=val_metrics.metrics, step=self.current_param_version)
-                pprint(
-                    f"[FullyAsyncTrainer] parameter version: {self.current_param_version} "
-                    f"Validation metrics: {val_metrics.metrics}"
-                )
-        self.logger.log(data=val_metrics.timing_raw, step=self.current_param_version)
+            # Standard path: trigger rollouter validation and get result
+            val_metrics = ray.get(self.rollouter.do_validate.remote())
+
+            pprint(
+                f"[FullyAsyncTrainer] parameter version: {self.current_param_version} "
+                f"Validation metrics: {val_metrics.metrics}"
+            )
+            self.logger.log(data=val_metrics.timing_raw, step=self.current_param_version)
+
+    async def _trainer_side_validate(self):
+        """Run trainer-side validation using elastic rollout replicas.
+
+        When use_trainer_do_validate is enabled, performs a full resource switch cycle.
+        All elastic replica management is delegated to the Rollouter's
+        FullyAsyncAgentLoopManager via RPC calls.
+
+        Phase 1 — Switch to Rollout (TRAIN → ROLLOUT for ALL GPUs):
+            1. switch_to_rollout(): offload actor weights to CPU on all trainer workers
+            2. Get elastic replicas from rollouter's ALM, add to hybrid_checkpoint_manager
+            3. update_weights(): sync latest params via naive backend
+            4. add_elastic_replica() via RPC to rollouter: wake up, register with LB
+
+        Phase 2 — Validate (via RPC to rollouter):
+            Call rollouter.do_validate() which runs _validate() using the
+            now-active elastic rollout servers for generation.
+
+        Phase 3 — Switch back to Train (ROLLOUT → TRAIN for ALL GPUs):
+            1. remove_elastic_replica() via RPC to rollouter: abort, LB cleanup, sleep
+            2. Remove elastic replicas from hybrid_checkpoint_manager
+            3. switch_to_train(): load actor weights back to GPU on all trainers
+        """
+        print("[FullyAsyncTrainer] _trainer_side_validate === START ===")
+        validate_start = time.time()
+
+        try:
+            # ================================================================
+            # Phase 1: Switch ALL trainer GPUs to ROLLOUT mode
+            # ================================================================
+            print("[FullyAsyncTrainer] Phase 1: Switching all GPUs to ROLLOUT mode")
+
+            # Step 1: Offload actor weights to CPU on all trainer workers
+            print("[FullyAsyncTrainer]   Step 1: switch_to_rollout()")
+            ray.get(self.actor_rollout_wg.switch_to_rollout.remote())
+
+            # Step 2: Get elastic replicas from rollouter's ALM and add to hybrid CP manager
+            print("[FullyAsyncTrainer]   Step 2: Get elastic replicas from rollouter")
+            elastic_replicas_dict = ray.get(self.rollouter.get_all_elastic_replicas.remote())
+            elastic_resource_ids = list(elastic_replicas_dict.keys())
+            elastic_replicas = [elastic_replicas_dict[rid] for rid in elastic_resource_ids]
+            if elastic_replicas:
+                self.hybrid_checkpoint_manager.add_replicas(elastic_replicas)
+                print(f"[FullyAsyncTrainer]   Step 2: Added {len(elastic_replicas)} replicas to hybrid CP mgr")
+
+            # Step 3: Sync weights from trainer to elastic rollout servers (naive backend)
+            print("[FullyAsyncTrainer]   Step 3: update_weights (naive sync)")
+            await self.hybrid_checkpoint_manager.update_weights(global_steps=self.current_param_version)
+
+            # Step 4: Wake up all elastic replicas via RPC to rollouter's ALM
+            print("[FullyAsyncTrainer]   Step 4: Activating elastic replicas (RPC to rollouter)")
+            for resource_id in elastic_resource_ids:
+                success = ray.get(self.rollouter.add_elastic_replica.remote(resource_id))
+                print(f"[FullyAsyncTrainer]     add_elastic_replica('{resource_id}'): {success}")
+
+            print(f"[FullyAsyncTrainer] Phase 1 done ({time.time()-validate_start:.2f}s)")
+
+            # ================================================================
+            # Phase 2: Run validation via RPC to rollouter
+            # ================================================================
+            print("[FullyAsyncTrainer] Phase 2: Running validation (RPC to rollouter)")
+            with marked_timer("trainer/validate_time", self.timing_raw):
+                val_metrics = ray.get(self.rollouter.do_validate.remote())
+            print(f"[FullyAsyncTrainer]   Validation done ({time.time()-validate_start:.2f}s)")
+            pprint(
+                f"[FullyAsyncTrainer] parameter version: {self.current_param_version} "
+                f"Trainer-side val metrics: {val_metrics.metrics}"
+            )
+            self.logger.log(data=val_metrics.timing_raw, step=self.current_param_version)
+
+            # ================================================================
+            # Phase 3: Switch ALL GPUs back to TRAIN mode
+            # ================================================================
+            print("[FullyAsyncTrainer] Phase 3: Switching all GPUs back to TRAIN mode")
+            phase3_start = time.time()
+
+            # Step 5: Remove elastic replicas via RPC to rollouter's ALM (abort + LB cleanup + sleep)
+            print("[FullyAsyncTrainer]   Step 5: Deactivating elastic replicas (RPC to rollouter)")
+            for resource_id in reversed(elastic_resource_ids):
+                success = ray.get(self.rollouter.remove_elastic_replica.remote(resource_id))
+                print(f"[FullyAsyncTrainer]     remove_elastic_replica('{resource_id}'): {success}")
+
+            # Step 6: Remove elastic replicas from hybrid checkpoint manager
+            if elastic_replicas:
+                self.hybrid_checkpoint_manager.remove_replicas(elastic_replicas)
+                print(f"[FullyAsyncTrainer]   Step 6: Removed {len(elastic_replicas)} replicas from hybrid CP mgr")
+
+            # Step 7: Load actor weights back to GPU on all trainer workers
+            print("[FullyAsyncTrainer]   Step 7: switch_to_train()")
+            ray.get(self.actor_rollout_wg.switch_to_train.remote())
+
+            total_time = time.time() - validate_start
+            print(
+                f"[FullyAsyncTrainer] _trainer_side_validate === END === "
+                f"(total: {total_time:.2f}s)"
+            )
+            self.timing_raw["trainer/validate_total_time"] = total_time
+
+        except Exception as e:
+            print(f"[FullyAsyncTrainer] _trainer_side_validate ERROR: {e}")
+            raise
 
     def _fit_save_checkpoint(self, force=False):
         if self.current_param_version == self.last_ckpt_version:
@@ -746,10 +764,6 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self.critic_wg.load_checkpoint(
                 critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
             )
-
-        if self.colocate_checkpoint_manager:
-            await self.colocate_checkpoint_manager.update_weights(self.current_param_version)
-            await self.colocate_checkpoint_manager.sleep_replicas()
 
         return self.current_param_version
 

@@ -32,10 +32,10 @@ NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 # Paths
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/MiMo-7B-RL"}
+MODEL_PATH="/home/hadoop-djst-algoplat/models/Qwen/Qwen2.5-0.5B-Instruct"
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
-TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
+TRAIN_FILE="/home/hadoop-djst-algoplat/data/gsm8k/train.parquet"
+TEST_FILE="/home/hadoop-djst-algoplat/data/gsm8k/test.parquet"
 
 # Algorithm
 temperature=1.0
@@ -59,7 +59,7 @@ train_prompt_mini_bsz=32
 
 mtp_params=(
   actor_rollout_ref.actor.megatron.use_mbridge=True
-  actor_rollout_ref.model.mtp.enable=True
+  actor_rollout_ref.model.mtp.enable=False
   actor_rollout_ref.model.mtp.enable_train=True
   actor_rollout_ref.model.mtp.mtp_loss_scaling_factor=0.1
   actor_rollout_ref.model.mtp.detach_encoder=True
@@ -82,6 +82,7 @@ fully_async=(
   async_training.trigger_parameter_sync_step=4
   async_training.require_batches=1
   async_training.partial_rollout=True
+  async_training.use_trainer_do_validate=True
 )
 
 python -m verl.experimental.fully_async_policy.fully_async_main \
