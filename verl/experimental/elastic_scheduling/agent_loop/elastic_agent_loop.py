@@ -235,6 +235,8 @@ class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
         # add_server() / remove_server() on each worker to keep their
         # _server_id_to_handle maps in sync when elastic replicas are activated.
         self.agent_loop_workers_class = ray.remote(ElasticAgentLoopWorker)
+        # Rollout replicas (alive hybrid and fixed)
+        self.rollout_replicas = []
         # Pre-registered elastic replicas: bound at init time but still sleeping.
         # Keyed by resource_id; populated by create() before add_elastic_replica().
         self.elastic_replicas: dict[str, RolloutReplica] = {}
@@ -437,7 +439,6 @@ class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
 
         Args:
             resource_id: Unique identifier of the elastic resource to activate.
-            param_version: Parameter version the replica has been synced to.
 
         Returns:
             True on success, False on failure (e.g. not pre-registered, already active).
@@ -460,7 +461,7 @@ class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
 
         logger.info(
             f"[ElasticAgentLoopManager] Activating elastic replica '{resource_id}' "
-            f"at {server_address} (param_version={param_version})"
+            f"at {server_address}"
         )
         try:
             # 1. Wake up: restore model weights / kv-cache on the shared GPU pool.
@@ -478,6 +479,7 @@ class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
             # 4. Record active state.
             self.alive_replicas[resource_id] = replica
             self.alive_addresses[resource_id] = server_address
+            self.rollout_replicas.append(replica)
             self.total_elastic_adds += 1
             self.last_elastic_add_time = time.time()
 
@@ -550,6 +552,8 @@ class ElasticAgentLoopManager(FullyAsyncAgentLoopManager):
             # Remove tracking state
             self.alive_replicas.pop(resource_id)
             self.alive_addresses.pop(resource_id)
+            if replica in self.rollout_replicas:
+                self.rollout_replicas.remove(replica)
             self.total_elastic_removes += 1
             self.last_elastic_remove_time = time.time()
 
