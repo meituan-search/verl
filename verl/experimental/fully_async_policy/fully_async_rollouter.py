@@ -609,10 +609,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             # Wait for the task to complete
             await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
 
-            # Shut down OldLogProbServer (if any) — it lives on the Rollouter side.
-            if self.async_rollout_manager is not None:
-                await self.async_rollout_manager.shutdown()
-
         print("[FullyAsyncRollouter] Rollouter fit completed")
 
     async def _async_monitor_loop(self):

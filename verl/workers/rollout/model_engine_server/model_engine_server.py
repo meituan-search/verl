@@ -269,7 +269,6 @@ class ModelEngineServer:
         self._request_queue: asyncio.Queue = asyncio.Queue()
         self._consumer_task: asyncio.Task | None = None
         self._infer_lock = asyncio.Lock()
-        self._shutdown = False
         self._serving: asyncio.Event = asyncio.Event()
         self._serving.set()  # Initially serving (not draining)
 
@@ -293,7 +292,7 @@ class ModelEngineServer:
         3. On timeout or full batch, dispatch immediately.
         4. If a drain starts mid-collection, put items back and wait.
         """
-        while not self._shutdown:
+        while True:
             batch_requests = []
             batch_futures = []
 
@@ -472,9 +471,6 @@ class ModelEngineServer:
         temperature: float,
     ) -> dict:
         """Enqueue a single request and return log_probs and entropy for valid response tokens."""
-        if self._shutdown:
-            raise RuntimeError("ModelEngineServer is shutting down, cannot accept new requests")
-
         response_len = min(len(response_ids), int(self.rollout_config.response_length))
 
         await self._serving.wait()
@@ -532,29 +528,6 @@ class ModelEngineServer:
         """Re-open the request gate after new weights have been loaded."""
         self._serving.set()
         logger.info("ModelEngineServer: wake_up done, consumer resuming")
-
-    async def shutdown(self):
-        """Shut down the server."""
-        logger.info("ModelEngineServer: shutting down")
-        self._shutdown = True
-
-        if self._consumer_task and not self._consumer_task.done():
-            self._consumer_task.cancel()
-            try:
-                await self._consumer_task
-            except asyncio.CancelledError:
-                pass
-
-        while not self._request_queue.empty():
-            try:
-                _, future = self._request_queue.get_nowait()
-                if not future.done():
-                    future.set_exception(RuntimeError("Server shutdown"))
-            except asyncio.QueueEmpty:
-                break
-
-        logger.info("ModelEngineServer: shutdown complete")
-
 
 class ModelEngineReplica(RolloutReplica):
     """RolloutReplica implementation for the old log probability inference server."""
@@ -653,8 +626,3 @@ class ModelEngineReplica(RolloutReplica):
         """No-op for ModelEngineReplica."""
         pass
 
-    async def shutdown(self):
-        """Gracefully shut down the ModelEngineServer."""
-        if self.servers:
-            await self.servers[0].shutdown.remote()
-            self.servers = []

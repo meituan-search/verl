@@ -242,12 +242,6 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         # Expose the server handle so _init_agent_loop_workers passes it to workers.
         self.model_engine_server_handle = replica.servers[0]
 
-    async def shutdown(self):
-        """Shut down OldLogProbServer if one was created."""
-        for replica in self.rollout_replicas:
-            if hasattr(replica, "shutdown"):
-                await replica.shutdown()
-
     @auto_await
     async def generate_sequences_single(self, prompts: DataProto) -> DataProto:
         """Split input batch and dispatch to agent loop workers.
