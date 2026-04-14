@@ -69,10 +69,10 @@ class SingleTurnAgentLoop(AgentLoopBase):
         response_mask = [1] * len(output.token_ids)
 
         extra_fields = output.extra_fields
-        if output.engine_server_logprobs:
-            extra_fields["engine_server_logprobs"] = output.engine_server_logprobs[: self.response_length]
-        if output.engine_server_entropys:
-            extra_fields["engine_server_entropys"] = output.engine_server_entropys[: self.response_length]
+        if extra_fields.get("engine_server_logprobs"):
+            extra_fields["engine_server_logprobs"] = extra_fields["engine_server_logprobs"][: self.response_length]
+        if extra_fields.get("engine_server_entropys"):
+            extra_fields["engine_server_entropys"] = extra_fields["engine_server_entropys"][: self.response_length]
 
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,

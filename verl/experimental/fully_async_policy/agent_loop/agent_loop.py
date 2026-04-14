@@ -89,8 +89,6 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         final_output = TokenOutput(
             token_ids=[],
             log_probs=[],
-            engine_server_logprobs=[],
-            engine_server_entropys=[],
             num_preempted=0,
         )
         min_global_steps, max_global_steps = None, None
@@ -113,10 +111,16 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
             final_output.token_ids.extend(output.token_ids)
             if output.log_probs is not None:
                 final_output.log_probs.extend(output.log_probs)
-            if output.engine_server_logprobs is not None:
-                final_output.engine_server_logprobs.extend(output.engine_server_logprobs)
-            if output.engine_server_entropys is not None:
-                final_output.engine_server_entropys.extend(output.engine_server_entropys)
+            if output.extra_fields.get("engine_server_logprobs") is not None:
+                final_output.extra_fields.setdefault("engine_server_logprobs", [])
+                final_output.extra_fields["engine_server_logprobs"].extend(
+                    output.extra_fields["engine_server_logprobs"]
+                )
+            if output.extra_fields.get("engine_server_entropys") is not None:
+                final_output.extra_fields.setdefault("engine_server_entropys", [])
+                final_output.extra_fields["engine_server_entropys"].extend(
+                    output.extra_fields["engine_server_entropys"]
+                )
             if output.routed_experts is not None:
                 if final_output.routed_experts is None:
                     final_output.routed_experts = output.routed_experts
@@ -155,15 +159,15 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
 
         # Only recompute old_log_probs for newly generated tokens in this turn.
         if len(output.token_ids) == 0:
-            output.engine_server_logprobs = []
-            output.engine_server_entropys = []
+            output.extra_fields["engine_server_logprobs"] = []
+            output.extra_fields["engine_server_entropys"] = []
             return output
 
         result = await self.model_engine_server_handle.compute_log_prob.remote(
             context_prompt_ids, output.token_ids, temperature
         )
-        output.engine_server_logprobs = result["log_probs"]
-        output.engine_server_entropys = result["entropy"]
+        output.extra_fields["engine_server_logprobs"] = result["log_probs"]
+        output.extra_fields["engine_server_entropys"] = result["entropy"]
         return output
 
 
