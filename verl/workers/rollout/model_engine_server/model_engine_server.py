@@ -529,6 +529,7 @@ class ModelEngineServer:
         self._serving.set()
         logger.info("ModelEngineServer: wake_up done, consumer resuming")
 
+
 class ModelEngineReplica(RolloutReplica):
     """RolloutReplica implementation for the old log probability inference server."""
 
@@ -625,4 +626,3 @@ class ModelEngineReplica(RolloutReplica):
     async def resume_generation(self):
         """No-op for ModelEngineReplica."""
         pass
-

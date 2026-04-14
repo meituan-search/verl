@@ -63,7 +63,6 @@ class AgentData:
         tools_kwargs: dict[str, Any],
         interaction: Optional[BaseInteraction] = None,
         interaction_kwargs: Optional[dict[str, Any]] = None,
-        validate: bool = False,
     ):
         self.messages = messages
         self.image_data = image_data
@@ -73,7 +72,6 @@ class AgentData:
         self.tools_kwargs = tools_kwargs
         self.interaction = interaction
         self.interaction_kwargs = interaction_kwargs or {}
-        self.validate = validate
 
         # State variables
         self.prompt_ids: list[int] = []
@@ -161,8 +159,8 @@ class ToolAgentLoop(AgentLoopBase):
             tools_kwargs=tools_kwargs,
             interaction=interaction,
             interaction_kwargs=interaction_kwargs,
-            validate=validate,
         )
+        agent_data.extra_fields["validate"] = validate
 
         # State machine loop
         state = AgentState.PENDING
@@ -227,7 +225,7 @@ class ToolAgentLoop(AgentLoopBase):
         """Handle the generating state: generate model response and check for tool calls."""
         add_messages: list[dict[str, Any]] = []
 
-        extra_kwargs = {"validate": agent_data.validate}
+        extra_kwargs = {"validate": agent_data.extra_fields.get("validate", False)}
         with simple_timer("generate_sequences", agent_data.metrics):
             output: TokenOutput = await self.server_manager.generate(
                 request_id=agent_data.request_id,
