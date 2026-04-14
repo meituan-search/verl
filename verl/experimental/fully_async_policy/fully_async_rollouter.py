@@ -13,23 +13,30 @@
 # limitations under the License.
 
 import asyncio
+import logging
 import multiprocessing
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pprint import pformat
 
-import numpy as np
 import ray
 import torch
 
+from verl.utils import tensordict_utils as tu
+
+try:
+    import transfer_queue as tq
+except ImportError:
+    print("Please install TQ by calling `pip install TransferQueue==0.1.6` and try again.")
+    from verl.utils.transferqueue_utils import tq
+
 from verl.experimental.fully_async_policy.detach_utils import (
-    RolloutSample,
     ValidateMetrics,
     prepare_single_generation_data,
     safe_create_task,
 )
-from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
+from verl.experimental.fully_async_policy.meta_buffer import MetaBuffer
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayWorkerGroup
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
@@ -37,6 +44,9 @@ from verl.trainer.ppo.utils import Role, WorkerType
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.profiler import marked_timer
 from verl.utils.tracking import ValidationGenerationsLogger
+
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 @ray.remote(num_cpus=10, max_concurrency=100)
@@ -136,7 +146,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.total_train_steps = None
 
         # Rollouter parameter configuration
-        self.message_queue_client = None
+        self.meta_buffer = None
 
         # Worker groups: rollout_wg is same to actor_rollout_wg
         self.rollout_wg = None
@@ -172,7 +182,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.dataloader_lock = asyncio.Lock()
 
         # Initialize async queues
-        self.pending_queue = asyncio.Queue(maxsize=128)
         self.active_tasks = set()
 
         cpu_cores = multiprocessing.cpu_count()
@@ -190,10 +199,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.condition = asyncio.Condition()
         self.lock = self.condition._lock
 
-    async def set_message_queue_client(self, message_queue_client: MessageQueueClient):
-        """Set message queue client"""
-        async with self.lock:
-            self.message_queue_client = message_queue_client
+    def set_meta_buffer(self, meta_buffer: MetaBuffer):
+        """Set meta buffer for TQ-based metadata channel."""
+        self.meta_buffer = meta_buffer
 
     async def set_max_required_samples(self):
         async with self.lock:
@@ -243,7 +251,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self.paused = False
             self.condition.notify_all()
             # every time param change, reset staleness_samples
-            self.staleness_samples = len(self.active_tasks) + await self.message_queue_client.get_queue_size()
+            self.staleness_samples = len(self.active_tasks) + ray.get(self.meta_buffer.pending_count.remote())
             timing_raw = {}
             rollout_active_time = self.idle_start_time - self.step_start_time
             rollout_version_time = time.time() - self.step_start_time
@@ -396,24 +404,39 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             config=self.config, worker_group=self.rollout_wg, reward_loop_worker_handles=reward_loop_worker_handles
         )
 
-    # Add samples to the pending_queue
+    # Write samples into TransferQueue for AgentLoopWorker to consume
     async def _feed_samples(self):
         continuous_iterator = self._create_continuous_iterator()
 
         for epoch, batch_dict in continuous_iterator:
-            # Similar to _prepare_generate_batch: Separate data
+            # Acquire slot from MetaBuffer (backpressure: blocks if too many in-flight)
+            ray.get(self.meta_buffer.acquire_slot.remote())
+            # Prepare generation data
             full_batch = prepare_single_generation_data(batch_dict, self.config)
-
             sample_id = f"sample_{epoch}_{self.global_steps}"
+            uid = f"uid_{sample_id}"
 
-            rollout_sample = RolloutSample(
-                full_batch=full_batch,
-                sample_id=sample_id,
-                epoch=epoch,
-                rollout_status={},
+            # Convert DataProto (batch_size=1 after prepare) to TensorDict for TQ
+            batch_tensor_dict = full_batch.to_tensordict()
+            tu.assign_non_tensor_data(batch_tensor_dict, "global_steps", self.global_steps)
+            tu.assign_non_tensor_data(batch_tensor_dict, "uid", uid)
+
+            # Write input batch to TQ (partition="rollout_input")
+            # AgentLoopWorker will read from this partition
+            tags = [
+                {
+                    "global_steps": self.global_steps,
+                    "status": "running",
+                    "sample_id": sample_id,
+                }
+            ]
+            await tq.async_kv_batch_put(
+                keys=[uid],
+                fields=batch_tensor_dict,
+                tags=tags,
+                partition_id="rollout_input",
             )
-
-            await self.pending_queue.put(rollout_sample)
+            self.total_generated_samples += 1
 
             # Check if have reached the last step
             if self.global_steps >= self.total_rollout_steps:
@@ -426,16 +449,17 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
             self.global_steps += 1
 
-        # End signal
-        await self.pending_queue.put(None)
-        print(f"[FullyAsyncRollouter][Feed] Sample addition is complete, {self.global_steps} samples have been added")
+        print(
+            f"[FullyAsyncRollouter][Feed] Sample addition is complete, "
+            f"{self.global_steps} samples have been written to TQ"
+        )
 
     async def _processor_worker(self):
         """
         Streaming worker coroutines, a sample is submitted for processing without waiting for batches
         """
         while True:
-            if self.paused or await self._should_pause_generation():
+            if self.paused or self._should_pause_generation():
                 print(
                     "[FullyAsyncRollouter][Processor] Received pause signal, waiting for remaining tasks to return..."
                 )
@@ -456,24 +480,26 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                         self.idle_start_time = time.time()
                         await self.condition.wait()
                 continue
-            # Get sample from appropriate queue and immediately mark task as done
-            rollout_sample = await self.pending_queue.get()
-            self.pending_queue.task_done()
-            self.staleness_samples += 1
 
-            if rollout_sample is None:
-                print(
-                    "[FullyAsyncRollouter][Processor] Received end signal, waiting for remaining tasks to complete..."
-                )
-                while self.active_tasks:
-                    async with self.lock:
-                        if self.active_tasks:
-                            done_tasks, self.active_tasks = await asyncio.wait(
-                                self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-                            )
-                            for task in done_tasks:
-                                await task
-                break
+            # Get a 'running' uid from MetaBuffer (written to TQ but not yet processed by AgentLoopWorker)
+            running_uids = ray.get(self.meta_buffer.get_running_keys.remote(partition_id="rollout_input", limit=1))
+            if not running_uids:
+                # check if feed is done
+                if self.feed_task and self.feed_task.done():
+                    while self.active_tasks:
+                        async with self.lock:
+                            if self.active_tasks:
+                                done_tasks, self.active_tasks = await asyncio.wait(
+                                    self.active_tasks, return_when=asyncio.FIRST_COMPLETED
+                                )
+                                for task in done_tasks:
+                                    await task
+                    break
+                else:
+                    await asyncio.sleep(10)
+                    continue
+            uid = running_uids[0]
+            self.staleness_samples += 1
 
             # Check whether the number of concurrent tasks exceeds the limit
             while len(self.active_tasks) >= self.max_concurrent_samples:
@@ -492,29 +518,23 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 while self.paused:
                     await self.condition.wait()
                 task = safe_create_task(
-                    self._process_single_sample_streaming(rollout_sample),
-                    name=rollout_sample.sample_id,
+                    self._process_single_sample_streaming(uid),
+                    name=f"dispatch_{uid}",
                     task_set=self.active_tasks,
                 )
 
-    async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
-        """Process a single sample streamingly"""
-        # Calling asynchronous generation methods
-        ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
-        rollout_sample.full_batch = ret
-        rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
-            [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
-        )
-        rollout_sample.rollout_status = await self.get_statistics()
-
-        success = await self.message_queue_client.put_sample(
-            sample=ray.cloudpickle.dumps(rollout_sample),
-        )
-        if success:
-            self.total_generated_samples += 1
-        else:
-            self.dropped_stale_samples += 1
-        self.processed_sample_count += 1
+    async def _process_single_sample_streaming(self, uid: str):
+        """Dispatch a single sample to agent loop worker by uid.
+        The manager internally selects a worker, which reads input from TQ
+        (partition=rollout_input) using the uid, runs agent loop,
+        and writes output to TQ (partition=train).
+        """
+        try:
+            await self.async_rollout_manager.generate_sequences_single(uid)
+        finally:
+            # Release slot: request has been processed by AgentLoopWorker
+            # (data now lives in TQ 'train' partition for Trainer to consume)
+            ray.get(self.meta_buffer.release_slot.remote())
 
     async def _streaming_generation_main(self):
         """The main entry method for stream processing"""
@@ -550,9 +570,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             await self.processor_task
             print("[FullyAsyncRollouter] Streaming process completed")
 
-            await self.pending_queue.join()
-            print("[FullyAsyncRollouter] pending_queue joined")
-
         except Exception as e:
             print(f"[FullyAsyncRollouter] Streaming process exception: {e}")
             raise e
@@ -569,9 +586,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self.feed_task = None
             self.processor_task = None
 
-            # Send a finish signal
-            await self.message_queue_client.put_sample(sample=None)
-
             async with self.lock:
                 self.running = False
 
@@ -583,8 +597,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         print("[FullyAsyncRollouter] Starting FullyAsyncRollouter...")
 
-        if self.message_queue_client is None:
-            raise ValueError("MessageQueue client not set. Call set_message_queue_client() first.")
+        assert self.meta_buffer is not None, "MetaBuffer not set. Call set_meta_buffer() first."
 
         # Set the running status flag
         async with self.lock:
@@ -640,16 +653,15 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                     print("[FullyAsyncRollouter][ShouldPause] notify all wait tasks.")
                     self.condition.notify_all()
 
-    async def _should_pause_generation(self) -> bool:
-        """Determine whether the build should be paused"""
-        queue_stats = self.message_queue_client.get_statistics_sync()
-        queue_size = queue_stats["queue_size"]
+    def _should_pause_generation(self) -> bool:
+        """Determine whether generation should be paused based on MetaBuffer state."""
+        pending = ray.get(self.meta_buffer.pending_count.remote())
 
-        if queue_size >= self.max_queue_size:
+        if self.max_queue_size and pending >= self.max_queue_size:
             if not self.paused:
                 print(
-                    f"[FullyAsyncRollouter][ShouldPause]  "
-                    f"due to full queue: size={queue_size}, max={self.max_queue_size}"
+                    f"[FullyAsyncRollouter][ShouldPause] "
+                    f"due to full buffer: pending={pending}, max={self.max_queue_size}"
                 )
             return True
 
@@ -657,21 +669,18 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             if not self.paused:
                 print(
                     "[FullyAsyncRollouter][ShouldPause] "
-                    f"due to "
-                    f"staleness_samples {self.staleness_samples} >= max_required_samples {self.max_required_samples} "
+                    f"due to staleness: {self.staleness_samples} >= {self.max_required_samples}"
                 )
             return True
 
         return False
 
     async def get_statistics(self) -> dict:
-        queue_stats = self.message_queue_client.get_statistics_sync()
+        mb_stats = ray.get(self.meta_buffer.get_statistics.remote())
 
         stats = {
             # monitor stats
             "monitor/active_tasks_size": len(self.active_tasks),
-            "monitor/queue/pending_queue_size": self.pending_queue.qsize(),
-            "monitor/queue/mq_queue_size": queue_stats["queue_size"],
             # counting stats
             "count/total_generated_samples": self.total_generated_samples,
             "count/staleness_samples": self.staleness_samples,
@@ -682,6 +691,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             "static/staleness_threshold": self.staleness_threshold,
             "static/max_queue_size": self.max_queue_size,
             "static/max_concurrent_samples": self.max_concurrent_samples,
+            # meta buffer stats
+            **mb_stats,
         }
 
         return stats

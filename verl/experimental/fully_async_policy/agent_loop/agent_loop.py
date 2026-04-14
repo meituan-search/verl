@@ -20,15 +20,20 @@ import ray
 import torch
 from omegaconf import DictConfig
 
+try:
+    import transfer_queue as tq
+except ImportError:
+    print("Please install TQ by calling `pip install TransferQueue==0.1.6` and try again.")
+    from verl.utils.transferqueue_utils import tq
+
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopManager,
-    AgentLoopWorker,
     AsyncLLMServerManager,
     TokenOutput,
 )
 from verl.experimental.teacher_loop import TeacherModelManager
-from verl.protocol import DataProto
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup
+from verl.trainer.main_ppo_sync import AgentLoopWorkerTQ
 from verl.utils.ray_utils import auto_await
 from verl.utils.rollout_trace import (
     rollout_trace_op,
@@ -127,8 +132,7 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         return final_output
 
 
-@ray.remote
-class FullyAsyncAgentLoopWorker(AgentLoopWorker):
+class FullyAsyncAgentLoopWorker(AgentLoopWorkerTQ):
     def __init__(
         self,
         config: DictConfig,
@@ -148,6 +152,19 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
             reward_loop_worker_handles,
         )
 
+    async def generate_sequences(self, uid: str) -> None:
+        """Read input batch from TQ and spawn agent loops for each sample.
+
+        Args:
+            uid (str): Key in TQ's rollout_input partition containing the input TensorDict.
+        """
+        # Read input batch from TQ's rollout_input partition
+        data = tq.kv_batch_get(keys=[uid], partition_id="rollout_input")
+        batch = data.to_tensordict()
+
+        # Delegate to parent class logic for agent loop processing + TQ output writing
+        await super().generate_sequences(batch)
+
 
 class FullyAsyncAgentLoopManager(AgentLoopManager):
     def __init__(
@@ -158,23 +175,21 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         teacher_model_manager: TeacherModelManager = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
     ):
-        self.agent_loop_workers_class = FullyAsyncAgentLoopWorker
+        self.agent_loop_workers_class = ray.remote(FullyAsyncAgentLoopWorker)
         super().__init__(config, worker_group, rollout_resource_pool, teacher_model_manager, reward_loop_worker_handles)
         if self.distillation_enabled:
             raise NotImplementedError("Distillation is not implemented in FullyAsyncAgentLoopManager yet.")
 
     @auto_await
-    async def generate_sequences_single(self, prompts: DataProto) -> DataProto:
-        """Split input batch and dispatch to agent loop workers.
+    async def generate_sequences_single(self, uid: str) -> None:
+        """Dispatch a uid to agent loop worker which reads input from TQ.
 
         Args:
-            prompts (DataProto): Input batch. Single sample data
-        Returns:
-            DataProto: Output batch.
+            uid (str): The key in TQ's rollout_input partition for this sample.
         """
         worker = self._select_best_worker()
-        output_future = worker.generate_sequences.remote(prompts)
-        return await asyncio.wrap_future(output_future.future())
+        output_future = worker.generate_sequences.remote(uid)
+        await asyncio.wrap_future(output_future.future())
 
     def _select_best_worker(self):
         """Select the best worker, simple round-robin load balancing"""

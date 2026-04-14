@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import asyncio
 import os
 import socket
 import threading
@@ -22,9 +21,15 @@ import hydra
 import ray
 from omegaconf import OmegaConf
 
+try:
+    import transfer_queue as tq
+except ImportError:
+    print("Please install TQ by calling `pip install TransferQueue==0.1.6` and try again.")
+    from verl.utils.transferqueue_utils import tq
+
 from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncRollouter
 from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
-from verl.experimental.fully_async_policy.message_queue import MessageQueue, MessageQueueClient
+from verl.experimental.fully_async_policy.meta_buffer import MetaBuffer
 from verl.experimental.separation.utils import create_resource_pool_manager, create_role_worker_mapping
 from verl.trainer.ppo.utils import Role
 from verl.utils.device import auto_set_device
@@ -89,16 +94,21 @@ class FullyAsyncTaskRunner:
         print(f"total_train_steps {total_train_steps}")
         ray.get(self.components["trainer"].set_total_train_steps.remote(total_train_steps))
 
-        # max_queue_size
+        # max_queue_size (used for MetaBuffer backpressure reference)
         max_queue_size = ray.get(self.components["rollouter"].get_max_queue_size.remote())
-        print(f"[ASYNC MAIN] Creating MessageQueue... max_queue_size {max_queue_size}")
-        message_queue = MessageQueue.remote(config, max_queue_size)
-        message_queue_client = MessageQueueClient(message_queue)
-        self.components["message_queue"] = message_queue
-        self.components["message_queue_client"] = message_queue_client
+        print(f"[ASYNC MAIN] Creating MetaBuffer + initializing TQ... max_queue_size {max_queue_size}")
 
-        ray.get(self.components["rollouter"].set_message_queue_client.remote(self.components["message_queue_client"]))
-        ray.get(self.components["trainer"].set_message_queue_client.remote(self.components["message_queue_client"]))
+        # Initialize TransferQueue (shared memory for zero-copy tensor transfer)
+        tq.init()
+
+        # Create MetaBuffer (metadata channel backed by TQ kv_list polling)
+        # max_pending_slots controls how many requests can be in-flight in TQ at once
+        meta_buffer = MetaBuffer(max_pending_slots=max_queue_size, poll_interval=1)
+        self.components["meta_buffer"] = meta_buffer
+
+        # Pass MetaBuffer to both rollouter and trainer
+        self.components["rollouter"].set_meta_buffer.remote(meta_buffer)
+        self.components["trainer"].set_meta_buffer.remote(meta_buffer)
 
         # param_version resume from ckpt or default 0
         ray.get(self.components["trainer"].load_checkpoint.remote())
@@ -187,7 +197,7 @@ class FullyAsyncTaskRunner:
                 ray.cancel(future)
             raise
         finally:
-            asyncio.run(self.components["message_queue_client"].clear_queue())
+            ray.get(self.components["meta_buffer"].signal_finish.remote())
             print("[ASYNC MAIN] Training completed or interrupted")
 
 
