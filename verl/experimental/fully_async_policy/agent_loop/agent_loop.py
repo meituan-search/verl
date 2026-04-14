@@ -63,6 +63,7 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         sampling_params: dict[str, Any],
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
+        **kwargs: Any,
     ) -> TokenOutput:
         """Generate tokens from prompt ids.
 
@@ -76,6 +77,7 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         Returns:
             TokenOutput: token output
         """
+        validate = kwargs.pop("validate", False)
         prompt_ids = normalize_token_ids(prompt_ids)
 
         limit_key = None
@@ -84,7 +86,6 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         elif "max_new_tokens" in sampling_params:
             limit_key = "max_new_tokens"
         original_max_tokens = sampling_params.get(limit_key) if limit_key else None
-        validate = sampling_params.pop("validate", None)
 
         final_output = TokenOutput(
             token_ids=[],
@@ -146,8 +147,6 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
             # 4. check stop reason
             if output.stop_reason not in ("aborted", "abort") or not self.config.async_training.partial_rollout:
                 break
-        if validate:  # restore for multi-turn use
-            sampling_params["validate"] = validate
         final_output.extra_fields["global_steps"] = global_steps
         final_output.extra_fields["min_global_steps"] = min_global_steps
         final_output.extra_fields["max_global_steps"] = max_global_steps

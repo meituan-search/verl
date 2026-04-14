@@ -72,6 +72,7 @@ staleness_threshold=0.5
 trigger_parameter_sync_step=4
 require_batches=4
 partial_rollout=True
+lr_decay_steps=$(((4*4*400)))
 
 python -X faulthandler -m verl.experimental.fully_async_policy.fully_async_main \
     --config-path=config \
@@ -107,6 +108,7 @@ python -X faulthandler -m verl.experimental.fully_async_policy.fully_async_main 
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
+    actor_rollout_ref.actor.optim.lr_decay_steps=${lr_decay_steps} \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \

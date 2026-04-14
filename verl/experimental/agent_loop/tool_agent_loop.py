@@ -63,6 +63,7 @@ class AgentData:
         tools_kwargs: dict[str, Any],
         interaction: Optional[BaseInteraction] = None,
         interaction_kwargs: Optional[dict[str, Any]] = None,
+        validate: bool = False,
     ):
         self.messages = messages
         self.image_data = image_data
@@ -72,6 +73,7 @@ class AgentData:
         self.tools_kwargs = tools_kwargs
         self.interaction = interaction
         self.interaction_kwargs = interaction_kwargs or {}
+        self.validate = validate
 
         # State variables
         self.prompt_ids: list[int] = []
@@ -122,6 +124,7 @@ class ToolAgentLoop(AgentLoopBase):
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+        validate = kwargs.pop("validate", False)
         messages = list(kwargs["raw_prompt"])
 
         # extract images and videos from messages
@@ -158,6 +161,7 @@ class ToolAgentLoop(AgentLoopBase):
             tools_kwargs=tools_kwargs,
             interaction=interaction,
             interaction_kwargs=interaction_kwargs,
+            validate=validate,
         )
 
         # State machine loop
@@ -223,6 +227,7 @@ class ToolAgentLoop(AgentLoopBase):
         """Handle the generating state: generate model response and check for tool calls."""
         add_messages: list[dict[str, Any]] = []
 
+        extra_kwargs = {"validate": agent_data.validate}
         with simple_timer("generate_sequences", agent_data.metrics):
             output: TokenOutput = await self.server_manager.generate(
                 request_id=agent_data.request_id,
@@ -230,6 +235,7 @@ class ToolAgentLoop(AgentLoopBase):
                 sampling_params=sampling_params,
                 image_data=agent_data.image_data,
                 video_data=agent_data.video_data,
+                **extra_kwargs,
             )
         # first time to set num_preempted
         if agent_data.metrics.get("num_preempted") is None:

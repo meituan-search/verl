@@ -160,6 +160,7 @@ class AsyncLLMServerManager:
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
+        kwargs.pop("validate", None)
         server_id, server = await self._acquire_server(request_id)
         try:
             output: TokenOutput | DiffusionOutput = await server.generate.remote(
@@ -531,7 +532,6 @@ class AgentLoopWorker:
             sampling_params["top_p"] = config.val_kwargs.top_p
             sampling_params["top_k"] = config.val_kwargs.top_k
             sampling_params["temperature"] = config.val_kwargs.temperature
-            sampling_params["validate"] = True
 
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch.non_tensor_batch:
@@ -610,10 +610,11 @@ class AgentLoopWorker:
                 dataset_cls=self.dataset_cls,
                 data_config=DictConfigWrap(self.config.data),
             )
+            kwargs["validate"] = trajectory["validate"]
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+            return await self._agent_loop_postprocess(output, **kwargs)
 
-    async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
+    async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
 
@@ -731,7 +732,7 @@ class AgentLoopWorker:
             output,
             prompt_ids=output.prompt_ids,
             response_ids=output.response_ids,
-            validate=validate,
+            validate=kwargs.get("validate"),
         )
         teacher_ids, teacher_logprobs = (
             output.extra_fields.pop("teacher_ids", None),

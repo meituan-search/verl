@@ -55,6 +55,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
         )
 
         # 3. generate sequences
+        extra_kwargs = {"validate": kwargs.pop("validate", False)}
         metrics = {}
         with simple_timer("generate_sequences", metrics):
             output: TokenOutput = await self.server_manager.generate(
@@ -63,6 +64,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 sampling_params=sampling_params,
                 image_data=images,
                 video_data=videos,
+                **extra_kwargs,
             )
         if metrics.get("num_preempted") is None:
             metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
