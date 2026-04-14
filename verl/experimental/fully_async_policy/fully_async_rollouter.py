@@ -133,6 +133,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         if self.config.rollout.total_rollout_steps is not None:
             self.total_rollout_steps = min(self.config.rollout.total_rollout_steps, self.total_rollout_steps)
         print(f"[FullyAsyncRollouter] Total rollout steps: {self.total_rollout_steps}")
+        self.total_train_steps = None
 
         # Rollouter parameter configuration
         self.message_queue_client = None
@@ -147,15 +148,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # required_samples use ppo_mini_batch_size*require_batches as the minimum number of samples.
         self.require_batches = config.async_training.require_batches
         self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
-        self.total_train_steps = None
-        self.max_required_samples = int(
-            self.required_samples
-            * (self.staleness_threshold + 1)
-            * self.config.async_training.trigger_parameter_sync_step
-        )
-        self.total_train_steps = int(
-            self.total_rollout_steps / (self.required_samples * self.config.async_training.trigger_parameter_sync_step)
-        )
+        self.max_required_samples = None
         self.max_concurrent_samples = None
         # queue size
         self.max_queue_size = None
@@ -186,7 +179,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # cpu case use cpu_cores; io case use cpu_cores*2
         self.validate_executor = ThreadPoolExecutor(max_workers=cpu_cores)
         self.validate_task = None
-        self._init_async_objects()
 
     def _init_async_objects(self):
         # Initialize asyncio synchronization primitives.
@@ -205,6 +197,16 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     async def set_max_required_samples(self):
         async with self.lock:
+            self.max_required_samples = int(
+                self.required_samples
+                * (self.staleness_threshold + 1)
+                * self.config.async_training.trigger_parameter_sync_step
+            )
+            self.total_train_steps = int(
+                self.total_rollout_steps
+                / (self.required_samples * self.config.async_training.trigger_parameter_sync_step)
+            )
+
             self.max_concurrent_samples = len(self.async_rollout_manager.server_handles) * 16
             self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
             self.max_queue_size = self.max_required_samples
@@ -352,6 +354,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         1. Ray resource pools from configuration
         2. Worker groups for each role (actor, critic, etc.)
         """
+        self._init_async_objects()
         self._create_worker_classes()
         self._init_reward_loop()
         await self._init_async_rollout_manager()
