@@ -78,8 +78,8 @@ class AgentData:
         self.response_ids: list[int] = []
         self.response_mask: list[int] = []
         self.response_logprobs: list[float] = []
-        self.response_engine_server_logprobs: list[float] = []
-        self.response_engine_server_entropys: list[float] = []
+        self.engine_server_logprobs: list[float] = []
+        self.engine_server_entropys: list[float] = []
         self.turn_scores: list[float] = []
         self.tool_rewards: list[float] = []
         self.user_turns = 0
@@ -186,6 +186,12 @@ class ToolAgentLoop(AgentLoopBase):
         if agent_data.video_data is not None:
             multi_modal_data["videos"] = agent_data.video_data
 
+        extra_fields = agent_data.extra_fields
+        if agent_data.engine_server_logprobs:
+            extra_fields["engine_server_logprobs"] = agent_data.engine_server_logprobs[: self.response_length]
+        if agent_data.engine_server_entropys:
+            extra_fields["engine_server_entropys"] = agent_data.engine_server_entropys[: self.response_length]
+
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids[: self.response_length],
@@ -194,16 +200,10 @@ class ToolAgentLoop(AgentLoopBase):
             response_logprobs=agent_data.response_logprobs[: self.response_length]
             if agent_data.response_logprobs
             else None,
-            response_engine_server_logprobs=agent_data.response_engine_server_logprobs[: self.response_length]
-            if agent_data.response_engine_server_logprobs
-            else None,
-            response_engine_server_entropys=agent_data.response_engine_server_entropys[: self.response_length]
-            if agent_data.response_engine_server_entropys
-            else None,
             num_turns=agent_data.user_turns + agent_data.assistant_turns + 1,
             metrics=agent_data.metrics,
             routed_experts=agent_data.routed_experts,
-            extra_fields=agent_data.extra_fields,
+            extra_fields=extra_fields,
         )
         output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
         return output
@@ -255,9 +255,9 @@ class ToolAgentLoop(AgentLoopBase):
         if output.log_probs:
             agent_data.response_logprobs += output.log_probs
         if output.engine_server_logprobs:
-            agent_data.response_engine_server_logprobs += output.engine_server_logprobs
+            agent_data.engine_server_logprobs += output.engine_server_logprobs
         if output.engine_server_entropys:
-            agent_data.response_engine_server_entropys += output.engine_server_entropys
+            agent_data.engine_server_entropys += output.engine_server_entropys
         if output.routed_experts is not None:
             agent_data.routed_experts = output.routed_experts
 
@@ -389,10 +389,10 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.response_mask += [0] * len(response_ids)
         if agent_data.response_logprobs:
             agent_data.response_logprobs += [0.0] * len(response_ids)
-        if agent_data.response_engine_server_logprobs:
-            agent_data.response_engine_server_logprobs += [0.0] * len(response_ids)
-        if agent_data.response_engine_server_entropys:
-            agent_data.response_engine_server_entropys += [0.0] * len(response_ids)
+        if agent_data.engine_server_logprobs:
+            agent_data.engine_server_logprobs += [0.0] * len(response_ids)
+        if agent_data.engine_server_entropys:
+            agent_data.engine_server_entropys += [0.0] * len(response_ids)
         agent_data.user_turns += 1
         return AgentState.GENERATING
 
@@ -425,10 +425,10 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.response_mask += [0] * len(response_ids)
         if agent_data.response_logprobs:
             agent_data.response_logprobs += [0.0] * len(response_ids)
-        if agent_data.response_engine_server_logprobs:
-            agent_data.response_engine_server_logprobs += [0.0] * len(response_ids)
-        if agent_data.response_engine_server_entropys:
-            agent_data.response_engine_server_entropys += [0.0] * len(response_ids)
+        if agent_data.engine_server_logprobs:
+            agent_data.engine_server_logprobs += [0.0] * len(response_ids)
+        if agent_data.engine_server_entropys:
+            agent_data.engine_server_entropys += [0.0] * len(response_ids)
 
         # double check prompt
         # Check termination condition

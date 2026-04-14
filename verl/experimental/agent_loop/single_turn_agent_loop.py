@@ -68,17 +68,17 @@ class SingleTurnAgentLoop(AgentLoopBase):
             metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
         response_mask = [1] * len(output.token_ids)
 
+        extra_fields = output.extra_fields
+        if output.engine_server_logprobs:
+            extra_fields["engine_server_logprobs"] = output.engine_server_logprobs[: self.response_length]
+        if output.engine_server_entropys:
+            extra_fields["engine_server_entropys"] = output.engine_server_entropys[: self.response_length]
+
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=output.token_ids[: self.response_length],
             response_mask=response_mask[: self.response_length],
             response_logprobs=output.log_probs[: self.response_length] if output.log_probs else None,
-            response_engine_server_logprobs=output.engine_server_logprobs[: self.response_length]
-            if output.engine_server_logprobs
-            else None,
-            response_engine_server_entropys=output.engine_server_entropys[: self.response_length]
-            if output.engine_server_entropys
-            else None,
             routed_experts=(
                 output.routed_experts[: len(prompt_ids) + self.response_length]
                 if output.routed_experts is not None
@@ -87,7 +87,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
             multi_modal_data=multi_modal_data,
             num_turns=2,
             metrics=metrics,
-            extra_fields=output.extra_fields,
+            extra_fields=extra_fields,
         )
 
         # keeping the schema consistent with tool_agent_loop

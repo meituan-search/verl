@@ -194,10 +194,6 @@ class AgentLoopOutput(BaseModel):
     """Response mask, 1 for LLM generated token, 0 for tool response token."""
     response_logprobs: Optional[list[float]] = None
     """Log probabilities for the response tokens."""
-    response_engine_server_logprobs: Optional[list[float]] = None
-    """Log probabilities calculated by standalone server for the response tokens."""
-    response_engine_server_entropys: Optional[list[float]] = None
-    """Per-token entropy, computed by ModelEngineServer."""
     routed_experts: Optional[Any] = None
     """Routed experts for the total tokens."""
     multi_modal_data: Optional[dict[str, Any]] = None
@@ -235,9 +231,9 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded log probabilities from teacher model for prompt/response tokens."""
     teacher_ids: Optional[torch.Tensor] = None
     """Padded token ids corresponding to the teacher log probabilities."""
-    response_engine_server_logprobs: Optional[torch.Tensor] = None
-    """Padded old log probabilities for the response tokens."""
-    response_engine_server_entropys: Optional[torch.Tensor] = None
+    engine_server_logprobs: Optional[torch.Tensor] = None
+    """Padded per-token logprobs, computed by ModelEngineServer."""
+    engine_server_entropys: Optional[torch.Tensor] = None
     """Padded per-token entropy, computed by ModelEngineServer."""
     routed_experts: Optional[torch.Tensor] = None
     """Padded routed experts for the total tokens."""
@@ -684,18 +680,16 @@ class AgentLoopWorker:
         if output.response_logprobs is not None:
             pad_size = self.rollout_config.response_length - len(output.response_logprobs)
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
-        response_engine_server_logprobs = None
-        if output.response_engine_server_logprobs is not None:
-            pad_size = self.rollout_config.response_length - len(output.response_engine_server_logprobs)
-            response_engine_server_logprobs = torch.tensor(
-                output.response_engine_server_logprobs + [0.0] * pad_size
-            ).unsqueeze(0)
-        response_engine_server_entropys = None
-        if output.response_engine_server_entropys is not None:
-            pad_size = self.rollout_config.response_length - len(output.response_engine_server_entropys)
-            response_engine_server_entropys = torch.tensor(
-                output.response_engine_server_entropys + [0.0] * pad_size
-            ).unsqueeze(0)
+        engine_server_logprobs = None
+        _es_logprobs = output.extra_fields.pop("engine_server_logprobs", None)
+        if _es_logprobs is not None:
+            pad_size = self.rollout_config.response_length - len(_es_logprobs)
+            engine_server_logprobs = torch.tensor(_es_logprobs + [0.0] * pad_size).unsqueeze(0)
+        engine_server_entropys = None
+        _es_entropys = output.extra_fields.pop("engine_server_entropys", None)
+        if _es_entropys is not None:
+            pad_size = self.rollout_config.response_length - len(_es_entropys)
+            engine_server_entropys = torch.tensor(_es_entropys + [0.0] * pad_size).unsqueeze(0)
 
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
@@ -771,8 +765,8 @@ class AgentLoopWorker:
             response_mask=response_mask,
             attention_mask=attention_mask,
             response_logprobs=response_logprobs,
-            response_engine_server_logprobs=response_engine_server_logprobs,
-            response_engine_server_entropys=response_engine_server_entropys,
+            engine_server_logprobs=engine_server_logprobs,
+            engine_server_entropys=engine_server_entropys,
             routed_experts=routed_experts,
             multi_modal_inputs=multi_modal_inputs,
             multi_modal_data=output.multi_modal_data,
@@ -907,13 +901,13 @@ class AgentLoopWorker:
         optional_outputs = {}
         if inputs[0].response_logprobs is not None:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
-        if inputs[0].response_engine_server_logprobs is not None:
+        if inputs[0].engine_server_logprobs is not None:
             optional_outputs["engine_server_logprobs"] = torch.cat(
-                [input.response_engine_server_logprobs for input in inputs], dim=0
+                [input.engine_server_logprobs for input in inputs], dim=0
             )
-        if inputs[0].response_engine_server_entropys is not None:
+        if inputs[0].engine_server_entropys is not None:
             optional_outputs["engine_server_entropys"] = torch.cat(
-                [input.response_engine_server_entropys for input in inputs], dim=0
+                [input.engine_server_entropys for input in inputs], dim=0
             )
         if inputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
