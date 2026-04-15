@@ -157,7 +157,6 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # Initialized in _setup_hybrid_checkpoint_manager() after models are loaded.
         self.hybrid_checkpoint_manager = None
 
-
     def _setup_checkpoint_manager(self, rollouter):
         """Setup checkpoint manager after rollouter is initialized"""
         replicas = ray.get(rollouter.get_replicas.remote())
@@ -200,6 +199,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             checkpoint_engine_cfg.backend = original_backend
 
         print("[FullyAsyncTrainer] Hybrid checkpoint manager initialized (naive backend, empty replicas)")
+
+        # Rollout starts in sleep state; GPU memory is owned by the training engine.
+        await self.hybrid_checkpoint_manager.sleep_replicas()
+        print("[FullyAsyncTrainer] Hybrid replicas slept after init")
 
     def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         """Set message queue client"""
@@ -517,23 +520,26 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         """Run trainer-side validation using elastic rollout replicas.
 
         When use_trainer_do_validate is enabled, performs a full resource switch cycle.
-        All elastic replica management is delegated to the Rollouter's
-        FullyAsyncAgentLoopManager via RPC calls.
+        Elastic replicas are managed by Rollouter's FullyAsyncAgentLoopManager (via RPC).
+        The hybrid_checkpoint_manager (naive backend) only drives the trainer-side
+        weight sync / rollout_mode transition on trainer GPUs.
 
-        Phase 1 — Switch to Rollout (TRAIN → ROLLOUT for ALL GPUs):
-            1. switch_to_rollout(): offload actor weights to CPU on all trainer workers
-            2. Get elastic replicas from rollouter's ALM, add to hybrid_checkpoint_manager
-            3. update_weights(): sync latest params via naive backend
-            4. add_elastic_replica() via RPC to rollouter: wake up, register with LB
+        Phase 1 — Switch to ROLLOUT mode (TRAIN → ROLLOUT for ALL GPUs):
+            1. update_weights(): sync latest params via naive backend
+               (triggers ActorRolloutRefWorker.update_weights() which performs the
+                full rollout_mode transition on each trainer worker:
+                 resume(weights) → export weights → sync to rollout → offload actor → resume(kv_cache))
+            2. Register elastic replicas with rollouter's ALM (wake up, LB registration)
+               (must be AFTER weight sync so replicas serve requests with latest params)
 
         Phase 2 — Validate (via RPC to rollouter):
             Call rollouter.do_validate() which runs _validate() using the
             now-active elastic rollout servers for generation.
 
-        Phase 3 — Switch back to Train (ROLLOUT → TRAIN for ALL GPUs):
-            1. remove_elastic_replica() via RPC to rollouter: abort, LB cleanup, sleep
-            2. Remove elastic replicas from hybrid_checkpoint_manager
-            3. switch_to_train(): load actor weights back to GPU on all trainers
+        Phase 3 — Switch back to TRAIN mode (ROLLOUT → TRAIN for ALL GPUs):
+            1. Unregister elastic replicas from rollouter's ALM (abort, LB cleanup, sleep)
+            2. sleep_replicas(): release rollout on trainer workers (weights + kv_cache),
+               GPU returns to training engine for subsequent computations.
         """
         print("[FullyAsyncTrainer] _trainer_side_validate === START ===")
         validate_start = time.time()
@@ -544,30 +550,25 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             # ================================================================
             print("[FullyAsyncTrainer] Phase 1: Switching all GPUs to ROLLOUT mode")
 
-            # Step 1: Offload actor weights to CPU on all trainer workers
-            print("[FullyAsyncTrainer]   Step 1: switch_to_rollout()")
-            ray.get(self.actor_rollout_wg.switch_to_rollout.remote())
-
-            # Step 2: Get elastic replicas from rollouter's ALM and add to hybrid CP manager
-            print("[FullyAsyncTrainer]   Step 2: Get elastic replicas from rollouter")
-            elastic_replicas_dict = ray.get(self.rollouter.get_all_elastic_replicas.remote())
-            elastic_resource_ids = list(elastic_replicas_dict.keys())
-            elastic_replicas = [elastic_replicas_dict[rid] for rid in elastic_resource_ids]
-            if elastic_replicas:
-                self.hybrid_checkpoint_manager.add_replicas(elastic_replicas)
-                print(f"[FullyAsyncTrainer]   Step 2: Added {len(elastic_replicas)} replicas to hybrid CP mgr")
-
-            # Step 3: Sync weights from trainer to elastic rollout servers (naive backend)
-            print("[FullyAsyncTrainer]   Step 3: update_weights (naive sync)")
+            # Step 1: Sync weights from trainer to rollout (naive backend)
+            # This triggers ActorRolloutRefWorker.update_weights() on each trainer worker,
+            # performing the full rollout_mode transition:
+            #   resume(weights) → get_per_tensor_param → rollout.update_weights()
+            #   → offload actor to CPU → resume(kv_cache)
+            # Must be done BEFORE registering replicas so they serve requests with latest params.
+            print("[FullyAsyncTrainer]   Step 1: update_weights (naive sync → rollout_mode)")
             await self.hybrid_checkpoint_manager.update_weights(global_steps=self.current_param_version)
 
-            # Step 4: Wake up all elastic replicas via RPC to rollouter's ALM
-            print("[FullyAsyncTrainer]   Step 4: Activating elastic replicas (RPC to rollouter)")
+            # Step 2: Register elastic replicas with rollouter's ALM
+            # (wake up replicas, register with load balancer — now serving with latest params)
+            print("[FullyAsyncTrainer]   Step 2: Register elastic replicas with rollouter ALM")
+            elastic_replicas_dict = ray.get(self.rollouter.get_all_elastic_replicas.remote())
+            elastic_resource_ids = list(elastic_replicas_dict.keys())
             for resource_id in elastic_resource_ids:
                 success = ray.get(self.rollouter.add_elastic_replica.remote(resource_id))
                 print(f"[FullyAsyncTrainer]     add_elastic_replica('{resource_id}'): {success}")
 
-            print(f"[FullyAsyncTrainer] Phase 1 done ({time.time()-validate_start:.2f}s)")
+            print(f"[FullyAsyncTrainer] Phase 1 done ({time.time() - validate_start:.2f}s)")
 
             # ================================================================
             # Phase 2: Run validation via RPC to rollouter
@@ -575,7 +576,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             print("[FullyAsyncTrainer] Phase 2: Running validation (RPC to rollouter)")
             with marked_timer("trainer/validate_time", self.timing_raw):
                 val_metrics = ray.get(self.rollouter.do_validate.remote())
-            print(f"[FullyAsyncTrainer]   Validation done ({time.time()-validate_start:.2f}s)")
+            print(f"[FullyAsyncTrainer]   Validation done ({time.time() - validate_start:.2f}s)")
             pprint(
                 f"[FullyAsyncTrainer] parameter version: {self.current_param_version} "
                 f"Trainer-side val metrics: {val_metrics.metrics}"
@@ -588,26 +589,23 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             print("[FullyAsyncTrainer] Phase 3: Switching all GPUs back to TRAIN mode")
             phase3_start = time.time()
 
-            # Step 5: Remove elastic replicas via RPC to rollouter's ALM (abort + LB cleanup + sleep)
-            print("[FullyAsyncTrainer]   Step 5: Deactivating elastic replicas (RPC to rollouter)")
+            # Step 1: Unregister elastic replicas from rollouter's ALM (abort + LB cleanup + sleep)
+            print("[FullyAsyncTrainer]   Step 1: Unregister elastic replicas from rollouter ALM")
             for resource_id in reversed(elastic_resource_ids):
                 success = ray.get(self.rollouter.remove_elastic_replica.remote(resource_id))
-                print(f"[FullyAsyncTrainer]     remove_elastic_replica('{resource_id}'): {success}")
+                print(f"[FullyAsyncTrainer] remove_elastic_replica('{resource_id}'): {success}")
 
-            # Step 6: Remove elastic replicas from hybrid checkpoint manager
-            if elastic_replicas:
-                self.hybrid_checkpoint_manager.remove_replicas(elastic_replicas)
-                print(f"[FullyAsyncTrainer]   Step 6: Removed {len(elastic_replicas)} replicas from hybrid CP mgr")
-
-            # Step 7: Load actor weights back to GPU on all trainer workers
-            print("[FullyAsyncTrainer]   Step 7: switch_to_train()")
-            ray.get(self.actor_rollout_wg.switch_to_train.remote())
+            # Step 2: Sleep rollout on trainer workers to release GPU memory (weights + kv_cache)
+            # Training engine model weights are already back on GPU after rollout_mode's
+            # offload+restore cycle inside update_weights. sleep_replicas() ensures the
+            # rollout engine fully releases its GPU resources so subsequent training
+            # computations (reward, log_prob, advantage, actor update) have full GPU access.
+            # (matches standard training step: sleep_replicas after generate_sequences)
+            print("[FullyAsyncTrainer]   Step 2: sleep_replicas (release rollout, GPU → train)")
+            await self.hybrid_checkpoint_manager.sleep_replicas()
 
             total_time = time.time() - validate_start
-            print(
-                f"[FullyAsyncTrainer] _trainer_side_validate === END === "
-                f"(total: {total_time:.2f}s)"
-            )
+            print(f"[FullyAsyncTrainer] _trainer_side_validate === END === (total: {total_time:.2f}s)")
             self.timing_raw["trainer/validate_total_time"] = total_time
 
         except Exception as e:

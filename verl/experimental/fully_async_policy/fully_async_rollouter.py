@@ -711,8 +711,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         return stats
 
-
-        # -------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # Elastic worker group injection
     # -------------------------------------------------------------------------
 
@@ -737,7 +736,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         logger.info(
             f"[ElasticRollouter] Elastic worker group set (world_size={getattr(worker_group, 'world_size', '?')})"
         )
-
 
     def _get_elastic_worker_group(self) -> "RayWorkerGroup | None":
         """
