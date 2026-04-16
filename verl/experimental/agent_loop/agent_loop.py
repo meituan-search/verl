@@ -423,6 +423,7 @@ class AgentLoopWorker:
         teacher_servers: list[tuple[str, ray.actor.ActorHandle]] = None,
         teacher_load_balancer_handle: ray.actor.ActorHandle = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
+        **kwargs: Any,
     ):
         """Initialize agent loop manager.
         Args:
@@ -1034,6 +1035,7 @@ class AgentLoopManager:
         self.worker_group = worker_group
         self.rollout_resource_pool = rollout_resource_pool
         self.reward_loop_worker_handles = reward_loop_worker_handles
+        self.model_engine_server_handle = None
 
         self.teacher_model_manager = teacher_model_manager
         self.distillation_enabled = is_distillation_enabled(self.config.get("distillation", None))
@@ -1150,7 +1152,7 @@ class AgentLoopManager:
                     teacher_servers,
                     teacher_load_balancer_handle,
                     self.reward_loop_worker_handles,
-                    self.model_engine_server_handle,
+                    model_engine_server_handle=self.model_engine_server_handle,
                 )
             )
 
