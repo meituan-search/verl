@@ -428,7 +428,7 @@ class CheckpointEngineManager:
 
         # 0. update weights for sync training with colocated trainer and rollout
         if self.backend == "naive":
-            ray.get(self.trainer.update_weights(global_steps=global_steps))
+            ray.get(self.trainer.update_weights(global_steps=global_steps, mode=self.backend))
             return
 
         # 1. abort and save all unfinished requests for partial rollout
@@ -448,7 +448,7 @@ class CheckpointEngineManager:
         self.build_process_group(rollout)
 
         # 5. update weights of all workers
-        ray.get(trainer.update_weights(global_steps=global_steps) + rollout.update_weights(global_steps=global_steps))
+        ray.get(trainer.update_weights(global_steps=global_steps, mode=self.backend) + rollout.update_weights(global_steps=global_steps))
 
         # 6. finalize all workers
         ray.get(
