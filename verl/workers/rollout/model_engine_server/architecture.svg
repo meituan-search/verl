@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 510" font-family="'Segoe UI', Arial, sans-serif">
+
+  <defs>
+    <marker id="call" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#555"/>
+    </marker>
+    <marker id="inherit" markerWidth="10" markerHeight="10" refX="9" refY="4" orient="auto">
+      <path d="M0,0 L0,8 L9,4 z" fill="#f9fafb" stroke="#888" stroke-width="1.2"/>
+    </marker>
+    <marker id="sync" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#6a1b9a"/>
+    </marker>
+  </defs>
+
+  <rect width="860" height="510" fill="#f9fafb" rx="10"/>
+
+  <!-- Title -->
+  <text x="430" y="34" text-anchor="middle" font-size="16" font-weight="bold" fill="#1a1a2e">Model Engine Server Architecture</text>
+
+  <!-- ============ ModelEngineReplica outer shell ============ -->
+  <rect x="30" y="52" width="800" height="360" rx="12" fill="none" stroke="#9e9e9e" stroke-width="1.5" stroke-dasharray="6,4"/>
+  <text x="50" y="72" font-size="11" fill="#9e9e9e">ModelEngineReplica  —  Standalone Resource Pool</text>
+
+  <!-- ============ ModelEngineServer (left) ============ -->
+  <rect x="50" y="84" width="260" height="310" rx="10" fill="#fff8e1" stroke="#f9a825" stroke-width="1.8"/>
+  <text x="180" y="106" text-anchor="middle" font-size="12" font-weight="bold" fill="#e65100">ModelEngineServer</text>
+  <text x="180" y="120" text-anchor="middle" font-size="10" fill="#888">(Ray Actor)</text>
+
+  <rect x="68" y="130" width="224" height="34" rx="6" fill="#ffe082" stroke="#f9a825" stroke-width="1"/>
+  <text x="180" y="152" text-anchor="middle" font-size="11" fill="#1a1a2e">compute_log_prob()</text>
+
+  <rect x="68" y="176" width="224" height="34" rx="6" fill="#ffe082" stroke="#f9a825" stroke-width="1"/>
+  <text x="180" y="198" text-anchor="middle" font-size="11" fill="#1a1a2e">asyncio.Queue</text>
+
+  <rect x="68" y="222" width="224" height="34" rx="6" fill="#ffe082" stroke="#f9a825" stroke-width="1"/>
+  <text x="180" y="244" text-anchor="middle" font-size="11" fill="#1a1a2e">_batch_consumer  (Async Task)</text>
+
+  <rect x="68" y="268" width="224" height="34" rx="6" fill="#ffe082" stroke="#f9a825" stroke-width="1"/>
+  <text x="180" y="290" text-anchor="middle" font-size="11" fill="#1a1a2e">infer_batch()</text>
+
+  <rect x="68" y="314" width="104" height="34" rx="6" fill="#ffcc80" stroke="#f9a825" stroke-width="1"/>
+  <text x="120" y="336" text-anchor="middle" font-size="11" fill="#1a1a2e">sleep()</text>
+
+  <rect x="188" y="314" width="104" height="34" rx="6" fill="#ffcc80" stroke="#f9a825" stroke-width="1"/>
+  <text x="240" y="336" text-anchor="middle" font-size="11" fill="#1a1a2e">wake_up()</text>
+
+  <!-- internal call arrows -->
+  <line x1="180" y1="164" x2="180" y2="176" stroke="#555" stroke-width="1.4" marker-end="url(#call)"/>
+  <line x1="180" y1="210" x2="180" y2="222" stroke="#555" stroke-width="1.4" marker-end="url(#call)"/>
+  <line x1="180" y1="256" x2="180" y2="268" stroke="#555" stroke-width="1.4" marker-end="url(#call)"/>
+
+  <!-- ============ RayWorkerGroup (outer wrapper) ============ -->
+  <rect x="368" y="84" width="442" height="310" rx="10" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.8"/>
+  <text x="589" y="106" text-anchor="middle" font-size="12" font-weight="bold" fill="#0d47a1">RayWorkerGroup</text>
+
+  <!-- ============ ModelEngineWorker × N (inner) ============ -->
+  <rect x="384" y="116" width="410" height="264" rx="8" fill="#fce4ec" stroke="#e91e63" stroke-width="1.8"/>
+  <text x="589" y="136" text-anchor="middle" font-size="12" font-weight="bold" fill="#880e4f">ModelEngineWorker × N</text>
+  <text x="589" y="150" text-anchor="middle" font-size="10" fill="#888">(Ray GPU Actor)</text>
+
+  <!-- compute_log_prob -->
+  <rect x="400" y="158" width="378" height="30" rx="6" fill="#f48fb1" stroke="#e91e63" stroke-width="1"/>
+  <text x="589" y="178" text-anchor="middle" font-size="11" fill="#1a1a2e">compute_log_prob(data)</text>
+
+  <!-- ModelEngineServerAdapter -->
+  <rect x="400" y="196" width="378" height="56" rx="8" fill="#fff" stroke="#e91e63" stroke-width="1" stroke-dasharray="4,3"/>
+  <text x="589" y="213" text-anchor="middle" font-size="11" font-weight="bold" fill="#c2185b">ModelEngineServerAdapter</text>
+  <text x="589" y="228" text-anchor="middle" font-size="10" fill="#555">BaseRollout Adapter  |  forward_only</text>
+  <text x="589" y="243" text-anchor="middle" font-size="10" fill="#555">compute_log_prob()  /  update_weights()</text>
+
+  <!-- TrainingWorker -->
+  <rect x="400" y="260" width="378" height="50" rx="8" fill="#fff" stroke="#e91e63" stroke-width="1" stroke-dasharray="4,3"/>
+  <text x="589" y="278" text-anchor="middle" font-size="11" font-weight="bold" fill="#c2185b">TrainingWorker</text>
+  <text x="589" y="294" text-anchor="middle" font-size="10" fill="#555">infer_batch()  →  forward_pass()  |  FSDP / Megatron Engine</text>
+
+  <!-- CheckpointEngineWorker -->
+  <rect x="400" y="318" width="378" height="50" rx="8" fill="#fff" stroke="#e91e63" stroke-width="1" stroke-dasharray="4,3"/>
+  <text x="589" y="338" text-anchor="middle" font-size="11" font-weight="bold" fill="#c2185b">CheckpointEngineWorker</text>
+  <text x="589" y="354" text-anchor="middle" font-size="10" fill="#555">Weight Receiver  (NCCL / NIXL)</text>
+
+
+
+  <!-- ============ Cross arrows ============ -->
+
+  <!-- infer_batch → RayWorkerGroup -->
+  <line x1="292" y1="285" x2="368" y2="285" stroke="#555" stroke-width="1.6" marker-end="url(#call)"/>
+  <text x="294" y="278" font-size="9.5" fill="#555">compute_log_prob()</text>
+
+  <!-- ============ External callers ============ -->
+
+  <!-- FullyAsyncLLMServerManager -->
+  <rect x="50" y="432" width="260" height="40" rx="8" fill="#e8f5e9" stroke="#388e3c" stroke-width="1.5"/>
+  <text x="180" y="457" text-anchor="middle" font-size="11" font-weight="bold" fill="#1b5e20">FullyAsyncLLMServerManager</text>
+
+  <line x1="180" y1="432" x2="180" y2="396" stroke="#388e3c" stroke-width="1.5" marker-end="url(#call)"/>
+  <text x="185" y="420" font-size="9.5" fill="#388e3c">compute_log_prob()</text>
+
+  <!-- CheckpointEngineManager -->
+  <rect x="368" y="432" width="442" height="52" rx="8" fill="#e8eaf6" stroke="#3949ab" stroke-width="1.5"/>
+  <text x="589" y="452" text-anchor="middle" font-size="11" font-weight="bold" fill="#1a237e">CheckpointEngineManager</text>
+  <text x="589" y="470" text-anchor="middle" font-size="10" fill="#555">sleep()  →  update_weights()  →  wake_up()</text>
+
+  <!-- CheckpointEngineManager → sleep/wake_up -->
+  <line x1="450" y1="432" x2="240" y2="396" stroke="#3949ab" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#call)"/>
+  <text x="310" y="428" font-size="9" fill="#3949ab">sleep / wake_up</text>
+
+
+  <!-- CheckpointEngineManager → CheckpointEngineWorker (NCCL weight sync) -->
+  <line x1="589" y1="432" x2="589" y2="368" stroke="#6a1b9a" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#sync)"/>
+  <text x="594" y="406" font-size="9" fill="#6a1b9a">NCCL Weights</text>
+
+</svg>

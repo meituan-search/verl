@@ -1,0 +1,112 @@
+<mxfile host="65bd71144e">
+    <diagram name="Model Engine Server Architecture" id="0">
+        <mxGraphModel dx="790" dy="561" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="0" pageScale="1" pageWidth="1169" pageHeight="827" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="title" value="Model Engine Server Architecture" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=18;fontStyle=1;" parent="1" vertex="1">
+                    <mxGeometry x="160" y="20" width="820" height="36" as="geometry"/>
+                </mxCell>
+                <mxCell id="replica" value="ModelEngineReplica  —  Standalone Resource Pool" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9E9E9E;dashed=1;dashPattern=8 5;strokeWidth=2;fontSize=11;fontColor=#9E9E9E;verticalAlign=top;align=center;spacingLeft=8;spacingTop=6;" parent="1" vertex="1">
+                    <mxGeometry x="40" y="64" width="1060" height="430" as="geometry"/>
+                </mxCell>
+                <mxCell id="mes_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff8e1;strokeColor=#f9a825;strokeWidth=2;arcSize=4;" parent="1" vertex="1">
+                    <mxGeometry x="60" y="96" width="310" height="380" as="geometry"/>
+                </mxCell>
+                <mxCell id="mes_title" value="ModelEngineServer" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontStyle=1;fontSize=13;fontColor=#E65100;" parent="1" vertex="1">
+                    <mxGeometry x="60" y="104" width="310" height="24" as="geometry"/>
+                </mxCell>
+                <mxCell id="mes_subtitle" value="(Ray Actor)" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=10;fontColor=#888888;" parent="1" vertex="1">
+                    <mxGeometry x="60" y="126" width="310" height="18" as="geometry"/>
+                </mxCell>
+                <mxCell id="mes_clp" value="compute_log_prob()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#60a917;strokeColor=#2D7600;fontSize=11;fontColor=#ffffff;" parent="1" vertex="1">
+                    <mxGeometry x="84" y="152" width="262" height="36" as="geometry"/>
+                </mxCell>
+                <mxCell id="mes_queue" value="asyncio.Queue" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe082;strokeColor=#f9a825;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="84" y="210" width="262" height="36" as="geometry"/>
+                </mxCell>
+                <mxCell id="mes_consumer" value="_batch_consumer  (Async Task)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe082;strokeColor=#f9a825;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="84" y="268" width="262" height="36" as="geometry"/>
+                </mxCell>
+                <mxCell id="mes_infer" value="infer_batch()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe082;strokeColor=#f9a825;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="84" y="326" width="262" height="36" as="geometry"/>
+                </mxCell>
+                <mxCell id="mes_sleep" value="sleep()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffcc80;strokeColor=#f9a825;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="84" y="392" width="120" height="36" as="geometry"/>
+                </mxCell>
+                <mxCell id="mes_wakeup" value="wake_up()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffcc80;strokeColor=#f9a825;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="226" y="392" width="120" height="36" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_clp_q" style="edgeStyle=orthogonalEdgeStyle;" parent="1" source="mes_clp" target="mes_queue" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_q_bc" style="edgeStyle=orthogonalEdgeStyle;" parent="1" source="mes_queue" target="mes_consumer" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_bc_infer" style="edgeStyle=orthogonalEdgeStyle;" parent="1" source="mes_consumer" target="mes_infer" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="rwg_box" value="RayWorkerGroup" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e3f2fd;strokeColor=#1565c0;strokeWidth=2;arcSize=4;verticalAlign=top;fontSize=13;fontStyle=1;fontColor=#0D47A1;spacingTop=6;" parent="1" vertex="1">
+                    <mxGeometry x="430" y="96" width="640" height="380" as="geometry"/>
+                </mxCell>
+                <mxCell id="mew_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fce4ec;strokeColor=#E91E63;strokeWidth=2;arcSize=4;" parent="1" vertex="1">
+                    <mxGeometry x="448" y="128" width="604" height="330" as="geometry"/>
+                </mxCell>
+                <mxCell id="mew_title" value="ModelEngineWorker × N" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontStyle=1;fontSize=13;fontColor=#880E4F;" parent="1" vertex="1">
+                    <mxGeometry x="448" y="136" width="604" height="24" as="geometry"/>
+                </mxCell>
+                <mxCell id="mew_subtitle" value="(Ray GPU Actor)" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=10;fontColor=#888888;" parent="1" vertex="1">
+                    <mxGeometry x="448" y="158" width="604" height="18" as="geometry"/>
+                </mxCell>
+                <mxCell id="mew_clp" value="compute_log_prob(data)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f48fb1;strokeColor=#E91E63;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="466" y="182" width="570" height="32" as="geometry"/>
+                </mxCell>
+                <mxCell id="adapter_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#E91E63;dashed=1;dashPattern=6 4;strokeWidth=1.5;arcSize=6;" parent="1" vertex="1">
+                    <mxGeometry x="466" y="222" width="570" height="68" as="geometry"/>
+                </mxCell>
+                <mxCell id="adapter_title" value="ModelEngineServerAdapter" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontStyle=1;fontSize=11;fontColor=#C2185B;" parent="1" vertex="1">
+                    <mxGeometry x="466" y="230" width="570" height="20" as="geometry"/>
+                </mxCell>
+                <mxCell id="adapter_body" value="BaseRollout Adapter  |  forward_only&lt;br&gt;compute_log_prob()  /  update_weights()" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=10;fontColor=#555555;" parent="1" vertex="1">
+                    <mxGeometry x="466" y="250" width="570" height="34" as="geometry"/>
+                </mxCell>
+                <mxCell id="tw_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#E91E63;dashed=1;dashPattern=6 4;strokeWidth=1.5;arcSize=6;" parent="1" vertex="1">
+                    <mxGeometry x="466" y="298" width="570" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="tw_title" value="TrainingWorker" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontStyle=1;fontSize=11;fontColor=#C2185B;" parent="1" vertex="1">
+                    <mxGeometry x="466" y="306" width="570" height="20" as="geometry"/>
+                </mxCell>
+                <mxCell id="tw_body" value="infer_batch()  →  forward_pass()  |  FSDP / Megatron Engine" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=10;fontColor=#555555;" parent="1" vertex="1">
+                    <mxGeometry x="466" y="326" width="570" height="26" as="geometry"/>
+                </mxCell>
+                <mxCell id="cew_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#E91E63;dashed=1;dashPattern=6 4;strokeWidth=1.5;arcSize=6;" parent="1" vertex="1">
+                    <mxGeometry x="466" y="366" width="570" height="54" as="geometry"/>
+                </mxCell>
+                <mxCell id="cew_title" value="CheckpointEngineWorker" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontStyle=1;fontSize=11;fontColor=#C2185B;" parent="1" vertex="1">
+                    <mxGeometry x="466" y="374" width="570" height="20" as="geometry"/>
+                </mxCell>
+                <mxCell id="cew_body" value="weight receive (NCCL / NIXL)" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=10;fontColor=#555555;" parent="1" vertex="1">
+                    <mxGeometry x="466" y="394" width="570" height="20" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_infer_rwg" value="compute_log_prob()" style="edgeStyle=orthogonalEdgeStyle;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;fontSize=10;fontColor=#555555;align=center;" parent="1" source="mes_infer" target="rwg_box" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="llm_mgr" value="&lt;b&gt;FullyAsyncLLMServerManager&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8f5e9;strokeColor=#388E3C;strokeWidth=1.8;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="60" y="540" width="310" height="44" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_llm_mes" value="compute_log_prob()" style="edgeStyle=orthogonalEdgeStyle;exitX=0.5;exitY=0;exitDx=0;exitDy=0;fontSize=10;fontColor=#388E3C;strokeColor=#388E3C;" parent="1" source="llm_mgr" target="mes_box" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="ckpt_mgr" value="&lt;b&gt;CheckpointEngineManager&lt;/b&gt;&lt;br&gt;&lt;font color='#555555'&gt;sleep()  →  update_weights()  →  wake_up()&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e8eaf6;strokeColor=#3949AB;strokeWidth=1.8;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="430" y="540" width="640" height="52" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_ckpt_sleep" value="sleep / wake_up" style="edgeStyle=orthogonalEdgeStyle;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;dashed=1;dashPattern=6 4;strokeColor=#3949AB;fontColor=#3949AB;fontSize=9;" parent="1" source="ckpt_mgr" target="mes_sleep" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_ckpt_cew" value="NCCL Weights" style="edgeStyle=orthogonalEdgeStyle;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;dashed=1;dashPattern=6 4;strokeColor=#6A1B9A;fontColor=#6A1B9A;fontSize=9;" parent="1" source="ckpt_mgr" target="cew_box" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+</mxfile>
