@@ -578,8 +578,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             # ================================================================
             # Phase 2: Run validation via RPC to rollouter
             # ================================================================
-            print("[FullyAsyncTrainer] Phase 2: Running validation (RPC to rollouter)")
+            print(f"[FullyAsyncTrainer] Phase 2: Running validation (RPC to rollouter) at {time.strftime('%H:%M:%S')}")
+            phase2_start = time.time()
             val_metrics = ray.get(self.rollouter.do_validate.remote())
+            print(f"[FullyAsyncTrainer] Phase 2: do_validate returned in {time.time() - phase2_start:.2f}s at {time.strftime('%H:%M:%S')}")
             pprint(
                 f"[FullyAsyncTrainer] parameter version: {self.current_param_version} "
                 f"Trainer-side val metrics: {val_metrics.metrics}"
@@ -590,30 +592,36 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             # Phase 3: Switch elastic GPUs back to TRAIN mode
             # ================================================================
             phase_3_start = time.time()
-            print("[FullyAsyncTrainer] Phase 3: Switching all GPUs back to TRAIN mode")
-            # Step 1: Abort ALL in-flight requests on every server (elastic + standalone).
-            # This triggers partial-rollout auto-resume: aborted requests will be
-            # re-routed to healthy servers once we resume generation below.
-            # Critical: must abort BEFORE sleep to avoid "Cannot pause allocation
-            # that is not active" from SGLang torch_memory_saver.
-            print("[FullyAsyncTrainer]   Step 1: abort_replicas (all servers, trigger partial rollout)")
+            print("[FullyAsyncTrainer] Phase 3: Switching elastic GPUs back to TRAIN mode")
+            print("[FullyAsyncTrainer]   Step 1: abort_replicas (standalone servers only)")
             await self.checkpoint_manager.abort_replicas()
-            await self.hybrid_checkpoint_manager.abort_replicas()
 
-            # Step 2: Unregister elastic replicas from rollouter's ALM
-            # (LB cleanup + sleep elastic replicas → GPUs returned to training engine)
             print("[FullyAsyncTrainer]   Step 2: Unregister elastic replicas from rollouter ALM")
+            # Process removals sequentially. Each remove_elastic_replica call involves:
+            #   LB remove_server → workers notify → abort_all_requests → LB cleanup → sleep()
+            # The sleep() step releases GPU memory (KV cache + weights) which can take time
+            # if there are many inflight requests to drain.
             for resource_id in reversed(elastic_resource_ids):
-                success = ray.get(self.rollouter.remove_elastic_replica.remote(resource_id))
-                print(f"[FullyAsyncTrainer] remove_elastic_replica('{resource_id}'): {success}")
+                print(f"[FullyAsyncTrainer]   Step 2: calling remove_elastic_replica('{resource_id}') at {time.strftime('%H:%M:%S')}")
+                step_start = time.time()
+                try:
+                    success = ray.get(
+                        self.rollouter.remove_elastic_replica.remote(resource_id),
+                        timeout=300,
+                    )
+                    print(f"[FullyAsyncTrainer]   remove_elastic_replica('{resource_id}'): {success} ({time.time() - step_start:.2f}s)")
+                except (ray.exceptions.GetTimeoutError, Exception) as e:
+                    print(f"[FullyAsyncTrainer]   WARNING: remove_elastic_replica('{resource_id}') failed after {time.time() - step_start:.2f}s: {e}")
+                    # Best-effort: try to clean up tracking state so training can continue
+                    try:
+                        ray.get(self.rollouter.force_remove_elastic_tracking.remote(resource_id), timeout=60)
+                        print(f"[FullyAsyncTrainer]   force_remove_elastic_tracking('{resource_id}') done")
+                    except Exception as e2:
+                        print(f"[FullyAsyncTrainer]   WARNING: force_remove also failed: {e2}")
 
-            # Step 3: Resume generation on remaining (standalone) servers.
-            # After abort+remove, only standalone servers are alive.  Resuming
-            # allows them to accept new requests again — all subsequent rollout
-            # traffic (training samples) goes to standalone machines.
+            # Step 3: Resume generation on remaining (standalone) servers only.
             print("[FullyAsyncTrainer]   Step 3: resume_generation (standalone servers ready)")
             await self.checkpoint_manager.resume_generation_replicas()
-            await self.hybrid_checkpoint_manager.resume_generation_replicas()
 
             total_time = time.time() - validate_start
             print(f"[FullyAsyncTrainer] _trainer_side_validate === END === (total: {total_time:.2f}s)")

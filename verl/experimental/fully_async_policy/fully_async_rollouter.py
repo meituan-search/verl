@@ -250,9 +250,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     def do_validate(self) -> ValidateMetrics:
         """Run validation and return metrics"""
+        print(f"[FullyAsyncRollouter] do_validate() === START === at {time.strftime('%H:%M:%S')}")
         timing_raw = {}
         with marked_timer("rollouter/validate_time", timing_raw, color="green"):
             val_metrics: dict = self._validate()
+        print(f"[FullyAsyncRollouter] do_validate() === END === at {time.strftime('%H:%M:%S')}")
         return ValidateMetrics(timing_raw=timing_raw, metrics=val_metrics)
 
     async def save_checkpoint(self, local_global_step_folder: str):
@@ -757,9 +759,26 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         """
         ok = await self.async_rollout_manager.remove_elastic_replica(resource_id)
         if ok and self.max_concurrent_samples is not None:
-            async with self.lock:
-                self.max_concurrent_samples = max(16, self.max_concurrent_samples - 16)
+            # Note: don't use self.lock here to avoid potential deadlock with
+            # _streaming_generation_main which may hold the lock during long-running
+            # generate operations. max_concurrent_samples is just an int; minor races
+            # are acceptable.
+            self.max_concurrent_samples = max(16, self.max_concurrent_samples - 16)
         return ok
+
+    async def force_remove_elastic_tracking(self, resource_id: str) -> None:
+        """
+        Force-remove elastic replica tracking state without waiting for
+        abort/sleep to complete. Used as a safety net when
+        remove_elastic_replica() times out (e.g. due to stuck inflight
+        requests on the SGLang server).
+        """
+        print(f"[FullyAsyncRollouter] force_remove_elastic_tracking('{resource_id}'): forcing cleanup")
+        await self.async_rollout_manager.force_remove_elastic_tracking(resource_id)
+        if self.max_concurrent_samples is not None:
+            # Same lock-free pattern as remove_elastic_replica to avoid deadlock.
+            self.max_concurrent_samples = max(16, self.max_concurrent_samples - 16)
+        print(f"[FullyAsyncRollouter] force_remove_elastic_tracking('{resource_id}'): done")
 
     def update_elastic_replica_version(self, resource_id: str, param_version: int) -> None:
         """Update the param version for an elastic replica after a sync."""
