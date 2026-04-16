@@ -1606,8 +1606,6 @@ def restore_megatron_model_from_cpu(models, cpu_state):
                             restore_size = buffer_state.get(
                                 "param_data_size", buffer_state["param_data"].storage().size()
                             )
-                            if restore_size > 0:
-                                print(f"{restore_size=}!!")
                             buffer.param_data.storage().resize_(restore_size)
                         buffer.param_data.copy_(buffer_state["param_data"], non_blocking=True)
 

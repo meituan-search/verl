@@ -263,7 +263,7 @@ class ModelEngineServer:
         else:
             self._min_dispatch_unit = dp_size * self.micro_batch_size_per_gpu
         self._dp_size = dp_size
-        self.batch_size = self._min_dispatch_unit if self._min_dispatch_unit < 0 else self.batch_size
+        self.batch_size = self._min_dispatch_unit if self.batch_size < 0 else self.batch_size
         if self.batch_size % self._min_dispatch_unit != 0:
             raise RuntimeError(f"ModelEngineServer {self.batch_size=} is not a multiple of {self._min_dispatch_unit=}.")
 
