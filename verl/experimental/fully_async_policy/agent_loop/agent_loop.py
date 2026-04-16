@@ -38,6 +38,7 @@ from verl.utils.rollout_trace import (
 )
 from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.rollout import RolloutReplica
+from verl.workers.rollout.replica import RolloutMode
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -577,8 +578,20 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         logger.info(f"[FullyAsyncAgentLoopManager] Activating elastic replica '{resource_id}' at {server_address}")
         try:
             # 1. Wake up: restore model weights / kv-cache on the shared GPU pool.
-            await replica.wake_up()
-            logger.info(f"[FullyAsyncAgentLoopManager] Replica '{resource_id}' woken up at {server_address}")
+            #    For HYBRID mode replicas, wake_up() is NOT supported because the
+            #    rollout engine is woken up inside update_weights() (which performs
+            #    the full rollout_mode transition: resume weights → sync → offload actor
+            #    → resume kv_cache).  The caller (_trainer_side_validate) already
+            #    invoked update_weights() in Phase 1 Step 1, so we skip wake_up()
+            #    here and only do LB registration for HYBRID replicas.
+            if replica.rollout_mode != RolloutMode.HYBRID:
+                await replica.wake_up()
+                logger.info(f"[FullyAsyncAgentLoopManager] Replica '{resource_id}' woken up at {server_address}")
+            else:
+                logger.info(
+                    f"[FullyAsyncAgentLoopManager] Replica '{resource_id}' is HYBRID mode — "
+                    f"skipping wake_up() (rollout was activated by update_weights() in Phase 1)"
+                )
 
             # 2. Push the new handle into every AgentLoopWorker's local map FIRST,
             #    so they can resolve the server_id before the LB starts routing to it.
