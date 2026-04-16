@@ -154,12 +154,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         # Hybrid checkpoint manager for trainer-side validation (use_trainer_do_validate)
         # Uses naive backend to sync weights from trainer to elastic rollout replicas.
-        # Initialized in _setup_hybrid_checkpoint_manager() after models are loaded.
+        # Initialized in _setup_hybrid_checkpoint_manager_and_sleep() via set_rollouter().
         self.hybrid_checkpoint_manager = None
 
-    def _setup_checkpoint_manager(self, rollouter):
+    def _setup_checkpoint_manager(self):
         """Setup checkpoint manager after rollouter is initialized"""
-        replicas = ray.get(rollouter.get_replicas.remote())
+        replicas = ray.get(self.rollouter.get_replicas.remote())
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
         self.checkpoint_manager = CheckpointEngineManager(
             config=checkpoint_engine_config, trainer=self.actor_wg, replicas=replicas
@@ -167,16 +167,29 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         print("[FullyAsyncTrainer] Checkpoint manager initialized")
 
     async def _setup_hybrid_checkpoint_manager(self):
-        """Setup hybrid checkpoint manager for trainer-side validation.
+        """Setup hybrid checkpoint manager and perform initial sleep of elastic replicas.
 
-        When use_trainer_do_validate is enabled, creates a CheckpointEngineManager
-        with naive backend that syncs weights from the trainer's actor worker group
-        to the elastic rollout replicas (managed by Rollouter's FullyAsyncAgentLoopManager).
-        Must be called after init_workers() so that actor_rollout_wg is initialized.
+        When use_trainer_do_validate is enabled:
+          1. Creates a CheckpointEngineManager with naive backend for trainer-side
+             weight sync to elastic rollout replicas.
+          2. Fetches elastic replicas from the rollouter's ALM (created during
+             rollouter.init_workers()).
+          3. Registers them with the hybrid CP manager and calls sleep_replicas()
+             to release GPU memory for training.
+
+        Must be called AFTER set_rollouter() so that self.rollouter is available,
+        and AFTER rollouter.init_workers() so that elastic replicas exist.
+        This mirrors the colocate pattern in ray_trainer.py:882-889 but fetches
+        replicas from the rollouter's ALM via RPC since they live on the rollout side.
         """
         if not self.config.async_training.use_trainer_do_validate:
             return
 
+        if self.rollouter is None:
+            print("[FullyAsyncTrainer] _setup_hybrid_cp_and_sleep: rollouter is None, skipping")
+            return
+
+        # --- Part 1: Create hybrid CheckpointEngineManager with naive backend ---
         print("[FullyAsyncTrainer] Setting up hybrid checkpoint manager (naive backend)")
 
         # Create hybrid CheckpointEngineManager with naive backend.
@@ -191,74 +204,54 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.hybrid_checkpoint_manager = CheckpointEngineManager(
             config=checkpoint_engine_config,
             trainer=self.actor_rollout_wg,
-            replicas=[],  # Start empty; elastic replicas added during validate
+            replicas=[],  # Start empty; will be populated below
         )
 
         # Restore original backend value
         with open_dict(checkpoint_engine_cfg):
             checkpoint_engine_cfg.backend = original_backend
 
-        print("[FullyAsyncTrainer] Hybrid checkpoint manager initialized (naive backend, empty replicas)")
+        print("[FullyAsyncTrainer] Hybrid checkpoint manager initialized (naive backend)")
 
-    async def _initial_sleep_elastic_replicas(self):
-        """Perform the initial sleep of elastic hybrid replicas.
-
-        Must be called AFTER rollouter.init_workers() because elastic replicas
-        are created by FullyAsyncAgentLoopManager._initialize_elastic_replicas()
-        on the rollout side.  We fetch them here and register with our hybrid
-        CheckpointEngineManager so that sleep_replicas() actually has replicas
-        to operate on.
-        """
-        if not self.config.async_training.use_trainer_do_validate:
-            print("[FullyAsyncTrainer] _initial_sleep: use_trainer_do_validate=False, skipping")
-            return
-
-        if self.hybrid_checkpoint_manager is None:
-            print("[FullyAsyncTrainer] _initial_sleep: hybrid_checkpoint_manager is None, skipping")
-            return
-
-        if self.rollouter is None:
-            print("[FullyAsyncTrainer] _initial_sleep: rollouter is None, skipping")
-            return
-
-        # Step 1: Fetch elastic replicas created by rollouter's ALM
-        print("[FullyAsyncTrainer] _initial_sleep: fetching elastic replicas from rollouter...")
+        # --- Part 2: Fetch elastic replicas from rollouter's ALM ---
+        print("[FullyAsyncTrainer] Fetching elastic replicas from rollouter...")
         elastic_replicas_dict = ray.get(self.rollouter.get_all_elastic_replicas.remote())
         print(
-            f"[FullyAsyncTrainer] _initial_sleep: got {len(elastic_replicas_dict)} elastic replicas: "
+            f"[FullyAsyncTrainer] Got {len(elastic_replicas_dict)} elastic replicas: "
             f"{list(elastic_replicas_dict.keys())}"
         )
 
         if not elastic_replicas_dict:
-            print("[FullyAsyncTrainer] _initial_sleep: no elastic replicas found, nothing to sleep")
+            print("[FullyAsyncTrainer] No elastic replicas found, skipping initial sleep")
             return
 
-        # Step 2: Register them with the hybrid checkpoint manager
+        # --- Part 3: Register replicas and perform initial sleep ---
         for resource_id, replica in elastic_replicas_dict.items():
             self.hybrid_checkpoint_manager.replicas.append(replica)
             print(
-                f"[FullyAsyncTrainer] _initial_sleep: registered '{resource_id}' "
+                f"[FullyAsyncTrainer] Registered '{resource_id}' "
                 f"(mode={getattr(replica, 'rollout_mode', '?')}, "
                 f"addr={getattr(replica, '_server_address', '?')})"
             )
 
         # Step 3: Sleep all elastic replicas
         print(
-            f"[FullyAsyncTrainer] _initial_sleep: calling sleep_replicas() on "
+            f"[FullyAsyncTrainer] Calling sleep_replicas() on "
             f"{len(self.hybrid_checkpoint_manager.replicas)} replicas..."
         )
         await self.hybrid_checkpoint_manager.sleep_replicas()
-        print(f"[FullyAsyncTrainer] _initial_sleep: sleep complete, GPU memory now owned by training engine")
+        print(f"[FullyAsyncTrainer] Initial sleep complete, GPU memory now owned by training engine")
 
     def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         """Set message queue client"""
         self.message_queue_client = message_queue_client
 
-    def set_rollouter(self, rollouter):
-        """Set rollouter reference for parameter synchronization"""
+    async def set_rollouter(self, rollouter):
+        """Set rollouter reference and initialize all checkpoint managers."""
         self.rollouter = rollouter
         # Setup checkpoint manager after rollouter is set
-        self._setup_checkpoint_manager(rollouter)
+        self._setup_checkpoint_manager()
+        await self._setup_hybrid_checkpoint_manager()
 
     def set_total_train_steps(self, total_training_steps):
         self.total_train_steps = total_training_steps
@@ -378,8 +371,6 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._create_worker_classes()
         self._init_worker_groups()
         self._init_models()
-        # Setup hybrid CP manager and elastic ALM after models are loaded
-        await self._setup_hybrid_checkpoint_manager()
 
     async def fit(self):
         """

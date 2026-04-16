@@ -85,19 +85,8 @@ class FullyAsyncTaskRunner:
         print("[ASYNC MAIN] Creating FullyAsyncRollouter...")
         self._create_rollouter(config)
 
-        # set_rollouter must be called BEFORE _initial_sleep_elastic_replicas
-        # because the trainer needs the rollouter reference to fetch elastic replicas.
         print("[ASYNC MAIN] Setting up rollouter reference on trainer (early)...")
         ray.get(self.components["trainer"].set_rollouter.remote(self.components["rollouter"]))
-
-        # Initial sleep of elastic replicas so the training engine owns GPU memory.
-        # Must be AFTER _create_rollouter() AND set_rollouter() because:
-        #   - rollouter.init_workers() creates the elastic replicas via ALM
-        #   - trainer needs rollouter ref to fetch those replicas
-        if config.async_training.use_trainer_do_validate:
-            print("[ASYNC MAIN] Performing initial sleep of elastic replicas...")
-            ray.get(self.components["trainer"]._initial_sleep_elastic_replicas.remote())
-            sleep(60)
 
         # sync total_train_steps between rollouter and trainer
         total_train_steps = ray.get(self.components["rollouter"].get_total_train_steps.remote())
