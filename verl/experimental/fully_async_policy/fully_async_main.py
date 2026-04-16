@@ -85,10 +85,15 @@ class FullyAsyncTaskRunner:
         print("[ASYNC MAIN] Creating FullyAsyncRollouter...")
         self._create_rollouter(config)
 
+        # set_rollouter must be called BEFORE _initial_sleep_elastic_replicas
+        # because the trainer needs the rollouter reference to fetch elastic replicas.
+        print("[ASYNC MAIN] Setting up rollouter reference on trainer (early)...")
+        ray.get(self.components["trainer"].set_rollouter.remote(self.components["rollouter"]))
+
         # Initial sleep of elastic replicas so the training engine owns GPU memory.
-        # Must be AFTER _create_rollouter() because that calls rollouter.init_workers()
-        # → _init_async_rollout_manager() → FullyAsyncAgentLoopManager.create()
-        # → _initialize_elastic_replicas() which creates the elastic RolloutReplica objects.
+        # Must be AFTER _create_rollouter() AND set_rollouter() because:
+        #   - rollouter.init_workers() creates the elastic replicas via ALM
+        #   - trainer needs rollouter ref to fetch those replicas
         if config.async_training.use_trainer_do_validate:
             print("[ASYNC MAIN] Performing initial sleep of elastic replicas...")
             ray.get(self.components["trainer"]._initial_sleep_elastic_replicas.remote())
@@ -113,9 +118,6 @@ class FullyAsyncTaskRunner:
         # param_version resume from ckpt or default 0
         ray.get(self.components["trainer"].load_checkpoint.remote())
         ray.get(self.components["rollouter"].load_checkpoint.remote())
-
-        print("[ASYNC MAIN] Setting up parameter synchronization...")
-        ray.get(self.components["trainer"].set_rollouter.remote(self.components["rollouter"]))
 
         print("[ASYNC MAIN] Param sync before fit..")
         ray.get(self.components["trainer"]._fit_update_weights.remote())

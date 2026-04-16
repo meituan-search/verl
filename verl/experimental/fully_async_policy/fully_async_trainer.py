@@ -201,8 +201,54 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         print("[FullyAsyncTrainer] Hybrid checkpoint manager initialized (naive backend, empty replicas)")
 
     async def _initial_sleep_elastic_replicas(self):
-        """Perform the initial sleep of elastic hybrid replicas."""
+        """Perform the initial sleep of elastic hybrid replicas.
+
+        Must be called AFTER rollouter.init_workers() because elastic replicas
+        are created by FullyAsyncAgentLoopManager._initialize_elastic_replicas()
+        on the rollout side.  We fetch them here and register with our hybrid
+        CheckpointEngineManager so that sleep_replicas() actually has replicas
+        to operate on.
+        """
+        if not self.config.async_training.use_trainer_do_validate:
+            print("[FullyAsyncTrainer] _initial_sleep: use_trainer_do_validate=False, skipping")
+            return
+
+        if self.hybrid_checkpoint_manager is None:
+            print("[FullyAsyncTrainer] _initial_sleep: hybrid_checkpoint_manager is None, skipping")
+            return
+
+        if self.rollouter is None:
+            print("[FullyAsyncTrainer] _initial_sleep: rollouter is None, skipping")
+            return
+
+        # Step 1: Fetch elastic replicas created by rollouter's ALM
+        print("[FullyAsyncTrainer] _initial_sleep: fetching elastic replicas from rollouter...")
+        elastic_replicas_dict = ray.get(self.rollouter.get_all_elastic_replicas.remote())
+        print(
+            f"[FullyAsyncTrainer] _initial_sleep: got {len(elastic_replicas_dict)} elastic replicas: "
+            f"{list(elastic_replicas_dict.keys())}"
+        )
+
+        if not elastic_replicas_dict:
+            print("[FullyAsyncTrainer] _initial_sleep: no elastic replicas found, nothing to sleep")
+            return
+
+        # Step 2: Register them with the hybrid checkpoint manager
+        for resource_id, replica in elastic_replicas_dict.items():
+            self.hybrid_checkpoint_manager.replicas.append(replica)
+            print(
+                f"[FullyAsyncTrainer] _initial_sleep: registered '{resource_id}' "
+                f"(mode={getattr(replica, 'rollout_mode', '?')}, "
+                f"addr={getattr(replica, '_server_address', '?')})"
+            )
+
+        # Step 3: Sleep all elastic replicas
+        print(
+            f"[FullyAsyncTrainer] _initial_sleep: calling sleep_replicas() on "
+            f"{len(self.hybrid_checkpoint_manager.replicas)} replicas..."
+        )
         await self.hybrid_checkpoint_manager.sleep_replicas()
+        print(f"[FullyAsyncTrainer] _initial_sleep: sleep complete, GPU memory now owned by training engine")
 
     def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         """Set message queue client"""
