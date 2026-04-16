@@ -246,8 +246,8 @@ class ModelEngineServer:
         self.model_engine_worker_group = model_engine_worker_group
         self.tokenizer = hf_tokenizer(model_path)
         self.rollout_config = rollout_config
-        self.batch_size = model_engine_cfg.get("batch_size", 8)
-        self.timeout = model_engine_cfg.get("timeout", 10.0)
+        self.batch_size = model_engine_cfg.get("batch_size", -1)
+        self.timeout = model_engine_cfg.get("timeout", 5.0)
         self.micro_batch_size_per_gpu = model_engine_cfg.get("micro_batch_size_per_gpu", 1)
         self.use_dynamic_bsz = model_engine_cfg.get("use_dynamic_bsz", False)
 
@@ -263,6 +263,7 @@ class ModelEngineServer:
         else:
             self._min_dispatch_unit = dp_size * self.micro_batch_size_per_gpu
         self._dp_size = dp_size
+        self.batch_size = self._min_dispatch_unit if self._min_dispatch_unit < 0 else self.batch_size
         if self.batch_size % self._min_dispatch_unit != 0:
             raise RuntimeError(f"ModelEngineServer {self.batch_size=} is not a multiple of {self._min_dispatch_unit=}.")
 
