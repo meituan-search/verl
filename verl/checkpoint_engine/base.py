@@ -401,6 +401,31 @@ class CheckpointEngineManager:
         await asyncio.gather(*[r.wake_up() for r in self.replicas])
 
     @auto_await
+    async def abort_replicas(self):
+        """Abort all in-flight requests on every replica.
+
+        Must be called **before** ``sleep_replicas()`` to ensure KV cache
+        allocations are in a clean (drained) state.  Without this, SGLang's
+        ``release_memory_occupation`` will fail with::
+
+            Cannot pause allocation that is not active
+
+        because the torch_memory_saver cannot pause an allocation that still
+        has active requests attached.
+        """
+        await asyncio.gather(*[r.abort_all_requests() for r in self.replicas])
+
+    @auto_await
+    async def resume_generation_replicas(self):
+        """Resume generation on all replicas after abort_all_requests.
+
+        Used to re-enable request processing on standalone/fixed servers after
+        elastic replicas have been removed and slept.  Aborted partial-rollout
+        requests will be re-routed to the now-active servers.
+        """
+        await asyncio.gather(*[r.resume_generation() for r in self.replicas])
+
+    @auto_await
     async def release_kv_cache_replicas(self):
         """Release kv_cache of all rollout replicas before NCCL weight sync.
 
@@ -432,7 +457,7 @@ class CheckpointEngineManager:
             return
 
         # 1. abort and save all unfinished requests for partial rollout
-        await asyncio.gather(*[r.abort_all_requests() for r in self.replicas])
+        await self.abort_replicas()
 
         # 2. create a temporay worker group for all replicas
         workers = []
@@ -463,4 +488,4 @@ class CheckpointEngineManager:
         await self.resume_kv_cache_replicas()
 
         # 8. resume all unfinished requests for partial rollout
-        await asyncio.gather(*[r.resume_generation() for r in self.replicas])
+        await self.resume_generation_replicas()
