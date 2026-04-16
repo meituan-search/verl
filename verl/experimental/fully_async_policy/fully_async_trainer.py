@@ -615,18 +615,6 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             await self.checkpoint_manager.resume_generation_replicas()
             await self.hybrid_checkpoint_manager.resume_generation_replicas()
 
-            # Step 4: Sleep rollout on trainer workers to release GPU memory (weights + kv_cache)
-            # Training engine model weights are already back on GPU after rollout_mode's
-            # offload+restore cycle inside update_weights. sleep_replicas() ensures the
-            # rollout engine fully releases its GPU resources so subsequent training
-            # computations (reward, log_prob, advantage, actor update) have full GPU access.
-            # Now safe because Step 1 already aborted all active requests.
-            print("[FullyAsyncTrainer]   Step 4: sleep_replicas (release rollout, GPU → train)")
-            await self.hybrid_checkpoint_manager.sleep_replicas()
-            phase_3_time = time.time() - phase_3_start
-            print(f"[FullyAsyncTrainer] Phase 3: Switching all GPUs back to TRAIN mode "
-                  f"(total: {phase_3_time:.2f}s)")
-
             total_time = time.time() - validate_start
             print(f"[FullyAsyncTrainer] _trainer_side_validate === END === (total: {total_time:.2f}s)")
             self.timing_raw["trainer/validate_total_time"] = total_time
