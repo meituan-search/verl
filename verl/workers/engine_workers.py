@@ -91,6 +91,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         initialize_global_process_group_ray(timeout_second=None)
 
         set_numa_affinity()
+        set_expandable_segments(True)
 
         self.config = config
         self.model_config = self.config.model_config

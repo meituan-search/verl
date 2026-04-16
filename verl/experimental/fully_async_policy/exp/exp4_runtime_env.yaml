@@ -1,0 +1,8 @@
+env_vars:
+  VLLM_USE_V1: "1"
+  CUDA_DEVICE_MAX_CONNECTIONS: "1"
+  HYDRA_FULL_ERROR: "1"
+  TENSORBOARD_DIR: "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/tensorboard/standalone_oldlog_prob/exp4_fully-async_model-engine-server_dapo_qwen2.5-7B-math_megatron_bs32"
+
+excludes:
+  - .git
