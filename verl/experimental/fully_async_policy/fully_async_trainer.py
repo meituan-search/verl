@@ -200,9 +200,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         print("[FullyAsyncTrainer] Hybrid checkpoint manager initialized (naive backend, empty replicas)")
 
-        # Rollout starts in sleep state; GPU memory is owned by the training engine.
+    async def _initial_sleep_elastic_replicas(self):
+        """Perform the initial sleep of elastic hybrid replicas."""
         await self.hybrid_checkpoint_manager.sleep_replicas()
-        print("[FullyAsyncTrainer] Hybrid replicas slept after init")
 
     def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         """Set message queue client"""

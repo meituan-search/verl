@@ -17,6 +17,7 @@ import os
 import socket
 import threading
 from pprint import pprint
+from time import sleep
 
 import hydra
 import ray
@@ -84,6 +85,15 @@ class FullyAsyncTaskRunner:
         print("[ASYNC MAIN] Creating FullyAsyncRollouter...")
         self._create_rollouter(config)
 
+        # Initial sleep of elastic replicas so the training engine owns GPU memory.
+        # Must be AFTER _create_rollouter() because that calls rollouter.init_workers()
+        # → _init_async_rollout_manager() → FullyAsyncAgentLoopManager.create()
+        # → _initialize_elastic_replicas() which creates the elastic RolloutReplica objects.
+        if config.async_training.use_trainer_do_validate:
+            print("[ASYNC MAIN] Performing initial sleep of elastic replicas...")
+            ray.get(self.components["trainer"]._initial_sleep_elastic_replicas.remote())
+            sleep(60)
+
         # sync total_train_steps between rollouter and trainer
         total_train_steps = ray.get(self.components["rollouter"].get_total_train_steps.remote())
         print(f"total_train_steps {total_train_steps}")
@@ -120,8 +130,6 @@ class FullyAsyncTaskRunner:
         rollouter = FullyAsyncRollouter.remote(
             config=config,
             tokenizer=self.components["tokenizer"],
-            role_worker_mapping=None,
-            resource_pool_manager=create_resource_pool_manager(config, roles=[Role.Rollout]),
             ray_worker_group_cls=self.components["ray_worker_group_cls"],
             processor=self.components["processor"],
             device_name=config.trainer.device,

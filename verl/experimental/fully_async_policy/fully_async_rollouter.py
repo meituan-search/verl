@@ -39,9 +39,6 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.profiler import marked_timer
 from verl.utils.tracking import ValidationGenerationsLogger
 
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-
 
 @ray.remote(num_cpus=10, max_concurrency=100)
 class FullyAsyncRollouter(SeparateRayPPOTrainer):
@@ -55,8 +52,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self,
         config,
         tokenizer,
-        role_worker_mapping: dict[Role, WorkerType],
-        resource_pool_manager: ResourcePoolManager,
         ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
         processor=None,
         device_name=None,
@@ -75,8 +70,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             "trigger_parameter_sync_step must larger or equal than 1"
         )
 
-        self.role_worker_mapping = role_worker_mapping
-        self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = False
 
         self.use_rm = False
@@ -118,19 +111,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
         self._validate_config()
-        if self.config.async_training.use_trainer_do_validate:
-            rollout_gpus = config.rollout.nnodes * config.rollout.n_gpus_per_node
-            train_gpus = config.trainer.nnodes * config.trainer.n_gpus_per_node
-            total_gpus = rollout_gpus + train_gpus
-            print(f"[FullyAsyncRollouter] split before val_dataset total len: {len(val_dataset)}")
-            split_dataset = val_dataset.split(total_gpus)
-            rollout_val_dataset0 = split_dataset[:rollout_gpus]
-            from torch.utils.data import ConcatDataset
-
-            val_dataset = ConcatDataset(rollout_val_dataset0)
-            print(f"[FullyAsyncRollouter] split after val_dataset total len: {len(val_dataset)}")
-        print(f"[FullyAsyncRollouter] Rollouter _create_dataloader...\n{train_dataset}\n{val_dataset}")
-
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.total_rollout_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
@@ -415,7 +395,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             reward_loop_worker_handles=reward_loop_worker_handles,
             elastic_worker_group=elastic_wg,
         )
-        logger.info(
+        print(
             f"[FullyAsyncRollouter] FullyAsyncAgentLoopManager initialised with "
             f"{len(self.async_rollout_manager.rollout_replicas)} fixed replicas, "
             f"{len(self.async_rollout_manager.elastic_replicas)} elastic replicas (sleeping)"
@@ -733,9 +713,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 elastic hybrid rollout replica.
         """
         self._elastic_worker_group = worker_group
-        logger.info(
-            f"[ElasticRollouter] Elastic worker group set (world_size={getattr(worker_group, 'world_size', '?')})"
-        )
+        print(f"[ElasticRollouter] Elastic worker group set (world_size={getattr(worker_group, 'world_size', '?')})")
 
     def _get_elastic_worker_group(self) -> "RayWorkerGroup | None":
         """
