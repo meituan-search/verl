@@ -266,7 +266,6 @@ class ReplayBuffer:
                     return KVBatchMeta(partition_id=partition_id, keys=keys, tags=tags)
 
 
-@ray.remote
 class AgentLoopWorkerTQ(AgentLoopWorker):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -425,7 +424,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
 
 class AgentLoopManagerTQ(AgentLoopManager):
     def __init__(self, *args, replay_buffer: ReplayBuffer, **kwargs):
-        self.agent_loop_workers_class = AgentLoopWorkerTQ
+        self.agent_loop_workers_class = ray.remote(AgentLoopWorkerTQ)
         super().__init__(*args, **kwargs)
         self.replay_buffer = replay_buffer
 
