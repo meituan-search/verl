@@ -1,0 +1,37 @@
+# fsdp model_engine_server config, inheriting from fully_async_policy/config/model_engine_server/model_engine_server.yaml
+defaults:
+  - model_engine_server
+
+  # fsdp engine config: ../engine resolves to verl/trainer/config/engine/ via searchpath
+  - ../engine@fsdp_config: fsdp
+
+  # load the reference default config, then apply the fields in the current yaml
+  - _self_
+
+# Target class for this configuration
+_target_: verl.workers.config.FSDPActorConfig
+
+# fsdp config
+fsdp_config:
+
+  # forward only
+  forward_only: True
+  # don't offload param
+  param_offload: False
+  # default same as actor.fsdp_config
+  fsdp_size: ${oc.select:actor_rollout_ref.actor.fsdp_config.fsdp_size,-1}
+  strategy: ${oc.select:actor_rollout_ref.actor.fsdp_config.strategy,fsdp}
+  dtype: ${oc.select:actor_rollout_ref.actor.fsdp_config.dtype,bfloat16}
+
+# sequence parallel size
+# same as actor_rollout_ref.actor.ulysses_sequence_parallel_size if it exists, otherwise 1
+ulysses_sequence_parallel_size: ${oc.select:actor_rollout_ref.actor.ulysses_sequence_parallel_size,1}
+
+# calculate entropy with chunking to reduce memory peak
+entropy_from_logits_with_chunking: False
+
+# recompute entropy
+entropy_checkpointing: False
+
+# Whether to remove padding tokens in inputs during training
+use_remove_padding: ${oc.select:actor_rollout_ref.model.use_remove_padding,false}

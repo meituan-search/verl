@@ -4,6 +4,10 @@ hydra:
 
 defaults:
   - ppo_trainer
+
+  # model_engine_server config (only used in fully_async)
+  - model_engine_server@model_engine_server: dp_model_engine_server
+
   - _self_
 
 trainer:
