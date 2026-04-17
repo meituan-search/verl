@@ -101,6 +101,12 @@ require_batches=4
 partial_rollout=True
 lr_decay_steps=$(((4 * 4 * 400)))
 
+# Rollout Correction
+rollout_is=token
+rollout_is_threshold=2.0
+rollout_rs=seq_mean_k1
+rollout_rs_threshold="0.99_1.001"
+
 python -X faulthandler -m verl.experimental.fully_async_policy.fully_async_main \
     --config-path=config \
     --config-name='fully_async_ppo_megatron_trainer.yaml' \
@@ -191,6 +197,10 @@ python -X faulthandler -m verl.experimental.fully_async_policy.fully_async_main 
     actor_rollout_ref.rollout.checkpoint_engine.backend='nccl' \
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
     algorithm.rollout_correction.bypass_mode=False \
+    algorithm.rollout_correction.rollout_is=${rollout_is} \
+    algorithm.rollout_correction.rollout_is_threshold=${rollout_is_threshold} \
+    algorithm.rollout_correction.rollout_rs=${rollout_rs} \
+    algorithm.rollout_correction.rollout_rs_threshold=${rollout_rs_threshold} \
     model_engine_server.enable_standalone=True \
     model_engine_server.nnodes="${NNODES_LOG_PROB}" \
     model_engine_server.n_gpus_per_node="${NGPUS_PER_NODE}" \
