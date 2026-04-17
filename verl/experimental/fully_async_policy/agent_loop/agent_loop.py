@@ -19,7 +19,6 @@ from typing import Any, Optional
 
 import ray
 import torch
-from cachetools import LRUCache
 from omegaconf import DictConfig
 
 from verl.experimental.agent_loop.agent_loop import (
@@ -62,9 +61,6 @@ class ElasticGlobalRequestLoadBalancer:
     def __init__(self, server_actor_ids: list[str], max_cache_size: int = DEFAULT_ROUTING_CACHE_SIZE):
         if not server_actor_ids:
             raise ValueError("server_actor_ids must be non-empty")
-
-        # Active servers with their in-flight request counts.
-        # Only servers in this dict are eligible for acquire_server().
         self._servers: dict[str, int] = {sid: 0 for sid in server_actor_ids}
 
     def acquire_server(self, request_id: str) -> str:
@@ -82,28 +78,13 @@ class ElasticGlobalRequestLoadBalancer:
             self._servers[server_id] -= 1
 
     def add_server(self, server_id: str) -> None:
-        """Add a new server to the pool.  No-op if already present."""
         if server_id not in self._servers:
             self._servers[server_id] = 0
             print(f"[ElasticLB] Added server: {server_id}")
 
     def remove_server(self, server_id: str) -> None:
-        """Remove a server from the pool immediately.
-
-        The caller MUST ensure no in-flight requests are routed to this
-        server before calling this (e.g. by aborting requests and removing
-        the handle from all workers' server_manager maps).
-        """
         self._servers.pop(server_id, None)
         print(f"[ElasticLB] Removed server: {server_id}")
-
-    def get_inflight_count(self, server_id: str) -> int:
-        """Get number of in-flight requests for a server."""
-        return self._servers.get(server_id, 0)
-
-    def get_all_servers(self) -> list[str]:
-        """Get list of all active server IDs."""
-        return list(self._servers.keys())
 
 
 class FullyAsyncLLMServerManager(AsyncLLMServerManager):
@@ -547,7 +528,10 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             #    → resume kv_cache).  The caller (_trainer_side_validate) already
             #    invoked update_weights() in Phase 1 Step 1, so we skip wake_up()
             #    here and only do LB registration for HYBRID replicas.
-            print(f"[FullyAsyncAgentLoopManager] add_elastic_replica('{resource_id}'): Step 1 wake_up (rollout_mode={replica.rollout_mode})")
+            print(
+                f"[FullyAsyncAgentLoopManager] add_elastic_replica('{resource_id}'): "
+                f"Step 1 wake_up (rollout_mode={replica.rollout_mode})"
+            )
             if replica.rollout_mode != RolloutMode.HYBRID:
                 await replica.wake_up()
                 print(f"[FullyAsyncAgentLoopManager] Replica '{resource_id}' woken up at {server_address}")
@@ -626,26 +610,13 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             print(f"[FullyAsyncAgentLoopManager] remove_elastic('{resource_id}'): Step 2 notify workers server_removed")
             await self._notify_workers_server_removed(server_address)
 
-            # Step 3: Abort in-flight requests → triggers partial-rollout resume
-            print(f"[FullyAsyncAgentLoopManager] remove_elastic('{resource_id}'): Step 3 abort_all_requests")
-            await replica.abort_all_requests()
             print(
-                f"[FullyAsyncAgentLoopManager] Aborted in-flight requests on {server_address}; "
-                f"partial-rollout resume will redirect them to healthy servers"
+                f"[FullyAsyncAgentLoopManager] remove_elastic('{resource_id}'): Step 5 sleep (release KV cache + weights)"
             )
 
-            # Step 4: (Skipped) ElasticGlobalRequestLoadBalancer uses immediate remove_server()
-            #         (no two-phase cleanup).  The server was already removed from the LB
-            #         in Step 1, so there is nothing to clean up here.
-
-            # Step 5: Sleep the replica to release model weights / kv-cache so the
-            #         training engine can reclaim the shared GPUs.
-            print(f"[FullyAsyncAgentLoopManager] remove_elastic('{resource_id}'): Step 5 sleep (release KV cache + weights)")
             await replica.sleep()
             print(f"[FullyAsyncAgentLoopManager] remove_elastic('{resource_id}'): Step 5 sleep DONE")
-            print(
-                f"[FullyAsyncAgentLoopManager] Replica '{resource_id}' put to sleep; GPUs released for training engine"
-            )
+
             # Remove tracking state
             self.alive_replicas.pop(resource_id)
             self.alive_addresses.pop(resource_id)
@@ -662,59 +633,6 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         except Exception as e:
             logger.error(f"[FullyAsyncAgentLoopManager] Failed to remove replica {resource_id}: {e}")
             return False
-
-    async def force_remove_elastic_tracking(self, resource_id: str) -> None:
-        """
-        Force-remove elastic replica tracking state without waiting for
-        abort/sleep to complete.  Used as a safety net when
-        remove_elastic_replica() times out (e.g. due to stuck in-flight
-        requests on the SGLang server).
-
-        This method only cleans up in-memory tracking state (alive_replicas,
-        alive_addresses, rollout_replicas, server_addresses/handles, LB).
-        It does NOT call abort_all_requests() or sleep() — the caller has
-        already decided those are stuck / timed out.
-        """
-        print(f"[FullyAsyncAgentLoopManager] force_remove_elastic_tracking('{resource_id}'): forcing cleanup")
-
-        if resource_id not in self.alive_replicas:
-            logger.warning(
-                f"[FullyAsyncAgentLoopManager] force_remove_elastic_tracking: "
-                f"'{resource_id}' not in alive_replicas, nothing to do"
-            )
-            return
-
-        server_address = self.alive_addresses.get(resource_id)
-        replica = self.alive_replicas[resource_id]
-
-        try:
-            # 1. Ensure server is removed from LB (idempotent)
-            if server_address:
-                try:
-                    await self.global_load_balancer.remove_server.remote(server_id=server_address)
-                except Exception:
-                    pass  # May already be removed or actor is dead
-
-            # 2. Remove handle from workers
-            if server_address:
-                try:
-                    await self._notify_workers_server_removed(server_address)
-                except Exception as e:
-                    logger.warning(f"[FullyAsyncAgentLoopManager] force_remove: worker notify failed: {e}")
-
-            # 3. Clean up tracking state
-            self.alive_replicas.pop(resource_id, None)
-            self.alive_addresses.pop(resource_id, None)
-            if replica in self.rollout_replicas:
-                self.rollout_replicas.remove(replica)
-
-            print(
-                f"[FullyAsyncAgentLoopManager] force_remove_elastic_tracking('{resource_id}'): done. "
-                f"Remaining elastic: {len(self.alive_replicas)}"
-            )
-
-        except Exception as e:
-            logger.error(f"[FullyAsyncAgentLoopManager] force_remove_elastic_tracking failed: {e}")
 
     # -------------------------------------------------------------------------
     # Private helpers

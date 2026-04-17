@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import asyncio
-import logging
 import multiprocessing
 import os
 import time
@@ -33,8 +32,7 @@ from verl.experimental.fully_async_policy.detach_utils import (
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayWorkerGroup
-from verl.trainer.ppo.ray_trainer import ResourcePoolManager
-from verl.trainer.ppo.utils import Role, WorkerType
+from verl.trainer.ppo.utils import Role
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.profiler import marked_timer
 from verl.utils.tracking import ValidationGenerationsLogger
@@ -390,7 +388,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         from verl.experimental.fully_async_policy.agent_loop import FullyAsyncAgentLoopManager
 
         self.async_rollout_mode = True
-        elastic_wg = self._get_elastic_worker_group()
+        elastic_wg = self.get_elastic_worker_group()
         self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
             config=self.config,
             worker_group=self.rollout_wg,
@@ -696,119 +694,36 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     # -------------------------------------------------------------------------
     # Elastic worker group injection
     # -------------------------------------------------------------------------
-
-    def set_elastic_worker_group(self, worker_group: RayWorkerGroup) -> None:
-        """
-        Inject the elastic worker group.
-
-        Must be called **before** ``init_workers()`` so that
-        ``_init_async_rollout_manager`` can pass it to
-        ``ElasticAgentLoopManager.create()``.
-
-        If ``init_workers()`` has already been called, use
-        ``_reinit_elastic_replicas()`` instead to register the hybrid replicas
-        after the fact.
-
-        Args:
-            worker_group: The RayWorkerGroup whose GPUs are shared with the
-                training engine.  Each worker in this group will back one
-                elastic hybrid rollout replica.
-        """
+    def set_elastic_worker_group(self, worker_group: RayWorkerGroup):
+        """Inject the elastic worker group."""
         self._elastic_worker_group = worker_group
-        print(f"[ElasticRollouter] Elastic worker group set (world_size={getattr(worker_group, 'world_size', '?')})")
 
-    def _get_elastic_worker_group(self) -> "RayWorkerGroup | None":
-        """
-        Return the worker group for elastic hybrid replicas.
-
-        Returns the worker group injected via ``set_elastic_worker_group()``,
-        or ``None`` if none was injected (no elastic replicas at start).
-        """
+    def get_elastic_worker_group(self):
+        """Return the worker group for elastic hybrid replicas."""
         return self._elastic_worker_group
 
     # -------------------------------------------------------------------------
     # Elastic replica management – thin delegation to async_rollout_manager
     # -------------------------------------------------------------------------
+    async def add_elastic_replica(self, resource_id: str):
+        """Activate a pre-registered elastic hybrid replica."""
+        await self.async_rollout_manager.add_elastic_replica(resource_id)
 
-    async def add_elastic_replica(self, resource_id: str) -> bool:
-        """
-        Activate a pre-registered elastic hybrid replica.
-
-        The replica must have been supplied via ``_get_elastic_worker_group()``
-        at initialisation time.  FullyAsyncAgentLoopManager will wake_up() the
-        server and register it with the load balancer.
-
-        Also adjusts max_concurrent_samples to account for the new replica.
-        """
-        ok = await self.async_rollout_manager.add_elastic_replica(resource_id)
-        if ok and self.max_concurrent_samples is not None:
-            async with self.lock:
-                self.max_concurrent_samples += 16  # ~16 slots per replica
-        return ok
-
-    async def remove_elastic_replica(self, resource_id: str) -> bool:
-        """
-        Deactivate an active elastic hybrid replica.
-
-        ElasticAgentLoopManager will abort in-flight requests (triggering
-        partial-rollout auto-resume on healthy servers), deregister from the
-        LB, then sleep() the server to return GPUs to the training engine.
-        The replica remains pre-registered and can be re-activated later.
-
-        Also adjusts max_concurrent_samples.
-        """
-        ok = await self.async_rollout_manager.remove_elastic_replica(resource_id)
-        if ok and self.max_concurrent_samples is not None:
-            # Note: don't use self.lock here to avoid potential deadlock with
-            # _streaming_generation_main which may hold the lock during long-running
-            # generate operations. max_concurrent_samples is just an int; minor races
-            # are acceptable.
-            self.max_concurrent_samples = max(16, self.max_concurrent_samples - 16)
-        return ok
-
-    async def force_remove_elastic_tracking(self, resource_id: str) -> None:
-        """
-        Force-remove elastic replica tracking state without waiting for
-        abort/sleep to complete. Used as a safety net when
-        remove_elastic_replica() times out (e.g. due to stuck inflight
-        requests on the SGLang server).
-        """
-        print(f"[FullyAsyncRollouter] force_remove_elastic_tracking('{resource_id}'): forcing cleanup")
-        await self.async_rollout_manager.force_remove_elastic_tracking(resource_id)
-        if self.max_concurrent_samples is not None:
-            # Same lock-free pattern as remove_elastic_replica to avoid deadlock.
-            self.max_concurrent_samples = max(16, self.max_concurrent_samples - 16)
-        print(f"[FullyAsyncRollouter] force_remove_elastic_tracking('{resource_id}'): done")
-
-    def update_elastic_replica_version(self, resource_id: str, param_version: int) -> None:
-        """Update the param version for an elastic replica after a sync."""
-        self.async_rollout_manager.update_elastic_replica_version(resource_id, param_version)
+    async def remove_elastic_replica(self, resource_id: str):
+        """Deactivate an active elastic hybrid replica."""
+        await self.async_rollout_manager.remove_elastic_replica(resource_id)
 
     def get_elastic_replica(self, resource_id: str):
-        """
-        Return the RolloutReplica object for a registered elastic resource.
-
-        Used by CheckpointEngineManager to register hybrid replicas for
-        parameter synchronisation.
-
-        Returns:
-            RolloutReplica if found in elastic_replicas, else None.
-        """
+        """Return the RolloutReplica object for a registered elastic resource."""
         return self.async_rollout_manager.elastic_replicas.get(resource_id)
 
     def get_all_elastic_replicas(self) -> dict:
-        """
-        Return all registered elastic replicas (sleeping + active).
-
-        Returns:
-            Dict[resource_id → RolloutReplica] from elastic_replicas.
-        """
+        """Return all registered elastic replicas (sleeping + active)."""
         return dict(self.async_rollout_manager.elastic_replicas)
 
     # -------------------------------------------------------------------------
     # Statistics / introspection – delegate to async_rollout_manager
     # -------------------------------------------------------------------------
-
     async def get_elastic_statistics(self) -> dict:
         """Combined rollout + elastic statistics."""
         base_stats = await self.get_statistics()
