@@ -25,12 +25,23 @@ ray job submit \
 --working-dir . \
 -- bash verl/experimental/fully_async_policy/exp/exp4_fully_async_model_engine_server.sh
 
-
 RAY_ADDRESS='http://33.18.236.7:44390' \
 ray job submit \
 --runtime-env verl/experimental/fully_async_policy/exp/exp4_runtime_env.yaml \
 --working-dir . \
 -- bash verl/experimental/fully_async_policy/exp/exp4_fully_async_model_engine_server.sh
-```
+
+RAY_ADDRESS='http://33.18.236.7:44390' \
+ray job submit \
+--runtime-env verl/experimental/fully_async_policy/exp/exp5_runtime_env.yaml \
+--working-dir . \
+-- bash verl/experimental/fully_async_policy/exp/exp5_fully_async_model_engine_server_fsdp.sh
+
+RAY_ADDRESS='http://33.18.250.9:44390'  \
+ray job submit \
+--runtime-env verl/experimental/fully_async_policy/shell/runtime_env.yaml \
+--working-dir . \
+-- bash verl/experimental/fully_async_policy/shell/dapo_7b_math_fsdp2_8_8_8.sh
+
 
 
