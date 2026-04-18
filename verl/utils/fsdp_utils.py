@@ -1157,13 +1157,13 @@ async def fsdp_load_full_state_dict_per_tensor(
 
     for handle in model._all_handles:
         flat_param = handle.flat_param
-        fqns = flat_param._fqns                   # list[str]: one entry per param slot
-        numels = flat_param._numels_with_padding   # list[int]: includes alignment padding
-        is_padding = flat_param._is_padding_mask   # list[bool]
+        fqns = flat_param._fqns  # list[str]: one entry per param slot
+        numels = flat_param._numels_with_padding  # list[int]: includes alignment padding
+        is_padding = flat_param._is_padding_mask  # list[bool]
 
         offsets = [0] + list(accumulate(numels))
         param_map = {}
-        for i, (fqn, is_pad) in enumerate(zip(fqns, is_padding)):
+        for i, (fqn, is_pad) in enumerate(zip(fqns, is_padding, strict=False)):
             if is_pad:
                 continue
             param_map[fqn] = (offsets[i], numels[i])
@@ -1194,9 +1194,7 @@ async def fsdp_load_full_state_dict_per_tensor(
         if handle is None:
             continue
         start, numel = handle_param_map[handle][name]
-        handle_flat_buf[handle][start : start + numel].copy_(
-            full_tensor.detach().cpu().flatten()
-        )
+        handle_flat_buf[handle][start : start + numel].copy_(full_tensor.detach().cpu().flatten())
 
     # ------------------------------------------------------------------ #
     # Step 4: shard and copy into flat_param._local_shard                 #
@@ -1242,16 +1240,29 @@ def _shard_full_tensor_locally(
     """
     from torch.distributed.tensor import Replicate, Shard
 
+    _log0 = (not dist.is_initialized()) or dist.get_rank() == 0
+    _log0 = False
     local = full_tensor
     for mesh_dim, placement in enumerate(placements):
         if isinstance(placement, Shard):
             shard_dim = placement.dim
             mesh_size = mesh.size(mesh_dim)
             mesh_coord = mesh.get_local_rank(mesh_dim)
+            if _log0:
+                print(
+                    f"[rank0] _shard_full_tensor_locally: mesh_dim={mesh_dim}, "
+                    f"shard_dim={shard_dim}, mesh_size={mesh_size}, mesh_coord={mesh_coord}, "
+                    f"input_shape={local.shape}",
+                    flush=True,
+                )
             # chunk semantics: last shard may be smaller
             chunks = local.chunk(mesh_size, dim=shard_dim)
             local = chunks[mesh_coord].contiguous()
+            if _log0:
+                print(f"[rank0]   -> local shard shape after chunk: {local.shape}", flush=True)
         elif isinstance(placement, Replicate):
+            if _log0:
+                print(f"[rank0] _shard_full_tensor_locally: mesh_dim={mesh_dim}, placement=Replicate, no-op, shape={local.shape}", flush=True)
             pass  # every rank keeps the full tensor
         else:
             raise NotImplementedError(f"Unsupported placement type: {type(placement)}")
@@ -1274,6 +1285,13 @@ async def fsdp2_load_full_state_dict_per_tensor(
     # Build a name → param map once so look-ups are O(1).
     param_map = dict(model.named_parameters())
 
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    _log0 = rank == 0  # only rank-0 prints to avoid interleaved output
+    _log0 = False
+    if _log0:
+        print(f"[rank0] fsdp2_load_full_state_dict_per_tensor: model={model.__class__.__name__}", flush=True)
+        print(f"[rank0] param_map keys ({len(param_map)}): {list(param_map.keys())}", flush=True)
+
     device = get_device_id()
 
     # Collect the FSDP device mesh so we can barrier on its process group only,
@@ -1281,14 +1299,20 @@ async def fsdp2_load_full_state_dict_per_tensor(
     fsdp_mesh = None
 
     async for name, full_tensor in state_dict_iter:
+        if _log0:
+            print(f"[rank0] received tensor: name={name!r}, shape={full_tensor.shape}, dtype={full_tensor.dtype}, device={full_tensor.device}", flush=True)
         param = param_map.get(name)
         if param is None:
+            if _log0:
+                print(f"[rank0]   -> name={name!r} not found in param_map, skipping", flush=True)
             continue
 
         if isinstance(param, DTensor):
             spec = param._spec
             mesh = spec.device_mesh
             placements = spec.placements
+            if _log0:
+                print(f"[rank0]   -> DTensor: mesh={mesh}, placements={placements}", flush=True)
 
             if fsdp_mesh is None:
                 fsdp_mesh = mesh
@@ -1308,6 +1332,8 @@ async def fsdp2_load_full_state_dict_per_tensor(
 
             del gpu_tensor, local_shard
         else:
+            if _log0:
+                print(f"[rank0]   -> non-DTensor param: name={name!r}, type={type(param)}", flush=True)
             # Non-DTensor parameter: copy directly to param device.
             param.data.copy_(full_tensor.to(device=param.device, non_blocking=False))
 

@@ -1,32 +1,37 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
+# ============================================================
+# Experiment Identity
+# ============================================================
 project_name='DAPO'
 exp_name='DAPO-Qwen2.5-7b-MATH-0527a1-fsdp2-fully-async-8-8'
 
+# ============================================================
 # Paths
+# NOTE: modify max_position_embeddings in config.json to 32768
+#       after downloading the model from HuggingFace.
+# ============================================================
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-# very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen2.5-Math-7B"}
+MODEL_PATH=${MODEL_PATH:-"/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/model/Qwen2___5-Math-7B"}
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
-TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
-# MODEL_PATH=/cfs_shtx5_serving_3/mlp/training/docker/user/hadoop-ai-search/houzhenggang/model/Qwen/Qwen2___5-Math-7B
-# TRAIN_FILE=/cfs_shtx5_serving_3/mlp/training/docker/user/hadoop-ai-search/houzhenggang/data/dapo/dapo-math-17k.parquet
-# TEST_FILE=/cfs_shtx5_serving_3/mlp/training/docker/user/hadoop-ai-search/houzhenggang/data/dapo/aime-2024.parquet
-MODEL_PATH=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/model/Qwen2___5-Math-7B
-TRAIN_FILE=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/data/dapo/dapo-math-17k.parquet
-TEST_FILE=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/data/dapo/aime-2024.parquet
+TRAIN_FILE=${TRAIN_FILE:-"/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/data/dapo/dapo-math-17k.parquet"}
+TEST_FILE=${TEST_FILE:-"/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/data/dapo/aime-2024.parquet"}
 
-
+# ============================================================
+# Rollout Mode
+# ============================================================
 rollout_mode="async"
-rollout_name="vllm" # sglang or vllm
+rollout_name="vllm"  # sglang or vllm
+
 if [ "$rollout_mode" = "async" ]; then
     export VLLM_USE_V1=1
     return_raw_chat="True"
 fi
 
-# Algorithm parameters
+# ============================================================
+# Algorithm
+# ============================================================
 adv_estimator=grpo
 
 use_kl_in_reward=False
@@ -37,46 +42,58 @@ kl_loss_coef=0.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
 
-# Response length parameters
+# ============================================================
+# Sequence Length
+# ============================================================
 max_prompt_length=$((1024 * 2))
 max_response_length=$((1024 * 8))
+
 enable_overlong_buffer=True
 overlong_buffer_len=$((1024 * 4))
 overlong_penalty_factor=1.0
 
-# Training parameters
+# ============================================================
+# Training Hyperparameters
+# ============================================================
 loss_agg_mode="token-mean"
-
-# Algorithm
 temperature=1.0
 top_p=1.0
-top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
+top_k=-1      # 0 for HF rollout, -1 for vLLM rollout
 val_top_p=0.7
 
-# Performance Related Parameter
-use_dynamic_bsz=True
+# ============================================================
+# Performance / Parallelism
+# ============================================================
+use_dynamic_bsz=False
 actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
 infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3))
+
 ref_offload=True
 actor_offload=False
 gen_tp=1
 sp_size=1
-fsdp_size=2
+fsdp_size=8
 
-# Fully async specific parameters
+# ============================================================
+# Cluster Topology
+# ============================================================
 NNODES_ROLLOUT=${NNODES_ROLLOUT:-1}
 NNODES_TRAIN=${NNODES_TRAIN:-1}
 NNODES_LOG_PROB=${NNODES_LOG_PROB:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
+# ============================================================
+# Fully-Async Specific
+# ============================================================
 train_prompt_bsz=0
 gen_prompt_bsz=1
 n_resp_per_prompt=8
 train_prompt_mini_bsz=4
 total_rollout_steps=$(((512*400)))
 test_freq=20
-staleness_threshold=0.5
-trigger_parameter_sync_step=2
+
+staleness_threshold=0
+trigger_parameter_sync_step=4
 require_batches=1
 partial_rollout=True
 
@@ -122,6 +139,8 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.80 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
@@ -170,6 +189,6 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     model_engine_server.enable_standalone=True \
     model_engine_server.nnodes="${NNODES_LOG_PROB}" \
     model_engine_server.n_gpus_per_node="${NGPUS_PER_NODE}" \
-    model_engine_server.use_dynamic_bsz=${use_dynamic_bsz} \
+    model_engine_server.use_dynamic_bsz=False \
     model_engine_server.fsdp_config.fsdp_size=2 \
     model_engine_server.fsdp_config.strategy=fsdp2
