@@ -20,7 +20,7 @@ import os
 from abc import ABC
 from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
-from typing import Optional, cast
+from typing import AsyncIterator, Optional, cast
 
 import torch
 import torch.distributed as dist
@@ -1114,3 +1114,239 @@ def fsdp2_sharded_load_from_cpu(
 
     # Process synchronization: ensure all processes complete loading before proceeding
     dist.barrier()
+
+
+@torch.no_grad()
+async def fsdp_load_full_state_dict_per_tensor(
+    model: FSDP,
+    state_dict_iter: AsyncIterator[tuple[str, torch.Tensor]],
+    cpu_offload: bool = False,
+) -> None:
+    """Load weights into an FSDP1 model one tensor at a time to avoid peak-memory OOM.
+
+    FSDP1 stores parameters as FlatParameter — each handle concatenates multiple original
+    parameters into one flat buffer. This function:
+      1. Builds a fqn → (handle, flat_offset, numel) map from handle metadata.
+      2. Allocates one temporary full flat buffer per handle on CPU.
+      3. Streams (name, tensor) pairs, writing each into the correct slot of its handle's
+         flat buffer.
+      4. After streaming, uses FlatParamHandle._get_shard to extract this rank's local
+         shard and copies it into flat_param._local_shard.
+
+    Args:
+        model: FSDP1-wrapped model (isinstance(model, FSDP) must be True).
+        state_dict_iter: Async iterable of ``(name, tensor)`` pairs. Every rank receives
+                         valid tensors from the checkpoint engine.
+        cpu_offload: If True, keep the result on CPU (CPUOffload model).
+    """
+    from itertools import accumulate
+
+    from torch.distributed.fsdp._flat_param import FlatParamHandle
+    from torch.distributed.fsdp._runtime_utils import _lazy_init
+
+    _lazy_init(model, model)
+
+    device = get_device_id()
+    rank = dist.get_rank()
+
+    # ------------------------------------------------------------------ #
+    # Step 1: build per-handle metadata                                   #
+    # ------------------------------------------------------------------ #
+    # handle → { fqn: (flat_offset_start, numel) }
+    handle_param_map: dict = {}
+
+    for handle in model._all_handles:
+        flat_param = handle.flat_param
+        fqns = flat_param._fqns  # list[str]: one entry per param slot
+        numels = flat_param._numels_with_padding  # list[int]: includes alignment padding
+        is_padding = flat_param._is_padding_mask  # list[bool]
+
+        offsets = [0] + list(accumulate(numels))
+        param_map = {}
+        for i, (fqn, is_pad) in enumerate(zip(fqns, is_padding, strict=False)):
+            if is_pad:
+                continue
+            param_map[fqn] = (offsets[i], numels[i])
+
+        handle_param_map[handle] = param_map
+
+    # ------------------------------------------------------------------ #
+    # Step 2: allocate temporary full flat buffers (CPU, one per handle)  #
+    # ------------------------------------------------------------------ #
+    fqn_to_handle: dict = {}
+    for handle, param_map in handle_param_map.items():
+        for fqn in param_map:
+            fqn_to_handle[fqn] = handle
+
+    handle_flat_buf: dict = {}
+    for handle in model._all_handles:
+        flat_param = handle.flat_param
+        # flat_param.numel() is the padded shard size; full flat = shard * world_size
+        handle_flat_buf[handle] = torch.zeros(
+            flat_param.numel() * handle.world_size, dtype=flat_param.dtype, device="cpu"
+        )
+
+    # ------------------------------------------------------------------ #
+    # Step 3: stream tensors and fill flat buffers                        #
+    # ------------------------------------------------------------------ #
+    async for name, full_tensor in state_dict_iter:
+        handle = fqn_to_handle.get(name)
+        if handle is None:
+            continue
+        start, numel = handle_param_map[handle][name]
+        handle_flat_buf[handle][start : start + numel].copy_(full_tensor.detach().cpu().flatten())
+
+    # ------------------------------------------------------------------ #
+    # Step 4: shard and copy into flat_param._local_shard                 #
+    # ------------------------------------------------------------------ #
+    for handle in model._all_handles:
+        flat_param = handle.flat_param
+        flat_buf = handle_flat_buf[handle]
+
+        # _get_shard replicates FSDP1's own sharding logic (chunk + pad)
+        local_shard, _ = FlatParamHandle._get_shard(flat_buf, rank, handle.world_size)
+
+        target = flat_param._local_shard
+        if cpu_offload:
+            target.copy_(local_shard)
+        else:
+            target.copy_(local_shard.to(device=device, non_blocking=False))
+
+        del flat_buf, local_shard
+        handle_flat_buf[handle] = None
+
+    # Barrier within the FSDP process group only — not the global process group,
+    # which may include unrelated workers on other nodes.
+    fsdp_pg = model.process_group
+    dist.barrier(group=fsdp_pg)
+
+
+def _shard_full_tensor_locally(
+    full_tensor: torch.Tensor,
+    placements,
+    mesh,
+) -> torch.Tensor:
+    """Compute the local shard of ``full_tensor`` for the calling rank without any
+    collective communication.
+
+    ``distribute_tensor`` internally performs a scatter/broadcast over the device
+    mesh, which deadlocks when called concurrently with the NCCL checkpoint-engine
+    broadcast running in a thread-pool executor.  Instead we replicate its
+    sharding arithmetic locally:
+
+    * ``Shard(dim)``  → ``torch.chunk`` along ``dim``, take this rank's piece.
+    * ``Replicate()`` → the full tensor is the local tensor (no-op).
+    * Nested / multi-dim meshes are handled dimension-by-dimension.
+    """
+    from torch.distributed.tensor import Replicate, Shard
+
+    _log0 = (not dist.is_initialized()) or dist.get_rank() == 0
+    _log0 = False
+    local = full_tensor
+    for mesh_dim, placement in enumerate(placements):
+        if isinstance(placement, Shard):
+            shard_dim = placement.dim
+            mesh_size = mesh.size(mesh_dim)
+            mesh_coord = mesh.get_local_rank(mesh_dim)
+            if _log0:
+                print(
+                    f"[rank0] _shard_full_tensor_locally: mesh_dim={mesh_dim}, "
+                    f"shard_dim={shard_dim}, mesh_size={mesh_size}, mesh_coord={mesh_coord}, "
+                    f"input_shape={local.shape}",
+                    flush=True,
+                )
+            # chunk semantics: last shard may be smaller
+            chunks = local.chunk(mesh_size, dim=shard_dim)
+            local = chunks[mesh_coord].contiguous()
+            if _log0:
+                print(f"[rank0]   -> local shard shape after chunk: {local.shape}", flush=True)
+        elif isinstance(placement, Replicate):
+            if _log0:
+                print(f"[rank0] _shard_full_tensor_locally: mesh_dim={mesh_dim}, placement=Replicate, no-op, shape={local.shape}", flush=True)
+            pass  # every rank keeps the full tensor
+        else:
+            raise NotImplementedError(f"Unsupported placement type: {type(placement)}")
+    return local
+
+
+@torch.no_grad()
+async def fsdp2_load_full_state_dict_per_tensor(
+    model: torch.nn.Module,
+    state_dict_iter: AsyncIterator[tuple[str, torch.Tensor]],
+    cpu_offload: bool = False,
+) -> None:
+    """Load weights into an FSDP2 model one tensor at a time to avoid peak-memory OOM.
+
+    Each rank receives the full tensor independently from the checkpoint engine and
+    computes its local shard via pure local arithmetic (no collective communication).
+    This avoids deadlocking with the NCCL broadcast that is already running in a
+    background thread for the checkpoint engine.
+    """
+    # Build a name → param map once so look-ups are O(1).
+    param_map = dict(model.named_parameters())
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    _log0 = rank == 0  # only rank-0 prints to avoid interleaved output
+    _log0 = False
+    if _log0:
+        print(f"[rank0] fsdp2_load_full_state_dict_per_tensor: model={model.__class__.__name__}", flush=True)
+        print(f"[rank0] param_map keys ({len(param_map)}): {list(param_map.keys())}", flush=True)
+
+    device = get_device_id()
+
+    # Collect the FSDP device mesh so we can barrier on its process group only,
+    # not on the global (gloo) process group which spans unrelated workers.
+    fsdp_mesh = None
+
+    async for name, full_tensor in state_dict_iter:
+        if _log0:
+            print(f"[rank0] received tensor: name={name!r}, shape={full_tensor.shape}, dtype={full_tensor.dtype}, device={full_tensor.device}", flush=True)
+        param = param_map.get(name)
+        if param is None:
+            if _log0:
+                print(f"[rank0]   -> name={name!r} not found in param_map, skipping", flush=True)
+            continue
+
+        if isinstance(param, DTensor):
+            spec = param._spec
+            mesh = spec.device_mesh
+            placements = spec.placements
+            if _log0:
+                print(f"[rank0]   -> DTensor: mesh={mesh}, placements={placements}", flush=True)
+
+            if fsdp_mesh is None:
+                fsdp_mesh = mesh
+
+            # Move full tensor to GPU (each rank received it independently).
+            gpu_tensor = full_tensor.to(device=device, non_blocking=False)
+
+            # Compute this rank's local shard purely locally — no collective comm.
+            local_shard = _shard_full_tensor_locally(gpu_tensor, placements, mesh)
+
+            # Write into the existing _local_tensor (avoids re-allocation).
+            target = param._local_tensor
+            if cpu_offload:
+                target.copy_(local_shard.cpu())
+            else:
+                target.copy_(local_shard)
+
+            del gpu_tensor, local_shard
+        else:
+            if _log0:
+                print(f"[rank0]   -> non-DTensor param: name={name!r}, type={type(param)}", flush=True)
+            # Non-DTensor parameter: copy directly to param device.
+            param.data.copy_(full_tensor.to(device=param.device, non_blocking=False))
+
+    # Barrier only within the FSDP process group (the ranks that share this model
+    # shard).  Using the global process group would include unrelated workers on
+    # other nodes and cause a "Connection closed by peer" error when those workers
+    # exit before reaching the barrier.
+    if fsdp_mesh is not None:
+        # device_mesh may be 1-D ["fsdp"] or 2-D ["ddp", "fsdp"].
+        # FSDP2 sharding is always on the "fsdp" dimension; get that sub-group.
+        if "fsdp" in fsdp_mesh.mesh_dim_names:
+            fsdp_pg = fsdp_mesh.get_group(mesh_dim="fsdp")
+        else:
+            # Fallback: single-dim mesh, mesh_dim=0.
+            fsdp_pg = fsdp_mesh.get_group(mesh_dim=0)
+        dist.barrier(group=fsdp_pg)

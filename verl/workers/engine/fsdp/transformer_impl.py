@@ -820,6 +820,31 @@ class FSDPEngine(BaseEngine):
         peft_config_dict = peft_config.to_dict() if peft_config is not None else None
         return per_tensor_param, peft_config_dict
 
+    async def set_param_from_async_generator(self, weight_generator) -> None:
+        """Load weights from an async (name, tensor) generator into the FSDP model."""
+        from verl.utils.fsdp_utils import (
+            fsdp2_load_full_state_dict_per_tensor,
+            fsdp_load_full_state_dict_per_tensor,
+            fsdp_version,
+        )
+
+        # For forward_only (CPUOffload) models, _is_offload_param is forced to False at
+        # init time, so detect the actual offload state from the parameter device.
+        is_cpu_offload = next(self.module.parameters()).device.type == "cpu"
+
+        if fsdp_version(self.module) == 1:
+            await fsdp_load_full_state_dict_per_tensor(
+                self.module,
+                weight_generator,
+                cpu_offload=is_cpu_offload,
+            )
+        else:
+            await fsdp2_load_full_state_dict_per_tensor(
+                self.module,
+                weight_generator,
+                cpu_offload=is_cpu_offload,
+            )
+
     def disable_adapter(self) -> ContextManager:
         return self.module.disable_adapter()
 
