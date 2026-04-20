@@ -161,13 +161,18 @@ class MetaBuffer:
         """
         while True:
             with self.lock:
-                ready = [(k, v) for k, v in self.partitions.get(partition_id).items() if v.get("status") == "success"]
+                part = self.partitions.get(partition_id)
+                if part is None:
+                    # Partition not yet created (no samples written yet), wait
+                    pass
+                else:
+                    ready = [(k, v) for k, v in part.items() if v.get("status") == "success"]
 
-                if len(ready) >= batch_size:
-                    return ready[:batch_size]
+                    if len(ready) >= batch_size:
+                        return ready[:batch_size]
 
-                if self._finished:
-                    return ready if ready else None
+                    if self._finished:
+                        return ready if ready else None
 
             time.sleep(self.poll_interval)
 
@@ -205,13 +210,11 @@ class MetaBuffer:
 
     # ======== Producer / control signals ========
 
-    @property
     def pending_count(self) -> int:
         """Count of samples with status='running' across all partitions."""
         with self.lock:
             return sum(1 for part in self.partitions.values() for v in part.values() if v.get("status") == "running")
 
-    @property
     def ready_count(self) -> int:
         """Count of samples with status='success' available for consumption."""
         with self.lock:
@@ -223,7 +226,6 @@ class MetaBuffer:
             self._finished = True
             self._slot_available.notify_all()
 
-    @property
     def is_finished(self) -> bool:
         """True if finish signaled and no pending slots remain."""
         with self.lock:

@@ -23,8 +23,6 @@ from pprint import pformat
 import ray
 import torch
 
-from verl.utils import tensordict_utils as tu
-
 try:
     import transfer_queue as tq
 except ImportError:
@@ -418,20 +416,29 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
             # Convert DataProto (batch_size=1 after prepare) to TensorDict for TQ
             batch_tensor_dict = full_batch.to_tensordict()
-            tu.assign_non_tensor_data(batch_tensor_dict, "global_steps", self.global_steps)
-            tu.assign_non_tensor_data(batch_tensor_dict, "uid", uid)
+            # Note: global_steps and uid are stored in tags, not in the TensorDict fields
+            # because TQ requires all fields to be indexable tensors (not scalars)
+            if "global_steps" in batch_tensor_dict:
+                batch_tensor_dict.pop("global_steps")
+            if "uid" in batch_tensor_dict:
+                batch_tensor_dict.pop("uid")
 
             # Write input batch to TQ (partition="rollout_input")
             # AgentLoopWorker will read from this partition
+            # Note: batch may have batch_size > 1 (e.g. n=16 rollouts per prompt),
+            # so we need one key per sample in the batch
+            batch_size = batch_tensor_dict.batch_size[0] if hasattr(batch_tensor_dict, "batch_size") else 1
             tags = [
                 {
                     "global_steps": self.global_steps,
                     "status": "running",
                     "sample_id": sample_id,
+                    "uid": str(uid),
                 }
-            ]
+            ] * batch_size
+            keys = [f"{str(uid)}_{i}" for i in range(batch_size)]
             await tq.async_kv_batch_put(
-                keys=[uid],
+                keys=keys,
                 fields=batch_tensor_dict,
                 tags=tags,
                 partition_id="rollout_input",
@@ -498,7 +505,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 else:
                     await asyncio.sleep(10)
                     continue
-            uid = running_uids[0]
+            uid = str(running_uids[0])
             self.staleness_samples += 1
 
             # Check whether the number of concurrent tasks exceeds the limit

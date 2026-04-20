@@ -103,7 +103,7 @@ class FullyAsyncTaskRunner:
 
         # Create MetaBuffer (metadata channel backed by TQ kv_list polling)
         # max_pending_slots controls how many requests can be in-flight in TQ at once
-        meta_buffer = MetaBuffer(max_pending_slots=max_queue_size, poll_interval=1)
+        meta_buffer = MetaBuffer.remote(max_pending_slots=max_queue_size, poll_interval=1)
         self.components["meta_buffer"] = meta_buffer
 
         # Pass MetaBuffer to both rollouter and trainer
