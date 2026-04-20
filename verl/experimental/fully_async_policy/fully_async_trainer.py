@@ -540,30 +540,21 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # ================================================================
         phase_1_start = time.time()
         print("[FullyAsyncTrainer] Phase 1: Switching all GPUs to ROLLOUT mode")
-        print("[FullyAsyncTrainer]   Step 1: update_weights (naive sync → rollout_mode)")
         await self.hybrid_checkpoint_manager.update_weights(global_steps=self.current_param_version)
-
-        print("[FullyAsyncTrainer]   Step 2: abort_replicas")
         await self.checkpoint_manager.abort_replicas()
         await self.hybrid_checkpoint_manager.abort_replicas()
-
-        print("[FullyAsyncTrainer]   Step 3: Register elastic replicas with rollouter")
         elastic_replicas_dict = ray.get(self.rollouter.get_all_elastic_replicas.remote())
         elastic_resource_ids = list(elastic_replicas_dict.keys())
         for resource_id in elastic_resource_ids:
             ray.get(self.rollouter.add_elastic_replica.remote(resource_id))
-            print(f"[FullyAsyncTrainer] add_elastic_replica('{resource_id}')")
-
-        print("[FullyAsyncTrainer]   Step 4: resume_generation_replicas")
         await self.checkpoint_manager.resume_generation_replicas()
         await self.hybrid_checkpoint_manager.resume_generation_replicas()
-
         print(f"[FullyAsyncTrainer] Phase 1 done ({time.time() - phase_1_start:.2f}s)")
 
         # ================================================================
         # Phase 2: Run validation via RPC to rollouter
         # ================================================================
-        print(f"[FullyAsyncTrainer] Phase 2: Running validation (RPC to rollouter) at {time.strftime('%H:%M:%S')}")
+        print("[FullyAsyncTrainer] Phase 2: Running validation")
         val_metrics = ray.get(self.rollouter.do_validate.remote())
         self.logger.log(data=val_metrics, step=self.current_param_version)
 
@@ -571,16 +562,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # Phase 3: Switch elastic GPUs back to TRAIN mode
         # ================================================================
         print("[FullyAsyncTrainer] Phase 3: Switching elastic GPUs back to TRAIN mode")
-        print("[FullyAsyncTrainer]   Step 1: abort_replicas")
         await self.checkpoint_manager.abort_replicas()
         await self.hybrid_checkpoint_manager.abort_replicas()
-        print("[FullyAsyncTrainer]   Step 2: Unregister elastic replicas from rollouter ALM")
         for resource_id in elastic_resource_ids:
             ray.get(self.rollouter.remove_elastic_replica.remote(resource_id))
-            print(f"[FullyAsyncTrainer] remove_elastic_replica('{resource_id}')")
-        print("[FullyAsyncTrainer]  Step 3: sleep")
         await self.hybrid_checkpoint_manager.sleep_replicas()
-        print("[FullyAsyncTrainer]  Step 4: resume_generation")
         await self.checkpoint_manager.resume_generation_replicas()
         await self.hybrid_checkpoint_manager.resume_generation_replicas()
 

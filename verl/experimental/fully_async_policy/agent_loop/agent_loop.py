@@ -22,11 +22,11 @@ import torch
 from omegaconf import DictConfig
 
 from verl.experimental.agent_loop.agent_loop import (
+    DEFAULT_ROUTING_CACHE_SIZE,
     AgentLoopManager,
     AgentLoopWorker,
     AsyncLLMServerManager,
     TokenOutput,
-    DEFAULT_ROUTING_CACHE_SIZE,
 )
 from verl.experimental.agent_loop.prometheus_utils import update_prometheus_config
 from verl.experimental.teacher_loop import TeacherModelManager
@@ -41,6 +41,7 @@ from verl.workers.rollout import RolloutReplica
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
 
 class ElasticGlobalRequestLoadBalancer:
     """
@@ -69,10 +70,7 @@ class ElasticGlobalRequestLoadBalancer:
         if request_id in self._request_id_to_server:
             server_id = self._request_id_to_server[request_id]
             # Check if server is still available (not removed and still in pool)
-            if (
-                server_id in self._inflight_requests
-                and server_id not in self._removed_servers
-            ):
+            if server_id in self._inflight_requests and server_id not in self._removed_servers:
                 self._inflight_requests[server_id] += 1
                 return server_id
             # Server was removed, clear stale cache entry

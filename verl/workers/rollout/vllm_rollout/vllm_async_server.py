@@ -24,7 +24,6 @@ import ray
 import vllm.entrypoints.cli.serve
 from packaging import version
 from ray.actor import ActorHandle
-from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.cli.serve import run_headless
 from vllm.entrypoints.openai.api_server import build_app, init_app_state
@@ -52,6 +51,7 @@ from verl.workers.rollout.vllm_rollout.utils import (
     extract_prompt_logprobs,
     get_vllm_max_lora_rank,
 )
+from vllm import SamplingParams
 
 _VLLM_VERSION = version.parse(vllm.__version__)
 
@@ -452,7 +452,6 @@ class vLLMHttpServer:
         """Generate sequence with token-in-token-out."""
         # If server is in aborted state, return immediately without processing
         if self._is_aborted:
-            print(f"[vLLMHttpServer] generate() called while aborted, returning immediately for request {request_id}")
             return TokenOutput(
                 token_ids=[],
                 log_probs=None,
@@ -627,7 +626,6 @@ class vLLMHttpServer:
 
         # wake_up(kv_cache): allocate and restore kv_cache memory
         await self.engine.wake_up(tags=["kv_cache"])
-
 
     async def start_profile(self, **kwargs):
         if (
