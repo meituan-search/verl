@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import os
 import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Optional
@@ -33,7 +35,12 @@ __all__ = [
     "EngineConfig",
     "EngineRouterReplayConfig",
     "QATEngineConfig",
+    "MindSpeedEngineConfig",
 ]
+
+
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 # TODO: rename to RouterReplayConfig after removing the legacy implementation
@@ -310,6 +317,8 @@ class VeOmniEngineConfig(EngineConfig):
 
     """
 
+    _mutable_fields = EngineConfig._mutable_fields | {"attn_implementation"}
+
     wrap_policy: dict[str, Any] = field(default_factory=dict)
     offload_policy: bool = False
     reshard_after_forward: bool = True
@@ -340,6 +349,16 @@ class VeOmniEngineConfig(EngineConfig):
     def __post_init__(self):
         super().__post_init__()
         assert self.strategy in ["veomni"], f"strategy {self.strategy} not supported"
+
+        replacements = {
+            "flash_attention_2": "veomni_flash_attention_2_with_sp",
+            "flash_attention_3": "veomni_flash_attention_3_with_sp",
+            "flash_attention_4": "veomni_flash_attention_4_with_sp",
+        }
+        if self.attn_implementation in replacements:
+            new_impl = replacements[self.attn_implementation]
+            logger.info(f"Replacing attn_implementation from '{self.attn_implementation}' to '{new_impl}'")
+            self.attn_implementation = new_impl
 
 
 @dataclass
@@ -521,6 +540,30 @@ class AutomodelEngineConfig(EngineConfig):
             f"distributed_strategy {self.distributed_strategy} not supported"
         )
         assert self.pp_size == 1, "Pipeline parallelism (pp_size > 1) is not yet supported for automodel backend"
+
+
+@dataclass
+class MindSpeedEngineConfig(McoreEngineConfig):
+    """Configuration for mindspeed parallelism.
+
+    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+
+    Args:
+        llm_kwargs (str): mindspeed_llm engine kwargs.
+        mm_kwargs (str): mindspeed_mm engine kwargs.
+    """
+
+    strategy: str = "mindspeed_llm"
+    llm_kwargs: dict[str, Any] = field(default_factory=dict)
+    mm_kwargs: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """config validation logics go here"""
+        assert self.strategy in ["mindspeed_llm", "mindspeed_mm"], f"strategy {self.strategy} not supported"
+        assert self.dtype in ["bfloat16", "float16"], f"dtype {self.dtype} not supported"
+        if self.tensor_model_parallel_size == 1:
+            warnings.warn("set sequence parallel to false as TP size is 1", stacklevel=2)
+            self.sequence_parallel = False
 
 
 @dataclass

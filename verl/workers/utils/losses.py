@@ -16,8 +16,8 @@
 import torch
 from tensordict import TensorDict
 
+from verl.trainer.diffusion.diffusion_algos import kl_penalty_image
 from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
-from verl.trainer.ppo.diffusion_algos import kl_penalty_image
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.metric import AggregationType, Metric
@@ -82,6 +82,14 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         metric_aggregation = AggregationType.MEAN
 
     metrics = {}
+
+    # select fields and convert to padded tensor
+    fields = ["response_mask", "old_log_probs", "advantages"]
+    if "rollout_is_weights" in data:
+        fields.append("rollout_is_weights")
+    if "ref_log_prob" in data:
+        fields.append("ref_log_prob")
+    data = data.select(*fields).to_padded_tensor()
 
     response_mask = data["response_mask"].to(bool)
     # compute policy loss
@@ -151,6 +159,8 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
     """
     vpreds = no_padding_2_padding(model_output["values"], data)  # (bsz, response_length)
 
+    # select fields and convert to padded tensor
+    data = data.select("values", "returns", "response_mask").to_padded_tensor()
     values = data["values"]
     returns = data["returns"]
     response_mask = data["response_mask"].to(bool)

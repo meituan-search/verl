@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import logging
 import os
 import time
@@ -37,7 +38,7 @@ from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
-from verl.utils.tracking import Tracking
+from verl.utils.tracking import Tracking, ValidationGenerationsLogger
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +98,6 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
-        self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
 
         # ==================== SeparateRayPPOTrainer config ====================
         self.global_steps = 0
@@ -284,7 +284,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         queue_len = 0
         while len(queue_samples) < self.required_samples:
             # Get a single sample and wait until there is a sample or None is received
-            sample, queue_len = self.message_queue_client.get_sample_sync()
+            sample, queue_len = await self.message_queue_client.get_sample()
 
             if sample is None:
                 print(
@@ -498,7 +498,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         )
 
         # Reset staleness in rollouter
-        timing_raw = ray.get(self.rollouter.reset_staleness.remote())
+        timing_raw = await asyncio.wrap_future(self.rollouter.reset_staleness.remote().future())
         self.logger.log(
             data=timing_raw,
             step=self.current_param_version,
