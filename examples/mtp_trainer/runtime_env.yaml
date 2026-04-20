@@ -2,6 +2,7 @@ working_dir: ./
 
 excludes:
   - ".git/"
+  - "sglang"
 
 env_vars:
   VLLM_USE_V1: "1"
@@ -15,3 +16,4 @@ env_vars:
   # For distributed training, the path must be set on a distributed file system (DFS) to ensure visibility across all nodes.
   HF_HOME: "/tmp/hf_home_mimo"
   PYTHONPATH: "/tmp/hf_home_mimo/modules/"
+  TENSORBOARD_DIR: "/home/hadoop-djst-algoplat/data/tensorboard/qwen2.5-7b-math/4-4-dapo-use_trainer_do_validate"

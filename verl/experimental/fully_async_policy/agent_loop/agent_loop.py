@@ -28,9 +28,8 @@ from verl.experimental.agent_loop.agent_loop import (
     AsyncLLMServerManager,
     TokenOutput,
 )
-from verl.experimental.teacher_loop import MultiTeacherModelManager
 from verl.experimental.agent_loop.prometheus_utils import update_prometheus_config
-from verl.experimental.teacher_loop import TeacherModelManager
+from verl.experimental.teacher_loop import MultiTeacherModelManager
 from verl.protocol import DataProto
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup
 from verl.utils.ray_utils import auto_await
