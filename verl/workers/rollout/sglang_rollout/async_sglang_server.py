@@ -20,6 +20,7 @@ import os
 from typing import Any, Optional
 
 import ray
+import sglang
 import sglang.srt.entrypoints.engine
 import torch
 from packaging import version
@@ -40,7 +41,6 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.tokenizer_manager import ServerStatus
 
-import sglang
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_visible_devices_keyword
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
