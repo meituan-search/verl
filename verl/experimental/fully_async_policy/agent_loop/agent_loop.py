@@ -37,7 +37,6 @@ from verl.utils.rollout_trace import (
 )
 from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.rollout import RolloutReplica
-from verl.workers.rollout.replica import RolloutMode
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -520,6 +519,9 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             logger.warning(f"[FullyAsyncAgentLoopManager] Replica '{resource_id}' already active, skipping")
             return False
 
+        lb_status = await self.global_load_balancer.get_status.remote()
+        print(f"[FullyAsyncAgentLoopManager] lb_status '{lb_status}'")
+
         replica = self.elastic_replicas.get(resource_id)
         if replica is None:
             logger.error(
@@ -532,36 +534,8 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         server_address = replica._server_address
         server_handle = replica._server_handle
 
-        print(f"[FullyAsyncAgentLoopManager] Activating elastic replica '{resource_id}' at {server_address}")
         try:
-            # 1. Wake up: restore model weights / kv-cache on the shared GPU pool.
-            #    For HYBRID mode replicas, wake_up() is NOT supported because the
-            #    rollout engine is woken up inside update_weights() (which performs
-            #    the full rollout_mode transition: resume weights → sync → offload actor
-            #    → resume kv_cache).  The caller (_trainer_side_validate) already
-            #    invoked update_weights() in Phase 1 Step 1, so we skip wake_up()
-            #    here and only do LB registration for HYBRID replicas.
-            print(
-                f"[FullyAsyncAgentLoopManager] add_elastic_replica('{resource_id}'): "
-                f"Step 1 wake_up (rollout_mode={replica.rollout_mode})"
-            )
-            if replica.rollout_mode != RolloutMode.HYBRID:
-                await replica.wake_up()
-                print(f"[FullyAsyncAgentLoopManager] Replica '{resource_id}' woken up at {server_address}")
-            else:
-                print(
-                    f"[FullyAsyncAgentLoopManager] Replica '{resource_id}' is HYBRID mode — "
-                    f"skipping wake_up() (rollout was activated by update_weights() in Phase 1)"
-                )
-
-            # 2. Push the new handle into every AgentLoopWorker's local map FIRST,
-            #    so they can resolve the server_id before the LB starts routing to it.
-            print(f"[FullyAsyncAgentLoopManager] add_elastic_replica('{resource_id}'): Step 2 notify workers")
             await self._notify_workers_server_added(server_address, server_handle)
-
-            # 3. Only after all workers have the handle, register with the load balancer
-            #    so new requests can be routed to this server without racing.
-            print(f"[FullyAsyncAgentLoopManager] add_elastic_replica('{resource_id}'): Step 3 LB add_server")
             await self.global_load_balancer.add_server.remote(server_id=server_address)
 
             # 4. Record active state.
@@ -616,22 +590,9 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         server_address = self.alive_addresses[resource_id]
         replica = self.alive_replicas[resource_id]
 
-        print(f"[FullyAsyncAgentLoopManager] Removing elastic replica {resource_id} at {server_address}")
         try:
-            # Step 1: Stop new routing to this server
-            print(f"[FullyAsyncAgentLoopManager] remove_elastic('{resource_id}'): Step 1 LB remove_server")
             await self.global_load_balancer.remove_server.remote(server_id=server_address)
-
-            # Step 2: Remove handle from workers BEFORE aborting
-            print(f"[FullyAsyncAgentLoopManager] remove_elastic('{resource_id}'): Step 2 notify workers server_removed")
             await self._notify_workers_server_removed(server_address)
-
-            print(
-                f"[FullyAsyncAgentLoopManager] remove_elastic('{resource_id}'): Step 5 sleep (release KV cache + weights)"
-            )
-
-            await replica.sleep()
-            print(f"[FullyAsyncAgentLoopManager] remove_elastic('{resource_id}'): Step 5 sleep DONE")
 
             # Remove tracking state
             self.alive_replicas.pop(resource_id)
@@ -642,7 +603,8 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             self.last_elastic_remove_time = time.time()
 
             print(
-                f"[FullyAsyncAgentLoopManager] Replica {resource_id} removed. Total elastic: {len(self.alive_replicas)}"
+                f"[FullyAsyncAgentLoopManager] Replica {resource_id} at {server_address} removed. "
+                f"Total elastic: {len(self.alive_replicas)}"
             )
             return True
 

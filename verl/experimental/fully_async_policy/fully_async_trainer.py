@@ -578,7 +578,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         for resource_id in elastic_resource_ids:
             ray.get(self.rollouter.remove_elastic_replica.remote(resource_id))
             print(f"[FullyAsyncTrainer] remove_elastic_replica('{resource_id}')")
-        print("[FullyAsyncTrainer] Step 3: resume_generation (standalone servers ready)")
+        print("[FullyAsyncTrainer]  Step 3: sleep")
+        await self.hybrid_checkpoint_manager.sleep_replicas()
+        print("[FullyAsyncTrainer]  Step 4: resume_generation")
         await self.checkpoint_manager.resume_generation_replicas()
         await self.hybrid_checkpoint_manager.resume_generation_replicas()
 
