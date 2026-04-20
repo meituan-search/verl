@@ -328,9 +328,13 @@ class SGLangHttpServer:
         ) and not self.model_config.lora.get("merge", False)
 
     async def sleep(self):
-        print(f"[SGLangHttpServer] sleep() called: node_rank={self.node_rank}, rollout_mode={self.rollout_mode}, free_cache_engine={self.config.free_cache_engine}")
+        print(
+            f"[SGLangHttpServer] sleep() called: node_rank={self.node_rank}, rollout_mode={self.rollout_mode}, free_cache_engine={self.config.free_cache_engine}"
+        )
         if self.node_rank != 0 or not self.config.free_cache_engine:
-            print(f"[SGLangHttpServer] sleep() early return (node_rank={self.node_rank}, free_cache={self.config.free_cache_engine})")
+            print(
+                f"[SGLangHttpServer] sleep() early return (node_rank={self.node_rank}, free_cache={self.config.free_cache_engine})"
+            )
             return
 
         # When using LoRA as adapter (merge=False), only release kv_cache —
@@ -352,7 +356,7 @@ class SGLangHttpServer:
             # In standalone mode, resume kv_cache if free_cache_engine is enabled
             obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
             await self.tokenizer_manager.release_memory_occupation(obj, None)
-        print(f"[SGLangHttpServer] sleep() DONE")
+        print("[SGLangHttpServer] sleep() DONE")
 
     async def clear_kv_cache(self):
         if self.node_rank == 0:
@@ -436,9 +440,16 @@ class SGLangHttpServer:
         finish_reason = finish_reason["type"] if finish_reason else None
         if return_logprob:
             output_token_logprobs = output["meta_info"]["output_token_logprobs"]
-            log_probs, token_ids = zip(
-                *[(log_prob, token_ids) for log_prob, token_ids, _ in output_token_logprobs], strict=True
-            )
+            # Handle abort case: when the request is aborted by pause_generation(abort),
+            # output_token_logprobs may be empty. Return empty results with stop_reason="aborted"
+            # instead of crashing with "not enough values to unpack (expected 2, got 0)".
+            if not output_token_logprobs:
+                log_probs = []
+                token_ids = []
+            else:
+                log_probs, token_ids = zip(
+                    *[(log_prob, token_ids) for log_prob, token_ids, _ in output_token_logprobs], strict=True
+                )
         else:
             token_ids = output["output_ids"]
             log_probs = None
@@ -474,14 +485,14 @@ class SGLangHttpServer:
         self.global_steps = global_steps
 
     async def abort_all_requests(self):
-        print(f"[SGLangHttpServer] abort_all_requests() called, calling pause_generation(abort)")
+        print("[SGLangHttpServer] abort_all_requests() called, calling pause_generation(abort)")
         await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="abort"))
-        print(f"[SGLangHttpServer] abort_all_requests() DONE")
+        print("[SGLangHttpServer] abort_all_requests() DONE")
 
     async def resume_generation(self):
-        print(f"[SGLangHttpServer] resume_generation() called, calling continue_generation")
+        print("[SGLangHttpServer] resume_generation() called, calling continue_generation")
         await self.tokenizer_manager.continue_generation(ContinueGenerationReqInput())
-        print(f"[SGLangHttpServer] resume_generation() DONE")
+        print("[SGLangHttpServer] resume_generation() DONE")
 
     async def start_profile(self, **kwargs):
         if (

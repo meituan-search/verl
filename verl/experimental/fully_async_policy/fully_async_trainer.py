@@ -16,7 +16,6 @@ import logging
 import os
 import time
 from datetime import datetime
-from pprint import pprint
 from typing import Any
 
 import ray
@@ -234,7 +233,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             f"{len(self.hybrid_checkpoint_manager.replicas)} replicas..."
         )
         await self.hybrid_checkpoint_manager.sleep_replicas()
-        print(f"[FullyAsyncTrainer] Initial sleep complete, GPU memory now owned by training engine")
+        print("[FullyAsyncTrainer] Initial sleep complete, GPU memory now owned by training engine")
 
     def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         """Set message queue client"""
@@ -525,27 +524,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # Skip validation if not needed and not validation before training
         if not need_validate and not val_before_train:
             return
-
-        # ================================================================
-        # Trainer-side validation (use_trainer_do_validate)
-        # Flow: switch_to_rollout → CP sync → wake_up + add to ALM
-        #       → do_validate via RPC → remove from ALM + sleep → switch_to_train
-        #
-        # When use_trainer_do_validate is enabled, _trainer_side_validate()
-        # handles the full validation cycle including the RPC to rollouter's
-        # do_validate(), so we skip the separate rollouter validation below.
-        # ================================================================
-        if self.config.async_training.use_trainer_do_validate and self.rollouter is not None:
+        # Execute validation
+        if self.config.async_training.use_trainer_do_validate:
             await self._trainer_side_validate()
         else:
-            # Standard path: trigger rollouter validation and get result
             val_metrics = ray.get(self.rollouter.do_validate.remote())
-
-            pprint(
-                f"[FullyAsyncTrainer] parameter version: {self.current_param_version} "
-                f"Validation metrics: {val_metrics.metrics}"
-            )
-            self.logger.log(data=val_metrics.timing_raw, step=self.current_param_version)
+            self.logger.log(data=val_metrics, step=self.current_param_version)
 
     async def _trainer_side_validate(self):
         """Run trainer-side validation using elastic rollout replicas."""
@@ -581,12 +565,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # ================================================================
         print(f"[FullyAsyncTrainer] Phase 2: Running validation (RPC to rollouter) at {time.strftime('%H:%M:%S')}")
         val_metrics = ray.get(self.rollouter.do_validate.remote())
-        pprint(
-            f"[FullyAsyncTrainer] parameter version: {self.current_param_version} "
-            f"Trainer-side val metrics: {val_metrics.metrics}"
-        )
-        self.logger.log(data=val_metrics.timing_raw, step=self.current_param_version)
-
+        self.logger.log(data=val_metrics, step=self.current_param_version)
 
         # ================================================================
         # Phase 3: Switch elastic GPUs back to TRAIN mode

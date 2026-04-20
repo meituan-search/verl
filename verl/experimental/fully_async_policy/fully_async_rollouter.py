@@ -25,7 +25,6 @@ import torch
 
 from verl.experimental.fully_async_policy.detach_utils import (
     RolloutSample,
-    ValidateMetrics,
     prepare_single_generation_data,
     safe_create_task,
 )
@@ -246,14 +245,12 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self.step_start_time = time.time()
         return timing_raw
 
-    def do_validate(self) -> ValidateMetrics:
+    def do_validate(self):
         """Run validation and return metrics"""
-        print(f"[FullyAsyncRollouter] do_validate() === START === at {time.strftime('%H:%M:%S')}")
         timing_raw = {}
         with marked_timer("rollouter/validate_time", timing_raw, color="green"):
             val_metrics: dict = self._validate()
-        print(f"[FullyAsyncRollouter] do_validate() === END === at {time.strftime('%H:%M:%S')}")
-        return ValidateMetrics(timing_raw=timing_raw, metrics=val_metrics)
+        return timing_raw | val_metrics
 
     async def save_checkpoint(self, local_global_step_folder: str):
         # WARNING!: Due to the asynchronous nature, there are some in-flight samples
