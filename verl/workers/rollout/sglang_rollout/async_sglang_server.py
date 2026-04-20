@@ -343,7 +343,6 @@ class SGLangHttpServer:
         else:
             tags = ["kv_cache", "weights"]
 
-        print(f"[SGLangHttpServer] sleep() calling release_memory_occupation with tags={tags}")
         if self.rollout_mode == RolloutMode.HYBRID:
             obj = ReleaseMemoryOccupationReqInput(tags=tags)
             await self.tokenizer_manager.release_memory_occupation(obj, None)
@@ -354,7 +353,6 @@ class SGLangHttpServer:
             # In standalone mode, resume kv_cache if free_cache_engine is enabled
             obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
             await self.tokenizer_manager.release_memory_occupation(obj, None)
-        print("[SGLangHttpServer] sleep() DONE")
 
     async def clear_kv_cache(self):
         if self.node_rank == 0:
@@ -493,16 +491,12 @@ class SGLangHttpServer:
         self.global_steps = global_steps
 
     async def abort_all_requests(self):
-        print("[SGLangHttpServer] abort_all_requests() called, calling pause_generation(abort)")
         self._is_aborted = True
         await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="abort"))
-        print("[SGLangHttpServer] abort_all_requests() DONE")
 
     async def resume_generation(self):
-        print("[SGLangHttpServer] resume_generation() called, calling continue_generation")
         self._is_aborted = False
         await self.tokenizer_manager.continue_generation(ContinueGenerationReqInput())
-        print("[SGLangHttpServer] resume_generation() DONE")
 
     async def start_profile(self, **kwargs):
         if (
