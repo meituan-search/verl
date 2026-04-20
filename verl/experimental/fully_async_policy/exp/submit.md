@@ -1,7 +1,7 @@
 
 ```shell
 
-RAY_ADDRESS='http://33.32.44.27:44390' \
+RAY_ADDRESS='http://33.18.250.9:44390' \
 ray job submit \
 --runtime-env verl/experimental/fully_async_policy/exp/exp1_runtime_env.yaml \
 --working-dir . \
@@ -31,7 +31,7 @@ ray job submit \
 --working-dir . \
 -- bash verl/experimental/fully_async_policy/exp/exp4_fully_async_model_engine_server.sh
 
-RAY_ADDRESS='http://33.18.236.7:44390' \
+RAY_ADDRESS='http://33.32.35.36:44390' \
 ray job submit \
 --runtime-env verl/experimental/fully_async_policy/exp/exp5_runtime_env.yaml \
 --working-dir . \

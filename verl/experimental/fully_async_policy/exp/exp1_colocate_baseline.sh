@@ -84,6 +84,12 @@ train_prompt_mini_bsz=32
 total_training_steps=400
 test_freq=20
 
+# Rollout Correction
+rollout_is=token
+rollout_is_threshold=2.0
+rollout_rs=seq_mean_k1
+rollout_rs_threshold="0.99_1.001"
+
 python -X faulthandler -m verl.trainer.main_ppo \
     --config-path=config \
     --config-name='ppo_megatron_trainer' \
@@ -161,4 +167,9 @@ python -X faulthandler -m verl.trainer.main_ppo \
     trainer.n_gpus_per_node="${NGPUS_PER_NODE}" \
     trainer.total_epochs=10 \
     trainer.test_freq="${test_freq}" \
-    trainer.total_training_steps="${total_training_steps}"    
+    trainer.total_training_steps="${total_training_steps}" \
+    algorithm.rollout_correction.bypass_mode=False \
+    algorithm.rollout_correction.rollout_is=${rollout_is} \
+    algorithm.rollout_correction.rollout_is_threshold=${rollout_is_threshold} \
+    algorithm.rollout_correction.rollout_rs=${rollout_rs} \
+    algorithm.rollout_correction.rollout_rs_threshold=${rollout_rs_threshold}
