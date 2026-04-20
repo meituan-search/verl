@@ -61,7 +61,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
 
-
+@ray.remote
 class GlobalRequestLoadBalancer:
     """Global sticky-session + in-flight load balancer shared by all AgentLoopWorkers."""
 
@@ -1175,7 +1175,7 @@ class AgentLoopManager:
             )
 
     async def _init_global_load_balancer(self) -> None:
-        self.global_load_balancer = ray.remote(GlobalRequestLoadBalancer).remote(
+        self.global_load_balancer = GlobalRequestLoadBalancer.remote(
             server_actor_ids=self.server_addresses,
             max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
         )
