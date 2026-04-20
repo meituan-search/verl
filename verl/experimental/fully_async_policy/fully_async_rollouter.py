@@ -13,10 +13,8 @@
 # limitations under the License.
 
 import asyncio
-import multiprocessing
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pprint import pformat
 
 import numpy as np
@@ -159,11 +157,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Initialize async queues
         self.pending_queue = asyncio.Queue(maxsize=128)
         self.active_tasks = set()
-
-        cpu_cores = multiprocessing.cpu_count()
-        # cpu case use cpu_cores; io case use cpu_cores*2
-        self.validate_executor = ThreadPoolExecutor(max_workers=cpu_cores)
-        self.validate_task = None
 
     def _init_async_objects(self):
         # Initialize asyncio synchronization primitives.

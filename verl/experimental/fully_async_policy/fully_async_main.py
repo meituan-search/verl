@@ -73,8 +73,6 @@ class FullyAsyncTaskRunner:
         self.components["role_worker_mapping"] = role_worker_mapping
         self.components["ray_worker_group_cls"] = ray_worker_group_cls
 
-        # from concurrent.futures import ThreadPoolExecutor  # No longer needed: sequential init order
-
         print("[ASYNC MAIN] Creating FullyAsyncTrainer first (needed for elastic worker group injection)...")
         self._create_trainer(config)
 
