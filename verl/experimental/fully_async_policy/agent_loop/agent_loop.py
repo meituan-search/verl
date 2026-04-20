@@ -86,6 +86,19 @@ class ElasticGlobalRequestLoadBalancer:
         self._servers.pop(server_id, None)
         print(f"[ElasticLB] Removed server: {server_id}")
 
+    def get_status(self) -> dict:
+        """Return current load balancer state for debugging.
+        Returns a dict with:
+          - servers: dict of server_id → in-flight count
+          - total_inflight: total number of in-flight requests across all servers
+          - active_servers: number of servers currently in the pool
+        """
+        return {
+            "servers": dict(self._servers),
+            "total_inflight": sum(self._servers.values()),
+            "active_servers": len(self._servers),
+        }
+
 
 class FullyAsyncLLMServerManager(AsyncLLMServerManager):
     """FullyAsyncLLMServerManager supports resume generation on partial rollout, making rollout interruption
@@ -583,9 +596,9 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
           2. Workers: remove server handle BEFORE abort, so that when
              FullyAsyncLLMServerManager retries after stop_reason="aborted" the
              dead handle is already gone and traffic re-routes to healthy servers.
-          3. abort_all_requests() → triggers partial-rollout resume
-          4. LB: full cleanup
-          5. sleep() — releases model weights / kv-cache; GPUs returned to trainer
+          3. abort_all_requests() → triggers partial-rollout resume on healthy servers;
+             also prevents Triton kernel errors when sleep() offloads weights to CPU.
+          4. sleep() — releases model weights / kv-cache; GPUs returned to trainer
 
         Args:
             resource_id: Unique identifier of the elastic resource to deactivate.
@@ -596,6 +609,9 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         if resource_id not in self.alive_replicas:
             logger.warning(f"[FullyAsyncAgentLoopManager] Replica {resource_id} not found, skipping")
             return False
+
+        lb_status = await self.global_load_balancer.get_status.remote()
+        print(f"[FullyAsyncAgentLoopManager] lb_status '{lb_status}'")
 
         server_address = self.alive_addresses[resource_id]
         replica = self.alive_replicas[resource_id]
