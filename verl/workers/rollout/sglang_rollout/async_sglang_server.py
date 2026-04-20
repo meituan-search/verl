@@ -20,7 +20,6 @@ import os
 from typing import Any, Optional
 
 import ray
-import sglang
 import sglang.srt.entrypoints.engine
 import torch
 from packaging import version
@@ -41,6 +40,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.tokenizer_manager import ServerStatus
 
+import sglang
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_visible_devices_keyword
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
@@ -115,6 +115,10 @@ class SGLangHttpServer:
         # used for http server
         self._server_address = ray.util.get_node_ip_address().strip("[]")
         self._server_port = None
+
+        # State flag to track if server is in aborted state
+        # When True, generate() will return immediately with stop_reason="aborted"
+        self._is_aborted = False
 
         # used for controlling sglang server profiler
         profiler_config = self.config.profiler
@@ -328,13 +332,7 @@ class SGLangHttpServer:
         ) and not self.model_config.lora.get("merge", False)
 
     async def sleep(self):
-        print(
-            f"[SGLangHttpServer] sleep() called: node_rank={self.node_rank}, rollout_mode={self.rollout_mode}, free_cache_engine={self.config.free_cache_engine}"
-        )
         if self.node_rank != 0 or not self.config.free_cache_engine:
-            print(
-                f"[SGLangHttpServer] sleep() early return (node_rank={self.node_rank}, free_cache={self.config.free_cache_engine})"
-            )
             return
 
         # When using LoRA as adapter (merge=False), only release kv_cache —
@@ -386,6 +384,16 @@ class SGLangHttpServer:
         video_data: Optional[list[Any]] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
+        # If server is in aborted state, return immediately without processing
+        if self._is_aborted:
+            print(f"[SGLangHttpServer] generate() called while aborted, returning immediately for request {request_id}")
+            return TokenOutput(
+                token_ids=[],
+                log_probs=None,
+                routed_experts=None,
+                stop_reason="aborted",
+            )
+
         # TODO(@wuxibin): switch to `/generate` http endpoint once multi-modal support ready.
         max_possible_tokens = self.config.max_model_len - len(prompt_ids) - 1
 
@@ -486,11 +494,13 @@ class SGLangHttpServer:
 
     async def abort_all_requests(self):
         print("[SGLangHttpServer] abort_all_requests() called, calling pause_generation(abort)")
+        self._is_aborted = True
         await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="abort"))
         print("[SGLangHttpServer] abort_all_requests() DONE")
 
     async def resume_generation(self):
         print("[SGLangHttpServer] resume_generation() called, calling continue_generation")
+        self._is_aborted = False
         await self.tokenizer_manager.continue_generation(ContinueGenerationReqInput())
         print("[SGLangHttpServer] resume_generation() DONE")
 

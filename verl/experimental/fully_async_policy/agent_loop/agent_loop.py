@@ -179,7 +179,7 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
                     final_output.stop_reason = "length"
                     break
 
-            await asyncio.sleep(10)
+            await asyncio.sleep(1)
 
             # 4. check stop reason
             if output.stop_reason not in ("aborted", "abort") or not self.config.async_training.partial_rollout:
