@@ -24,6 +24,7 @@ import ray
 import vllm.entrypoints.cli.serve
 from packaging import version
 from ray.actor import ActorHandle
+from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.cli.serve import run_headless
 from vllm.entrypoints.openai.api_server import build_app, init_app_state
@@ -51,7 +52,6 @@ from verl.workers.rollout.vllm_rollout.utils import (
     extract_prompt_logprobs,
     get_vllm_max_lora_rank,
 )
-from vllm import SamplingParams
 
 _VLLM_VERSION = version.parse(vllm.__version__)
 
