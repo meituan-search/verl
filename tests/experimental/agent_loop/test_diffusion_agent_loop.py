@@ -80,7 +80,7 @@ def test_single_turn(init_config):
         }
     )
     try:
-        agent_loop_manager = AgentLoopManager.create(init_config)
+        agent_loop_manager = AgentLoopManager.create(config=init_config)
 
         system_prompt = (
             "Describe the image by detailing the color, shape, size, texture, quantity, text, "

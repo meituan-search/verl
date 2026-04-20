@@ -29,7 +29,6 @@ from verl.experimental.fully_async_policy.detach_utils import (
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayWorkerGroup
-from verl.trainer.ppo.utils import Role
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.profiler import marked_timer
 from verl.utils.tracking import ValidationGenerationsLogger
@@ -117,9 +116,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Rollouter parameter configuration
         self.message_queue_client = None
 
-        # Worker groups: rollout_wg is same to actor_rollout_wg
-        self.rollout_wg = None
-        self.actor_rollout_wg = None
         self.async_rollout_manager = None
 
         # Elastic worker group (injected via set_elastic_worker_group before init_workers)
@@ -197,10 +193,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 f"total_rollout_steps: {self.total_rollout_steps} "
                 f"max_concurrent_samples: {self.max_concurrent_samples} "
             )
-
-    def get_rollout_wg(self):
-        """Get rollout worker group"""
-        return self.rollout_wg
 
     def get_replicas(self):
         """Get rollout worker group"""
@@ -341,11 +333,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Skip rollout creation and let agentloop handle it
         pass
 
-    def _init_models(self):
-        self.rollout_wg = self.all_wg[str(Role.Rollout)]
-        self.rollout_wg.init_model()
-        self.actor_rollout_wg = self.rollout_wg
-
     def _create_continuous_iterator(self):
         """
         Create a continuous data iterator across epoch
@@ -358,7 +345,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     async def _init_async_rollout_manager(self):
         """
         Create the unified FullyAsyncAgentLoopManager that manages both:
-        - Fixed rollout replicas (from self.rollout_wg)
+        - Fixed rollout replicas (standalone)
         - Elastic hybrid replicas (from self._elastic_worker_group, injected via set_elastic_worker_group)
 
         Must be called AFTER set_elastic_worker_group() if elastic resources are used,
@@ -378,12 +365,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         from verl.experimental.fully_async_policy.agent_loop import FullyAsyncAgentLoopManager
 
         self.async_rollout_mode = True
-        elastic_wg = self.get_elastic_worker_group()
         self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
             config=self.config,
-            worker_group=self.rollout_wg,
+            worker_group=self.get_elastic_worker_group(),
             reward_loop_worker_handles=reward_loop_worker_handles,
-            elastic_worker_group=elastic_wg,
         )
         print(
             f"[FullyAsyncRollouter] FullyAsyncAgentLoopManager initialised with "

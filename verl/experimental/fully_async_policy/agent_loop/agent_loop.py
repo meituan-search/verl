@@ -45,13 +45,29 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 class ElasticGlobalRequestLoadBalancer:
     """
-    Extended GlobalRequestLoadBalancer that supports dynamic server addition/removal.
+    Extended GlobalRequestLoadBalancer that supports dynamic server addition/removal
+    with sticky session support via LRU cache.
 
-    Adds:
-    - add_server(): add a new server to the pool
-    - remove_server(): mark a server for removal (no new requests)
-    - cleanup_removed_server(): fully remove a drained server
-    - get_inflight_count(): get the number of in-flight requests for a server
+    Key features:
+    - **Sticky Session**: Uses LRUCache to map request_id → server_id, ensuring
+      multi-turn conversations route to the same server.
+    - **Least-loaded Selection**: When no sticky session exists, selects the
+      server with the fewest in-flight requests.
+    - **Dynamic Server Management**: Supports add/remove servers at runtime
+      for elastic scaling.
+
+    Two-phase removal for safe server shutdown::
+
+        1. remove_server(server_id)    # Mark as removed, no new requests routed
+        2. cleanup_removed_server(server_id)  # Fully remove after drained
+
+    When a sticky session points to a removed server, the cache entry is
+    automatically invalidated and a new server is selected.
+
+    Attributes:
+        _inflight_requests: dict mapping server_id → in-flight request count
+        _request_id_to_server: LRUCache for sticky session (request_id → server_id)
+        _removed_servers: set of server_ids marked for removal
     """
 
     def __init__(self, server_actor_ids: list[str], max_cache_size: int = 10000):
@@ -144,10 +160,6 @@ class ElasticGlobalRequestLoadBalancer:
 
 
 class FullyAsyncLLMServerManager(AsyncLLMServerManager):
-    """FullyAsyncLLMServerManager supports resume generation on partial rollout, making rollout interruption
-    invisible to the AgentLoop.
-    """
-
     @rollout_trace_op
     async def generate(
         self,
@@ -254,31 +266,10 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
         )
 
     def add_server(self, server_address: str, server_handle: ray.actor.ActorHandle) -> None:
-        """
-        Dynamically add a new rollout server to this worker's server manager.
-
-        Called by ElasticAgentLoopManager when an elastic resource switches to rollout mode.
-        After this call, the worker's load balancer can route requests to the new server.
-
-        Args:
-            server_address: The address/id of the new server (used as LB key).
-            server_handle: The Ray actor handle for the new vLLM/SGLang server.
-        """
         self.server_manager._server_id_to_handle[server_address] = server_handle
         logger.debug(f"[FullyAsyncAgentLoopWorker] Added server: {server_address}")
 
     def remove_server(self, server_address: str) -> None:
-        """
-        Remove a rollout server from this worker's server manager.
-
-        Called by ElasticAgentLoopManager BEFORE abort_all_requests(), so that
-        when FullyAsyncLLMServerManager resumes after stop_reason="aborted",
-        the dead server handle is no longer in the map and the LB routes the
-        resume request to a healthy server (partial rollout auto-resume).
-
-        Args:
-            server_address: The address/id of the server to remove.
-        """
         self.server_manager._server_id_to_handle.pop(server_address, None)
         logger.debug(f"[FullyAsyncAgentLoopWorker] Removed server: {server_address}")
 
@@ -302,10 +293,10 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
 
     Internal data structures::
 
-        self.rollout_replicas: list[RolloutReplica]   # fixed + active elastic
+        self.rollout_replicas: list[RolloutReplica]       # fixed + active elastic
         self.elastic_replicas: dict[str, RolloutReplica]  # all elastic (sleeping + alive), keyed by "elastic_{i}"
         self.alive_replicas: dict[str, RolloutReplica]    # currently active (awake + in LB) subset
-        self.alive_addresses: dict[str, str]               # resource_id → server_address for alive ones
+        self.alive_addresses: dict[str, str]              # resource_id → server_address for alive ones
 
     Elastic replica lifecycle::
 
@@ -314,24 +305,33 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         sleep()                           # release weights/kv-cache; trainer owns GPUs now
           ↓  ────────────────────────────────────────────────────────
         add_elastic_replica(resource_id)  # called by Trainer via RPC → Rollouter
-          ├─ wake_up()                   # restore model weights / kv-cache
-          ├─ _notify_workers_server_added()  # push handle into every worker's map
-          └─ global_load_balancer.add_server()  # start routing requests
+          ├─ _notify_workers_server_added()   # push handle into every worker's map
+          ├─ global_load_balancer.add_server() # start routing requests
+          └─ update alive_replicas / rollout_replicas
           ↓
         [serving generation requests as part of rollout_replicas]
           ↓
         remove_elastic_replica(resource_id)
-          ├─ global_load_balancer.remove_server()    # stop NEW requests
-          ├─ _notify_workers_server_removed()       # drop handle from workers
-          ├─ abort_all_requests()                   # trigger partial-rollout auto-resume
-          ├─ global_load_balancer.cleanup_removed_server()
-          └─ sleep()                                # release GPUs back to trainer
+          ├─ global_load_balancer.remove_server()      # mark as removed, no new requests
+          ├─ _notify_workers_server_removed()         # drop handle from workers
+          ├─ global_load_balancer.cleanup_removed_server()  # fully remove from LB
+          └─ update alive_replicas / rollout_replicas
 
-    The ordering in ``remove_elastic_replica`` is critical: workers must drop
-    the server handle **before** ``abort_all_requests()`` is called, so that
-    when :class:`FullyAsyncLLMServerManager` retries after receiving
-    ``stop_reason="aborted"`` the dead handle is already gone and traffic is
-    re-routed to healthy servers (partial-rollout resume).
+    Note: The actual ``abort_all_requests()`` and ``sleep()`` are called by the
+    Trainer AFTER ``remove_elastic_replica()`` returns, not inside this method.
+    This allows the Trainer to coordinate abort timing with other cleanup.
+
+    Load Balancer Sticky Session::
+
+        ElasticGlobalRequestLoadBalancer uses LRU cache to maintain sticky sessions.
+        When a request retries after ``stop_reason="aborted"``, it checks:
+
+        1. If cached server is still available (not in _removed_servers)
+           → reuse the same server
+        2. If cached server was removed
+           → clear cache entry and select a new least-loaded server
+
+        This ensures aborted requests are re-routed to healthy servers.
     """
 
     def __init__(
@@ -360,8 +360,6 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         self.prometheus_server_addresses = []
 
         # Timing / counters
-        self.total_elastic_adds: int = 0
-        self.total_elastic_removes: int = 0
         self.last_elastic_add_time: float = 0.0
         self.last_elastic_remove_time: float = 0.0
 
@@ -374,7 +372,6 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         rollout_resource_pool=None,
         reward_loop_worker_handles: list = None,
         teacher_model_manager=None,
-        elastic_worker_group: RayWorkerGroup = None,
     ) -> "FullyAsyncAgentLoopManager":
         """
         Create a FullyAsyncAgentLoopManager with both fixed and optional elastic replicas.
@@ -405,7 +402,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             reward_loop_worker_handles: Actor handles for streaming reward
                 computation.
             teacher_model_manager: Manager for distillation teacher servers.
-            elastic_worker_group: Worker group whose GPUs are shared with the
+            worker_group: Worker group whose GPUs are shared with the
                 training engine (typically the trainer's ``actor_rollout_wg``).
                 Pass ``None`` (default) when there are no elastic resources.
 
@@ -420,12 +417,12 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         # lowest-numbered placement-group bundles which are co-located with the
         # training engine, maximising GPU affinity on multi-node deployments.
         num_elastic = 0
-        if elastic_worker_group is not None:
-            num_elastic = await instance._initialize_elastic_replicas(start_rank=0, worker_group=elastic_worker_group)
+        if worker_group is not None:
+            num_elastic = await instance._initialize_elastic_replicas(start_rank=0, worker_group=worker_group)
 
         # ── Step 2: fixed replicas (replica_rank N_e … N_e+N_f-1) ───────────
         # start_rank=num_elastic ensures the Ray actor names (e.g.
-        # sglang_server_{rank}_{node}) are globally unique and never collide
+        # server_{rank}_{node}) are globally unique and never collide
         # with the elastic actors created above.
         num_elastic = await instance._initialize_elastic_replicas(start_rank=num_elastic)
 
@@ -558,14 +555,15 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         server_handle = replica._server_handle
 
         try:
+            # step 1: notify workers to add the server handle
             await self._notify_workers_server_added(server_address, server_handle)
+            # step 2: LB add server
             await self.global_load_balancer.add_server.remote(server_id=server_address)
 
-            # 4. Record active state.
+            # Add tracking state
             self.alive_replicas[resource_id] = replica
             self.alive_addresses[resource_id] = server_address
             self.rollout_replicas.append(replica)
-            self.total_elastic_adds += 1
             self.last_elastic_add_time = time.time()
 
             print(
@@ -603,7 +601,6 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             self.alive_addresses.pop(resource_id)
             if replica in self.rollout_replicas:
                 self.rollout_replicas.remove(replica)
-            self.total_elastic_removes += 1
             self.last_elastic_remove_time = time.time()
 
             print(
@@ -702,8 +699,6 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         """Return elastic-specific counters for monitoring."""
         return {
             "elastic/num_elastic_replicas": len(self.alive_replicas),
-            "elastic/total_adds": self.total_elastic_adds,
-            "elastic/total_removes": self.total_elastic_removes,
             "elastic/last_add_time": self.last_elastic_add_time,
             "elastic/last_remove_time": self.last_elastic_remove_time,
         }
@@ -739,7 +734,6 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
     # -------------------------------------------------------------------------
     # Inherited / overridden from AgentLoopManager
     # -------------------------------------------------------------------------
-
     @auto_await
     async def generate_sequences_single(self, prompts: DataProto) -> DataProto:
         """Split input batch and dispatch to agent loop workers."""

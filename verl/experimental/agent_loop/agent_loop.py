@@ -1037,16 +1037,9 @@ class AgentLoopManager:
 
     @classmethod
     @auto_await
-    async def create(
-        cls,
-        config: DictConfig,
-        worker_group: RayWorkerGroup = None,
-        rollout_resource_pool: RayResourcePool = None,
-        reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
-        teacher_model_manager: TeacherModelManager = None,
-    ):
+    async def create(cls, **kwargs):
         """Create agent loop manager."""
-        instance = cls(config, worker_group, rollout_resource_pool, teacher_model_manager, reward_loop_worker_handles)
+        instance = cls(**kwargs)
         await instance._initialize_llm_servers()
         await instance._init_global_load_balancer()
         await instance._init_agent_loop_workers()
