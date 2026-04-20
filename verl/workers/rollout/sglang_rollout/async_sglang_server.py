@@ -384,7 +384,6 @@ class SGLangHttpServer:
         """Generate sequence with token-in-token-out."""
         # If server is in aborted state, return immediately without processing
         if self._is_aborted:
-            print(f"[SGLangHttpServer] generate() called while aborted, returning immediately for request {request_id}")
             return TokenOutput(
                 token_ids=[],
                 log_probs=None,

@@ -26,6 +26,7 @@ from verl.experimental.agent_loop.agent_loop import (
     AgentLoopWorker,
     AsyncLLMServerManager,
     TokenOutput,
+    DEFAULT_ROUTING_CACHE_SIZE,
 )
 from verl.experimental.agent_loop.prometheus_utils import update_prometheus_config
 from verl.experimental.teacher_loop import TeacherModelManager
@@ -41,61 +42,106 @@ from verl.workers.rollout import RolloutReplica
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-DEFAULT_ROUTING_CACHE_SIZE = 10000
-
-
 class ElasticGlobalRequestLoadBalancer:
     """
-    Simplified GlobalRequestLoadBalancer with dynamic add/remove support.
+    Extended GlobalRequestLoadBalancer that supports dynamic server addition/removal.
 
-    Design principles:
-    - Round-robin / least-loaded routing among active servers only.
-    - No sticky session cache — avoids stale routing after server removal.
-    - No two-phase removal (remove_server → cleanup_removed_server) —
-      just add_server / remove_server directly.  Caller is responsible for
-      draining in-flight requests *before* calling remove_server.
-    - All operations are O(1) and stateless enough to avoid deadlocks.
+    Adds:
+    - add_server(): add a new server to the pool
+    - remove_server(): mark a server for removal (no new requests)
+    - cleanup_removed_server(): fully remove a drained server
+    - get_inflight_count(): get the number of in-flight requests for a server
     """
 
-    def __init__(self, server_actor_ids: list[str], max_cache_size: int = DEFAULT_ROUTING_CACHE_SIZE):
+    def __init__(self, server_actor_ids: list[str], max_cache_size: int = 10000):
+        from cachetools import LRUCache
+
         if not server_actor_ids:
             raise ValueError("server_actor_ids must be non-empty")
-        self._servers: dict[str, int] = {sid: 0 for sid in server_actor_ids}
+
+        self._inflight_requests: dict[str, int] = {sid: 0 for sid in server_actor_ids}
+        self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
+        self._removed_servers: set[str] = set()  # Servers being drained
 
     def acquire_server(self, request_id: str) -> str:
-        """Acquire a server for the given request (least-loaded)."""
-        if not self._servers:
+        """Acquire a server for the given request (sticky + least-loaded)."""
+        # Try sticky session first
+        if request_id in self._request_id_to_server:
+            server_id = self._request_id_to_server[request_id]
+            # Check if server is still available (not removed and still in pool)
+            if (
+                server_id in self._inflight_requests
+                and server_id not in self._removed_servers
+            ):
+                self._inflight_requests[server_id] += 1
+                return server_id
+            # Server was removed, clear stale cache entry
+            del self._request_id_to_server[request_id]
+
+        # Select new server (least-loaded among available)
+        available = {sid: cnt for sid, cnt in self._inflight_requests.items() if sid not in self._removed_servers}
+        if not available:
             raise RuntimeError("No available servers in load balancer")
 
-        server_id = min(self._servers, key=self._servers.get)
-        self._servers[server_id] += 1
+        server_id = min(available, key=available.get)
+        self._request_id_to_server[request_id] = server_id
+        self._inflight_requests[server_id] += 1
         return server_id
 
     def release_server(self, server_id: str) -> None:
         """Release a server after a request completes."""
-        if server_id in self._servers and self._servers[server_id] > 0:
-            self._servers[server_id] -= 1
+        if server_id not in self._inflight_requests:
+            return
+        if self._inflight_requests[server_id] > 0:
+            self._inflight_requests[server_id] -= 1
 
     def add_server(self, server_id: str) -> None:
-        if server_id not in self._servers:
-            self._servers[server_id] = 0
-            print(f"[ElasticLB] Added server: {server_id}")
+        """Add a new server to the load balancer pool."""
+        if server_id in self._inflight_requests:
+            self._removed_servers.discard(server_id)
+            return
+        self._inflight_requests[server_id] = 0
+        self._removed_servers.discard(server_id)
+        logger.info(f"[ElasticLB] Added server: {server_id}")
 
     def remove_server(self, server_id: str) -> None:
-        self._servers.pop(server_id, None)
-        print(f"[ElasticLB] Removed server: {server_id}")
+        """Mark server for removal (no new requests routed to it)."""
+        if server_id in self._inflight_requests:
+            self._removed_servers.add(server_id)
+        logger.info(f"[ElasticLB] Marked server for removal: {server_id}")
+
+    def get_inflight_count(self, server_id: str) -> int:
+        """Get number of in-flight requests for a server."""
+        return self._inflight_requests.get(server_id, 0)
+
+    def cleanup_removed_server(self, server_id: str) -> None:
+        """Fully remove a server that has been drained."""
+        self._inflight_requests.pop(server_id, None)
+        self._removed_servers.discard(server_id)
+        logger.info(f"[ElasticLB] Cleaned up server: {server_id}")
+
+    def get_all_servers(self) -> list[str]:
+        """Get list of all active server IDs."""
+        return [sid for sid in self._inflight_requests if sid not in self._removed_servers]
+
+    def set_inflight(self, server_id: str, count: int) -> None:
+        """Directly set in-flight count for a server (test use only)."""
+        self._inflight_requests[server_id] = count
+
+    def is_server_removed(self, server_id: str) -> bool:
+        """Return True if the server is in the removed set (test use only)."""
+        return server_id in self._removed_servers
+
+    def has_server(self, server_id: str) -> bool:
+        """Return True if the server exists in the inflight table (test use only)."""
+        return server_id in self._inflight_requests
 
     def get_status(self) -> dict:
-        """Return current load balancer state for debugging.
-        Returns a dict with:
-          - servers: dict of server_id → in-flight count
-          - total_inflight: total number of in-flight requests across all servers
-          - active_servers: number of servers currently in the pool
-        """
+        """Return current load balancer state for debugging."""
         return {
-            "servers": dict(self._servers),
-            "total_inflight": sum(self._servers.values()),
-            "active_servers": len(self._servers),
+            "servers": dict(self._inflight_requests),
+            "total_inflight": sum(self._inflight_requests.values()),
+            "active_servers": len(self._inflight_requests),
         }
 
 
@@ -493,28 +539,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         print(f"[FullyAsyncAgentLoopManager] Load balancer initialised with {len(self.server_addresses)} servers")
 
     async def add_elastic_replica(self, resource_id: str) -> bool:
-        """
-        Activate a pre-registered elastic hybrid replica and add it to the
-        active server pool.
-
-        The replica must have been pre-registered via the elastic_replicas
-        argument of ElasticAgentLoopManager.create().  Its server is already
-        bound to the shared resource pool (init_hybrid / init_colocated) and is
-        currently sleeping.  This method:
-          1. wake_up() — restores model weights / kv-cache
-          2. Notifies all AgentLoopWorkers (push handle into local map)
-          3. Registers the server with the load balancer (after workers are ready)
-
-        The worker notification MUST happen before LB registration to avoid a
-        race condition where the LB routes a request to the new server before
-        any worker has the handle in its _server_id_to_handle map.
-
-        Args:
-            resource_id: Unique identifier of the elastic resource to activate.
-
-        Returns:
-            True on success, False on failure (e.g. not pre-registered, already active).
-        """
+        """Activate a pre-registered elastic hybrid replica and add it to the active server pool."""
         if resource_id in self.alive_replicas:
             logger.warning(f"[FullyAsyncAgentLoopManager] Replica '{resource_id}' already active, skipping")
             return False
@@ -556,30 +581,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             return False
 
     async def remove_elastic_replica(self, resource_id: str) -> bool:
-        """
-        Deactivate an active elastic hybrid replica and return its GPUs to the
-        training engine.
-
-        "Removal" means sleeping the server so model weights / kv-cache are
-        released and the shared GPU pool can be reclaimed by the training engine.
-        The replica object is NOT destroyed; it remains in elastic_replicas
-        and can be re-activated later via add_elastic_replica().
-
-        Ordering is critical for partial-rollout auto-resume:
-          1. LB: mark server as removing (no NEW requests)
-          2. Workers: remove server handle BEFORE abort, so that when
-             FullyAsyncLLMServerManager retries after stop_reason="aborted" the
-             dead handle is already gone and traffic re-routes to healthy servers.
-          3. abort_all_requests() → triggers partial-rollout resume on healthy servers;
-             also prevents Triton kernel errors when sleep() offloads weights to CPU.
-          4. sleep() — releases model weights / kv-cache; GPUs returned to trainer
-
-        Args:
-            resource_id: Unique identifier of the elastic resource to deactivate.
-
-        Returns:
-            True on success, False if resource_id is not currently active.
-        """
+        """Deactivate an active elastic hybrid replica and return its GPUs to the training engine."""
         if resource_id not in self.alive_replicas:
             logger.warning(f"[FullyAsyncAgentLoopManager] Replica {resource_id} not found, skipping")
             return False
@@ -591,8 +593,12 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         replica = self.alive_replicas[resource_id]
 
         try:
+            # Step 1: Mark server as removed (no new requests routed to it)
             await self.global_load_balancer.remove_server.remote(server_id=server_address)
+            # Step 2: Notify workers to remove the server handle
             await self._notify_workers_server_removed(server_address)
+            # Step 3: Fully remove from LB (cleanup)
+            await self.global_load_balancer.cleanup_removed_server.remote(server_id=server_address)
 
             # Remove tracking state
             self.alive_replicas.pop(resource_id)
@@ -615,7 +621,6 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
     # -------------------------------------------------------------------------
     # Private helpers
     # -------------------------------------------------------------------------
-
     async def _notify_workers_server_added(self, server_address: str, server_handle) -> None:
         """
         Notify all AgentLoopWorkers that a new server is available, and keep
@@ -681,7 +686,6 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
     # -------------------------------------------------------------------------
     # Statistics / introspection
     # -------------------------------------------------------------------------
-
     def get_num_elastic_replicas(self) -> int:
         """Return the number of currently active elastic replicas."""
         return len(self.alive_replicas)

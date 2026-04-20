@@ -136,6 +136,14 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         priority: int = 0,
     ) -> DiffusionOutput:
         """Generate sequence with token-in-image-out."""
+        # If server is in aborted state, return immediately without processing
+        if self._is_aborted:
+            return DiffusionOutput(
+                images=None,
+                log_probs=None,
+                stop_reason="aborted",
+            )
+
         prompt_ids = normalize_token_ids(prompt_ids)
 
         multi_modal_data = {}
@@ -186,6 +194,16 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         async for output in generator:
             final_res = output
         assert final_res is not None
+
+        # Handle abort case: when the request is aborted by pause_generation(abort),
+        # images may be empty. Return empty results with stop_reason="aborted"
+        # instead of crashing with "IndexError: list index out of range".
+        if not final_res.images:
+            return DiffusionOutput(
+                images=None,
+                log_probs=None,
+                stop_reason="aborted",
+            )
 
         diffusion_output = self._to_tensor(final_res.images[0]).float() / 255.0
 

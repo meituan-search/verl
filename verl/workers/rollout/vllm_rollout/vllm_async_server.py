@@ -131,6 +131,10 @@ class vLLMHttpServer:
         self._server_address = ray.util.get_node_ip_address().strip("[]")
         self._server_port = None
 
+        # State flag to track if server is in aborted state
+        # When True, generate() will return immediately with stop_reason="aborted"
+        self._is_aborted = False
+
         # used for controlling vllm server profiler
         profiler_config = self.config.profiler
         tool_config = None
@@ -446,6 +450,16 @@ class vLLMHttpServer:
         priority: int = 0,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
+        # If server is in aborted state, return immediately without processing
+        if self._is_aborted:
+            print(f"[vLLMHttpServer] generate() called while aborted, returning immediately for request {request_id}")
+            return TokenOutput(
+                token_ids=[],
+                log_probs=None,
+                routed_experts=None,
+                stop_reason="aborted",
+            )
+
         prompt_ids = normalize_token_ids(prompt_ids)
 
         # Calculate the maximum possible new tokens based on available context space
@@ -513,6 +527,17 @@ class vLLMHttpServer:
             final_res = output
         assert final_res is not None
 
+        # Handle abort case: when the request is aborted by pause_generation(abort),
+        # outputs may be empty. Return empty results with stop_reason="aborted"
+        # instead of crashing with "IndexError: list index out of range".
+        if not final_res.outputs:
+            return TokenOutput(
+                token_ids=[],
+                log_probs=None,
+                routed_experts=None,
+                stop_reason="aborted",
+            )
+
         extra_fields = {"global_steps": self.global_steps}
         extract_prompt_logprobs(
             output=final_res,
@@ -576,6 +601,34 @@ class vLLMHttpServer:
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
 
+    async def clear_kv_cache(self):
+        if self.node_rank == 0:
+            await self.engine.reset_prefix_cache()
+
+    async def release_kv_cache(self):
+        """Release only kv_cache GPU memory, keeping model weights intact.
+
+        This is used during weight sync to free GPU memory for new weights.
+        Implementation: sleep(level=1) offloads weights and discards kv_cache,
+        then wake_up(weights) restores weights, leaving kv_cache memory free.
+        """
+        if self.node_rank != 0 or not self.config.free_cache_engine:
+            return
+
+        # sleep(level=1): offload weights to CPU, discard kv_cache
+        await self.engine.sleep(level=1)
+        # wake_up(weights): restore weights to GPU, kv_cache remains free
+        await self.engine.wake_up(tags=["weights"])
+
+    async def resume_kv_cache(self):
+        """Restore kv_cache GPU memory after a weight sync. Counterpart to release_kv_cache()."""
+        if self.node_rank != 0:
+            return
+
+        # wake_up(kv_cache): allocate and restore kv_cache memory
+        await self.engine.wake_up(tags=["kv_cache"])
+
+
     async def start_profile(self, **kwargs):
         if (
             self.profiler_controller.check_enable()
@@ -591,10 +644,6 @@ class vLLMHttpServer:
             and self.profiler_controller.is_discrete_mode()
         ):
             await self.engine.stop_profile()
-
-    async def clear_kv_cache(self):
-        if self.node_rank == 0:
-            await self.engine.reset_prefix_cache()
 
     async def set_global_steps(self, global_steps: int):
         """Set the global steps of the model weights."""
@@ -618,6 +667,7 @@ class vLLMHttpServer:
                 - aborted_count: Number of requests aborted
                 - request_ids: List of aborted request IDs
         """
+        self._is_aborted = True
         try:
             if _VLLM_VERSION >= version.parse("0.12.0"):
                 # Snapshot request IDs before pausing for reporting
@@ -672,6 +722,7 @@ class vLLMHttpServer:
         Only effective on vLLM >= 0.12.0 where pause_generation is used.
         No-op on older versions.
         """
+        self._is_aborted = False
         if self.node_rank != 0:
             return
         if _VLLM_VERSION >= version.parse("0.12.0"):
@@ -686,6 +737,7 @@ class vLLMHttpServer:
         Returns:
             dict[str, Any]: Dictionary containing abort result.
         """
+        self._is_aborted = True
         try:
             request_states = self.engine.output_processor.request_states
             req_state = request_states.get(request_id)
