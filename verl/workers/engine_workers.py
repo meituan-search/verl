@@ -728,6 +728,64 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.base_sync_done = True
         set_expandable_segments(True)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def prepare_for_validation(self):
+        """Save current training memory state and release GPU memory for validation.
+
+        This method saves the current state of model/optimizer/grad GPU residency,
+        then releases all GPU memory to make room for rollout during validation.
+
+        State is saved in `_validation_state` and restored by `restore_after_validation()`.
+        """
+        # Save current state
+        self._validation_state = {
+            "actor_model_on_gpu": not self.actor.engine.is_param_offload_enabled,
+            "actor_optimizer_on_gpu": not self.actor.engine.is_optimizer_offload_enabled,
+            "actor_grad_on_gpu": not self.actor.engine.is_param_offload_enabled,  # grad follows param
+        }
+        if self._is_ref:
+            self._validation_state["ref_model_on_gpu"] = not self.ref.engine.is_param_offload_enabled
+
+        # Offload actor model, optimizer, and grad to CPU if they are on GPU
+        self.actor.to(device="cpu", model=True, optimizer=True, grad=True)
+
+        # Offload ref model to CPU if it exists and is on GPU
+        if self._is_ref:
+            self.ref.to(device="cpu", model=True, optimizer=False, grad=False)
+
+        # Empty cache to ensure memory is released
+        aggressive_empty_cache(force_sync=True)
+        log_gpu_memory_usage("After prepare_for_validation", logger=logger)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def restore_after_validation(self):
+        """Restore training memory state after validation.
+
+        This method restores the model/optimizer/grad to GPU based on the state
+        saved by `prepare_for_validation()`. If they were already on CPU before
+        validation, they remain on CPU.
+        """
+        if not hasattr(self, "_validation_state"):
+            logger.warning("No validation state found, skipping restore")
+            return
+
+        state = self._validation_state
+
+        # Restore actor model, optimizer, and grad to GPU if they were on GPU before
+        self.actor.to(
+            device=get_device_name(),
+            model=state["actor_model_on_gpu"],
+            optimizer=state["actor_optimizer_on_gpu"],
+            grad=state["actor_grad_on_gpu"],
+        )
+
+        # Restore ref model to GPU if it was on GPU before
+        if self._is_ref and state.get("ref_model_on_gpu", False):
+            self.ref.to(device=get_device_name(), model=True, optimizer=False, grad=False)
+
+        aggressive_empty_cache(force_sync=True)
+        log_gpu_memory_usage("After restore_after_validation", logger=logger)
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
         """Execute checkpoint engine method.

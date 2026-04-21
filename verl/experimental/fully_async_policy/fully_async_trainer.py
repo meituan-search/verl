@@ -536,6 +536,14 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         print("[FullyAsyncTrainer] _trainer_side_validate === START ===")
         validate_start = time.time()
         # ================================================================
+        # Phase 0: Release training memory (model/optimizer/grad) for validation
+        # ================================================================
+        phase_0_start = time.time()
+        print("[FullyAsyncTrainer] Phase 0: Releasing training memory for validation")
+        self.actor_rollout_wg.prepare_for_validation()
+        print(f"[FullyAsyncTrainer] Phase 0 done ({time.time() - phase_0_start:.2f}s)")
+
+        # ================================================================
         # Phase 1: Switch ALL trainer GPUs to ROLLOUT mode
         # ================================================================
         phase_1_start = time.time()
@@ -561,6 +569,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # ================================================================
         # Phase 3: Switch elastic GPUs back to TRAIN mode
         # ================================================================
+        phase_3_start = time.time()
         print("[FullyAsyncTrainer] Phase 3: Switching elastic GPUs back to TRAIN mode")
         await self.checkpoint_manager.abort_replicas()
         await self.hybrid_checkpoint_manager.abort_replicas()
@@ -568,7 +577,15 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             ray.get(self.rollouter.remove_elastic_replica.remote(resource_id))
         await self.hybrid_checkpoint_manager.sleep_replicas()
         await self.checkpoint_manager.resume_generation_replicas()
-        await self.hybrid_checkpoint_manager.resume_generation_replicas()
+        print(f"[FullyAsyncTrainer] Phase 3 done ({time.time() - phase_3_start:.2f}s)")
+
+        # ================================================================
+        # Phase 4: Restore training memory (model/optimizer/grad) after validation
+        # ================================================================
+        phase_4_start = time.time()
+        print("[FullyAsyncTrainer] Phase 4: Restoring training memory after validation")
+        self.actor_rollout_wg.restore_after_validation()
+        print(f"[FullyAsyncTrainer] Phase 4 done ({time.time() - phase_4_start:.2f}s)")
 
         total_time = time.time() - validate_start
         print(f"[FullyAsyncTrainer] _trainer_side_validate === END === (total: {total_time:.2f}s)")
