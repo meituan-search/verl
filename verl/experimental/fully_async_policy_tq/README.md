@@ -795,4 +795,3 @@ verl/experimental/fully_async_policy_tq/
 - [TransferQueue 文档](docs/data/transfer_queue.md)
 - [main_ppo_sync.py](verl/trainer/main_ppo_sync.py)
 - [fully_async_policy 原始实现](verl/experimental/fully_async_policy/)
-- [prepare_single_generation_data](verl/experimental/fully_async_policy/detach_utils.py)
