@@ -19,10 +19,17 @@
 
 ```mermaid
 graph TB
-    subgraph Rollouter
+    subgraph Rollouter[Rollouter]
         RM[FullyAsyncRollouter]
         ALM[AgentLoopManager]
+    end
+
+    subgraph Workers[AgentLoopWorkers]
         ALW[AgentLoopWorker]
+    end
+
+    subgraph Servers[LLM Servers]
+        S[RolloutReplica]
     end
 
     subgraph MessageQueue
@@ -34,12 +41,26 @@ graph TB
     end
 
     RM -->|generate_sequences| ALM
-    ALM -->|Worker RPC| ALW
-    ALW -->|put_sample<br/>pickle serialized| MQ
-    MQ -->|MQ_QUEUE| MQ
+    ALM -->|dispatch| ALW
+    ALW -->|generate RPC| S
+    S -->|TokenOutput| ALW
+    ALW -->|DataProto| ALM
+    ALM -->|DataProto| RM
+    RM -->|put_sample<br/>pickle serialized| MQ
     MQ -->|get_sample<br/>pickle deserialized| TM
     TM -->|request samples| MQ
 ```
+
+**核心流程**:
+1. **Rollouter** 从 dataloader 读取数据
+2. **Rollouter** 调用 `AgentLoopManager.generate_sequences()`
+3. **AgentLoopManager** 分发任务到 **AgentLoopWorker**
+4. **AgentLoopWorker** 调用 **LLM Server** 执行生成
+5. **LLM Server** 返回 `TokenOutput` 给 Worker
+6. **Worker** 返回 `DataProto` 给 AgentLoopManager
+7. **AgentLoopManager** 返回 `DataProto` 给 Rollouter
+8. **Rollouter** 将样本序列化后写入 **MessageQueue**
+9. **Trainer** 从 MessageQueue 获取样本，执行训练
 
 **问题**:
 
@@ -51,8 +72,16 @@ graph TB
 
 ```mermaid
 graph TB
-    subgraph Rollouter
+    subgraph Rollouter[Rollouter]
         RM[TQFullyAsyncRollouter]
+    end
+
+    subgraph Workers[TQAgentLoopWorkers]
+        W[Worker<br/>内置事件循环]
+    end
+
+    subgraph Servers[LLM Servers]
+        S[RolloutReplica]
     end
 
     subgraph TransferQueue
@@ -62,14 +91,6 @@ graph TB
 
     subgraph ReplayBuffer
         RB[ReplayBuffer]
-    end
-
-    subgraph Worker
-        W[TQAgentLoopWorker<br/>内置事件循环]
-    end
-
-    subgraph Server
-        S[LLM Server<br/>直接读写 TQ]
     end
 
     subgraph Trainer
@@ -87,18 +108,24 @@ graph TB
     TM -->|wait_and_sample| RB
     TM -->|kv_batch_get| TQ_DATA
     TM -->|kv_clear| TQ_DATA
+    RB -->|release_slot| RB
 ```
 
-**目标**: Server 直接从 TQ 获取数据
+**核心流程**:
+1. **Rollouter** 从 dataloader 读取数据，获取 slot，写入 prompt 到 **TQ**
+2. **Worker** 从 **ReplayBuffer** 拉取 pending 任务
+3. **Worker** 选择 **LLM Server**，调用 `generate_with_tq`
+4. **Server** 从 TQ 获取 prompt，执行生成，将 response 写回 TQ
+5. **Trainer** 从 ReplayBuffer 获取 finish 样本，从 TQ 获取完整数据
 
-```mermaid
-graph LR
-    R[Rollouter] -->|kv_batch_put| TQ[TransferQueue]
-    W[Worker] -->|dispatch key| S[LLM Server]
-    S -->|kv_batch_get| TQ
-    S -->|generate + kv_batch_put| TQ
-    T[Trainer] -->|kv_batch_get| TQ
-```
+**关键变化**:
+
+| 现有架构 | 新架构 |
+|---------|--------|
+| Rollouter 调用 `generate_sequences` 并等待返回 | Rollouter 仅写入 TQ，不等待生成 |
+| Rollouter 将结果写入 MessageQueue | Server 直接写入 TQ |
+| Worker 被 AgentLoopManager 调用 | Worker 主动从 ReplayBuffer 拉取任务 |
+| MessageQueue 存储完整样本 (pickle) | TQ 存储零拷贝 Tensor + 元数据分离 |
 
 **优势**:
 
@@ -234,6 +261,25 @@ class ReplayBuffer:
     # === 统计接口 ===
     def total_in_flight(self) -> int: ...
     def get_staleness_statistics(self, current_version, partition_id="train") -> dict: ...
+```
+
+#### Slot 控制机制
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle: 初始化
+    Idle --> Pending: acquire_slot()
+    Pending --> Running: 写入 TQ<br/>status=running
+    Running --> Success: kv_list poll 检测<br/>status=finish
+    Success --> Idle: release_slot()<br/>notify 等待者
+    note right of Pending
+        pending_slots++
+        阻塞等待 if >= max_pending_slots
+    end note
+    note right of Success
+        pending_slots--
+        自动释放 slot
+    end note
 ```
 
 ### TQFullyAsyncRollouter
@@ -729,25 +775,6 @@ sequenceDiagram
     T->>R: update_weights()
     T->>R: reset_staleness()
     R->>RB: 更新版本计数
-```
-
-### Slot 控制机制
-
-```mermaid
-stateDiagram-v2
-    [*] --> Idle: 初始化
-    Idle --> Pending: acquire_slot()
-    Pending --> Running: 写入 TQ<br/>status=running
-    Running --> Success: kv_list poll 检测<br/>status=finish
-    Success --> Idle: release_slot()<br/>notify 等待者
-    note right of Pending
-        _pending_slots++
-        阻塞等待 if >= max_pending_slots
-    end note
-    note right of Success
-        _pending_slots--
-        自动释放 slot
-    end note
 ```
 
 ### Staleness 与 Slot 协同
