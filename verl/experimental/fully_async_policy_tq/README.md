@@ -1,4 +1,4 @@
-# Fully Async Policy with TransferQueue (TQ)
+# Fully Async Policy with TransferQueue
 
 ## 概述
 
