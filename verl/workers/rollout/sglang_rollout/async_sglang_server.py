@@ -115,6 +115,10 @@ class SGLangHttpServer:
         self._server_address = ray.util.get_node_ip_address().strip("[]")
         self._server_port = None
 
+        # State flag to track if server is in aborted state
+        # When True, generate() will return immediately with stop_reason="aborted"
+        self._is_aborted = False
+
         # used for controlling sglang server profiler
         profiler_config = self.config.profiler
         tool_config = None
@@ -368,6 +372,21 @@ class SGLangHttpServer:
         if self.node_rank == 0:
             await self.tokenizer_manager.flush_cache()
 
+    async def release_kv_cache(self):
+        """Release only kv_cache GPU memory, keeping model weights intact."""
+        if self.node_rank != 0 or not self.config.free_cache_engine:
+            return
+        obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
+        await self.tokenizer_manager.release_memory_occupation(obj, None)
+
+    async def resume_kv_cache(self):
+        """Restore kv_cache GPU memory after a weight sync. Counterpart to release_kv_cache()."""
+        if self.node_rank != 0:
+            return
+        obj = ResumeMemoryOccupationReqInput(tags=["kv_cache"])
+        await self.tokenizer_manager.resume_memory_occupation(obj, None)
+        await self.tokenizer_manager.flush_cache()
+
     async def generate(
         self,
         prompt_ids: torch.Tensor,
@@ -377,6 +396,15 @@ class SGLangHttpServer:
         video_data: Optional[list[Any]] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
+        # If server is in aborted state, return immediately without processing
+        if self._is_aborted:
+            return TokenOutput(
+                token_ids=[],
+                log_probs=None,
+                routed_experts=None,
+                stop_reason="aborted",
+            )
+
         # TODO(@wuxibin): switch to `/generate` http endpoint once multi-modal support ready.
         max_possible_tokens = self.config.max_model_len - len(prompt_ids) - 1
 
@@ -439,10 +467,12 @@ class SGLangHttpServer:
                 # SGLang may return mismatched lengths (e.g. max_new_tokens=0
                 # produces a phantom logprob entry with empty output_ids), or
                 # an abort may leave an empty logprob payload.
-                assert not token_ids, (
-                    f"output_token_logprobs length ({len(output_token_logprobs)}) != "
-                    f"output_ids length ({len(token_ids)}) for request {request_id}"
-                )
+                if len(output_token_logprobs) != len(token_ids):
+                    logger.error(
+                        f"output_token_logprobs length ({len(output_token_logprobs)}) != "
+                        f"output_ids length ({len(token_ids)}) for request {request_id}"
+                    )
+                token_ids = []
                 log_probs = []
         else:
             token_ids = output["output_ids"]
@@ -479,9 +509,11 @@ class SGLangHttpServer:
         self.global_steps = global_steps
 
     async def abort_all_requests(self):
+        self._is_aborted = True
         await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="abort"))
 
     async def resume_generation(self):
+        self._is_aborted = False
         await self.tokenizer_manager.continue_generation(ContinueGenerationReqInput())
 
     async def start_profile(self, **kwargs):

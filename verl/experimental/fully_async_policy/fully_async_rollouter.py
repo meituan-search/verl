@@ -13,10 +13,8 @@
 # limitations under the License.
 
 import asyncio
-import multiprocessing
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pprint import pformat
 
 import numpy as np
@@ -25,15 +23,12 @@ import torch
 
 from verl.experimental.fully_async_policy.detach_utils import (
     RolloutSample,
-    ValidateMetrics,
     prepare_single_generation_data,
     safe_create_task,
 )
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayWorkerGroup
-from verl.trainer.ppo.ray_trainer import ResourcePoolManager
-from verl.trainer.ppo.utils import Role, WorkerType
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.profiler import marked_timer
 from verl.utils.tracking import ValidationGenerationsLogger
@@ -51,8 +46,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self,
         config,
         tokenizer,
-        role_worker_mapping: dict[Role, WorkerType],
-        resource_pool_manager: ResourcePoolManager,
         ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
         processor=None,
         device_name=None,
@@ -71,8 +64,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             "trigger_parameter_sync_step must larger or equal than 1"
         )
 
-        self.role_worker_mapping = role_worker_mapping
-        self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = False
 
         self.use_rm = False
@@ -113,19 +104,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
         self._validate_config()
-        if self.config.async_training.use_trainer_do_validate:
-            rollout_gpus = config.rollout.nnodes * config.rollout.n_gpus_per_node
-            train_gpus = config.trainer.nnodes * config.trainer.n_gpus_per_node
-            total_gpus = rollout_gpus + train_gpus
-            print(f"[FullyAsyncRollouter] split before val_dataset total len: {len(val_dataset)}")
-            split_dataset = val_dataset.split(total_gpus)
-            rollout_val_dataset0 = split_dataset[:rollout_gpus]
-            from torch.utils.data import ConcatDataset
-
-            val_dataset = ConcatDataset(rollout_val_dataset0)
-            print(f"[FullyAsyncRollouter] split after val_dataset total len: {len(val_dataset)}")
-        print(f"[FullyAsyncRollouter] Rollouter _create_dataloader...\n{train_dataset}\n{val_dataset}")
-
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.total_rollout_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
@@ -137,10 +115,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Rollouter parameter configuration
         self.message_queue_client = None
 
-        # Worker groups: rollout_wg is same to actor_rollout_wg
-        self.rollout_wg = None
-        self.actor_rollout_wg = None
         self.async_rollout_manager = None
+
+        # Elastic worker group (injected via set_elastic_worker_group before init_workers)
+        # When set, its GPUs back elastic hybrid replicas for trainer-side validation.
+        self._elastic_worker_group = None
 
         # Config
         self.staleness_threshold: float = config.async_training.get("staleness_threshold", 1)
@@ -173,11 +152,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Initialize async queues
         self.pending_queue = asyncio.Queue(maxsize=128)
         self.active_tasks = set()
-
-        cpu_cores = multiprocessing.cpu_count()
-        # cpu case use cpu_cores; io case use cpu_cores*2
-        self.validate_executor = ThreadPoolExecutor(max_workers=cpu_cores)
-        self.validate_task = None
 
     def _init_async_objects(self):
         # Initialize asyncio synchronization primitives.
@@ -219,10 +193,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 f"max_concurrent_samples: {self.max_concurrent_samples} "
             )
 
-    def get_rollout_wg(self):
-        """Get rollout worker group"""
-        return self.rollout_wg
-
     def get_replicas(self):
         """Get rollout worker group"""
         return self.async_rollout_manager.rollout_replicas
@@ -263,36 +233,12 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self.step_start_time = time.time()
         return timing_raw
 
-    def _maybe_log_val_generations(self, inputs, outputs, scores):
-        """Capture validation generations to send back to trainer instead of logging directly.
-
-        The rollouter process does not have an active wandb session, so we capture the
-        sampled generations and return them via ValidateMetrics to the trainer for logging.
-        """
-        generations_to_log = self.config.trainer.log_val_generations
-        if generations_to_log == 0:
-            self._captured_val_generations = []
-            return
-
-        samples = list(zip(inputs, outputs, scores, strict=True))
-        samples.sort(key=lambda x: x[0])
-
-        rng = np.random.RandomState(42)
-        rng.shuffle(samples)
-
-        self._captured_val_generations = samples[:generations_to_log]
-
-    def do_validate(self) -> ValidateMetrics:
+    def do_validate(self):
         """Run validation and return metrics"""
         timing_raw = {}
-        self._captured_val_generations = []
         with marked_timer("rollouter/validate_time", timing_raw, color="green"):
             val_metrics: dict = self._validate()
-        return ValidateMetrics(
-            timing_raw=timing_raw,
-            metrics=val_metrics,
-            val_generations=self._captured_val_generations,
-        )
+        return timing_raw | val_metrics
 
     async def save_checkpoint(self, local_global_step_folder: str):
         # WARNING!: Due to the asynchronous nature, there are some in-flight samples
@@ -390,11 +336,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Skip rollout creation and let agentloop handle it
         pass
 
-    def _init_models(self):
-        self.rollout_wg = self.all_wg[str(Role.Rollout)]
-        self.rollout_wg.init_model()
-        self.actor_rollout_wg = self.rollout_wg
-
     def _create_continuous_iterator(self):
         """
         Create a continuous data iterator across epoch
@@ -405,6 +346,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 yield epoch, batch_dict
 
     async def _init_async_rollout_manager(self):
+        """
+        Create the unified FullyAsyncAgentLoopManager that manages both:
+        - Fixed rollout replicas (standalone)
+        - Elastic hybrid replicas (from self._elastic_worker_group, injected via set_elastic_worker_group)
+
+        Must be called AFTER set_elastic_worker_group() if elastic resources are used,
+        because this method reads self._get_elastic_worker_group() at init time.
+        """
         # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
         # agent_reward_loop: streaming reward computation with actor rollout
         # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
@@ -420,7 +369,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         self.async_rollout_mode = True
         self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
-            config=self.config, worker_group=self.rollout_wg, reward_loop_worker_handles=reward_loop_worker_handles
+            config=self.config,
+            worker_group=self.get_elastic_worker_group(),
+            reward_loop_worker_handles=reward_loop_worker_handles,
+        )
+        print(
+            f"[FullyAsyncRollouter] FullyAsyncAgentLoopManager initialised with "
+            f"{len(self.async_rollout_manager.rollout_replicas)} fixed replicas, "
+            f"{len(self.async_rollout_manager.elastic_replicas)} elastic replicas (sleeping)"
         )
 
     # Add samples to the pending_queue
@@ -712,3 +668,54 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         }
 
         return stats
+
+    # -------------------------------------------------------------------------
+    # Elastic worker group injection
+    # -------------------------------------------------------------------------
+    def set_elastic_worker_group(self, worker_group: RayWorkerGroup):
+        """Inject the elastic worker group."""
+        self._elastic_worker_group = worker_group
+
+    def get_elastic_worker_group(self):
+        """Return the worker group for elastic hybrid replicas."""
+        return self._elastic_worker_group
+
+    # -------------------------------------------------------------------------
+    # Elastic replica management – thin delegation to async_rollout_manager
+    # -------------------------------------------------------------------------
+    async def add_elastic_replica(self, resource_id: str):
+        """Activate a pre-registered elastic hybrid replica."""
+        await self.async_rollout_manager.add_elastic_replica(resource_id)
+
+    async def remove_elastic_replica(self, resource_id: str):
+        """Deactivate an active elastic hybrid replica."""
+        await self.async_rollout_manager.remove_elastic_replica(resource_id)
+
+    def get_elastic_replica(self, resource_id: str):
+        """Return the RolloutReplica object for a registered elastic resource."""
+        return self.async_rollout_manager.elastic_replicas.get(resource_id)
+
+    def get_all_elastic_replicas(self) -> dict:
+        """Return all registered elastic replicas (sleeping + active)."""
+        return dict(self.async_rollout_manager.elastic_replicas)
+
+    # -------------------------------------------------------------------------
+    # Statistics / introspection – delegate to async_rollout_manager
+    # -------------------------------------------------------------------------
+    async def get_elastic_statistics(self) -> dict:
+        """Combined rollout + elastic statistics."""
+        base_stats = await self.get_statistics()
+        elastic_stats = self.async_rollout_manager.get_elastic_statistics()
+        return {**base_stats, **elastic_stats}
+
+    def get_num_active_replicas(self) -> int:
+        """Total active rollout replicas (fixed + elastic)."""
+        return self.async_rollout_manager.get_active_server_count()
+
+    def get_elastic_replicas_info(self) -> list[dict]:
+        """Metadata for all active elastic replicas."""
+        return self.async_rollout_manager.get_elastic_replicas_info()
+
+    def get_total_produced_samples(self) -> int:
+        """Total samples produced (uses base class counter)."""
+        return self.total_generated_samples

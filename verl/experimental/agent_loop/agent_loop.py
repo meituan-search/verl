@@ -1077,22 +1077,15 @@ class AgentLoopManager:
 
     @classmethod
     @auto_await
-    async def create(
-        cls,
-        config: DictConfig,
-        worker_group: RayWorkerGroup = None,
-        rollout_resource_pool: RayResourcePool = None,
-        reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
-        teacher_model_manager: MultiTeacherModelManager = None,
-    ):
+    async def create(cls, **kwargs):
         """Create agent loop manager."""
-        instance = cls(config, worker_group, rollout_resource_pool, teacher_model_manager, reward_loop_worker_handles)
+        instance = cls(**kwargs)
         await instance._initialize_llm_servers()
         await instance._init_global_load_balancer()
         await instance._init_agent_loop_workers()
         return instance
 
-    async def _initialize_llm_servers(self):
+    async def _initialize_llm_servers(self, start_rank: int = 0):
         rollout_world_size = (
             self.rollout_config.tensor_model_parallel_size
             * self.rollout_config.data_parallel_size
@@ -1107,12 +1100,12 @@ class AgentLoopManager:
 
         self.rollout_replicas = [
             self.rollout_replica_class(
-                replica_rank=replica_rank,
+                replica_rank=start_rank + i,
                 config=self.rollout_config,
                 model_config=self.model_config,
                 gpus_per_node=self.rollout_config.n_gpus_per_node,
             )
-            for replica_rank in range(num_replicas)
+            for i in range(num_replicas)
         ]
 
         if self.worker_group and self.rollout_config.name != "trtllm":
