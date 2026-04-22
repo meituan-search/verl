@@ -2,7 +2,8 @@
 
 ## 概述
 
-本方案旨在将 `fully_async_policy` 的数据传输通道从 Ray MessageQueue 迁移到 TransferQueue (TQ)，实现零拷贝、高性能的异步 PPO 训练。
+本方案旨在将 `fully_async_policy` 的数据传输通道从 Ray MessageQueue 迁移到 TransferQueue (TQ)，实现零拷贝、高性能的异步
+PPO 训练。
 
 ### 核心目标
 
@@ -10,8 +11,6 @@
 2. **元数据与数据分离**: Tensor 数据走 TQ 数据平面，元数据走 TQ kv_list 元数据通道
 3. **背压控制**: 通过 slot 机制限制 in-flight 请求数量
 4. **完全异步**: Rollouter 和 Trainer 完全解耦，独立运行
-
-
 
 ## 架构对比
 
@@ -52,6 +51,7 @@ graph TB
 ```
 
 **核心流程**:
+
 1. **Rollouter** 从 dataloader 读取数据
 2. **Rollouter** 调用 `AgentLoopManager.generate_sequences()`
 3. **AgentLoopManager** 分发任务到 **AgentLoopWorker**
@@ -66,7 +66,6 @@ graph TB
 
 - 数据完整序列化/反序列化开销大
 - Ray Actor 单点瓶颈
-- 无背压机制，可能 OOM
 
 ### 新架构 (TransferQueue)
 
@@ -112,28 +111,39 @@ graph TB
 ```
 
 **核心流程**:
+
 1. **Rollouter** 从 dataloader 读取数据，获取 slot，写入 prompt 到 **TQ**
 2. **Worker** 从 **ReplayBuffer** 拉取 pending 任务
 3. **Worker** 选择 **LLM Server**，调用 `generate_with_tq`
 4. **Server** 从 TQ 获取 prompt，执行生成，将 response 写回 TQ
 5. **Trainer** 从 ReplayBuffer 获取 finish 样本，从 TQ 获取完整数据
 
+Server 直接从 TQ 获取数据
+
+```mermaid
+graph LR
+    R[Rollouter] -->|kv_batch_put| TQ[TransferQueue]
+    W[Worker] -->|dispatch key| S[LLM Server]
+    S -->|kv_batch_get| TQ
+    S -->|generate + kv_batch_put| TQ
+    T[Trainer] -->|kv_batch_get| TQ
+```
+
 **关键变化**:
 
-| 现有架构 | 新架构 |
-|---------|--------|
-| Rollouter 调用 `generate_sequences` 并等待返回 | Rollouter 仅写入 TQ，不等待生成 |
-| Rollouter 将结果写入 MessageQueue | Server 直接写入 TQ |
-| Worker 被 AgentLoopManager 调用 | Worker 主动从 ReplayBuffer 拉取任务 |
-| MessageQueue 存储完整样本 (pickle) | TQ 存储零拷贝 Tensor + 元数据分离 |
+| 现有架构                                    | 新架构                          |
+|-----------------------------------------|------------------------------|
+| Rollouter 调用 `generate_sequences` 并等待返回 | Rollouter 仅写入 TQ，不等待生成       |
+| Rollouter 将结果写入 MessageQueue            | Server 直接写入 TQ, 返回结束         |
+| Worker 被 AgentLoopManager 调用            | Worker 主动从 ReplayBuffer 拉取任务 |
+| MessageQueue 存储完整样本 (pickle)            | TQ 存储零拷贝 Tensor + 元数据分离      |
 
 **优势**:
 
-- ✅ Tensor 数据零拷贝传输
 - ✅ 元数据轻量级同步 (kv_list)
-- ✅ slot 机制实现背压控制
+- ✅ slot 机制实现令牌控流
 - ✅ 分布式存储，无单点瓶颈
-- ✅ Server 直接读写 TQ，减少数据拷贝
+- ✅ Server，Tensor 直接读写 TQ，减少数据拷贝
 
 ## 数据结构
 
@@ -221,6 +231,7 @@ key = f"{partition_id}_{uid}_{session_id}_{trajectory_id}"
 ```
 
 **字段说明**:
+
 - `partition_id`: 分区标识，如 "train" 或 "val"
 - `uid`: 原始 prompt 的唯一标识
 - `session_id`: 同一 prompt 的第 n 次采样 (0 到 n-1)
@@ -248,7 +259,8 @@ class ReplayBuffer:
         self._poll_thread.start()
 
     # === Slot 控制 (Rollouter) ===
-    def acquire_slot(self, timeout=None) -> bool: ...
+    def acquire_slot(self) -> bool: ...
+
     def release_slot(self): ...
 
     # === Worker 拉取接口 ===
@@ -256,10 +268,12 @@ class ReplayBuffer:
 
     # === Trainer 消费接口 ===
     def wait_and_sample(self, partition_id, batch_size) -> list[tuple[str, dict]] | None: ...
+
     def remove(self, partition_id, keys): ...
 
     # === 统计接口 ===
     def total_in_flight(self) -> int: ...
+
     def get_staleness_statistics(self, current_version, partition_id="train") -> dict: ...
 ```
 
@@ -287,6 +301,7 @@ stateDiagram-v2
 分配 prompt 到 TQ，控制生成速率。
 
 **职责**:
+
 1. 从 dataloader 读取数据
 2. 调用 `prepare_single_generation_data` 处理数据
 3. 获取 slot，写入 TQ
@@ -316,7 +331,7 @@ class TQFullyAsyncRollouter:
             uid = full_batch.non_tensor_batch["uid"][i]
 
             # 阻塞获取 slot (背压控制)
-            acquired = await self.replay_buffer.acquire_slot.remote(timeout=60.0)
+            acquired = await self.replay_buffer.acquire_slot.remote()
             if not acquired:
                 logger.warning("Failed to acquire slot, stopping...")
                 break
@@ -348,6 +363,7 @@ class TQFullyAsyncRollouter:
 独立实现的 Worker，内置事件循环，主动拉取任务。
 
 **职责**:
+
 1. 主动从 ReplayBuffer 拉取 pending 任务
 2. 处理 n 次采样（每个 prompt 生成 n 个 session）
 3. 调用 AgentLoop 执行生成
@@ -359,13 +375,13 @@ class TQFullyAsyncRollouter:
 @ray.remote(num_cpus=1)
 class TQAgentLoopWorker:
     def __init__(
-        self,
-        config: DictConfig,
-        replay_buffer_handle: ray.actor.ActorHandle,
-        servers: list[tuple[str, ray.actor.ActorHandle]],
-        load_balancer_handle: ray.actor.ActorHandle,
-        tokenizer,
-        processor=None,
+            self,
+            config: DictConfig,
+            replay_buffer_handle: ray.actor.ActorHandle,
+            servers: list[tuple[str, ray.actor.ActorHandle]],
+            load_balancer_handle: ray.actor.ActorHandle,
+            tokenizer,
+            processor=None,
     ):
         self.config = config
         self.replay_buffer = replay_buffer_handle
@@ -468,11 +484,11 @@ class TQAgentLoopWorker:
             )
 
     async def _run_session(
-        self,
-        session_key: str,
-        parent_key: str,
-        session_id: int,
-        parent_meta: dict,
+            self,
+            session_key: str,
+            parent_key: str,
+            session_id: int,
+            parent_meta: dict,
     ):
         """执行单次采样 (一个 AgentLoop)"""
         # 1. 创建 AgentLoop 实例
@@ -547,13 +563,13 @@ class TQLLMServer:
     """LLM Server 的 TQ 扩展，处理数据读写"""
 
     async def generate_with_tq(
-        self,
-        request_id: str,
-        prompt_ids: list[int],
-        sampling_params: dict,
-        partition_id: str,
-        session_key: str,
-        **kwargs,
+            self,
+            request_id: str,
+            prompt_ids: list[int],
+            sampling_params: dict,
+            partition_id: str,
+            session_key: str,
+            **kwargs,
     ) -> TokenOutput:
         """执行生成并处理 TQ 数据读写"""
         final_output = TokenOutput(token_ids=[], log_probs=[], num_preempted=0)
@@ -642,6 +658,7 @@ class TQLLMServer:
 消费完成样本，执行 PPO 训练。
 
 **职责**:
+
 1. 从 ReplayBuffer 获取 finish 状态的样本
 2. 从 TQ 获取完整数据
 3. 执行 PPO 训练步骤
@@ -650,13 +667,13 @@ class TQLLMServer:
 ```python
 class TQFullyAsyncTrainer(PPOTrainer):
     def __init__(
-        self,
-        config: DictConfig,
-        role_worker_mapping: dict[Role, WorkerType],
-        resource_pool_manager: ResourcePoolManager,
-        replay_buffer_handle: ray.actor.ActorHandle,
-        rollouter_handle: ray.actor.ActorHandle,
-        **kwargs,
+            self,
+            config: DictConfig,
+            role_worker_mapping: dict[Role, WorkerType],
+            resource_pool_manager: ResourcePoolManager,
+            replay_buffer_handle: ray.actor.ActorHandle,
+            rollouter_handle: ray.actor.ActorHandle,
+            **kwargs,
     ):
         super().__init__(config, role_worker_mapping, resource_pool_manager, **kwargs)
         self.replay_buffer = replay_buffer_handle
@@ -737,53 +754,48 @@ sequenceDiagram
     participant W as Worker
     participant S as Server
     participant T as Trainer
-
-    Note over R,T: 1. Rollouter 写入任务
-    R->>RB: acquire_slot() [阻塞]
-    RB-->>R: slot acquired
-    R->>TQ: kv_batch_put(fields=prompt, tags={status: pending})
-    TQ->>RB: kv_list poll
-
-    Note over R,T: 2. Worker 拉取任务 & 处理生成
+    Note over R, T: 1. Rollouter 写入任务
+    R ->> RB: acquire_slot() [阻塞]
+    RB -->> R: slot acquired
+    R ->> TQ: kv_batch_put(fields=prompt, tags={status: pending})
+    TQ ->> RB: kv_list poll
+    Note over R, T: 2. Worker 拉取任务 & 处理生成
     loop Worker 事件循环
-        W->>RB: get_pending_keys(status=pending)
-        RB-->>W: [(key1, meta1), ...]
-        W->>TQ: kv_batch_put(tags={status: running})
-
-        W->>S: generate_with_tq(request_id, key)
-        S->>TQ: kv_batch_get(prompt data)
-        TQ-->>S: prompt data
-        S->>S: generate()
+        W ->> RB: get_pending_keys(status=pending)
+        RB -->> W: [(key1, meta1), ...]
+        W ->> TQ: kv_batch_put(tags={status: running})
+        W ->> S: generate_with_tq(request_id, key)
+        S ->> TQ: kv_batch_get(prompt data)
+        TQ -->> S: prompt data
+        S ->> S: generate()
         Note over S: 可能发生 partial rollout
-        S->>TQ: kv_batch_put(fields=response, tags={status: finish/partial})
-        S-->>W: output
-
-        TQ->>RB: kv_list poll
-        RB->>RB: release_slot()
+        S ->> TQ: kv_batch_put(fields=response, tags={status: finish/partial})
+        S -->> W: output
+        TQ ->> RB: kv_list poll
+        RB ->> RB: release_slot()
     end
 
-    Note over R,T: 3. Trainer 消费
-    T->>RB: wait_and_sample()
-    RB-->>T: [(key, tags)]
-    T->>TQ: kv_batch_get(keys)
-    TQ-->>T: full data
-    T->>T: 训练...
-    T->>TQ: kv_clear(keys)
-    T->>RB: remove(keys)
-
-    Note over R,T: 4. 参数同步
-    T->>R: update_weights()
-    T->>R: reset_staleness()
-    R->>RB: 更新版本计数
+    Note over R, T: 3. Trainer 消费
+    T ->> RB: wait_and_sample()
+    RB -->> T: [(key, tags)]
+    T ->> TQ: kv_batch_get(keys)
+    TQ -->> T: full data
+    T ->> T: 训练...
+    T ->> TQ: kv_clear(keys)
+    T ->> RB: remove(keys)
+    Note over R, T: 4. 参数同步
+    T ->> R: update_weights()
+    T ->> R: reset_staleness()
+    R ->> RB: 更新版本计数
 ```
 
 ### Staleness 与 Slot 协同
 
-| 原概念                 | TQ 方案对应                                           |
-| ---------------------- | ----------------------------------------------------- |
+| 原概念                    | TQ 方案对应                                       |
+|------------------------|-----------------------------------------------|
 | `staleness_samples`    | `pending_slots` (正在生成) + `ready_count` (等待消费) |
-| `max_required_samples` | `max_pending_slots`                                   |
-| 参数更新后 reset       | `reset_staleness()` → 重置计数                       |
+| `max_required_samples` | `max_pending_slots`                           |
+| 参数更新后 reset            | `reset_staleness()` → 重置计数                    |
 
 **Rollouter 暂停条件**:
 
@@ -806,16 +818,14 @@ verl/experimental/fully_async_policy_tq/
     └── fully_async_ppo_trainer.yaml
 ```
 
-
-
 ## 性能预期
 
-| 指标         | MessageQueue    | TransferQueue  | 提升 |
-| ------------ | --------------- | -------------- | ---- |
-| 数据传输延迟 | ~10ms (序列化)  | ~1ms (零拷贝)  | 10x  |
-| 内存占用     | 2x (序列化副本) | 1x (零拷贝)    | 2x   |
-| 吞吐量       | ~1K samples/s   | ~10K samples/s | 10x  |
-| CPU 开销     | 高 (序列化)     | 低 (无序列化)  | 5x   |
+| 指标     | MessageQueue  | TransferQueue  | 提升  |
+|--------|---------------|----------------|-----|
+| 数据传输延迟 | ~10ms (序列化)   | ~1ms (零拷贝)     | 10x |
+| 内存占用   | 2x (序列化副本)    | 1x (零拷贝)       | 2x  |
+| 吞吐量    | ~1K samples/s | ~10K samples/s | 10x |
+| CPU 开销 | 高 (序列化)       | 低 (无序列化)       | 5x  |
 
 ## 参考
 
