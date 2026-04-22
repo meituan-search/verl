@@ -126,6 +126,7 @@ graph LR
     W[Worker] -->|dispatch key| S[LLM Server]
     S -->|kv_batch_get| TQ
     S -->|generate + kv_batch_put| TQ
+    A[AgentLoop/GateWay] -->|kv_batch_put| TQ
     T[Trainer] -->|kv_batch_get| TQ
 ```
 
@@ -143,7 +144,8 @@ graph LR
 - ✅ 元数据轻量级同步 (kv_list)
 - ✅ slot 机制实现令牌控流
 - ✅ 分布式存储，无单点瓶颈
-- ✅ Server，Tensor 直接读写 TQ，减少数据拷贝
+- ✅ Server，Train, GateWay, AgentLoop 直接读写 TQ，减少数据拷贝
+- ✅ 统一消息传输的所有过程
 
 ## 数据结构
 
@@ -166,8 +168,6 @@ tags = {
     "trajectory_id": int,  # 每次 AgentLoop 可能有多个输出（prefix 切换）
 
     # ===版本追踪===
-    "start_model_version": int,  # 生成开始时的模型版本
-    "end_model_version": int,  # 生成结束时的模型版本
     "min_global_steps": int,  # partial rollout 最小版本
     "max_global_steps": int,  # partial rollout 最大版本
 
