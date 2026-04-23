@@ -103,14 +103,16 @@ def preprocess_packed_seqs(
             start_idx = cu_seqlens_padded_cpu[i] // cp_size
             # split to 2 chunks
             d = input_ids[i, attention_mask[i]]
-            input_ids_rmpad[start_idx : start_idx + half_seqlen] = d[
-                half_seqlen * cp_rank : half_seqlen * (cp_rank + 1)
-            ]
+            first_start = half_seqlen * cp_rank
+            first_end = min(half_seqlen * (cp_rank + 1), d.shape[0])
+            first_len = max(first_end - first_start, 0)
+            if first_len > 0:
+                input_ids_rmpad[start_idx : start_idx + first_len] = d[first_start:first_end]
 
             remain_start = seqlen_padded_i - half_seqlen * (cp_rank + 1)
             remain_end = seqlen_padded_i - half_seqlen * cp_rank
             remain_end = min(remain_end, d.shape[0])
-            remain_len = remain_end - remain_start
+            remain_len = max(remain_end - remain_start, 0)
             if remain_len > 0:
                 input_ids_rmpad[start_idx + half_seqlen : start_idx + half_seqlen + remain_len] = d[
                     remain_start:remain_end
@@ -726,3 +728,41 @@ def postprocess_bshd_engine(
     output_new_tensor = torch.nested.as_nested_tensor(output_new, layout=torch.jagged)
 
     return output_new_tensor
+
+
+def build_vlm_attn_mask_thd(input_ids: torch.Tensor, pad_token_id: int = None):
+    input_ids_rmpad = input_ids.to_padded_tensor(pad_token_id)
+
+    if is_npu_available:
+        return input_ids_rmpad, None
+
+    seqlens_in_batch = input_ids.offsets().diff()
+    attention_mask = torch.zeros_like(input_ids_rmpad, dtype=torch.bool)
+    for i, seqlen in enumerate(seqlens_in_batch):
+        attention_mask[i, :seqlen] = True
+
+    return input_ids_rmpad, attention_mask
+
+
+def build_vlm_attn_mask_bshd(input_ids: torch.Tensor, batch_size: int, pad_token_id: int = None):
+    seqlens_in_batch = input_ids.offsets().diff()
+    max_seqlen = seqlens_in_batch.max().item()
+
+    # For CP, sequence length must be divisible by (2 * cp_size), and for SP by tp_size.
+    tp_size = mpu.get_tensor_model_parallel_world_size()
+    cp_size = mpu.get_context_parallel_world_size()
+    align_size = math.lcm(tp_size, 2 * cp_size) if cp_size > 1 else tp_size
+    if align_size > 1:
+        pad_size = (align_size - max_seqlen % align_size) % align_size
+        max_seqlen += pad_size
+
+    input_ids_bshd = input_ids.to_padded_tensor(pad_token_id, output_size=(batch_size, max_seqlen))
+
+    if is_npu_available:
+        return input_ids_bshd, None
+
+    attention_mask = torch.zeros_like(input_ids_bshd, dtype=torch.bool)
+    for i, seqlen in enumerate(seqlens_in_batch):
+        attention_mask[i, :seqlen] = True
+
+    return input_ids_bshd, attention_mask
