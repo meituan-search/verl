@@ -126,7 +126,7 @@ graph LR
     W[Worker] -->|dispatch key| S[LLM Server]
     S -->|kv_batch_get| TQ
     S -->|generate + kv_batch_put| TQ
-    A[AgentLoop/GateWay] -->|kv_batch_put| TQ
+    A[AgentLoop/Gateway] -->|kv_batch_put| TQ
     T[Trainer] -->|kv_batch_get| TQ
 ```
 
@@ -230,12 +230,29 @@ key = f"{partition_id}_{uid}_{session_id}_{trajectory_id}"
 # 示例: "train_42_0_0", "val_100_3_1"
 ```
 
+
+
+### partition
+
+用于做数据的分区。
+
+```
+{
+	partiton_id1: {key1: tag1, key2: tag2},
+  partiton_id2: {key3: tag3, key4: tag4},
+}
+```
+
+
+
 **字段说明**:
 
 - `partition_id`: 分区标识，如 "train" 或 "val"
 - `uid`: 原始 prompt 的唯一标识
 - `session_id`: 同一 prompt 的第 n 次采样 (0 到 n-1)
 - `trajectory_id`: 同一 session 的第 m 个输出 (用于 multi-output agent loop)
+
+
 
 ## 核心组件
 
@@ -364,10 +381,11 @@ class TQFullyAsyncRollouter:
 
 **职责**:
 
-1. 主动从 ReplayBuffer 拉取 pending 任务
-2. 处理 n 次采样（每个 prompt 生成 n 个 session）
-3. 调用 AgentLoop 执行生成
-4. 不直接写 TQ，由 Server 侧处理
+1. 主动从 ReplayBuffer 拉取 pending 任务 {uid}
+2. 处理 n 次采样（每个 prompt 生成 n 个 session）：{uid}_{session_id}
+3. 调用 AgentLoop 执行生成，每个session可以在AgentLoop侧，可能返回多条轨迹：{uid}\_{session_id}\_{trajectory_id}
+4. 最终，拷贝 {uid}_{session_id} prompt，并将 {uid}\_{session_id}\_{trajectory_id} 写回到TQ中
+5. 将key传递给由 Server 侧，有Server侧继续处理 哦·
 
 **实现**:
 
