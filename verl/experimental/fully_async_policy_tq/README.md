@@ -238,7 +238,7 @@ key = f"{partition_id}_{uid}_{session_id}_{trajectory_id}"
 
 ```
 {
-	partiton_id1: {key1: tag1, key2: tag2},
+  partiton_id1: {key1: tag1, key2: tag2},
   partiton_id2: {key3: tag3, key4: tag4},
 }
 ```
