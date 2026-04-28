@@ -106,7 +106,7 @@ class TQFullyAsyncTaskRunner:
         # ==================== 4. Create ReplayBuffer ====================
         max_pending_slots = config.async_training.get("max_pending_slots", 256)
         poll_interval = config.async_training.get("poll_interval", 1.0)
-        print(f"[TQ_ASYNC MAIN] Creating ReplayBuffer (max_slots={max_pending_slots}, poll={poll_interval}s)")
+        print(f"[TQ_ASYNC MAIN] Creating ReplayBuffer (max_slots={max_pending_slots}, poll={poll_interval}s)"
         replay_buffer = ReplayBuffer.remote(
             max_pending_slots=max_pending_slots,
             poll_interval=poll_interval,
@@ -231,7 +231,7 @@ class TQFullyAsyncTaskRunner:
         # For now, we create a minimal ALM just to get its servers/LB infrastructure.
         # The actual rollout replicas are managed by the rollouter's internal ALM.
 
-        num_workers = config.async_training.get("num_agent_loop_workers", 2)
+        num_workers = config.actor_rollout_ref.rollout.agent.get("num_workers", 2)
         print(f"[TQ_ASYNC MAIN] Creating {num_workers} TQAgentLoopWorkers...")
 
         # Get server addresses and handles from the rollouter's internal rollout manager.
