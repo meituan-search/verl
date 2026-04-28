@@ -79,7 +79,9 @@ class ModelEngineServerAdapter(BaseRollout):
         # Remap model_engine_server-specific config keys to ppo-compatible names expected
         # by TrainingWorkerConfig / EngineConfig.
         with open_dict(self._full_config.model_engine_server):
-            self._full_config.model_engine_server.pop("enable_standalone", None)
+            self._full_config.model_engine_server.pop("enable", None)
+            self._full_config.model_engine_server.pop("enable_old_mode", None)
+            self._full_config.model_engine_server.pop("enable_ref_mode", None)
             self._full_config.model_engine_server.pop("nnodes", None)
             self._full_config.model_engine_server.pop("n_gpus_per_node", None)
             self._full_config.model_engine_server.pop("batch_size", None)
@@ -536,7 +538,7 @@ class ModelEngineReplica(RolloutReplica):
 
     def __init__(
         self,
-        replica_rank: int,
+        name: str,
         full_config: DictConfig,
         worker_cls,
         rollout_config=None,
@@ -544,7 +546,7 @@ class ModelEngineReplica(RolloutReplica):
         # model_engine_server uses a plain DP training engine (no TP/PP), so world_size is
         # simply n_gpus_per_node * nnodes.  We bypass RolloutReplica.__init__'s
         # world_size formula (which reads rollout TP/PP) and set the fields directly.
-        self.replica_rank = replica_rank
+        self.name = name
         self.config = None  # not used by ModelEngineReplica
         self.model_config = None  # not used by ModelEngineReplica
         self._rollout_config = rollout_config
@@ -587,7 +589,7 @@ class ModelEngineReplica(RolloutReplica):
         self.rollout_mode = RolloutMode.STANDALONE
 
         # 1. Create an independent Ray resource pool for this replica.
-        resource_pool_name = f"model_engine_pool_{self.replica_rank}"
+        resource_pool_name = f"model_engine_pool_{self.name}"
         resource_pool_spec = {resource_pool_name: [self.gpus_per_replica_node] * self.nnodes}
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=None)
         resource_pool_manager.create_resource_pool()
@@ -598,7 +600,7 @@ class ModelEngineReplica(RolloutReplica):
             resource_pool=self.resource_pool,
             ray_cls_with_init=self.get_ray_class_with_init_args(),
             bin_pack=False,
-            name_prefix=f"model_engine_standalone_{self.replica_rank}",
+            name_prefix=f"model_engine_standalone_{self.name}",
             device_name="cuda" if not is_torch_npu_available(check_device=False) else "npu",
         )
         self.workers = self._worker_group.workers
@@ -611,7 +613,7 @@ class ModelEngineReplica(RolloutReplica):
         self._worker_group.init_model()
 
         server = ModelEngineServer.options(
-            name=f"model_engine_server_{self.replica_rank}",
+            name=f"model_engine_server_{self.name}",
         ).remote(
             model_engine_worker_group=self._worker_group,
             model_engine_cfg=self._full_config.model_engine_server,
@@ -627,3 +629,62 @@ class ModelEngineReplica(RolloutReplica):
     async def resume_generation(self):
         """No-op for ModelEngineReplica."""
         pass
+
+
+class ModelEngineServerManager:
+    """Manages old and ref ModelEngineReplica instances with a unified compute interface.
+
+    Reads enable_old_mode / enable_ref_mode from full_config.model_engine_server.
+    Both instances reuse the same full_config (parallelism, strategy, etc.).
+    Only old_instance is registered for CheckpointEngine weight sync.
+    """
+
+    def __init__(self, full_config):
+        self._full_config = full_config
+        self._config = full_config.model_engine_server
+        self._has_old_instance: bool = self._config.get("enable_old_mode", False)
+        self._has_ref_instance: bool = self._config.get("enable_ref_mode", False)
+        self._old_instance: ModelEngineReplica = None
+        self._ref_instance: ModelEngineReplica = None
+
+    async def initialize(self):
+        """Create and init_standalone() each configured replica."""
+        if self._has_old_instance:
+            self._old_instance = ModelEngineReplica(
+                name="old",
+                full_config=self._full_config,
+                worker_cls=ModelEngineWorker,
+                rollout_config=self._full_config.actor_rollout_ref.rollout,
+            )
+            await self._old_instance.init_standalone()
+        if self._has_ref_instance:
+            self._ref_instance = ModelEngineReplica(
+                name="ref",
+                full_config=self._full_config,
+                worker_cls=ModelEngineWorker,
+                rollout_config=self._full_config.actor_rollout_ref.rollout,
+            )
+            await self._ref_instance.init_standalone()
+
+    async def compute_log_probs(self, data, **kwargs) -> dict:
+        """Compute log probabilities for configured instances in parallel.
+
+        Returns dict with keys: old_log_probs, old_entropys, ref_log_probs, ref_entropys
+        (only keys for enabled instances are present).
+        """
+        import asyncio
+
+        tasks, labels = [], []
+        if self._has_old_instance:
+            tasks.append(self._old_instance.servers[0].compute_log_prob.remote(data, **kwargs))
+            labels.append("old")
+        if self._has_ref_instance:
+            tasks.append(self._ref_instance.servers[0].compute_log_prob.remote(data, **kwargs))
+            labels.append("ref")
+
+        results = await asyncio.gather(*tasks)
+        output = {}
+        for label, result in zip(labels, results, strict=False):
+            output[f"{label}_log_probs"] = result["log_probs"]
+            output[f"{label}_entropys"] = result["entropys"]
+        return output

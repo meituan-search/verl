@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .model_engine_server import ModelEngineReplica, ModelEngineServer, ModelEngineServerAdapter, ModelEngineWorker
+from .model_engine_server import (
+    ModelEngineReplica,
+    ModelEngineServer,
+    ModelEngineServerAdapter,
+    ModelEngineServerManager,
+    ModelEngineWorker,
+)
 
-__all__ = ["ModelEngineServerAdapter", "ModelEngineWorker", "ModelEngineServer", "ModelEngineReplica"]
+__all__ = [
+    "ModelEngineServerAdapter",
+    "ModelEngineWorker",
+    "ModelEngineServer",
+    "ModelEngineReplica",
+    "ModelEngineServerManager",
+]

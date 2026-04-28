@@ -1,5 +1,11 @@
-# Whether enable standalone model engine server
-enable_standalone: False
+# Whether enable model engine server
+enable: False
+
+# Enable old policy log prob computation (requires weight sync from actor)
+enable_old_mode: False
+
+# Enable ref policy log prob computation (static weights, no sync)
+enable_ref_mode: False
 
 # Number of nodes for standalone model engine workers
 nnodes: null

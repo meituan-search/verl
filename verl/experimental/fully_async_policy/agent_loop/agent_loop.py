@@ -49,10 +49,10 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         config: DictConfig,
         servers: list[tuple[str, ray.actor.ActorHandle]],
         load_balancer_handle: ray.actor.ActorHandle,
-        model_engine_server_handle: ray.actor.ActorHandle = None,
+        model_engine_server_manager=None,
     ):
         super().__init__(config=config, servers=servers, load_balancer_handle=load_balancer_handle)
-        self.model_engine_server_handle = model_engine_server_handle
+        self.model_engine_server_manager = model_engine_server_manager
 
     @rollout_trace_op
     async def generate(
@@ -107,7 +107,7 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
             current_temperature = sampling_params.get("temperature", 1.0)
             # Skip old log prob computation during validation
             if not validate:
-                output = await self._compute_old_log_prob(output, current_prompt_ids, current_temperature)
+                output = await self._compute_log_probs(output, current_prompt_ids, current_temperature)
             # 2. merge output into final_output
             final_output.token_ids.extend(output.token_ids)
             if output.log_probs is not None:
@@ -122,6 +122,12 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
                 final_output.extra_fields["engine_server_entropys"].extend(
                     output.extra_fields["engine_server_entropys"]
                 )
+            if output.extra_fields.get("ref_logprobs") is not None:
+                final_output.extra_fields.setdefault("ref_logprobs", [])
+                final_output.extra_fields["ref_logprobs"].extend(output.extra_fields["ref_logprobs"])
+            if output.extra_fields.get("ref_entropys") is not None:
+                final_output.extra_fields.setdefault("ref_entropys", [])
+                final_output.extra_fields["ref_entropys"].extend(output.extra_fields["ref_entropys"])
             # On partial rollout resume the model version may differ, so keep
             # existing routing and only append routing for newly generated tokens.
             if output.routed_experts is not None and len(output.token_ids) > 0:
@@ -157,21 +163,28 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         final_output.extra_fields["max_global_steps"] = max_global_steps
         return final_output
 
-    async def _compute_old_log_prob(self, output: TokenOutput, context_prompt_ids, temperature: float):
-        if self.model_engine_server_handle is None:
+    async def _compute_log_probs(self, output: TokenOutput, context_prompt_ids, temperature: float):
+        if self.model_engine_server_manager is None:
             return output
 
-        # Only recompute old_log_probs for newly generated tokens in this turn.
+        # Only recompute log_probs for newly generated tokens in this turn.
         if len(output.token_ids) == 0:
             output.extra_fields["engine_server_logprobs"] = []
             output.extra_fields["engine_server_entropys"] = []
+            if self.model_engine_server_manager._has_ref_instance:
+                output.extra_fields["ref_logprobs"] = []
+                output.extra_fields["ref_entropys"] = []
             return output
 
-        result = await self.model_engine_server_handle.compute_log_prob.remote(
+        results = await self.model_engine_server_manager.compute_log_probs(
             context_prompt_ids, output.token_ids, temperature
         )
-        output.extra_fields["engine_server_logprobs"] = result["log_probs"]
-        output.extra_fields["engine_server_entropys"] = result["entropy"]
+        if "old_log_probs" in results:
+            output.extra_fields["engine_server_logprobs"] = results["old_log_probs"]
+            output.extra_fields["engine_server_entropys"] = results["old_entropys"]
+        if "ref_log_probs" in results:
+            output.extra_fields["ref_logprobs"] = results["ref_log_probs"]
+            output.extra_fields["ref_entropys"] = results["ref_entropys"]
         return output
 
 
@@ -185,13 +198,13 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
         teacher_servers: list[tuple[str, ray.actor.ActorHandle]] = None,
         teacher_load_balancer_handle: ray.actor.ActorHandle = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
-        model_engine_server_handle: ray.actor.ActorHandle = None,
+        model_engine_server_manager=None,
     ):
         self.server_manager = FullyAsyncLLMServerManager(
             config,
             servers,
             load_balancer_handle,
-            model_engine_server_handle,
+            model_engine_server_manager,
         )
         super().__init__(
             config,
@@ -218,34 +231,22 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             raise NotImplementedError("Distillation is not implemented in FullyAsyncAgentLoopManager yet.")
 
     async def _initialize_llm_servers(self):
-        """Extend base class to also create ModelEngineReplica when configured."""
+        """Extend base class to also create ModelEngineServerManager when configured."""
         await super()._initialize_llm_servers()
-        if self.config.model_engine_server.enable_standalone:
+        if self.config.model_engine_server.get("enable", False):
             await self._init_model_engine_replica()
 
     async def _init_model_engine_replica(self):
-        """Create ModelEngineReplica, call init_standalone, and append to rollout_replicas.
+        """Initialize ModelEngineServerManager and register old_instance for weight sync."""
+        from verl.workers.rollout.model_engine_server import ModelEngineServerManager
 
-        ModelEngineReplica.init_standalone() self-allocates a Ray resource pool,
-        spawns ModelEngineWorker actors, calls init_model(), and creates the
-        OldLogProbServer — all in one call, exactly like vLLM/SGLang replicas.
+        self.model_engine_server_manager = ModelEngineServerManager(full_config=self.config)
+        await self.model_engine_server_manager.initialize()
 
-        After this, self.model_engine_server_handle is set so that
-        _init_agent_loop_workers() passes it to every FullyAsyncAgentLoopWorker.
-        """
-        from verl.workers.rollout.model_engine_server import ModelEngineReplica, ModelEngineWorker
-
-        replica = ModelEngineReplica(
-            replica_rank=len(self.rollout_replicas),
-            full_config=self.config,
-            worker_cls=ModelEngineWorker,
-            rollout_config=self.rollout_config,
-        )
-        await replica.init_standalone()
-        self.rollout_replicas.append(replica)
-
-        # Expose the server handle so _init_agent_loop_workers passes it to workers.
-        self.model_engine_server_handle = replica.servers[0]
+        # Only old_instance participates in CheckpointEngine weight sync.
+        # ref_instance has static weights and must not be added here.
+        if self.model_engine_server_manager._has_old_instance:
+            self.rollout_replicas.append(self.model_engine_server_manager._old_instance)
 
     @auto_await
     async def generate_sequences_single(self, prompts: DataProto) -> DataProto:

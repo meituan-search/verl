@@ -166,7 +166,8 @@ python -X faulthandler -m verl.experimental.fully_async_policy.fully_async_main 
     actor_rollout_ref.rollout.checkpoint_engine.backend='nccl' \
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
     algorithm.rollout_correction.bypass_mode=False \
-    model_engine_server.enable_standalone=True \
+    model_engine_server.enable=True \
+    model_engine_server.enable_old_mode=True \
     model_engine_server.nnodes="${NNODES_LOG_PROB}" \
     model_engine_server.n_gpus_per_node="${NGPUS_PER_NODE}" \
     model_engine_server.use_dynamic_bsz=${use_dynamic_bsz} \
