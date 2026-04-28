@@ -906,7 +906,8 @@ class vLLMHttpServer:
         """HYBRID sleep: lora adapters only need level=1; full weights need level=2."""
         # Don't use engine.sleep(level=2) here
         # lora only update adapter weights, so set sleep level to 1
-        if self.lora_as_adapter:
+        # vllm_ascend not support sleep_level now. Enabling EP during training may lead to accuracy issues.
+        if self.lora_as_adapter or is_torch_npu_available(check_device=False):
             sleep_level = 1
         else:
             sleep_level = 2
