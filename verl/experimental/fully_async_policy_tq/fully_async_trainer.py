@@ -156,9 +156,9 @@ class TQFullyAsyncTrainer(SeparateRayPPOTrainer):
         # Hybrid checkpoint manager for trainer-side validation
         self.hybrid_checkpoint_manager = None
 
-    def _setup_checkpoint_manager(self):
+    async def _setup_checkpoint_manager(self):
         """Setup checkpoint manager after rollouter is initialized."""
-        replicas = ray.get(self.rollouter.get_replicas.remote())
+        replicas = await self.rollouter.get_replicas.remote()
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
         self.checkpoint_manager = CheckpointEngineManager(
             config=checkpoint_engine_config, trainer=self.actor_wg, replicas=replicas
@@ -187,7 +187,7 @@ class TQFullyAsyncTrainer(SeparateRayPPOTrainer):
         with open_dict(checkpoint_engine_cfg):
             checkpoint_engine_cfg.backend = original_backend
 
-        elastic_replicas_dict = ray.get(self.rollouter.get_all_elastic_replicas.remote())
+        elastic_replicas_dict = await self.rollouter.get_all_elastic_replicas.remote()
         print(f"[TQFullyAsyncTrainer] Got {len(elastic_replicas_dict)} elastic replicas")
 
         if not elastic_replicas_dict:
@@ -207,7 +207,7 @@ class TQFullyAsyncTrainer(SeparateRayPPOTrainer):
     async def set_rollouter(self, rollouter):
         """Set rollouter reference and initialize checkpoint managers."""
         self.rollouter = rollouter
-        self._setup_checkpoint_manager()
+        await self._setup_checkpoint_manager()
         await self._setup_hybrid_checkpoint_manager()
 
     def set_total_train_steps(self, total_training_steps):
@@ -477,7 +477,7 @@ class TQFullyAsyncTrainer(SeparateRayPPOTrainer):
         if self.current_param_version % self.config.trainer.test_freq != 0 or self.local_trigger_step > 1:
             await self._fit_update_weights()
             await self._fit_validate()
-        self._fit_save_checkpoint(force=True)
+        await self._fit_save_checkpoint(force=True)
 
     async def fit_step(self, batch_dict: dict = None):
         """Single training step."""
@@ -503,7 +503,7 @@ class TQFullyAsyncTrainer(SeparateRayPPOTrainer):
             self._fit_dump_data(batch)
 
         await self._fit_validate()
-        self._fit_save_checkpoint()
+        await self._fit_save_checkpoint()
         self._fit_stop_profile()
         self._fit_collect_metrics(batch)
         self._fit_postprocess_step()
@@ -586,7 +586,7 @@ class TQFullyAsyncTrainer(SeparateRayPPOTrainer):
         if self.config.async_training.use_trainer_do_validate:
             await self._trainer_side_validate()
         else:
-            val_metrics = ray.get(self.rollouter.do_validate.remote())
+            val_metrics = await self.rollouter.do_validate.remote()
             self.logger.log(data=val_metrics, step=self.current_param_version)
 
     async def _trainer_side_validate(self):
@@ -600,17 +600,17 @@ class TQFullyAsyncTrainer(SeparateRayPPOTrainer):
         await self.hybrid_checkpoint_manager.update_weights(global_steps=self.current_param_version)
         await self.checkpoint_manager.abort_replicas()
         await self.hybrid_checkpoint_manager.abort_replicas()
-        elastic_replicas_dict = ray.get(self.rollouter.get_all_elastic_replicas.remote())
+        elastic_replicas_dict = await self.rollouter.get_all_elastic_replicas.remote()
         elastic_resource_ids = list(elastic_replicas_dict.keys())
         for resource_id in elastic_resource_ids:
-            ray.get(self.rollouter.add_elastic_replica.remote(resource_id))
+            await self.rollouter.add_elastic_replica.remote(resource_id)
         await self.checkpoint_manager.resume_generation_replicas()
         await self.hybrid_checkpoint_manager.resume_generation_replicas()
         print(f"[TQFullyAsyncTrainer] Phase 1 done ({time.time() - phase_1_start:.2f}s)")
 
         # Phase 2: Run validation
         print("[TQFullyAsyncTrainer] Phase 2: Running validation")
-        val_metrics = ray.get(self.rollouter.do_validate.remote())
+        val_metrics = await self.rollouter.do_validate.remote()
         self.logger.log(data=val_metrics, step=self.current_param_version)
 
         # Phase 3: Switch back to TRAIN mode
@@ -618,7 +618,7 @@ class TQFullyAsyncTrainer(SeparateRayPPOTrainer):
         await self.checkpoint_manager.abort_replicas()
         await self.hybrid_checkpoint_manager.abort_replicas()
         for resource_id in elastic_resource_ids:
-            ray.get(self.rollouter.remove_elastic_replica.remote(resource_id))
+            await self.rollouter.remove_elastic_replica.remote(resource_id)
         await self.hybrid_checkpoint_manager.sleep_replicas()
         await self.checkpoint_manager.resume_generation_replicas()
         await self.hybrid_checkpoint_manager.resume_generation_replicas()
@@ -626,7 +626,7 @@ class TQFullyAsyncTrainer(SeparateRayPPOTrainer):
         total_time = time.time() - validate_start
         print(f"[TQFullyAsyncTrainer] _trainer_side_validate === END === ({total_time:.2f}s)")
 
-    def _fit_save_checkpoint(self, force=False):
+    async def _fit_save_checkpoint(self, force=False):
         if self.current_param_version == self.last_ckpt_version:
             return
 
@@ -641,7 +641,7 @@ class TQFullyAsyncTrainer(SeparateRayPPOTrainer):
             if esi_close_to_expiration:
                 print("Force saving checkpoint: ESI expiration approaching.")
             with marked_timer("save_checkpoint", timing_raw, color="green"):
-                self._save_checkpoint()
+                await self._save_checkpoint()
                 self.last_ckpt_version = self.current_param_version
 
     def _fit_postprocess_step(self):
@@ -652,7 +652,7 @@ class TQFullyAsyncTrainer(SeparateRayPPOTrainer):
         if self.local_trigger_step == 1:
             self.progress_bar.update(1)
 
-    def _save_checkpoint(self):
+    async def _save_checkpoint(self):
         local_global_step_folder = os.path.join(
             self.config.trainer.default_local_dir, f"global_step_{self.current_param_version}"
         )
@@ -695,7 +695,7 @@ class TQFullyAsyncTrainer(SeparateRayPPOTrainer):
                 self.current_param_version,
                 max_ckpt_to_keep=max_critic_ckpt_to_keep,
             )
-        ray.get(self.rollouter.save_checkpoint.remote(local_global_step_folder))
+        await self.rollouter.save_checkpoint.remote(local_global_step_folder)
 
         local_latest_checkpointed_iteration = os.path.join(
             self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"

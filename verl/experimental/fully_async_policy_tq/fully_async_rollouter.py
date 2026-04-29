@@ -45,7 +45,7 @@ except ImportError:
     from verl.utils.transferqueue_utils import tq
 
 
-@ray.remote()
+@ray.remote(num_cpus=10, max_concurrency=100)
 class TQFullyAsyncRollouter(SeparateRayPPOTrainer):
     """Async sample generator that writes prompts to TransferQueue.
 
@@ -175,8 +175,10 @@ class TQFullyAsyncRollouter(SeparateRayPPOTrainer):
             sample_id: Unique identifier for this sample.
         """
         try:
-            # Convert to DataProto (without repeat — repeat is handled by AgentWorker)
+            # Convert to DataProto
             full_batch = DataProto.from_single_dict(batch_dict)
+
+            print(full_batch)
 
             if not self.config.actor_rollout_ref.rollout.multi_turn.enable:
                 full_batch.non_tensor_batch["agent_name"] = np.array(

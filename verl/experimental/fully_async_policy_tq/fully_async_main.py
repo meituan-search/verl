@@ -29,7 +29,6 @@ Key differences from fully_async_main.py (MessageQueue):
 
 import os
 import socket
-import threading
 from pprint import pprint
 
 import hydra
@@ -53,7 +52,6 @@ class TQFullyAsyncTaskRunner:
     def __init__(self):
         self.running = False
         self.components = {}
-        self.shutdown_event = threading.Event()
 
     def run(self, config):
         """Main entry point called by Ray."""
@@ -122,12 +120,12 @@ class TQFullyAsyncTaskRunner:
         self.components["replay_buffer"] = replay_buffer
 
         # ==================== 5. Create Trainer first (needed for elastic worker group injection) ====================
-        print("[TQ_ASYNC MAIN] Creating TQFullyAsyncTrainer first...")
-        self._create_trainer(config)
-
-        # ==================== 6. Setup elastic worker group ====================
-        print("[TQ_ASYNC MAIN] Setting up elastic worker group...")
-        self._setup_elastic_worker_group(config)
+        # print("[TQ_ASYNC MAIN] Creating TQFullyAsyncTrainer first...")
+        # self._create_trainer(config)
+        #
+        # # ==================== 6. Setup elastic worker group ====================
+        # print("[TQ_ASYNC MAIN] Setting up elastic worker group...")
+        # self._setup_elastic_worker_group(config)
 
         # ==================== 7. Create Rollouter ====================
         print("[TQ_ASYNC MAIN] Creating TQFullyAsyncRollouter...")
@@ -138,32 +136,32 @@ class TQFullyAsyncTaskRunner:
 
         # Set ReplayBuffer on both rollouter and trainer
         ray.get(self.components["rollouter"].set_replay_buffer.remote(replay_buffer))
-        ray.get(self.components["trainer"].set_replay_buffer.remote(replay_buffer))
+        # ray.get(self.components["trainer"].set_replay_buffer.remote(replay_buffer))
 
         # Set rollouter reference on trainer (for param sync, validation, checkpointing)
-        ray.get(self.components["trainer"].set_rollouter.remote(self.components["rollouter"]))
+        # ray.get(self.components["trainer"].set_rollouter.remote(self.components["rollouter"]))
 
         # Get total_rollout_steps from rollouter (has dataloader), compute total_train_steps in main
         total_rollout_steps = ray.get(self.components["rollouter"].get_total_rollout_steps.remote())
         total_train_steps = int(total_rollout_steps / (required_samples * trigger_parameter_sync_step))
         print(f"[TQ_ASYNC MAIN] total_train_steps: {total_train_steps}")
-        ray.get(self.components["trainer"].set_total_train_steps.remote(total_train_steps))
+        # ray.get(self.components["trainer"].set_total_train_steps.remote(total_train_steps))
 
         # ==================== 9. Create and start TQAgentLoopWorkers ====================
         print("[TQ_ASYNC MAIN] Creating TQAgentLoopWorkers...")
         self._create_and_start_workers(config)
 
         # ==================== 10. Load checkpoints ====================
-        ray.get(self.components["trainer"].load_checkpoint.remote())
-        ray.get(self.components["rollouter"].load_checkpoint.remote())
+        # ray.get(self.components["trainer"].load_checkpoint.remote())
+        # ray.get(self.components["rollouter"].load_checkpoint.remote())
 
         # ==================== 11. Initial parameter sync ====================
         print("[TQ_ASYNC MAIN] Initial parameter sync before fit...")
-        ray.get(self.components["trainer"]._fit_update_weights.remote())
+        # ray.get(self.components["trainer"]._fit_update_weights.remote())
 
         # ==================== 12. Optional pre-training validation ====================
-        if config.trainer.get("val_before_train", True):
-            ray.get(self.components["trainer"]._fit_validate.remote(True))
+        # if config.trainer.get("val_before_train", True):
+        # ray.get(self.components["trainer"]._fit_validate.remote(True))
 
         print("[TQ_ASYNC MAIN] All components initialized successfully")
 
@@ -206,8 +204,6 @@ class TQFullyAsyncTaskRunner:
             ray.get(rollouter.set_elastic_worker_group.remote(self.components["elastic_worker_group"]))
             print("[TQ_ASYNC MAIN] Elastic worker group injected into rollouter")
 
-        ray.get(rollouter.init_workers.remote())
-
         self.components["rollouter"] = rollouter
         print("[TQ_ASYNC MAIN] TQFullyAsyncRollouter created and initialized")
 
@@ -245,7 +241,6 @@ class TQFullyAsyncTaskRunner:
         # FullyAsyncAgentLoopManager after it's been initialized.
         # For now, workers will be started but need server handles injected later.
 
-        self.components["tq_workers"] = []
         self.components["worker_handles"] = []
 
         for i in range(num_workers):
@@ -257,7 +252,6 @@ class TQFullyAsyncTaskRunner:
                 tokenizer=self.components["tokenizer"],
                 processor=self.components["processor"],
             )
-            self.components["tq_workers"].append(worker)
             self.components["worker_handles"].append(worker)
 
             # Start the event loop
@@ -273,9 +267,10 @@ class TQFullyAsyncTaskRunner:
 
         print("[TQ_ASYNC MAIN] Starting Rollouter and Trainer...")
         rollouter_future = self.components["rollouter"].fit.remote()
-        trainer_future = self.components["trainer"].fit.remote()
+        # trainer_future = self.components["trainer"].fit.remote()
 
-        futures = [rollouter_future, trainer_future]
+        # futures = [rollouter_future, trainer_future]
+        futures = [rollouter_future]
 
         try:
             while futures:
@@ -306,8 +301,8 @@ class TQFullyAsyncTaskRunner:
     def _cleanup(self):
         """Clean up resources on shutdown."""
         # Signal finish to all TQAgentLoopWorkers
-        if "tq_workers" in self.components:
-            for worker in self.components["tq_workers"]:
+        if "worker_handles" in self.components:
+            for worker in self.components["worker_handles"]:
                 try:
                     ray.get(worker.signal_finish.remote())
                 except Exception as e:
@@ -323,7 +318,7 @@ class TQFullyAsyncTaskRunner:
         print("[TQ_ASYNC MAIN] Training completed or interrupted")
 
 
-@hydra.main(config_path="config", config_name="fully_async_ppo_trainer", version_base=None)
+@hydra.main(config_path="../fully_async_policy/config", config_name="fully_async_ppo_trainer", version_base=None)
 def main(config):
     """Main entry point for TQ-based fully async PPO training."""
     from verl.trainer.main_ppo import run_ppo

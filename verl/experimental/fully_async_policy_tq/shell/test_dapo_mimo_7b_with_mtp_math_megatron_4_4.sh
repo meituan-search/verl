@@ -32,10 +32,10 @@ NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 # Paths
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-MODEL_PATH="/home/hadoop-djst-algoplat/models/Qwen2.5-Math-7B"
+MODEL_PATH="/home/hadoop-djst-algoplat/models/Qwen/Qwen2.5-0.5B-Instruct"
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"/home/hadoop-djst-algoplat/data/dapo-math-17k.parquet"}
-TEST_FILE=${TEST_FILE:-"/home/hadoop-djst-algoplat/data/aime-2024.parquet"}
+TRAIN_FILE="/home/hadoop-djst-algoplat/data/gsm8k/train.parquet"
+TEST_FILE="/home/hadoop-djst-algoplat/data/gsm8k/test.parquet"
 
 # Algorithm
 temperature=1.0
@@ -57,15 +57,6 @@ train_prompt_bsz=128
 n_resp_per_prompt=16
 train_prompt_mini_bsz=32
 
-mtp_params=(
-  actor_rollout_ref.actor.megatron.use_mbridge=True
-  actor_rollout_ref.model.mtp.enable=False
-  actor_rollout_ref.model.mtp.enable_train=True
-  actor_rollout_ref.model.mtp.mtp_loss_scaling_factor=0.1
-  actor_rollout_ref.model.mtp.detach_encoder=True
-  actor_rollout_ref.model.mtp.enable_rollout=True
-  )
-
 fully_async=(
   data.train_batch_size=0
   data.gen_batch_size=1
@@ -85,8 +76,8 @@ fully_async=(
   async_training.use_trainer_do_validate=True
 )
 
-python -m verl.experimental.fully_async_policy.fully_async_main \
-    --config-path=config \
+python -m verl.experimental.fully_async_policy_tq.fully_async_main \
+    --config-path='../fully_async_policy/config' \
     --config-name='fully_async_ppo_megatron_trainer.yaml'\
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
@@ -158,4 +149,5 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     trainer.log_val_generations=10 \
     trainer.total_epochs=10 \
     "${mtp_params[@]}" \
-    "${fully_async[@]}"
+    "${fully_async[@]}" \
+    actor_rollout_ref.rollout.agent.num_workers=1
