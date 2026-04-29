@@ -221,121 +221,15 @@ class TQFullyAsyncRollouter(SeparateRayPPOTrainer):
         """Return max pending slots (equivalent to max queue size in MQ version)."""
         return self.max_pending_slots
 
-    async def reset_staleness(self):
-        """Reset staleness after parameter update.
-
-        Returns timing_raw dictionary for metrics.
-        """
-        async with self.lock:
-            self.paused = False
-            self._resume_event.set()
-            # Reset staleness counter
-            self.staleness_samples = len(self.active_tasks) + await self._get_rb_ready_count()
-            timing_raw = {}
-            rollout_version_time = max(time.time() - self.step_start_time, 1e-6)
-            if self.idle_start_time > self.step_start_time:
-                rollout_active_time = self.idle_start_time - self.step_start_time
-                idle_ratio = 1 - rollout_active_time / rollout_version_time
-            else:
-                rollout_active_time = rollout_version_time
-                idle_ratio = 0
-            timing_raw["fully_async/rollouter/active_time"] = rollout_active_time
-            timing_raw["fully_async/rollouter/version_time"] = rollout_version_time
-            timing_raw["fully_async/rollouter/idle_ratio"] = idle_ratio
-
-            print(
-                f"[TQFullyAsyncRollouter][reset_staleness] "
-                f"reset staleness_samples to: {self.staleness_samples} "
-                f"idle_ratio: {timing_raw['fully_async/rollouter/idle_ratio']:.4f}"
-            )
-            self.step_start_time = time.time()
-            self.current_model_version += 1
-
-        return timing_raw
-
-    async def _get_rb_ready_count(self) -> int:
-        """Get count of ready (finish status) samples from ReplayBuffer."""
-        if self.replay_buffer_handle is None:
-            return 0
-        try:
-            stats = await self.replay_buffer_handle.get_statistics.remote()
-            return stats.get("total_ready", 0)
-        except Exception:
-            return 0
-
     def do_validate(self):
         """Run validation and return metrics."""
         timing_raw = {}
         with marked_timer("rollouter/validate_time", timing_raw, color="green"):
-            val_metrics: dict = self._validate()
+            # val_metrics: dict = self._validate()
+            # TODO
+            val_metrics = {}
+            pass
         return timing_raw | val_metrics
-
-    async def save_checkpoint(self, local_global_step_folder: str):
-        """Save rollouter checkpoint including dataloader state."""
-        from verl.utils.fs import local_mkdir_safe
-
-        local_mkdir_safe(local_global_step_folder)
-        dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
-        async with self.dataloader_lock:
-            dataloader_state_dict = self.train_dataloader.state_dict()
-        torch.save(dataloader_state_dict, dataloader_local_path)
-        print(f"[TQFullyAsyncRollouter] Saved dataloader checkpoint to {dataloader_local_path}")
-
-    def load_checkpoint(self):
-        """Load checkpoint including dataloader state."""
-        from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
-
-        if self.config.trainer.resume_mode == "disable":
-            print("[TQFullyAsyncRollouter] Resume mode is disabled, starting from scratch")
-            return 0
-
-        if self.config.trainer.default_hdfs_dir is not None:
-            raise NotImplementedError("[TQFullyAsyncRollouter] Load from hdfs is not implemented yet")
-        else:
-            checkpoint_folder = self.config.trainer.default_local_dir
-            if not os.path.isabs(checkpoint_folder):
-                working_dir = os.getcwd()
-                checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
-
-            global_step_folder = find_latest_ckpt_path(checkpoint_folder)
-
-        if self.config.trainer.resume_mode == "auto":
-            if global_step_folder is None:
-                print("[TQFullyAsyncRollouter] Training from scratch (no checkpoint found)")
-                return 0
-        elif self.config.trainer.resume_mode == "resume_path":
-            assert isinstance(self.config.trainer.resume_from_path, str), (
-                "[TQFullyAsyncRollouter] resume_from_path must be str type"
-            )
-            assert "global_step_" in self.config.trainer.resume_from_path, (
-                "[TQFullyAsyncRollouter] resume_from_path must specify the global_steps"
-            )
-            global_step_folder = self.config.trainer.resume_from_path
-            if not os.path.isabs(global_step_folder):
-                working_dir = os.getcwd()
-                global_step_folder = os.path.join(working_dir, global_step_folder)
-        else:
-            raise ValueError(f"[TQFullyAsyncRollouter] Unknown resume_mode: {self.config.trainer.resume_mode}")
-
-        print(f"[TQFullyAsyncRollouter] Loading checkpoint from: {global_step_folder}")
-
-        trainer_global_steps = int(global_step_folder.split("global_step_")[-1])
-        self.global_steps = (
-            trainer_global_steps * self.required_samples * self.config.async_training.trigger_parameter_sync_step + 1
-        )
-        self.current_model_version = trainer_global_steps
-        print(
-            f"[TQFullyAsyncRollouter] Setting global_steps to {self.global_steps}, "
-            f"model_version to {self.current_model_version}"
-        )
-
-        dataloader_local_path = os.path.join(global_step_folder, "data.pt")
-        if os.path.exists(dataloader_local_path):
-            dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
-            self.train_dataloader.load_state_dict(dataloader_state_dict)
-            print(f"[TQFullyAsyncRollouter] Loaded dataloader state from {dataloader_local_path}")
-        else:
-            print(f"[TQFullyAsyncRollouter] Warning: No dataloader state found at {dataloader_local_path}")
 
     def _validate_config(self):
         """Validate asynchronous training configuration."""
@@ -346,28 +240,7 @@ class TQFullyAsyncRollouter(SeparateRayPPOTrainer):
     async def init_workers(self):
         """Initialize distributed training workers."""
         self._init_async_objects()
-        self._create_worker_classes()
-        await self._create_reward_loop_manager()
 
-    async def _create_reward_loop_manager(self):
-        """Create RewardLoopManager for reward computation."""
-        import asyncio
-
-        from verl.experimental.reward_loop import RewardLoopManager
-
-        loop = asyncio.get_running_loop()
-        self.reward_loop_manager = await loop.run_in_executor(
-            None,
-            lambda: RewardLoopManager(config=self.config, rm_resource_pool=None),
-        )
-
-    def _create_actor_rollout_classes(self):
-        """Skip rollout creation - AgentLoop workers handle this in TQ mode."""
-        pass
-
-    def _create_reward_model_class(self):
-        """Skip RM worker creation - managed by RewardLoopManager in standalone mode."""
-        pass
 
     def _create_continuous_iterator(self):
         """Create a continuous data iterator across epochs."""

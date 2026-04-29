@@ -558,8 +558,10 @@ class TQFullyAsyncTrainer(SeparateRayPPOTrainer):
             f"current_param_version: {self.current_param_version}"
         )
 
-        # Reset staleness in rollouter
-        timing_raw = await asyncio.wrap_future(self.rollouter.reset_staleness.remote().future())
+        # Reset staleness in ReplayBuffer (centralized staleness tracking)
+        timing_raw = await asyncio.wrap_future(
+            self.replay_buffer_handle.reset_staleness.remote(active_task_count=0).future()
+        )
         self.logger.log(data=timing_raw, step=self.current_param_version)
 
         # Log aggregated metrics

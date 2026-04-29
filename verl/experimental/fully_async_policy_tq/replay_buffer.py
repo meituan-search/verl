@@ -428,6 +428,77 @@ class ReplayBuffer:
 
             return dict(distribution)
 
+    def reset_staleness(self, active_task_count: int = 0) -> dict:
+        """Reset staleness after parameter update.
+
+        Called by TQFullyAsyncTrainer after parameter synchronization.
+        Resets the staleness sample count and increments the current model version.
+
+        Args:
+            active_task_count: Number of currently active tasks in the rollouter
+                              (tasks that are in-flight but not yet in RB).
+
+        Returns:
+            Dict with timing metrics for logging.
+        """
+        import time
+
+        with self.lock:
+            # Reset staleness counter: active tasks + ready samples in RB
+            ready_count = self.ready_count()
+            self._staleness_samples = active_task_count + ready_count
+
+            # Compute timing metrics
+            now = time.time()
+            if not hasattr(self, "_last_reset_time"):
+                self._last_reset_time = now
+            version_time = max(now - self._last_reset_time, 1e-6)
+
+            if hasattr(self, "_idle_start_time") and self._idle_start_time > self._last_reset_time:
+                active_time = self._idle_start_time - self._last_reset_time
+                idle_ratio = 1 - active_time / version_time
+            else:
+                active_time = version_time
+                idle_ratio = 0
+
+            self._current_model_version = getattr(self, "_current_model_version", 0) + 1
+            self._last_reset_time = now
+
+            timing_raw = {
+                "fully_async/rollouter/active_time": active_time,
+                "fully_async/rollouter/version_time": version_time,
+                "fully_async/rollouter/idle_ratio": idle_ratio,
+            }
+
+            print(
+                f"[ReplayBuffer][reset_staleness] "
+                f"model_version={self._current_model_version}, "
+                f"staleness_samples={self._staleness_samples}, "
+                f"ready_count={ready_count}, "
+                f"active_tasks={active_task_count}, "
+                f"idle_ratio={idle_ratio:.4f}"
+            )
+
+        return timing_raw
+
+    @property
+    def current_model_version(self) -> int:
+        """Current model version (incremented on each reset_staleness call)."""
+        with self.lock:
+            return getattr(self, "_current_model_version", 0)
+
+    @property
+    def staleness_samples(self) -> int:
+        """Current staleness sample count (set by last reset_staleness call)."""
+        with self.lock:
+            return getattr(self, "_staleness_samples", 0)
+
+    def note_idle_start(self):
+        """Record that rollouter has gone idle (for idle_ratio calculation)."""
+        with self.lock:
+            import time
+            self._idle_start_time = time.time()
+
     def get_statistics(self) -> dict:
         """Return statistics about the buffer state."""
         with self.lock:
