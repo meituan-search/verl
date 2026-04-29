@@ -87,7 +87,6 @@ class TQAgentLoopWorker:
 
         # AgentLoop configuration
         self.rollout_config = config.actor_rollout_ref.rollout
-        self.n = self.rollout_config.n  # number of samples per prompt
         self.partition_id = config.trainer.get("partition_id", "train")
 
         # State
@@ -164,7 +163,7 @@ class TQAgentLoopWorker:
 
             # 2. n samplings (each sample is one AgentLoop execution)
             session_tasks = []
-            for session_id in range(self.n):
+            for session_id in range(self.rollout_config.n):
                 session_key = f"{self.partition_id}_{uid}_{session_id}_0"
                 task = asyncio.create_task(self._run_session(session_key, key, session_id, meta))
                 session_tasks.append(task)
@@ -179,7 +178,7 @@ class TQAgentLoopWorker:
                 partition_id=self.partition_id,
             )
 
-            logger.debug(f"[TQAgentLoopWorker] Completed processing prompt {uid}, {self.n} sessions")
+            logger.debug(f"[TQAgentLoopWorker] Completed processing prompt {uid}, {self.rollout_config.n} sessions")
 
         except Exception as e:
             logger.exception(f"[TQAgentLoopWorker] Error processing {key}: {e}")

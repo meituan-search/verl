@@ -104,9 +104,17 @@ class TQFullyAsyncTaskRunner:
         self.components["ray_worker_group_cls"] = ray_worker_group_cls
 
         # ==================== 4. Create ReplayBuffer ====================
-        max_pending_slots = config.async_training.get("max_pending_slots", 256)
+        # Calculate max_pending_slots from config (same formula as before, now centralized)
+        staleness_threshold = config.async_training.get("staleness_threshold", 1)
+        require_batches = config.async_training.require_batches
+        required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * require_batches
+        trigger_parameter_sync_step = config.async_training.trigger_parameter_sync_step
+        max_pending_slots = int(required_samples * (staleness_threshold + 1) * trigger_parameter_sync_step)
+        # Also allow explicit override via config
+        max_pending_slots = config.async_training.get("max_pending_slots", max_pending_slots)
+
         poll_interval = config.async_training.get("poll_interval", 1.0)
-        print(f"[TQ_ASYNC MAIN] Creating ReplayBuffer (max_slots={max_pending_slots}, poll={poll_interval}s)"
+        print(f"[TQ_ASYNC MAIN] Creating ReplayBuffer (max_slots={max_pending_slots}, poll={poll_interval}s)")
         replay_buffer = ReplayBuffer.remote(
             max_pending_slots=max_pending_slots,
             poll_interval=poll_interval,
@@ -135,13 +143,11 @@ class TQFullyAsyncTaskRunner:
         # Set rollouter reference on trainer (for param sync, validation, checkpointing)
         ray.get(self.components["trainer"].set_rollouter.remote(self.components["rollouter"]))
 
-        # Sync total_train_steps between rollouter and trainer
-        total_train_steps = ray.get(self.components["rollouter"].get_total_train_steps.remote())
+        # Get total_rollout_steps from rollouter (has dataloader), compute total_train_steps in main
+        total_rollout_steps = ray.get(self.components["rollouter"].get_total_rollout_steps.remote())
+        total_train_steps = int(total_rollout_steps / (required_samples * trigger_parameter_sync_step))
         print(f"[TQ_ASYNC MAIN] total_train_steps: {total_train_steps}")
         ray.get(self.components["trainer"].set_total_train_steps.remote(total_train_steps))
-
-        # Initialize max_required_samples on rollouter
-        ray.get(self.components["rollouter"].set_max_required_samples.remote())
 
         # ==================== 9. Create and start TQAgentLoopWorkers ====================
         print("[TQ_ASYNC MAIN] Creating TQAgentLoopWorkers...")

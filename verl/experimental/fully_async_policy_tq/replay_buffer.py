@@ -95,6 +95,10 @@ class ReplayBuffer:
         self._poll_thread = threading.Thread(target=self._poll_from_tq, daemon=True)
         self._poll_thread.start()
 
+        # Background thread: periodic statistics logging
+        self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._monitor_thread.start()
+
     def _poll_from_tq(self):
         """Background thread that polls TQ for metadata updates.
 
@@ -128,6 +132,21 @@ class ReplayBuffer:
         except Exception as e:
             logger.error(f"[ReplayBuffer] _poll_from_tq error: {e}")
             os._exit(1)
+
+    def _monitor_loop(self):
+        """Background thread that periodically logs buffer statistics."""
+        from pprint import pformat
+
+        monitor_interval = 60.0
+        while not self._finished:
+            time.sleep(monitor_interval)
+            if self._finished:
+                break
+            try:
+                stats = self.get_statistics()
+                print(f"[ReplayBuffer][Monitor] {pformat(stats)}")
+            except Exception as e:
+                logger.error(f"[ReplayBuffer] _monitor_loop error: {e}")
 
     # ======== Slot control (backpressure for TQ request count) ========
 
@@ -497,6 +516,7 @@ class ReplayBuffer:
         """Record that rollouter has gone idle (for idle_ratio calculation)."""
         with self.lock:
             import time
+
             self._idle_start_time = time.time()
 
     def get_statistics(self) -> dict:

@@ -25,6 +25,15 @@ async_training:
   # whether to use trainer do_validate
   use_trainer_do_validate: False
 
+  # ==================== TQ-specific config ====================
+
+  # Maximum number of pending slots (in-flight requests) in ReplayBuffer
+  # Controls backpressure: Rollouter blocks when pending_slots >= max_pending_slots
+  max_pending_slots: 256
+
+  # Poll interval for ReplayBuffer background thread (seconds)
+  poll_interval: 1.0
+
 # Rollout config
 rollout:
 
