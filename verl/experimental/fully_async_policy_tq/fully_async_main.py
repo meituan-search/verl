@@ -113,7 +113,7 @@ class TQFullyAsyncTaskRunner:
 
         poll_interval = config.async_training.get("poll_interval", 1.0)
         print(f"[TQ_ASYNC MAIN] Creating ReplayBuffer (max_slots={max_pending_slots}, poll={poll_interval}s)")
-        replay_buffer = ReplayBuffer.remote(
+        replay_buffer = ray.remote(ReplayBuffer).remote(
             max_pending_slots=max_pending_slots,
             poll_interval=poll_interval,
         )
@@ -243,8 +243,9 @@ class TQFullyAsyncTaskRunner:
 
         self.components["worker_handles"] = []
 
+        # Create all workers first (triggers __init__.remote() in parallel)
         for i in range(num_workers):
-            worker = TQAgentLoopWorker.remote(
+            worker = ray.remote(TQAgentLoopWorker).remote(
                 config=config,
                 replay_buffer_handle=self.components["replay_buffer"],
                 servers=[],  # Will be populated via add_server calls
@@ -254,10 +255,8 @@ class TQFullyAsyncTaskRunner:
             )
             self.components["worker_handles"].append(worker)
 
-            # Start the event loop
-            ray.get(worker.start.remote())
-            print(f"[TQ_ASYNC MAIN] TQAgentLoopWorker-{i} started")
-
+        # Start all event loops in parallel, wait for all to complete
+        ray.get([w.start.remote() for w in self.components["worker_handles"]])
         print(f"[TQ_ASYNC MAIN] All {num_workers} TQAgentLoopWorkers created and started")
         print("[TQ_ASYNC MAIN] NOTE: Server handles need to be registered with workers after rollout init")
 

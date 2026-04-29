@@ -49,7 +49,6 @@ from collections import defaultdict
 from typing import Any, Literal
 
 import numpy as np
-import ray
 
 try:
     import transfer_queue as tq
@@ -64,7 +63,6 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 StatusType = Literal["pending", "running", "partial", "finish"]
 
 
-@ray.remote(num_cpus=1)
 class ReplayBuffer:
     """Lightweight metadata channel backed by TQ kv_list polling.
 
@@ -198,43 +196,55 @@ class ReplayBuffer:
     def get_pending_keys(
         self,
         partition_id: str | None = None,
-        limit: int = 0,
+        limit: int = 1,
         timeout: float | None = None,
     ) -> list[tuple[str, dict]]:
-        """Get keys with current_status='pending' for Worker to process.
+        """Get keys with current_status='pending' and atomically mark them as 'running'.
 
         Worker pulls tasks from this interface, then gets actual data from TQ.
+        The status transition (pending -> running) happens atomically here to
+        prevent multiple workers from grabbing the same key.
 
         Args:
             partition_id: Filter by partition. None = all partitions.
-            limit: Max number of keys to return. 0 = all.
+            limit: Max number of keys to return. Default 1 (one at a time).
             timeout: Max seconds to wait for pending tasks. None = no wait.
 
         Returns:
-            List of (key, meta) tuples with status='pending'.
+            List of (key, meta) tuples with status atomically set to 'running'.
         """
         with self._pending_condition:
             result = []
 
-            def _collect():
+            def _collect_and_claim():
                 pids = [partition_id] if partition_id else list(self.partitions.keys())
                 for pid in pids:
                     for k, v in self.partitions.get(pid, {}).items():
                         if v.get("current_status") == "pending":
+                            # Atomically claim: pending -> running (both RB memory + TQ tags)
+                            v["current_status"] = "running"
                             result.append((k, v))
-                            if limit > 0 and len(result) >= limit:
+                            if 0 < limit <= len(result):
                                 break
-                    if limit > 0 and len(result) >= limit:
+                    if 0 < limit <= len(result):
                         break
 
-            _collect()
+            _collect_and_claim()
 
             # Wait if no pending tasks and timeout specified
             if not result and timeout is not None and timeout > 0:
                 self._pending_condition.wait(timeout)
-                _collect()
+                _collect_and_claim()
 
-            return result
+        # Sync status to TQ outside the lock (avoid holding lock during TQ I/O)
+        if result:
+            claimed_keys = [k for k, _ in result]
+            tq.kv_batch_put(
+                keys=claimed_keys,
+                tags=[{"current_status": "running"}] * len(claimed_keys),
+            )
+
+        return result
 
     def get_keys_by_status(
         self,

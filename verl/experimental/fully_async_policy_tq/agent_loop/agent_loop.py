@@ -36,13 +36,8 @@ from typing import Any
 import hydra
 import ray
 import torch
+import transfer_queue as tq
 from omegaconf import DictConfig, OmegaConf
-
-try:
-    import transfer_queue as tq
-except ImportError:
-    print("Please install TQ by calling `pip install TransferQueue==0.1.6` and try again.")
-    from verl.utils.transferqueue_utils import tq
 
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopOutput,
@@ -53,7 +48,6 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-@ray.remote(num_cpus=1)
 class TQAgentLoopWorker:
     """Independent Worker with built-in event loop, actively pulling tasks from ReplayBuffer.
 
@@ -105,13 +99,13 @@ class TQAgentLoopWorker:
         print(f"[TQAgentLoopWorker] Event loop started, partition={self.partition_id}")
 
     async def _run_loop(self):
-        """Main loop that actively pulls and processes tasks."""
+        """Main loop that actively pulls and processes tasks one at a time."""
         while not self.finished:
             try:
-                # 1. Pull pending tasks from ReplayBuffer
+                # 1. Pull one pending task (atomically claimed as 'running' in RB)
                 pending_tasks = await self.replay_buffer.get_pending_keys.remote(
                     partition_id=self.partition_id,
-                    limit=self.rollout_config.batch_size if hasattr(self.rollout_config, "batch_size") else 8,
+                    limit=1,
                     timeout=1.0,
                 )
 
@@ -119,14 +113,14 @@ class TQAgentLoopWorker:
                     await asyncio.sleep(0.1)
                     continue
 
-                # 2. Create processing task for each pending item
-                for key, meta in pending_tasks:
-                    task = asyncio.create_task(self._process_single_prompt(key, meta))
-                    self.active_tasks.add(task)
-                    task.add_done_callback(self.active_tasks.discard)
+                # 2. Process the single claimed task (status already set to running)
+                key, meta = pending_tasks[0]
+                task = asyncio.create_task(self._process_single_prompt(key, meta))
+                self.active_tasks.add(task)
+                task.add_done_callback(self.active_tasks.discard)
 
                 # 3. Control concurrency: wait for some tasks to complete
-                max_concurrent = getattr(self.rollout_config, "max_concurrent", 16)
+                max_concurrent = getattr(self.rollout_config, "max_concurrent", 100)
                 if len(self.active_tasks) >= max_concurrent:
                     done, _ = await asyncio.wait(
                         self.active_tasks,
@@ -148,23 +142,15 @@ class TQAgentLoopWorker:
         """Process a single prompt including n samplings.
 
         Args:
-            key: The original key written by Rollouter (format: {partition_id}_{uid})
-            meta: Metadata dictionary containing uid and other info
+            key: The original key written by Rollouter (format: {partition_id}_{sample_id})
+                 key itself serves as the uid.
+            meta: Metadata dictionary from ReplayBuffer (tags info).
         """
-        uid = meta["uid"]
-
         try:
-            # 1. Update status to running
-            await tq.async_kv_batch_put(
-                keys=[key],
-                tags=[{"current_status": "running"}],
-                partition_id=self.partition_id,
-            )
-
-            # 2. n samplings (each sample is one AgentLoop execution)
+            # 1. n samplings (each sample is one AgentLoop execution)
             session_tasks = []
             for session_id in range(self.rollout_config.n):
-                session_key = f"{self.partition_id}_{uid}_{session_id}_0"
+                session_key = f"{key}_{session_id}"
                 task = asyncio.create_task(self._run_session(session_key, key, session_id, meta))
                 session_tasks.append(task)
 
@@ -178,7 +164,7 @@ class TQAgentLoopWorker:
                 partition_id=self.partition_id,
             )
 
-            logger.debug(f"[TQAgentLoopWorker] Completed processing prompt {uid}, {self.rollout_config.n} sessions")
+            logger.debug(f"[TQAgentLoopWorker] Completed processing prompt {key}, {self.rollout_config.n} sessions")
 
         except Exception as e:
             logger.exception(f"[TQAgentLoopWorker] Error processing {key}: {e}")
@@ -228,43 +214,34 @@ class TQAgentLoopWorker:
 
         # 3. Copy prompt data from parent_key to session_key in TQ
         # This ensures each session has its own copy of the prompt data
-        await self._copy_prompt_to_session(parent_key, session_key, parent_meta)
+        await self._copy_prompt_to_session(parent_key, session_key, parent_meta, session_id)
 
-        # 4. Get prompt data for the AgentLoop
-        prompt_data = await tq.async_kv_batch_get(
-            keys=[parent_key],
-            select_fields=["input_ids", "attention_mask", "position_ids"],
-            partition_id=self.partition_id,
-        )
-
-        if not prompt_data or len(prompt_data.get("input_ids", [])) == 0:
-            logger.warning(f"[TQAgentLoopWorker] No prompt data found for key {parent_key}")
-            return
-
-        # 5. Execute AgentLoop
+        # 4. Execute AgentLoop
         # The AgentLoop will call back into self.generate() which dispatches to Server
         try:
-            output = await agent_loop.run(
-                sampling_params=sampling_params,
-                session_key=session_key,
-                parent_key=parent_key,
-                partition_id=self.partition_id,
-                **parent_meta,
-            )
-
-            # 6. Post-process output: write trajectory data to TQ
-            if output is not None:
-                await self._postprocess_output(output, session_key, session_id, parent_meta)
+            # output = await agent_loop.run(
+            #     sampling_params=sampling_params,
+            #     session_key=session_key,
+            #     parent_key=parent_key,
+            #     partition_id=self.partition_id,
+            #     **parent_meta,
+            # )
+            #
+            # # 6. Post-process output: write trajectory data to TQ
+            # if output is not None:
+            #     await self._postprocess_output(output, session_key, session_id, parent_meta)
+            await asyncio.sleep(10.0)
+            print(agent_loop)
 
         except Exception as e:
             logger.exception(f"[TQAgentLoopWorker] Error in _run_session for {session_key}: {e}")
             await tq.async_kv_batch_put(
                 keys=[session_key],
-                tags={"current_status": "error", "error": str(e)},
+                tags=[{"current_status": "error", "error": str(e)}],
                 partition_id=self.partition_id,
             )
 
-    async def _copy_prompt_to_session(self, parent_key: str, session_key: str, parent_meta: dict):
+    async def _copy_prompt_to_session(self, parent_key: str, session_key: str, parent_meta: dict, session_id: int):
         """Copy prompt data from parent key to session key in TQ.
 
         Each session needs its own copy of the input data so that different
@@ -272,8 +249,6 @@ class TQAgentLoopWorker:
         """
         # Read prompt fields from parent
         fields_to_copy = ["input_ids", "attention_mask", "position_ids"]
-        # Also copy non-tensor metadata fields
-        meta_fields = ["uid", "data_source", "raw_prompt"]
 
         prompt_data = await tq.async_kv_batch_get(
             keys=[parent_key],
@@ -283,25 +258,17 @@ class TQAgentLoopWorker:
 
         if prompt_data:
             # Write copied data to session key with initial tags
-            session_tags = {
-                "current_status": "pending",
-                "uid": parent_meta.get("uid", ""),
-                "session_id": 0,  # Will be updated per session
-                "trajectory_id": 0,
-                "start_model_version": parent_meta.get("start_model_version", 0),
-                "end_model_version": parent_meta.get("end_model_version", 0),
-                "prompt_len": parent_meta.get("prompt_len", 0),
-            }
-
-            # Add any additional metadata fields
-            for mf in meta_fields:
-                if mf in parent_meta:
-                    session_tags[mf] = parent_meta[mf]
+            session_tags = parent_meta.copy()
+            session_tags.update(
+                {
+                    "session_id": session_id,
+                }
+            )
 
             await tq.async_kv_batch_put(
                 keys=[session_key],
                 fields=prompt_data,
-                tags=session_tags,
+                tags=[session_tags],
                 partition_id=self.partition_id,
             )
 
@@ -345,13 +312,8 @@ class TQAgentLoopWorker:
             tags_list.append(
                 {
                     "current_status": "finish",
-                    "uid": parent_meta.get("uid", ""),
                     "session_id": session_id,
                     "trajectory_id": traj_idx,
-                    "start_model_version": parent_meta.get("start_model_version", 0),
-                    "end_model_version": out.extra_fields.get("global_steps", parent_meta.get("end_model_version", 0))
-                    if out.extra_fields
-                    else parent_meta.get("end_model_version", 0),
                     "prompt_len": prompt_len,
                     "response_len": response_len,
                     "seq_len": prompt_len + response_len,
@@ -410,8 +372,8 @@ class TQAgentLoopWorker:
                     elif isinstance(v, int | float):
                         field_dict[k] = torch.tensor([v], dtype=torch.float32 if isinstance(v, float) else torch.int64)
 
-        # Copy non-tensor metadata from parent
-        for meta_key in ["uid", "data_source", "agent_name"]:
+        # Copy non-tensor metadata from parent (uid comes from key, not meta)
+        for meta_key in ["data_source", "agent_name"]:
             if meta_key in parent_meta:
                 field_dict[meta_key] = parent_meta[meta_key]
 

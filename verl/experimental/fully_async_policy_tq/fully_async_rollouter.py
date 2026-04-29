@@ -198,7 +198,7 @@ class TQFullyAsyncRollouter(SeparateRayPPOTrainer):
             field_tensors.update({k: np.array([v[0]], dtype=object) for k, v in full_batch.non_tensor_batch.items()})
 
             # 5. Write to TQ
-            tags = [{"current_status": "pending"}]
+            tags = [{"current_status": "pending", "sample_id": sample_id}]
 
             print(f"[TQFullyAsyncRollouter] field_tensors: {field_tensors}\n tags: {tags}\n\n")
 
