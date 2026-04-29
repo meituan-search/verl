@@ -157,7 +157,7 @@ class TQAgentLoopWorker:
             # 1. Update status to running
             await tq.async_kv_batch_put(
                 keys=[key],
-                tags={"current_status": "running"},
+                tags=[{"current_status": "running"}],
                 partition_id=self.partition_id,
             )
 
@@ -174,7 +174,7 @@ class TQAgentLoopWorker:
             # 4. Update the original key status to finish (marking prompt processing complete)
             await tq.async_kv_batch_put(
                 keys=[key],
-                tags={"current_status": "finish"},
+                tags=[{"current_status": "finish"}],
                 partition_id=self.partition_id,
             )
 
@@ -185,7 +185,7 @@ class TQAgentLoopWorker:
             # Mark as error
             await tq.async_kv_batch_put(
                 keys=[key],
-                tags={"current_status": "error", "error": str(e)},
+                tags=[{"current_status": "error", "error": str(e)}],
                 partition_id=self.partition_id,
             )
 

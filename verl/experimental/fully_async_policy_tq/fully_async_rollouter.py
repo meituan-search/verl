@@ -29,7 +29,6 @@ import logging
 
 import numpy as np
 import ray
-import torch
 from tensordict import TensorDict
 
 from verl import DataProto
@@ -126,7 +125,7 @@ class TQFullyAsyncRollouter(SeparateRayPPOTrainer):
         print(f"[TQFullyAsyncRollouter] Total rollout steps: {self.total_rollout_steps}")
 
         # Rollouter parameter configuration
-        self.replay_buffer_handle = None  # Set via set_replay_buffer()
+        self.replay_buffer_handle = None
         self.partition_id = config.trainer.get("partition_id", "train")
 
         # Reward loop manager
@@ -178,66 +177,42 @@ class TQFullyAsyncRollouter(SeparateRayPPOTrainer):
             # Convert to DataProto
             full_batch = DataProto.from_single_dict(batch_dict)
 
-            print(full_batch)
-
             if not self.config.actor_rollout_ref.rollout.multi_turn.enable:
                 full_batch.non_tensor_batch["agent_name"] = np.array(
                     ["single_turn_agent"] * len(full_batch), dtype=object
                 )
 
-            for i in range(len(full_batch)):
-                uid = f"uid_{sample_id}_{i}"
+            assert len(full_batch) == 1
 
-                # Extract non_tensor fields for metadata
-                meta_fields = {}
-                for nk in list(full_batch.non_tensor_batch.keys()):
-                    val = full_batch.non_tensor_batch[nk]
-                    if i < len(val):
-                        meta_fields[nk] = val[i]
+            # 1. Acquire slot (blocking, backpressure control)
+            acquired = await self.replay_buffer_handle.acquire_slot.remote(timeout=None)
+            if not acquired:
+                logging.warning("[TQFullyAsyncRollouter] Failed to acquire slot, stopping...")
+                return
 
-                # 1. Acquire slot (blocking, backpressure control)
-                acquired = await self.replay_buffer_handle.acquire_slot.remote(timeout=None)
-                if not acquired:
-                    logging.warning("[TQFullyAsyncRollouter] Failed to acquire slot, stopping...")
-                    return
+            # 2. Build key
+            key = f"{self.partition_id}_{sample_id}"
 
-                # 2. Build key
-                key = f"{self.partition_id}_{uid}"
+            # 3. Build field_tensors: merge tensor + non_tensor fields, all with batch_size=1
+            field_tensors = {k: t[0].unsqueeze(0) for k, t in full_batch.batch.items()}
+            field_tensors.update({k: np.array([v[0]], dtype=object) for k, v in full_batch.non_tensor_batch.items()})
 
-                # 3. Extract tensor fields for TQ (batch_size=1 TensorDict)
-                field_tensors = {}
-                for bk in list(full_batch.batch.keys()):
-                    tensor = full_batch.batch[bk]
-                    if tensor.dim() >= 1 and i < tensor.shape[0]:
-                        # Add batch dimension: (seq,) -> (1, seq)
-                        field_tensors[bk] = tensor[i].unsqueeze(0)
+            # 5. Write to TQ
+            tags = [{"current_status": "pending"}]
 
-                # Add non-tensor metadata to fields
-                for nk, nv in meta_fields.items():
-                    field_tensors[nk] = nv
+            print(f"[TQFullyAsyncRollouter] field_tensors: {field_tensors}\n tags: {tags}\n\n")
 
-                # 4. Determine prompt_len
-                prompt_len = field_tensors.get("input_ids", torch.tensor([])).shape[0]
-
-                # 5. Write to TQ
-                tags = [
-                    {
-                        "current_status": "pending",
-                        "uid": uid,
-                        "prompt_len": prompt_len,
-                        **meta_fields,
-                    }
-                ]
-
-                await tq.async_kv_batch_put(
-                    keys=[key],
-                    fields=TensorDict(field_tensors, batch_size=1),
-                    tags=tags,
-                    partition_id=self.partition_id,
-                )
+            await tq.async_kv_batch_put(
+                keys=[key],
+                fields=TensorDict(field_tensors, batch_size=1),
+                tags=tags,
+                partition_id=self.partition_id,
+            )
 
         except Exception as e:
-            logging.exception(f"[TQFullyAsyncRollouter] Error writing sample {sample_id} to TQ: {e}")
+            logging.exception(
+                f"[TQFullyAsyncRollouter] Error writing sample {sample_id} to TQ: {e}full_batch: {full_batch}"
+            )
 
     async def fit(self):
         """Start the TQ-based async rollouter: dataloader -> acquire slot -> write to TQ.

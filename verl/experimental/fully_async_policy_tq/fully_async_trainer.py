@@ -72,16 +72,12 @@ class TQFullyAsyncTrainer(SeparateRayPPOTrainer):
     def __init__(
         self,
         config,
-        tokenizer,
         role_worker_mapping: dict[Role, WorkerType],
         resource_pool_manager: ResourcePoolManager,
         ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
-        processor=None,
         device_name=None,
     ):
         # ==================== Base config ====================
-        self.tokenizer = tokenizer
-        self.processor = processor
         self.config = config
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert not self.hybrid_engine
