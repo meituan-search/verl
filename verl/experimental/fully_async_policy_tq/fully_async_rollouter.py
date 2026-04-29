@@ -35,7 +35,6 @@ import ray
 import torch
 
 from verl.experimental.fully_async_policy.detach_utils import (
-    RolloutSample,
     prepare_single_generation_data,
     safe_create_task,
 )
@@ -165,11 +164,7 @@ class TQFullyAsyncRollouter(SeparateRayPPOTrainer):
         self.paused = False
         self.running = True
 
-        # Dataloader lock
-        self.dataloader_lock = asyncio.Lock()
-
-        # Async queues
-        self.pending_queue = asyncio.Queue(maxsize=128)
+        # Active TQ write tasks
         self.active_tasks = set()
 
     def _init_async_objects(self):
@@ -241,7 +236,6 @@ class TQFullyAsyncRollouter(SeparateRayPPOTrainer):
         """Initialize distributed training workers."""
         self._init_async_objects()
 
-
     def _create_continuous_iterator(self):
         """Create a continuous data iterator across epochs."""
         for epoch in range(self.config.trainer.total_epochs):
@@ -249,52 +243,24 @@ class TQFullyAsyncRollouter(SeparateRayPPOTrainer):
             for batch_dict in iterator:
                 yield epoch, batch_dict
 
-    async def _feed_samples(self):
-        """Read batches from dataloader and put them into pending_queue for TQ writing."""
+    async def _feed_and_write_loop(self):
+        """Unified loop: read from dataloader, acquire slot, write to TQ.
+
+        Merges the previous _feed_samples + _processor_worker + _process_single_sample_to_tq
+        into a single task that handles the full pipeline: dataloader -> slot -> TQ.
+        """
         continuous_iterator = self._create_continuous_iterator()
 
         for epoch, batch_dict in continuous_iterator:
-            # Prepare generation data
-            full_batch = prepare_single_generation_data(batch_dict, self.config)
-
-            sample_id = f"sample_{epoch}_{self.global_steps}"
-
-            rollout_sample = RolloutSample(
-                full_batch=full_batch,
-                sample_id=sample_id,
-                epoch=epoch,
-                rollout_status={},
-            )
-
-            await self.pending_queue.put(rollout_sample)
-
-            if self.global_steps >= self.total_rollout_steps:
-                print(
-                    f"[TQFullyAsyncRollouter][Feed] "
-                    f"Maximum steps reached, stopping: "
-                    f"{self.global_steps} >= {self.total_rollout_steps}"
-                )
-                break
-
-            self.global_steps += 1
-
-        # End signal
-        await self.pending_queue.put(None)
-        print(f"[TQFullyAsyncRollouter][Feed] Sample feed complete, {self.global_steps} samples added")
-
-    async def _processor_worker(self):
-        """Process samples from pending_queue: acquire slots and write to TQ."""
-        while True:
-            # Check pause condition
+            # Check pause condition (backpressure from RB)
             if self.paused or await self._should_pause_generation():
-                print("[TQFullyAsyncRollouter][Processor] Paused, waiting...")
+                print("[TQFullyAsyncRollouter][FeedLoop] Paused, waiting...")
                 async with self.lock:
                     self.paused = True
                     self._resume_event.clear()
 
                 resume_future = asyncio.ensure_future(self._resume_event.wait())
                 try:
-                    # Drain active tasks or wait for resume
                     while self.active_tasks and not resume_future.done():
                         wait_set = set(self.active_tasks) | {resume_future}
                         done, _ = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
@@ -304,9 +270,9 @@ class TQFullyAsyncRollouter(SeparateRayPPOTrainer):
                                 for task in actual_done:
                                     self.active_tasks.discard(task)
                                     await task
-                        if resume_future in done:
-                            print("[TQFullyAsyncRollouter][Processor] Resumed early")
-                            break
+                    if resume_future in done:
+                        print("[TQFullyAsyncRollouter][FeedLoop] Resumed early")
+                        break
 
                     if not resume_future.done():
                         self.idle_start_time = time.time()
@@ -315,26 +281,9 @@ class TQFullyAsyncRollouter(SeparateRayPPOTrainer):
                     if not resume_future.done():
                         resume_future.cancel()
                         await asyncio.gather(resume_future, return_exceptions=True)
-                continue
+                continue  # Re-check pause after resume
 
-            # Get next sample
-            rollout_sample = await self.pending_queue.get()
-            self.pending_queue.task_done()
-            self.staleness_samples += 1
-
-            if rollout_sample is None:
-                print("[TQFullyAsyncRollouter][Processor] End signal received, draining...")
-                while self.active_tasks:
-                    async with self.lock:
-                        if self.active_tasks:
-                            done_tasks, self.active_tasks = await asyncio.wait(
-                                self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-                            )
-                            for task in done_tasks:
-                                await task
-                break
-
-            # Concurrency control
+            # Concurrency control: wait for a slot in active_tasks
             while len(self.active_tasks) >= self.max_concurrent_samples:
                 async with self.lock:
                     if self.active_tasks:
@@ -344,35 +293,54 @@ class TQFullyAsyncRollouter(SeparateRayPPOTrainer):
                         for task in done_tasks:
                             await task
 
-            # Submit TQ write task
-            if self.paused:
-                await self._resume_event.wait()
+            # Prepare generation data
+            full_batch = prepare_single_generation_data(batch_dict, self.config)
+            sample_id = f"sample_{epoch}_{self.global_steps}"
+
+            # Submit write task (acquire slot -> write to TQ)
             async with self.lock:
                 task = safe_create_task(
-                    self._process_single_sample_to_tq(rollout_sample),
-                    name=rollout_sample.sample_id,
+                    self._write_single_to_tq(full_batch, sample_id),
+                    name=sample_id,
                     task_set=self.active_tasks,
                 )
 
-    async def _process_single_sample_to_tq(self, rollout_sample: RolloutSample):
-        """Process a single sample: acquire slot and write prompt to TQ.
+            if self.global_steps >= self.total_rollout_steps:
+                print(
+                    f"[TQFullyAsyncRollouter][FeedLoop] "
+                    f"Maximum steps reached: {self.global_steps} >= {self.total_rollout_steps}"
+                )
+                break
 
-        This is the key difference from MessageQueue-based rollouter:
-        - We do NOT wait for generation results
-        - We only write the prompt data + metadata to TQ
-        - Worker will pick up the task and handle generation
+            self.global_steps += 1
+
+        # End of dataloader: drain active tasks
+        print("[TQFullyAsyncRollouter][FeedLoop] End of dataloader, draining active tasks...")
+        while self.active_tasks:
+            async with self.lock:
+                if self.active_tasks:
+                    done_tasks, self.active_tasks = await asyncio.wait(
+                        self.active_tasks, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for task in done_tasks:
+                        await task
+
+        print(f"[TQFullyAsyncRollouter][FeedLoop] Completed. {self.global_steps} samples processed")
+
+    async def _write_single_to_tq(self, full_batch, sample_id: str):
+        """Acquire slot and write a single sample's prompt data to TQ.
+
+        Args:
+            full_batch: Prepared DataProto batch from prepare_single_generation_data.
+            sample_id: Unique identifier for this sample.
         """
-        full_batch = rollout_sample.full_batch
-
         try:
-            # Process each sample in the batch (typically gen_batch_size=1, so 1 iteration)
             for i in range(len(full_batch)):
-                uid = f"uid_{rollout_sample.sample_id}_{i}"
+                uid = f"uid_{sample_id}_{i}"
 
                 # Extract non_tensor fields for metadata
-                non_tensor_keys = list(full_batch.non_tensor_batch.keys())
                 meta_fields = {}
-                for nk in non_tensor_keys:
+                for nk in list(full_batch.non_tensor_batch.keys()):
                     val = full_batch.non_tensor_batch[nk]
                     if i < len(val):
                         meta_fields[nk] = val[i]
@@ -388,11 +356,10 @@ class TQFullyAsyncRollouter(SeparateRayPPOTrainer):
 
                 # 3. Extract tensor fields for TQ
                 fields = {}
-                batch_keys = list(full_batch.batch.keys())
-                for bk in batch_keys:
+                for bk in list(full_batch.batch.keys()):
                     tensor = full_batch.batch[bk]
                     if tensor.dim() >= 1 and i < tensor.shape[0]:
-                        fields[bk] = tensor[i]  # Single sample tensor
+                        fields[bk] = tensor[i]
 
                 # Add non-tensor metadata to fields
                 for nk, nv in meta_fields.items():
@@ -405,7 +372,7 @@ class TQFullyAsyncRollouter(SeparateRayPPOTrainer):
                 tags = {
                     "current_status": "pending",
                     "uid": uid,
-                    "session_id": 0,  # Placeholder; Worker handles n samplings
+                    "session_id": 0,
                     "trajectory_id": 0,
                     "start_model_version": self.current_model_version,
                     "end_model_version": self.current_model_version,
@@ -425,7 +392,7 @@ class TQFullyAsyncRollouter(SeparateRayPPOTrainer):
             self.processed_sample_count += 1
 
         except Exception as e:
-            logging.exception(f"[TQFullyAsyncRollouter] Error processing sample {rollout_sample.sample_id}: {e}")
+            logging.exception(f"[TQFullyAsyncRollouter] Error writing sample {sample_id} to TQ: {e}")
             self.dropped_stale_samples += 1
 
     async def _streaming_generation_main(self):
@@ -436,38 +403,21 @@ class TQFullyAsyncRollouter(SeparateRayPPOTrainer):
             f"max pending slots: {self.max_pending_slots}"
         )
 
-        # Start feed and processor tasks
-        self.feed_task = safe_create_task(self._feed_samples(), name="feed_task")
-        self.processor_task = safe_create_task(self._processor_worker(), name="processor_task")
+        # Single unified loop: dataloader -> acquire slot -> write to TQ
+        self.feed_task = safe_create_task(self._feed_and_write_loop(), name="feed_and_write_loop")
 
         try:
-            done, pending = await asyncio.wait(
-                [self.feed_task, self.processor_task], return_when=asyncio.FIRST_COMPLETED
-            )
-
-            for task in done:
-                if task.exception():
-                    raise task.exception()
-
-            if self.feed_task not in done:
-                raise RuntimeError("Processor task exited prematurely")
-
-            print("[TQFullyAsyncRollouter] Sample feed completed")
-            await self.processor_task
-            print("[TQFullyAsyncRollouter] Processor completed")
-            await self.pending_queue.join()
-            print("[TQFullyAsyncRollouter] pending_queue joined")
+            await self.feed_task
+            print("[TQFullyAsyncRollouter] Feed and write loop completed")
 
         except Exception as e:
             print(f"[TQFullyAsyncRollouter] Streaming error: {e}")
             raise e
         finally:
-            for t in [self.feed_task, self.processor_task]:
-                if t and not t.done():
-                    t.cancel()
-                    await asyncio.gather(t, return_exceptions=True)
+            if self.feed_task and not self.feed_task.done():
+                self.feed_task.cancel()
+                await asyncio.gather(self.feed_task, return_exceptions=True)
             self.feed_task = None
-            self.processor_task = None
 
             # Signal finish to ReplayBuffer
             if self.replay_buffer_handle is not None:
@@ -564,7 +514,6 @@ class TQFullyAsyncRollouter(SeparateRayPPOTrainer):
 
         stats = {
             "monitor/active_tasks_size": len(self.active_tasks),
-            "monitor/queue/pending_queue_size": self.pending_queue.qsize(),
             "monitor/rb/pending_slots": rb_stats.get("pending_slots", 0),
             "monitor/rb/ready_count": rb_stats.get("total_ready", 0),
             "count/total_generated_samples": self.total_generated_samples,
