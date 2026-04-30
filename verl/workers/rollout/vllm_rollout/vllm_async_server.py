@@ -287,7 +287,6 @@ class vLLMHttpServer:
                     served_model_name = served_model_name.split("/")[-1]
                 args["served_model_name"] = served_model_name
 
-        # mtp (None for diffusion models; only LLM models use speculative decoding)
         if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
             speculative_config = {
                 "method": self.config.mtp.method,
@@ -1082,5 +1081,5 @@ class vLLMReplica(RolloutReplica):
             )
 
     def _get_server_name_prefix(self) -> str:
-        """Return the Ray actor name prefix (e.g. 'vllm_' or 'vllm_omni_')."""
+        """Return the Ray actor name prefix (e.g. 'vllm_')."""
         return "vllm_"

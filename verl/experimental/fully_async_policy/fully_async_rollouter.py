@@ -21,6 +21,7 @@ import numpy as np
 import ray
 import torch
 
+from verl.experimental.agent_loop.agent_loop import AgentLoopManager
 from verl.experimental.fully_async_policy.detach_utils import (
     RolloutSample,
     prepare_single_generation_data,
@@ -28,11 +29,36 @@ from verl.experimental.fully_async_policy.detach_utils import (
 )
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
+from verl.protocol import DataProto
 from verl.single_controller.ray import RayWorkerGroup
 from verl.trainer.ppo.utils import need_reward_model
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.profiler import marked_timer
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.workers.rollout.llm_server import LLMServerManager
+
+
+class FullyAsyncAgentLoopManager(AgentLoopManager):
+    async def generate_sequences_single(self, prompts: DataProto) -> DataProto:
+        """Split input batch and dispatch to agent loop workers.
+
+        Args:
+            prompts (DataProto): Input batch. Single sample data
+        Returns:
+            DataProto: Output batch.
+        """
+        worker = self._select_best_worker()
+        output_future = worker.generate_sequences.remote(prompts)
+        return await asyncio.wrap_future(output_future.future())
+
+    def _select_best_worker(self):
+        """Select the best worker, simple round-robin load balancing"""
+        if not hasattr(self, "_worker_index"):
+            self._worker_index = 0
+
+        worker = self.agent_loop_workers[self._worker_index]
+        self._worker_index = (self._worker_index + 1) % len(self.agent_loop_workers)
+        return worker
 
 
 @ray.remote(num_cpus=10, max_concurrency=100)
@@ -184,7 +210,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 / (self.required_samples * self.config.async_training.trigger_parameter_sync_step)
             )
 
-            self.max_concurrent_samples = len(self.async_rollout_manager.server_handles) * 16
+            self.max_concurrent_samples = len(self.llm_server_manager.get_replicas()) * 16
             self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
             self.max_queue_size = self.max_required_samples
 
@@ -199,7 +225,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     def get_replicas(self):
         """Get rollout worker group"""
-        return self.async_rollout_manager.rollout_replicas
+        return self.llm_server_manager.get_replicas()
 
     def get_max_queue_size(self):
         return self.max_queue_size
@@ -393,8 +419,15 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         # create async rollout manager and request scheduler
         assert self.config.actor_rollout_ref.rollout.mode == "async"
-        from verl.experimental.fully_async_policy.agent_loop import FullyAsyncAgentLoopManager
 
+        self.async_rollout_mode = True
+        self.llm_server_manager = await LLMServerManager.create(config=self.config)
+        self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
+            config=self.config,
+            llm_client=self.llm_server_manager.get_client(fully_async=True),
+            reward_loop_worker_handles=reward_loop_worker_handles,
+        )
+        """
         self.async_rollout_mode = True
         self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
             config=self.config,
@@ -406,6 +439,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             f"{len(self.async_rollout_manager.rollout_replicas)} fixed replicas, "
             f"{len(self.async_rollout_manager.elastic_replicas)} elastic replicas (sleeping)"
         )
+        """
 
     # Add samples to the pending_queue
     async def _feed_samples(self):
