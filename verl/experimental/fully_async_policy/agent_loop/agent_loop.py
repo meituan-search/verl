@@ -38,125 +38,10 @@ from verl.utils.rollout_trace import (
 )
 from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.rollout import RolloutReplica
+from verl.workers.rollout.llm_server import GlobalRequestLoadBalancer
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-
-
-class ElasticGlobalRequestLoadBalancer:
-    """
-    Extended GlobalRequestLoadBalancer that supports dynamic server addition/removal
-    with sticky session support via LRU cache.
-
-    Key features:
-    - **Sticky Session**: Uses LRUCache to map request_id → server_id, ensuring
-      multi-turn conversations route to the same server.
-    - **Least-loaded Selection**: When no sticky session exists, selects the
-      server with the fewest in-flight requests.
-    - **Dynamic Server Management**: Supports add/remove servers at runtime
-      for elastic scaling.
-
-    Two-phase removal for safe server shutdown::
-
-        1. remove_server(server_id)    # Mark as removed, no new requests routed
-        2. cleanup_removed_server(server_id)  # Fully remove after drained
-
-    When a sticky session points to a removed server, the cache entry is
-    automatically invalidated and a new server is selected.
-
-    Attributes:
-        _inflight_requests: dict mapping server_id → in-flight request count
-        _request_id_to_server: LRUCache for sticky session (request_id → server_id)
-        _removed_servers: set of server_ids marked for removal
-    """
-
-    def __init__(self, server_actor_ids: list[str], max_cache_size: int = 10000):
-        from cachetools import LRUCache
-
-        if not server_actor_ids:
-            raise ValueError("server_actor_ids must be non-empty")
-
-        self._inflight_requests: dict[str, int] = {sid: 0 for sid in server_actor_ids}
-        self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
-        self._removed_servers: set[str] = set()  # Servers being drained
-
-    def acquire_server(self, request_id: str) -> str:
-        """Acquire a server for the given request (sticky + least-loaded)."""
-        # Try sticky session first
-        if request_id in self._request_id_to_server:
-            server_id = self._request_id_to_server[request_id]
-            # Check if server is still available (not removed and still in pool)
-            if server_id in self._inflight_requests and server_id not in self._removed_servers:
-                self._inflight_requests[server_id] += 1
-                return server_id
-            # Server was removed, clear stale cache entry
-            del self._request_id_to_server[request_id]
-
-        # Select new server (least-loaded among available)
-        available = {sid: cnt for sid, cnt in self._inflight_requests.items() if sid not in self._removed_servers}
-        if not available:
-            raise RuntimeError("No available servers in load balancer")
-
-        server_id = min(available, key=available.get)
-        self._request_id_to_server[request_id] = server_id
-        self._inflight_requests[server_id] += 1
-        return server_id
-
-    def release_server(self, server_id: str) -> None:
-        """Release a server after a request completes."""
-        if server_id not in self._inflight_requests:
-            return
-        if self._inflight_requests[server_id] > 0:
-            self._inflight_requests[server_id] -= 1
-
-    def add_server(self, server_id: str) -> None:
-        """Add a new server to the load balancer pool."""
-        if server_id in self._inflight_requests:
-            self._removed_servers.discard(server_id)
-            return
-        self._inflight_requests[server_id] = 0
-        self._removed_servers.discard(server_id)
-        logger.info(f"[ElasticLB] Added server: {server_id}")
-
-    def remove_server(self, server_id: str) -> None:
-        """Mark server for removal (no new requests routed to it)."""
-        if server_id in self._inflight_requests:
-            self._removed_servers.add(server_id)
-        logger.info(f"[ElasticLB] Marked server for removal: {server_id}")
-
-    def get_inflight_count(self, server_id: str) -> int:
-        """Get number of in-flight requests for a server."""
-        return self._inflight_requests.get(server_id, 0)
-
-    def cleanup_removed_server(self, server_id: str) -> None:
-        """Fully remove a server that has been drained."""
-        self._inflight_requests.pop(server_id, None)
-        self._removed_servers.discard(server_id)
-        logger.info(f"[ElasticLB] Cleaned up server: {server_id}")
-
-    def get_all_servers(self) -> list[str]:
-        """Get list of all active server IDs."""
-        return [sid for sid in self._inflight_requests if sid not in self._removed_servers]
-
-    def set_inflight(self, server_id: str, count: int) -> None:
-        """Directly set in-flight count for a server (test use only)."""
-        self._inflight_requests[server_id] = count
-
-    def is_server_removed(self, server_id: str) -> bool:
-        """Return True if the server is in the removed set (test use only)."""
-        return server_id in self._removed_servers
-
-    def has_server(self, server_id: str) -> bool:
-        """Return True if the server exists in the inflight table (test use only)."""
-        return server_id in self._inflight_requests
-
-    def get_status(self) -> dict:
-        """Return current load balancer state for debugging."""
-        return {
-            "servers": dict(self._inflight_requests),
-            "total_inflight": sum(self._inflight_requests.values()),
-            "active_servers": len(self._inflight_requests),
-        }
 
 
 class FullyAsyncLLMServerManager(AsyncLLMServerManager):
@@ -291,7 +176,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
     * **Fixed replicas** — always-on rollout servers backed by ``worker_group``
       (the rollouter's own GPU pool).  Created during :meth:`create` via
       ``init_standalone()`` and registered with the
-      :class:`ElasticGlobalRequestLoadBalancer` at startup.  These are never
+      :class:`GlobalRequestLoadBalancer` at startup.  These are never
       touched by the elastic add/remove API.
 
     * **Elastic hybrid replicas** — optional rollout servers that **share GPUs**
@@ -332,7 +217,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
 
     Load Balancer Sticky Session::
 
-        ElasticGlobalRequestLoadBalancer uses LRU cache to maintain sticky sessions.
+        :class:`GlobalRequestLoadBalancer` uses LRU cache to maintain sticky sessions.
         When a request retries after ``stop_reason="aborted"``, it checks:
 
         1. If cached server is still available (not in _removed_servers)
@@ -399,7 +284,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
            (e.g. ``sglang_server_0_0``) with the elastic actors above.
            These are registered with the load balancer at startup.
 
-        3. **Infrastructure**: build the :class:`ElasticGlobalRequestLoadBalancer`
+        3. **Infrastructure**: build the :class:`GlobalRequestLoadBalancer`
            with fixed server addresses, then spawn :class:`FullyAsyncAgentLoopWorker`
            actors.  Elastic servers are **not** added to the LB; they join on demand
            via :meth:`add_elastic_replica`.
@@ -535,9 +420,9 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         return num_replicas
 
     async def _init_global_load_balancer(self) -> None:
-        """Override to use ElasticGlobalRequestLoadBalancer (supports add/remove)."""
-        self.global_load_balancer = ray.remote(ElasticGlobalRequestLoadBalancer).remote(
-            server_actor_ids=self.server_addresses,
+        """Override to use GlobalRequestLoadBalancer with elastic support (add/remove)."""
+        self.global_load_balancer = GlobalRequestLoadBalancer.remote(
+            servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
             max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
         )
         print(f"[FullyAsyncAgentLoopManager] Load balancer initialised with {len(self.server_addresses)} servers")

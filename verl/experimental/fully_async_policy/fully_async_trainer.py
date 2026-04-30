@@ -63,14 +63,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         role_worker_mapping: dict[Role, WorkerType],
         resource_pool_manager: ResourcePoolManager,
         ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
-        processor=None,
         device_name=None,
     ):
         # ==================== RayPPOTrainer config ====================
 
         # Store the tokenizer for text processing
         self.tokenizer = tokenizer
-        self.processor = processor
         self.config = config
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine

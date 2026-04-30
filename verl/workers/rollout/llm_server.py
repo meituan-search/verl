@@ -44,7 +44,25 @@ DEFAULT_ROUTING_CACHE_SIZE = 10000
 
 @ray.remote
 class GlobalRequestLoadBalancer:
-    """Global sticky-session + in-flight load balancer shared by all AgentLoopWorkers."""
+    """Global sticky-session + in-flight load balancer shared by all AgentLoopWorkers.
+
+    Supports dynamic server addition/removal for elastic scaling with two-phase
+    removal for safe server shutdown::
+
+        1. remove_server(server_id)    # Mark as removed, no new requests routed
+        2. cleanup_removed_server(server_id)  # Fully remove after drained
+
+    When a sticky session points to a removed server, the cache entry is
+    automatically invalidated and a new server is selected.
+
+    Key features:
+    - **Sticky Session**: Uses LRUCache to map request_id → server_id, ensuring
+      multi-turn conversations route to the same server.
+    - **Least-loaded Selection**: When no sticky session exists, selects the
+      server with the fewest in-flight requests.
+    - **Dynamic Server Management**: Supports add/remove servers at runtime
+      for elastic scaling.
+    """
 
     def __init__(self, servers: dict[str, ray.actor.ActorHandle], max_cache_size: int = DEFAULT_ROUTING_CACHE_SIZE):
         if not servers:
@@ -53,36 +71,73 @@ class GlobalRequestLoadBalancer:
         self._server = servers
         self._inflight_requests: dict[str, int] = {sid: 0 for sid in servers}
         self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
+        self._removed_servers: set[str] = set()  # Servers being drained
 
     def acquire_server(self, request_id: str) -> str:
-        """Acquire a server for the given request, reusing the same server for multi-turn conversations."""
-        # request-level sticky (multi-turn: same conversation -> same server)
+        """Acquire a server for the given request (sticky + least-loaded)."""
+        # Try sticky session first
         if request_id in self._request_id_to_server:
             server_id = self._request_id_to_server[request_id]
-            self._inflight_requests[server_id] += 1
-            return server_id
+            # Check if server is still available (not removed and still in pool)
+            if server_id in self._inflight_requests and server_id not in self._removed_servers:
+                self._inflight_requests[server_id] += 1
+                return server_id
+            # Server was removed, clear stale cache entry
+            del self._request_id_to_server[request_id]
 
-        # new request: route to least loaded server
-        server_id = min(self._inflight_requests, key=self._inflight_requests.get)
+        # Select new server (least-loaded among available)
+        available = {sid: cnt for sid, cnt in self._inflight_requests.items() if sid not in self._removed_servers}
+        if not available:
+            raise RuntimeError("No available servers in load balancer")
+
+        server_id = min(available, key=available.get)
         self._request_id_to_server[request_id] = server_id
         self._inflight_requests[server_id] += 1
         return server_id
 
     def release_server(self, server_id: str) -> None:
-        """Release a server after a request completes, decrementing its inflight count."""
+        """Release a server after a request completes."""
         if server_id not in self._inflight_requests:
-            raise ValueError(f"Invalid server_id for release: {server_id}")
-        if self._inflight_requests[server_id] <= 0:
-            raise ValueError(f"Release called with no inflight requests on server {server_id}")
-        self._inflight_requests[server_id] -= 1
+            return
+        if self._inflight_requests[server_id] > 0:
+            self._inflight_requests[server_id] -= 1
 
-    def add_servers(self, servers: dict[str, ray.actor.ActorHandle]) -> None:
-        """Add new servers to the server handles."""
-        raise NotImplementedError("Not implemented")
+    def add_server(self, server_id: str) -> None:
+        """Add a new server to the load balancer pool."""
+        if server_id in self._inflight_requests:
+            self._removed_servers.discard(server_id)
+            return
+        self._inflight_requests[server_id] = 0
+        self._removed_servers.discard(server_id)
+        logger.info(f"[GlobalLoadBalancer] Added server: {server_id}")
 
-    def remove_servers(self, server_ids: list[str]) -> None:
-        """Remove servers from the server handles."""
-        raise NotImplementedError("Not implemented")
+    def remove_server(self, server_id: str) -> None:
+        """Mark server for removal (no new requests routed to it)."""
+        if server_id in self._inflight_requests:
+            self._removed_servers.add(server_id)
+        logger.info(f"[GlobalLoadBalancer] Marked server for removal: {server_id}")
+
+    def get_inflight_count(self, server_id: str) -> int:
+        """Get number of in-flight requests for a server."""
+        return self._inflight_requests.get(server_id, 0)
+
+    def cleanup_removed_server(self, server_id: str) -> None:
+        """Fully remove a server that has been drained."""
+        self._inflight_requests.pop(server_id, None)
+        self._removed_servers.discard(server_id)
+        logger.info(f"[GlobalLoadBalancer] Cleaned up server: {server_id}")
+
+    def get_all_servers(self) -> list[str]:
+        """Get list of all active server IDs."""
+        return [sid for sid in self._inflight_requests if sid not in self._removed_servers]
+
+    def get_status(self) -> dict:
+        """Return current load balancer state for debugging."""
+        return {
+            "servers": dict(self._inflight_requests),
+            "total_inflight": sum(self._inflight_requests.values()),
+            "active_servers": len([sid for sid in self._inflight_requests if sid not in self._removed_servers]),
+        }
 
 
 class LLMServerClient:

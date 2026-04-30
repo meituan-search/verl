@@ -670,6 +670,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         LoRA handling: when model.lora.merge=True (peft_merge), LoRA is merged into
         base weights before sync. The engine returns full HF-keyed params with
         peft_config=None, so the rollout receives a standard weight update.
+
+        Args:
+            global_steps: Current global training step count, passed to rollout for logging/tracking.
+            mode: Weight update strategy. Supported values:
+                - ``"auto"``: Automatically resolve to the backend configured in
+                  ``config.rollout.checkpoint_engine.backend`` (default).
+                - ``"naive"``: Direct in-process weight sync between colocated trainer
+                  and rollout. Used for synchronous training where both share the same
+                  process. Rollout must be in sleep mode before this call.
+                - Any other value: Delegates to
+                  :meth:`checkpoint_engine.send_weights` for asynchronous weight
+                  transfer via checkpoint engine, suitable for disaggregated
+                  trainer/rollout deployments.
         """
 
         # Resolve mode: "auto" falls back to config, explicit values take precedence
