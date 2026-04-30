@@ -241,6 +241,7 @@ class ReplayBuffer:
             claimed_keys = [k for k, _ in result]
             tq.kv_batch_put(
                 keys=claimed_keys,
+                partition_id="train",
                 tags=[{"current_status": "running"}] * len(claimed_keys),
             )
 

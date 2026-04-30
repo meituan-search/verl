@@ -200,7 +200,7 @@ class TQFullyAsyncRollouter(SeparateRayPPOTrainer):
             # 5. Write to TQ
             tags = [{"current_status": "pending", "sample_id": sample_id}]
 
-            print(f"[TQFullyAsyncRollouter] field_tensors: {field_tensors}\n tags: {tags}\n\n")
+            print(f"[TQFullyAsyncRollouter] tags: {tags}\n\n")
 
             await tq.async_kv_batch_put(
                 keys=[key],

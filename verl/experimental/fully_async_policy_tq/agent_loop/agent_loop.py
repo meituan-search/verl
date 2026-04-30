@@ -36,13 +36,18 @@ from typing import Any
 import hydra
 import ray
 import torch
-import transfer_queue as tq
 from omegaconf import DictConfig, OmegaConf
 
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopOutput,
     TokenOutput,
 )
+
+try:
+    import transfer_queue as tq
+except ImportError:
+    print("Please install TQ by calling `pip install TransferQueue==0.1.6` and try again.")
+    from verl.utils.transferqueue_utils import tq
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
