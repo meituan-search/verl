@@ -13,33 +13,427 @@
 # limitations under the License.
 
 import asyncio
-import multiprocessing
+import logging
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pprint import pformat
 
 import numpy as np
 import ray
 import torch
+from omegaconf import DictConfig
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager
 from verl.experimental.fully_async_policy.detach_utils import (
     RolloutSample,
-    ValidateMetrics,
     prepare_single_generation_data,
     safe_create_task,
 )
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.protocol import DataProto
-from verl.single_controller.ray import RayWorkerGroup
-from verl.trainer.ppo.ray_trainer import ResourcePoolManager
-from verl.trainer.ppo.utils import Role, WorkerType, need_reward_model
+from verl.single_controller.ray import RayResourcePool, RayWorkerGroup
+from verl.trainer.ppo.utils import need_reward_model
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.profiler import marked_timer
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.workers.rollout import RolloutReplica
 from verl.workers.rollout.llm_server import LLMServerManager
+from verl.workers.rollout.utils import update_prometheus_config
+
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+class FullyAsyncLLMServerManager(LLMServerManager):
+    """Unified AgentLoopManager for fully async training with elastic replica support.
+
+    Manages two categories of rollout replicas:
+
+    * **Fixed replicas** — always-on rollout servers backed by ``worker_group``
+      (the rollouter's own GPU pool).  Created during :meth:`create` via
+      ``init_standalone()`` and registered with the
+      :class:`GlobalRequestLoadBalancer` at startup.  These are never
+      touched by the elastic add/remove API.
+
+    * **Elastic hybrid replicas** — optional rollout servers that **share GPUs**
+      with the training engine (``elastic_worker_group``, injected by the
+      caller before ``init_workers()``).  Created via ``init_hybrid()`` inside
+      :meth:`create`, immediately put to **sleep** so the training engine can
+      reclaim their GPU memory, and activated on demand.
+
+    Internal data structures::
+
+        self.rollout_replicas: list[RolloutReplica]       # fixed + active elastic
+        self.elastic_replicas: dict[str, RolloutReplica]  # all elastic (sleeping + alive), keyed by "elastic_{i}"
+        self.alive_replicas: dict[str, RolloutReplica]    # currently active (awake + in LB) subset
+        self.alive_addresses: dict[str, str]              # resource_id → server_address for alive ones
+
+    Elastic replica lifecycle::
+
+        create()                          # init_hybrid() on trainer GPUs
+          ↓
+        sleep()                           # release weights/kv-cache; trainer owns GPUs now
+          ↓  ────────────────────────────────────────────────────────
+        add_elastic_replica(resource_id)  # called by Trainer via RPC → Rollouter
+          ├─ _notify_workers_server_added()   # push handle into every worker's map
+          ├─ global_load_balancer.add_server() # start routing requests
+          └─ update alive_replicas / rollout_replicas
+          ↓
+        [serving generation requests as part of rollout_replicas]
+          ↓
+        remove_elastic_replica(resource_id)
+          ├─ global_load_balancer.remove_server()      # mark as removed, no new requests
+          ├─ _notify_workers_server_removed()         # drop handle from workers
+          ├─ global_load_balancer.cleanup_removed_server()  # fully remove from LB
+          └─ update alive_replicas / rollout_replicas
+
+    Note: The actual ``abort_all_requests()`` and ``sleep()`` are called by the
+    Trainer AFTER ``remove_elastic_replica()`` returns, not inside this method.
+    This allows the Trainer to coordinate abort timing with other cleanup.
+
+    Load Balancer Sticky Session::
+
+        :class:`GlobalRequestLoadBalancer` uses LRU cache to maintain sticky sessions.
+        When a request retries after ``stop_reason="aborted"``, it checks:
+
+        1. If cached server is still available (not in _removed_servers)
+           → reuse the same server
+        2. If cached server was removed
+           → clear cache entry and select a new least-loaded server
+
+        This ensures aborted requests are re-routed to healthy servers.
+    """
+
+    def __init__(
+        self,
+        config: DictConfig,
+        worker_group: RayWorkerGroup = None,
+        rollout_resource_pool: RayResourcePool = None,
+    ):
+        super().__init__(config, worker_group, rollout_resource_pool)
+
+        # Rollout replicas (alive hybrid and fixed)
+        self.rollout_replicas = []
+        # Pre-registered elastic replicas: bound at init time but still sleeping.
+        # Keyed by resource_id; populated by create() before add_elastic_replica().
+        self.elastic_replicas: dict[str, RolloutReplica] = {}
+        # resource_id -> RolloutReplica  (hybrid elastic replicas only)
+        self.alive_replicas: dict[str, RolloutReplica] = {}
+        # resource_id -> server_address  (for LB / worker notification)
+        self.alive_addresses: dict[str, str] = {}
+        # Prometheus server addresses
+        self.prometheus_server_addresses = []
+
+        # Timing / counters
+        self.last_elastic_add_time: float = 0.0
+        self.last_elastic_remove_time: float = 0.0
+
+    async def _initialize_llm_servers(self):
+        # ── Step 1: elastic replicas first (replica_rank 0 … N_e-1) ──────────
+        # Initialise and immediately sleep them so the training engine can
+        # reclaim GPU memory.  Starting from rank 0 gives elastic actors the
+        # lowest-numbered placement-group bundles which are co-located with the
+        # training engine, maximising GPU affinity on multi-node deployments.
+        num_elastic = 0
+        if self.worker_group is not None:
+            num_elastic = await self._initialize_elastic_replicas(start_rank=0, worker_group=self.worker_group)
+
+        # ── Step 2: fixed replicas (replica_rank N_e … N_e+N_f-1) ───────────
+        # start_rank=num_elastic ensures the Ray actor names (e.g.
+        # server_{rank}_{node}) are globally unique and never collide
+        # with the elastic actors created above.
+        num_elastic = await self._initialize_elastic_replicas(start_rank=num_elastic)
+
+        print(
+            f"[FullyAsyncAgentLoopManager] Created: "
+            f"{len(self.rollout_replicas)} fixed replicas (rank {num_elastic}+), "
+            f"{num_elastic} elastic replicas registered (sleeping, rank 0-{num_elastic - 1})"
+        )
+
+    async def _initialize_elastic_replicas(
+        self,
+        start_rank: int = 0,
+        worker_group: RayWorkerGroup = None,
+    ) -> int:
+        """
+        Create, initialise (init_hybrid), and sleep elastic hybrid replicas.
+
+        Called internally by create() when elastic_worker_group is provided.
+        Each replica is assigned a contiguous slice of workers from
+        elastic_worker_group, and its ``replica_rank`` starts at ``start_rank``
+        so that it is globally unique across both elastic and fixed replicas
+        (avoiding Ray named-actor collisions such as ``sglang_server_0_0``).
+
+        After init_hybrid() the replica is immediately put to sleep so that
+        The replica is stored in
+        elastic_replicas keyed by "elastic_{i}" (0-indexed within
+        the elastic group) and can be activated later via add_elastic_replica().
+
+        Args:
+            worker_group: Worker group whose workers back the elastic
+                hybrid replicas.  Must already be fully initialised.
+            start_rank: First global ``replica_rank`` to assign.  Pass 0 so
+                that elastic actors occupy the lowest-numbered Ray actor names
+                and therefore the best GPU affinity in multi-node deployments.
+
+        Returns:
+            Number of elastic replicas created (so the caller can pass
+            ``start_rank=num_elastic`` to ``_initialize_llm_servers``).
+        """
+        rollout_world_size = (
+            self.rollout_config.tensor_model_parallel_size
+            * self.rollout_config.data_parallel_size
+            * self.rollout_config.pipeline_model_parallel_size
+        )
+
+        world_size = (
+            worker_group.world_size
+            if worker_group
+            else self.rollout_config.n_gpus_per_node * self.rollout_config.nnodes
+        )
+
+        num_replicas = world_size // rollout_world_size
+
+        tmp_replicas = [
+            self.rollout_replica_class(
+                replica_rank=start_rank + i,
+                config=self.rollout_config,
+                model_config=self.model_config,
+                gpus_per_node=self.rollout_config.n_gpus_per_node,
+            )
+            for i in range(num_replicas)
+        ]
+
+        if worker_group:
+            await asyncio.gather(*[replica.init_hybrid(worker_group) for replica in tmp_replicas])
+            # Register elastic replicas.
+            for i, replica in enumerate(tmp_replicas):
+                resource_id = f"elastic_{i}"
+                self.elastic_replicas[resource_id] = replica
+                print(
+                    f"[FullyAsyncAgentLoopManager] Elastic replica '{resource_id}' "
+                    f"(rank={start_rank + i}) initialised at {replica._server_address} "
+                )
+            elastic_addresses = [replica._server_address for replica in tmp_replicas]
+            self.prometheus_server_addresses.extend(elastic_addresses)
+            print(f"AgentLoopManager Elastic: {elastic_addresses}")
+        else:
+            self.rollout_replicas = tmp_replicas
+            await asyncio.gather(*[replica.init_standalone() for replica in self.rollout_replicas])
+            self.server_handles = [replica._server_handle for replica in self.rollout_replicas]
+            self.server_addresses = [replica._server_address for replica in self.rollout_replicas]
+            self.prometheus_server_addresses.extend(self.server_addresses)
+            print(f"AgentLoopManager Standalone: {self.server_addresses}")
+
+        # Update Prometheus configuration with server addresses
+        if self.rollout_config.prometheus.enable:
+            if self.rollout_config.disable_log_stats:
+                raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
+            print(f"Prometheus: {self.prometheus_server_addresses}")
+            update_prometheus_config(
+                self.rollout_config.prometheus, self.prometheus_server_addresses, self.rollout_config.name
+            )
+
+        return num_replicas
+
+    async def add_elastic_replica(self, resource_id: str) -> bool:
+        """Activate a pre-registered elastic hybrid replica and add it to the active server pool."""
+        if resource_id in self.alive_replicas:
+            logger.warning(f"[FullyAsyncAgentLoopManager] Replica '{resource_id}' already active, skipping")
+            return False
+
+        lb_status = await self.global_load_balancer.get_status.remote()
+        print(f"[FullyAsyncAgentLoopManager] lb_status '{lb_status}'")
+
+        replica = self.elastic_replicas.get(resource_id)
+        if replica is None:
+            logger.error(
+                f"[FullyAsyncAgentLoopManager] Replica '{resource_id}' is not registered. "
+                f"Elastic replicas are created inside FullyAsyncAgentLoopManager.create() "
+                f"via elastic_worker_group; ensure that argument was provided."
+            )
+            return False
+
+        server_address = replica._server_address
+        server_handle = replica._server_handle
+
+        try:
+            # step 1: notify workers to add the server handle
+            await self._notify_workers_server_added(server_address, server_handle)
+            # step 2: LB add server
+            await self.global_load_balancer.add_server.remote(server_id=server_address)
+
+            # Add tracking state
+            self.alive_replicas[resource_id] = replica
+            self.alive_addresses[resource_id] = server_address
+            self.rollout_replicas.append(replica)
+            self.last_elastic_add_time = time.time()
+
+            print(
+                f"[FullyAsyncAgentLoopManager] Replica '{resource_id}' added at {server_address}. "
+                f"Active elastic replicas: {len(self.alive_replicas)}"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"[FullyAsyncAgentLoopManager] Failed to activate replica '{resource_id}': {e}")
+            return False
+
+    async def remove_elastic_replica(self, resource_id: str) -> bool:
+        """Deactivate an active elastic hybrid replica and return its GPUs to the training engine."""
+        if resource_id not in self.alive_replicas:
+            logger.warning(f"[FullyAsyncAgentLoopManager] Replica {resource_id} not found, skipping")
+            return False
+
+        lb_status = await self.global_load_balancer.get_status.remote()
+        print(f"[FullyAsyncAgentLoopManager] lb_status '{lb_status}'")
+
+        server_address = self.alive_addresses[resource_id]
+        replica = self.alive_replicas[resource_id]
+
+        try:
+            # Step 1: Mark server as removed (no new requests routed to it)
+            await self.global_load_balancer.remove_server.remote(server_id=server_address)
+            # Step 2: Notify workers to remove the server handle
+            await self._notify_workers_server_removed(server_address)
+            # Step 3: Fully remove from LB (cleanup)
+            await self.global_load_balancer.cleanup_removed_server.remote(server_id=server_address)
+
+            # Remove tracking state
+            self.alive_replicas.pop(resource_id)
+            self.alive_addresses.pop(resource_id)
+            if replica in self.rollout_replicas:
+                self.rollout_replicas.remove(replica)
+            self.last_elastic_remove_time = time.time()
+
+            print(
+                f"[FullyAsyncAgentLoopManager] Replica {resource_id} at {server_address} removed. "
+                f"Total elastic: {len(self.alive_replicas)}"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"[FullyAsyncAgentLoopManager] Failed to remove replica {resource_id}: {e}")
+            return False
+
+    # -------------------------------------------------------------------------
+    # Private helpers
+    # -------------------------------------------------------------------------
+    async def _notify_workers_server_added(self, server_address: str, server_handle) -> None:
+        """
+        Notify all AgentLoopWorkers that a new server is available, and keep
+        the manager-level server lists (server_addresses / server_handles) in sync.
+
+        The manager-level lists are the source of truth used when spawning new
+        workers later (e.g. after a scale-out event).  Each existing worker's
+        FullyAsyncLLMServerManager._server_id_to_handle is updated via add_server().
+        """
+        # 1. Update manager-level server lists so future workers get the full pool.
+        if server_address not in self.server_addresses:
+            self.server_addresses.append(server_address)
+            self.server_handles.append(server_handle)
+
+        # 2. Notify each existing worker to add the new handle into its server_manager.
+        if not getattr(self, "agent_loop_workers", None):
+            return
+        futures = []
+        for worker in self.agent_loop_workers:
+            try:
+                futures.append(worker.add_server.remote(server_address, server_handle))
+            except AttributeError:
+                logger.debug("[FullyAsyncAgentLoopManager] Worker doesn't support add_server()")
+        if futures:
+            results = await asyncio.gather(
+                *[asyncio.wrap_future(f.future()) for f in futures],
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning(f"[FullyAsyncAgentLoopManager] Worker add_server failed: {result}")
+
+    async def _notify_workers_server_removed(self, server_address: str) -> None:
+        """
+        Notify all AgentLoopWorkers that a server is no longer available, and
+        remove it from the manager-level server lists.
+
+        Must be called BEFORE abort_all_requests() so that when
+        FullyAsyncLLMServerManager retries after stop_reason="aborted", the dead
+        handle is already gone from every worker's _server_id_to_handle.
+        """
+        # 1. Update manager-level server lists.
+        if server_address in self.server_addresses:
+            idx = self.server_addresses.index(server_address)
+            self.server_addresses.pop(idx)
+            self.server_handles.pop(idx)
+
+        # 2. Notify each existing worker to remove the stale handle.
+        if not getattr(self, "agent_loop_workers", None):
+            return
+        futures = []
+        for worker in self.agent_loop_workers:
+            try:
+                futures.append(worker.remove_server.remote(server_address))
+            except AttributeError:
+                logger.debug("[FullyAsyncAgentLoopManager] Worker doesn't support remove_server()")
+        if futures:
+            await asyncio.gather(
+                *[asyncio.wrap_future(f.future()) for f in futures],
+                return_exceptions=True,
+            )
+
+    # -------------------------------------------------------------------------
+    # Statistics / introspection
+    # -------------------------------------------------------------------------
+    def get_num_elastic_replicas(self) -> int:
+        """Return the number of currently active elastic replicas."""
+        return len(self.alive_replicas)
+
+    def get_elastic_replicas_info(self) -> list[dict]:
+        """Return metadata for all active elastic replicas."""
+        return [
+            {
+                "resource_id": rid,
+                "server_address": self.alive_addresses.get(rid, "unknown"),
+            }
+            for rid in self.alive_replicas
+        ]
+
+    def get_elastic_statistics(self) -> dict:
+        """Return elastic-specific counters for monitoring."""
+        return {
+            "elastic/num_elastic_replicas": len(self.alive_replicas),
+            "elastic/last_add_time": self.last_elastic_add_time,
+            "elastic/last_remove_time": self.last_elastic_remove_time,
+        }
+
+    def get_active_server_count(self) -> int:
+        """Total active rollout servers (fixed + elastic)."""
+        fixed = len(self.rollout_replicas)
+        return fixed + len(self.alive_replicas)
+
+    def get_server_info(self) -> list[dict]:
+        """Metadata for all active rollout servers."""
+        servers = []
+        if hasattr(self, "rollout_replicas"):
+            for replica in self.rollout_replicas:
+                servers.append(
+                    {
+                        "address": getattr(replica, "_server_address", "unknown"),
+                        "type": "fixed",
+                        "is_elastic": False,
+                    }
+                )
+        for rid, address in self.alive_addresses.items():
+            servers.append(
+                {
+                    "address": address,
+                    "resource_id": rid,
+                    "type": "elastic",
+                    "is_elastic": True,
+                }
+            )
+        return servers
 
 
 class FullyAsyncAgentLoopManager(AgentLoopManager):
@@ -77,8 +471,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self,
         config,
         tokenizer,
-        role_worker_mapping: dict[Role, WorkerType],
-        resource_pool_manager: ResourcePoolManager,
         ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
         processor=None,
         device_name=None,
@@ -97,8 +489,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             "trigger_parameter_sync_step must larger or equal than 1"
         )
 
-        self.role_worker_mapping = role_worker_mapping
-        self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = False
 
         self.use_rm = need_reward_model(self.config)
@@ -144,19 +534,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
         self._validate_config()
-        if self.config.async_training.use_trainer_do_validate:
-            rollout_gpus = config.rollout.nnodes * config.rollout.n_gpus_per_node
-            train_gpus = config.trainer.nnodes * config.trainer.n_gpus_per_node
-            total_gpus = rollout_gpus + train_gpus
-            print(f"[FullyAsyncRollouter] split before val_dataset total len: {len(val_dataset)}")
-            split_dataset = val_dataset.split(total_gpus)
-            rollout_val_dataset0 = split_dataset[:rollout_gpus]
-            from torch.utils.data import ConcatDataset
-
-            val_dataset = ConcatDataset(rollout_val_dataset0)
-            print(f"[FullyAsyncRollouter] split after val_dataset total len: {len(val_dataset)}")
-        print(f"[FullyAsyncRollouter] Rollouter _create_dataloader...\n{train_dataset}\n{val_dataset}")
-
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.total_rollout_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
@@ -168,10 +545,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Rollouter parameter configuration
         self.message_queue_client = None
 
-        # Worker groups: rollout_wg is same to actor_rollout_wg
-        self.rollout_wg = None
-        self.actor_rollout_wg = None
         self.async_rollout_manager = None
+
+        # Elastic worker group (injected via set_elastic_worker_group before init_workers)
+        # When set, its GPUs back elastic hybrid replicas for trainer-side validation.
+        self._elastic_worker_group = None
 
         # Config
         self.staleness_threshold: float = config.async_training.get("staleness_threshold", 1)
@@ -204,11 +582,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Initialize async queues
         self.pending_queue = asyncio.Queue(maxsize=128)
         self.active_tasks = set()
-
-        cpu_cores = multiprocessing.cpu_count()
-        # cpu case use cpu_cores; io case use cpu_cores*2
-        self.validate_executor = ThreadPoolExecutor(max_workers=cpu_cores)
-        self.validate_task = None
 
     def _init_async_objects(self):
         # Initialize asyncio synchronization primitives.
@@ -291,36 +664,12 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         return timing_raw
 
-    def _maybe_log_val_generations(self, inputs, outputs, scores):
-        """Capture validation generations to send back to trainer instead of logging directly.
-
-        The rollouter process does not have an active wandb session, so we capture the
-        sampled generations and return them via ValidateMetrics to the trainer for logging.
-        """
-        generations_to_log = self.config.trainer.log_val_generations
-        if generations_to_log == 0:
-            self._captured_val_generations = []
-            return
-
-        samples = list(zip(inputs, outputs, scores, strict=True))
-        samples.sort(key=lambda x: x[0])
-
-        rng = np.random.RandomState(42)
-        rng.shuffle(samples)
-
-        self._captured_val_generations = samples[:generations_to_log]
-
-    def do_validate(self) -> ValidateMetrics:
+    def do_validate(self):
         """Run validation and return metrics"""
         timing_raw = {}
-        self._captured_val_generations = []
         with marked_timer("rollouter/validate_time", timing_raw, color="green"):
             val_metrics: dict = self._validate()
-        return ValidateMetrics(
-            timing_raw=timing_raw,
-            metrics=val_metrics,
-            val_generations=self._captured_val_generations,
-        )
+        return timing_raw | val_metrics
 
     async def save_checkpoint(self, local_global_step_folder: str):
         # WARNING!: Due to the asynchronous nature, there are some in-flight samples
@@ -449,6 +798,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 yield epoch, batch_dict
 
     async def _init_async_rollout_manager(self):
+        """
+        Create the unified FullyAsyncAgentLoopManager that manages both:
+        - Fixed rollout replicas (standalone)
+        - Elastic hybrid replicas (from self._elastic_worker_group, injected via set_elastic_worker_group)
+
+        Must be called AFTER set_elastic_worker_group() if elastic resources are used,
+        because this method reads self._get_elastic_worker_group() at init time.
+        """
         # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
         # agent_reward_loop: streaming reward computation with actor rollout
         # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
@@ -468,6 +825,19 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             llm_client=self.llm_server_manager.get_client(fully_async=True),
             reward_loop_worker_handles=reward_loop_worker_handles,
         )
+        """
+        self.async_rollout_mode = True
+        self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
+            config=self.config,
+            worker_group=self.get_elastic_worker_group(),
+            reward_loop_worker_handles=reward_loop_worker_handles,
+        )
+        print(
+            f"[FullyAsyncRollouter] FullyAsyncAgentLoopManager initialised with "
+            f"{len(self.async_rollout_manager.rollout_replicas)} fixed replicas, "
+            f"{len(self.async_rollout_manager.elastic_replicas)} elastic replicas (sleeping)"
+        )
+        """
 
     # Add samples to the pending_queue
     async def _feed_samples(self):
@@ -777,3 +1147,54 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         }
 
         return stats
+
+    # -------------------------------------------------------------------------
+    # Elastic worker group injection
+    # -------------------------------------------------------------------------
+    def set_elastic_worker_group(self, worker_group: RayWorkerGroup):
+        """Inject the elastic worker group."""
+        self._elastic_worker_group = worker_group
+
+    def get_elastic_worker_group(self):
+        """Return the worker group for elastic hybrid replicas."""
+        return self._elastic_worker_group
+
+    # -------------------------------------------------------------------------
+    # Elastic replica management – thin delegation to async_rollout_manager
+    # -------------------------------------------------------------------------
+    async def add_elastic_replica(self, resource_id: str):
+        """Activate a pre-registered elastic hybrid replica."""
+        await self.async_rollout_manager.add_elastic_replica(resource_id)
+
+    async def remove_elastic_replica(self, resource_id: str):
+        """Deactivate an active elastic hybrid replica."""
+        await self.async_rollout_manager.remove_elastic_replica(resource_id)
+
+    def get_elastic_replica(self, resource_id: str):
+        """Return the RolloutReplica object for a registered elastic resource."""
+        return self.async_rollout_manager.elastic_replicas.get(resource_id)
+
+    def get_all_elastic_replicas(self) -> dict:
+        """Return all registered elastic replicas (sleeping + active)."""
+        return dict(self.async_rollout_manager.elastic_replicas)
+
+    # -------------------------------------------------------------------------
+    # Statistics / introspection – delegate to async_rollout_manager
+    # -------------------------------------------------------------------------
+    async def get_elastic_statistics(self) -> dict:
+        """Combined rollout + elastic statistics."""
+        base_stats = await self.get_statistics()
+        elastic_stats = self.async_rollout_manager.get_elastic_statistics()
+        return {**base_stats, **elastic_stats}
+
+    def get_num_active_replicas(self) -> int:
+        """Total active rollout replicas (fixed + elastic)."""
+        return self.async_rollout_manager.get_active_server_count()
+
+    def get_elastic_replicas_info(self) -> list[dict]:
+        """Metadata for all active elastic replicas."""
+        return self.async_rollout_manager.get_elastic_replicas_info()
+
+    def get_total_produced_samples(self) -> int:
+        """Total samples produced (uses base class counter)."""
+        return self.total_generated_samples
