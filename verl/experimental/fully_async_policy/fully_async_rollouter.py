@@ -31,7 +31,7 @@ from verl.experimental.fully_async_policy.detach_utils import (
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.protocol import DataProto
-from verl.single_controller.ray import RayWorkerGroup
+from verl.single_controller.ray import RayWorkerGroup, ResourcePoolManager
 from verl.trainer.ppo.utils import need_reward_model
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.profiler import marked_timer
@@ -77,7 +77,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self,
         config,
         tokenizer,
-        ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
         processor=None,
         device_name=None,
     ):
@@ -105,7 +104,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             )
 
         self.use_critic = False
-        self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
         self.validation_generations_logger = ValidationGenerationsLogger(
             project_name=self.config.trainer.project_name,
@@ -403,7 +401,19 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         if is_distillation_enabled(self.config.get("distillation")):
             from verl.experimental.teacher_loop import MultiTeacherModelManager
 
-            teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
+            resource_pool_spec = {}
+            mapping = {}
+            distillation_cfg = self.config.get("distillation", {})
+            n_gpus = distillation_cfg.get("n_gpus_per_node", 0)
+            nnodes = distillation_cfg.get("nnodes", 1)
+            assert n_gpus > 0, "distillation.n_gpus_per_node must be greater than 0 for TeacherModel"
+            teacher_pool = [n_gpus] * nnodes
+            resource_pool_spec["teacher_pool"] = teacher_pool
+            mapping[Role.TeacherModel] = "teacher_pool"
+
+            resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+            teacher_resource_pool = resource_pool_manager.get_resource_pool(Role.TeacherModel)
+
             loop = asyncio.get_running_loop()
             self.teacher_model_manager = await loop.run_in_executor(
                 None,
