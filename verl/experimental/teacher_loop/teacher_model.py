@@ -146,10 +146,9 @@ class TeacherModelManager:
     def _initialize_load_balancer_handle(self):
         from verl.workers.rollout.llm_server import GlobalRequestLoadBalancer
 
-        server_map = dict(zip(self.server_addresses, self.server_handles, strict=True))
-        # The load balancer now also holds the server-handle registry
-        # (former ServerHandleRegistry merged in).
-        self.load_balancer_handle = GlobalRequestLoadBalancer.remote(servers=server_map)
+        self.load_balancer_handle = GlobalRequestLoadBalancer.remote(
+            servers=dict(zip(self.server_addresses, self.server_handles, strict=True))
+        )
 
 
 class MultiTeacherModelManager:

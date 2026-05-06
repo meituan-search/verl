@@ -152,10 +152,6 @@ class LLMServerClient:
     A class to manage multiple OpenAI compatible LLM servers. This class provides
     - Load balance: least in-flight requests load balancing via global coordination
     - Sticky session: send multi-turn chat completions to same server for automatic prefix caching
-
-    Server handles are obtained atomically from ``GlobalRequestLoadBalancer``
-    (which merges the former ``ServerHandleRegistry``), so acquire is a single
-    Ray RPC — no TOCTOU race.
     """
 
     def __init__(
@@ -422,9 +418,8 @@ class LLMServerManager:
             update_prometheus_config(self.rollout_config.prometheus, self.server_addresses, self.rollout_config.name)
 
     async def _init_global_load_balancer(self) -> None:
-        server_map = dict(zip(self.server_addresses, self.server_handles, strict=True))
         self.global_load_balancer = GlobalRequestLoadBalancer.remote(
-            servers=server_map,
+            servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
             max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
         )
 
@@ -434,7 +429,7 @@ class LLMServerManager:
         Args:
             client_cls: The client class to instantiate (default: ``LLMServerClient``).
                 Pass ``FullyAsyncLLMServerClient`` for abort-resume support.
-            *args, **kwargs: Forwarded to the client constructor.
+            **kwargs: Forwarded to the client constructor.
         """
         return client_cls(
             config=self.config,
@@ -467,13 +462,7 @@ class LLMServerManager:
 
 
 class FullyAsyncLLMServerManager(LLMServerManager):
-    """Extension of :class:`LLMServerManager` for fully async training with elastic scaling.
-
-    Elastic replica lifecycle is managed here via :meth:`add_replica` /
-    :meth:`remove_replica`, which atomically update the
-    ``GlobalRequestLoadBalancer`` (which also holds the handle registry) —
-    **no per-client/worker notification needed**.
-    """
+    """Extension of :class:`LLMServerManager` for fully async training with elastic scaling."""
 
     def __init__(
         self,
