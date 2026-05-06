@@ -1,0 +1,43 @@
+env_vars:
+  RAY_TEMP_DIR: "/workdir/ray_temp"
+  HYDRA_FULL_ERROR: "1"
+  VERL_LOGGING_LEVEL: "INFO"
+  # WANDB_MODE: "offline"
+  # WANDB_API_KEY: "c6a505ac97983529cf303349f68c7658350a2bb8"
+
+  TORCH_CUDA_ARCH_LIST: "9.0"
+  NVTE_FP8_BLOCK_SCALING_FP32_SCALES: "1"
+  SGLANG_PATCH: "1"
+  SGLANG_PORT: "30300"
+
+  TENSORBOARD_DIR: "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/tensorboard/fp8/test0"
+
+  PYTHONPATH: "./third_party/Megatron-Bridge/src:./third_party/Megatron-LM:${PYTHONPATH}"
+
+  # DeepGEMM JIT compilation cache directory (fix NVCC permission issue)
+  SGLANG_DEEP_GEMM_TMP_DIR: "/tmp/deep_gemm_cache"
+  TMPDIR: "/tmp"
+
+excludes:
+    - .git
+    - third_party/Megatron-Bridge/.git
+    - third_party/Megatron-LM/.git
+
+
+# pip:
+#   - numpy
+#   - pyyaml
+#   - psutil
+#   - hydra-core
+#   - codetiming
+#   - torchdata
+#   - peft
+#   - tensorboard
+#   - nvidia-modelopt
+#   - pyvers==0.2.0
+#   - tensordict>=0.10
+
+
+# Note: tensordict>=0.10 should be pre-installed in the base environment
+# before running Ray job to avoid pyvers dependency conflict
+# Install command: pip install tensordict==0.10.0 --no-deps
