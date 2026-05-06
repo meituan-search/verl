@@ -336,30 +336,30 @@ class TestLoadBalancerRouting:
 
     def test_distributes_across_servers(self, ray_for_lb):
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None, "s2": None})
-        servers = [ray.get(lb.acquire_server.remote(request_id=f"r{i}")) for i in range(3)]
+        servers = [ray.get(lb.acquire_server.remote(request_id=f"r{i}"))[0] for i in range(3)]
         assert sorted(servers) == ["s0", "s1", "s2"]
 
     def test_new_requests_route_to_least_loaded(self, ray_for_lb):
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None, "s2": None})
         # Load s0 with 3 inflight requests
-        ray.get(lb.acquire_server.remote(request_id="a"))  # -> s0
-        ray.get(lb.acquire_server.remote(request_id="a"))  # sticky -> s0
-        ray.get(lb.acquire_server.remote(request_id="a"))  # sticky -> s0
+        ray.get(lb.acquire_server.remote(request_id="a"))[0]  # -> s0
+        ray.get(lb.acquire_server.remote(request_id="a"))[0]  # sticky -> s0
+        ray.get(lb.acquire_server.remote(request_id="a"))[0]  # sticky -> s0
         # Load s1 with 1 inflight request
-        ray.get(lb.acquire_server.remote(request_id="b"))  # -> s1
+        ray.get(lb.acquire_server.remote(request_id="b"))[0]  # -> s1
         # s2 has 0 inflight, so next new request must go to s2
-        s_new = ray.get(lb.acquire_server.remote(request_id="d"))
+        s_new = ray.get(lb.acquire_server.remote(request_id="d"))[0]
         assert s_new == "s2"
 
     def test_release_rebalances(self, ray_for_lb):
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None})
-        s0 = ray.get(lb.acquire_server.remote(request_id="r0"))
-        s1 = ray.get(lb.acquire_server.remote(request_id="r1"))
+        s0 = ray.get(lb.acquire_server.remote(request_id="r0"))[0]
+        s1 = ray.get(lb.acquire_server.remote(request_id="r1"))[0]
         assert s0 != s1
         ray.get(lb.release_server.remote(server_id=s0))
         ray.get(lb.release_server.remote(server_id=s1))
-        s2 = ray.get(lb.acquire_server.remote(request_id="r2"))
-        s3 = ray.get(lb.acquire_server.remote(request_id="r3"))
+        s2 = ray.get(lb.acquire_server.remote(request_id="r2"))[0]
+        s3 = ray.get(lb.acquire_server.remote(request_id="r3"))[0]
         assert s2 != s3
 
     def test_release_invalid_server_silently_ignored(self, ray_for_lb):
@@ -380,9 +380,9 @@ class TestLoadBalancerStickySession:
 
     def test_same_request_id_same_server(self, ray_for_lb):
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None, "s2": None, "s3": None})
-        s0 = ray.get(lb.acquire_server.remote(request_id="conv-abc"))
+        s0 = ray.get(lb.acquire_server.remote(request_id="conv-abc"))[0]
         ray.get(lb.release_server.remote(server_id=s0))
-        s1 = ray.get(lb.acquire_server.remote(request_id="conv-abc"))
+        s1 = ray.get(lb.acquire_server.remote(request_id="conv-abc"))[0]
         assert s0 == s1
 
 
@@ -391,40 +391,45 @@ class TestLoadBalancerElastic:
 
     def test_add_server(self, ray_for_lb):
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None})
-        ray.get(lb.add_server.remote(server_id="s2"))
+        ray.get(lb.add_server.remote(server_id="s2", handle=None))
         status = ray.get(lb.get_status.remote())
         assert "s2" in status["servers"]
         assert status["servers"]["s2"] == 0
 
-    def test_remove_server_marks_for_removal(self, ray_for_lb):
+    def test_remove_server_purges_handle(self, ray_for_lb):
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None})
         ray.get(lb.remove_server.remote(server_id="s1"))
-        # s1 should still be in servers but no longer routable
+        # remove_server now purges from both _inflight_requests and _servers
         status = ray.get(lb.get_status.remote())
-        assert "s1" in status["servers"]
+        assert "s1" not in status["servers"]
+        assert "s1" not in status["registered_handles"]
         # New requests should only go to s0
-        s = ray.get(lb.acquire_server.remote(request_id="r1"))
+        s = ray.get(lb.acquire_server.remote(request_id="r1"))[0]
         assert s == "s0"
 
     def test_removed_server_invalidates_sticky_session(self, ray_for_lb):
         """When a sticky session points to a removed server, cache is invalidated."""
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None})
-        # Pin request to s1
-        s1 = ray.get(lb.acquire_server.remote(request_id="sticky-req"))
+        # Occupy s0 so that the sticky request is assigned to s1
+        ray.get(lb.acquire_server.remote(request_id="occupy-s0"))[0]  # -> s0
+        # Pin request to s1 (least-loaded now)
+        s1 = ray.get(lb.acquire_server.remote(request_id="sticky-req"))[0]
         assert s1 == "s1"
         ray.get(lb.release_server.remote(server_id=s1))
         # Remove s1
         ray.get(lb.remove_server.remote(server_id="s1"))
         # Sticky session should be invalidated and reroute to s0
-        s_new = ray.get(lb.acquire_server.remote(request_id="sticky-req"))
+        s_new = ray.get(lb.acquire_server.remote(request_id="sticky-req"))[0]
         assert s_new == "s0"
 
-    def test_cleanup_removed_server(self, ray_for_lb):
+    def test_remove_server_also_purges_registry(self, ray_for_lb):
+        """remove_server atomically purges from both LB pool and handle registry."""
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None})
         ray.get(lb.remove_server.remote(server_id="s1"))
-        ray.get(lb.cleanup_removed_server.remote(server_id="s1"))
         status = ray.get(lb.get_status.remote())
+        # Both _inflight_requests and _servers are cleaned up (no separate cleanup step needed)
         assert "s1" not in status["servers"]
+        assert "s1" not in status["registered_handles"]
 
     def test_get_all_servers_excludes_removed(self, ray_for_lb):
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None, "s2": None})
@@ -441,22 +446,22 @@ class TestLoadBalancerElastic:
         with pytest.raises(ray.exceptions.RayTaskError, match="No available servers"):
             ray.get(lb.acquire_server.remote(request_id="r1"))
 
-    def test_add_server_unmarks_previously_removed(self, ray_for_lb):
-        """Re-adding a previously removed server unmarks it and makes it routable again."""
+    def test_add_server_readds_previously_removed(self, ray_for_lb):
+        """Re-adding a previously removed server makes it routable again."""
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None})
         ray.get(lb.remove_server.remote(server_id="s1"))
         # s1 is removed, only s0 is available
-        assert ray.get(lb.acquire_server.remote(request_id="r1")) == "s0"
+        assert ray.get(lb.acquire_server.remote(request_id="r1"))[0] == "s0"
         # Re-add s1
-        ray.get(lb.add_server.remote(server_id="s1"))
+        ray.get(lb.add_server.remote(server_id="s1", handle=None))
         # Now both s0 and s1 should be available
-        s = ray.get(lb.acquire_server.remote(request_id="r2"))
+        s = ray.get(lb.acquire_server.remote(request_id="r2"))[0]
         assert s in ("s0", "s1")
 
     def test_get_inflight_count(self, ray_for_lb):
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None})
         assert ray.get(lb.get_inflight_count.remote(server_id="s0")) == 0
-        ray.get(lb.acquire_server.remote(request_id="r1"))  # -> s0 (least loaded)
+        ray.get(lb.acquire_server.remote(request_id="r1"))[0]  # -> s0 (least loaded)
         assert ray.get(lb.get_inflight_count.remote(server_id="s0")) == 1
 
     def test_get_status_reports_active_correctly(self, ray_for_lb):
