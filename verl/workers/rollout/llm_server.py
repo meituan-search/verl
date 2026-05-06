@@ -44,58 +44,14 @@ DEFAULT_ROUTING_CACHE_SIZE = 10000
 
 
 @ray.remote
-class ServerHandleRegistry:
-    """Global registry mapping server_id → ray.actor.ActorHandle.
-
-    Single source of truth for server handles.  Clients no longer maintain
-    their own ``_server_id_to_handle`` cache — they look up handles here
-    on every request via ``get_handle()``.
-
-    This enables elastic scaling: adding or removing a replica only requires
-    updating the LoadBalancer + this Registry, with zero per-client
-    notification overhead.
-    """
-
-    def __init__(self, servers: dict[str, ray.actor.ActorHandle]):
-        """Initialize with initial server pool."""
-        if not servers:
-            raise ValueError("servers must be non-empty")
-        self._servers: dict[str, ray.actor.ActorHandle] = dict(servers)
-
-    def register(self, server_id: str, handle: ray.actor.ActorHandle) -> None:
-        """Register (or update) a server handle."""
-        self._servers[server_id] = handle
-
-    def deregister(self, server_id: str) -> None:
-        """Remove a server handle."""
-        self._servers.pop(server_id, None)
-
-    def get_handle(self, server_id: str) -> ray.actor.ActorHandle:
-        """Get the actor handle for a server_id."""
-        handle = self._servers.get(server_id)
-        if handle is None:
-            raise RuntimeError(f"[ServerHandleRegistry] Unknown server_id: {server_id}")
-        return handle
-
-    def get_all(self) -> dict[str, ray.actor.ActorHandle]:
-        """Return a copy of all registered servers."""
-        return dict(self._servers)
-
-
-@ray.remote
 class GlobalRequestLoadBalancer:
     """Global sticky-session + in-flight load balancer shared by all AgentLoopWorkers.
-
-    Supports dynamic server addition/removal for elastic scaling with two-phase
-    removal for safe server shutdown::
-
-        1. remove_server(server_id)    # Mark as removed, no new requests routed
-        2. cleanup_removed_server(server_id)  # Fully remove after drained
 
     When a sticky session points to a removed server, the cache entry is
     automatically invalidated and a new server is selected.
 
     Key features:
+    - **Atomic acquire**: ``acquire_server()`` returns ``(server_id, handle)``
     - **Sticky Session**: Uses LRUCache to map request_id → server_id, ensuring
       multi-turn conversations route to the same server.
     - **Least-loaded Selection**: When no sticky session exists, selects the
@@ -106,34 +62,36 @@ class GlobalRequestLoadBalancer:
 
     def __init__(self, servers: dict[str, ray.actor.ActorHandle], max_cache_size: int = DEFAULT_ROUTING_CACHE_SIZE):
         if not servers:
-            raise ValueError("server must be non-empty")
+            raise ValueError("servers must be non-empty")
 
-        self._server = servers
+        self._servers: dict[str, ray.actor.ActorHandle] = dict(servers)
         self._inflight_requests: dict[str, int] = {sid: 0 for sid in servers}
         self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
-        self._removed_servers: set[str] = set()  # Servers being drained
 
-    def acquire_server(self, request_id: str) -> str:
-        """Acquire a server for the given request (sticky + least-loaded)."""
+    def acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
+        """Acquire a server for the given request (sticky + least-loaded).
+
+        Returns:
+            A tuple of ``(server_id, actor_handle)`` in a single atomic call.
+        """
         # Try sticky session first
         if request_id in self._request_id_to_server:
             server_id = self._request_id_to_server[request_id]
-            # Check if server is still available (not removed and still in pool)
-            if server_id in self._inflight_requests and server_id not in self._removed_servers:
+            # Check if server is still in the active pool
+            if server_id in self._inflight_requests:
                 self._inflight_requests[server_id] += 1
-                return server_id
-            # Server was removed, clear stale cache entry
+                return server_id, self._servers[server_id]
+            # Server was removed, clear stale cache entry and re-select
             del self._request_id_to_server[request_id]
 
         # Select new server (least-loaded among available)
-        available = {sid: cnt for sid, cnt in self._inflight_requests.items() if sid not in self._removed_servers}
-        if not available:
+        if not self._inflight_requests:
             raise RuntimeError("No available servers in load balancer")
 
-        server_id = min(available, key=available.get)
+        server_id = min(self._inflight_requests, key=self._inflight_requests.get)
         self._request_id_to_server[request_id] = server_id
         self._inflight_requests[server_id] += 1
-        return server_id
+        return server_id, self._servers[server_id]
 
     def release_server(self, server_id: str) -> None:
         """Release a server after a request completes."""
@@ -142,41 +100,50 @@ class GlobalRequestLoadBalancer:
         if self._inflight_requests[server_id] > 0:
             self._inflight_requests[server_id] -= 1
 
-    def add_server(self, server_id: str) -> None:
-        """Add a new server to the load balancer pool."""
+    def add_server(self, server_id: str, handle: ray.actor.ActorHandle) -> None:
+        """Add a new server to the load balancer pool.
+
+        Args:
+            server_id: Server identifier (typically the server address).
+            handle: Optional actor handle.  If provided, also registers it
+                in the internal handle table
+        """
         if server_id in self._inflight_requests:
-            self._removed_servers.discard(server_id)
+            # Still update the handle if a newer one is supplied.
+            if handle is not None:
+                self._servers[server_id] = handle
             return
         self._inflight_requests[server_id] = 0
-        self._removed_servers.discard(server_id)
+        self._servers[server_id] = handle
         logger.info(f"[GlobalLoadBalancer] Added server: {server_id}")
 
     def remove_server(self, server_id: str) -> None:
-        """Mark server for removal (no new requests routed to it)."""
-        if server_id in self._inflight_requests:
-            self._removed_servers.add(server_id)
-        logger.info(f"[GlobalLoadBalancer] Marked server for removal: {server_id}")
+        """Remove a server from the load balancer pool.
+
+        Immediately removes the server.  Also removes the
+        associated handle from the internal registry.  In-flight requests
+        that finish after removal will be silently ignored by
+        :meth:`release_server`.
+        """
+        self._inflight_requests.pop(server_id, None)
+        self._servers.pop(server_id, None)
+        logger.info(f"[GlobalLoadBalancer] Removed server: {server_id}")
 
     def get_inflight_count(self, server_id: str) -> int:
         """Get number of in-flight requests for a server."""
         return self._inflight_requests.get(server_id, 0)
 
-    def cleanup_removed_server(self, server_id: str) -> None:
-        """Fully remove a server that has been drained."""
-        self._inflight_requests.pop(server_id, None)
-        self._removed_servers.discard(server_id)
-        logger.info(f"[GlobalLoadBalancer] Cleaned up server: {server_id}")
-
     def get_all_servers(self) -> list[str]:
         """Get list of all active server IDs."""
-        return [sid for sid in self._inflight_requests if sid not in self._removed_servers]
+        return list(self._inflight_requests.keys())
 
     def get_status(self) -> dict:
         """Return current load balancer state for debugging."""
         return {
             "servers": dict(self._inflight_requests),
             "total_inflight": sum(self._inflight_requests.values()),
-            "active_servers": len([sid for sid in self._inflight_requests if sid not in self._removed_servers]),
+            "active_servers": len(self._inflight_requests),
+            "registered_handles": list(self._servers.keys()),
         }
 
 
@@ -186,32 +153,30 @@ class LLMServerClient:
     - Load balance: least in-flight requests load balancing via global coordination
     - Sticky session: send multi-turn chat completions to same server for automatic prefix caching
 
-    Server handles are looked up remotely from ``ServerHandleRegistry`` on every
-    request, enabling elastic replica add/remove without any per-client notification.
+    Server handles are obtained atomically from ``GlobalRequestLoadBalancer``
+    (which merges the former ``ServerHandleRegistry``), so acquire is a single
+    Ray RPC — no TOCTOU race.
     """
 
     def __init__(
         self,
         config: DictConfig,
         load_balancer_handle: ray.actor.ActorHandle,
-        registry_handle: ray.actor.ActorHandle,
         **kwargs,
     ):
         """Initialize the LLMServerClient.
 
         Args:
             config (DictConfig): whole config for main entrypoint.
-            load_balancer_handle (ray.actor.ActorHandle): shared global load balancer actor.
-            registry_handle (ray.actor.ActorHandle): shared global server handle registry actor.
+            load_balancer_handle (ray.actor.ActorHandle): shared global load balancer actor
+                that also holds the server-handle registry.
         """
         self.config = config
         self._load_balancer = load_balancer_handle
-        self._registry = registry_handle
 
     async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
-        server_id = await self._load_balancer.acquire_server.remote(request_id=request_id)
-        handle = await self._registry.get_handle.remote(server_id)
-        return server_id, handle
+        # Atomic acquire: returns (server_id, handle) in one Ray RPC.
+        return await self._load_balancer.acquire_server.remote(request_id=request_id)
 
     def _release_server(self, server_id: str) -> None:
         # Fire-and-forget: release is just a counter decrement, no need to await.
@@ -443,8 +408,6 @@ class LLMServerManager:
             servers=server_map,
             max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
         )
-        # Create global handle registry as the single source of truth for server handles.
-        self.handle_registry = ServerHandleRegistry.remote(servers=server_map)
 
     def get_client(self, client_cls=LLMServerClient, **kwargs) -> LLMServerClient:
         """Get the LLMServerClient to request LLM server replicas.
@@ -457,52 +420,8 @@ class LLMServerManager:
         return client_cls(
             config=self.config,
             load_balancer_handle=self.global_load_balancer,
-            registry_handle=self.handle_registry,
             **kwargs,
         )
-
-    # ── Elastic replica management ──
-
-    async def add_replica(
-        self,
-        server_address: str,
-        server_handle: ray.actor.ActorHandle,
-        replica: RolloutReplica = None,
-    ) -> None:
-        """Add a replica to the active pool.
-
-        Only needs to update the two global actors (Registry + LB).
-        No per-client / per-worker notification required.
-        """
-        await self.handle_registry.register.remote(server_address, server_handle)
-        await self.global_load_balancer.add_server.remote(server_id=server_address)
-        if server_address not in self.server_addresses:
-            self.server_handles.append(server_handle)
-            self.server_addresses.append(server_address)
-        if replica is not None and replica not in self.rollout_replicas:
-            self.rollout_replicas.append(replica)
-        logger.info("[LLMServerManager] Added replica: %s", server_address)
-
-    async def remove_replica(
-        self,
-        server_address: str,
-        replica: RolloutReplica = None,
-    ) -> None:
-        """Remove a replica from the active pool (two-phase removal).
-
-        Phase 1: mark as removed in LB (no new requests routed).
-        Phase 2: cleanup after draining.
-        """
-        await self.global_load_balancer.remove_server.remote(server_id=server_address)
-        await self.handle_registry.deregister.remote(server_address)
-        await self.global_load_balancer.cleanup_removed_server.remote(server_id=server_address)
-        if server_address in self.server_addresses:
-            idx = self.server_addresses.index(server_address)
-            self.server_addresses.pop(idx)
-            self.server_handles.pop(idx)
-        if replica is not None and replica in self.rollout_replicas:
-            self.rollout_replicas.remove(replica)
-        logger.info("[LLMServerManager] Removed replica: %s", server_address)
 
     def get_addresses(self) -> list[str]:
         """Get the OpenAI chat completion API http addresses of the LLM server replicas."""
@@ -529,16 +448,12 @@ class LLMServerManager:
 
 
 class FullyAsyncLLMServerManager(LLMServerManager):
-    """Lightweight extension of :class:`LLMServerManager` for fully async training.
+    """Extension of :class:`LLMServerManager` for fully async training with elastic scaling.
 
-    Overrides ``_initialize_llm_servers()`` to perform two-phase init:
-    Phase 1 (elastic): init_hybrid on trainer GPUs → sleep.
-    Phase 2 (fixed):  init_standalone on rollout GPUs.
-
-    Elastic replica add/remove is handled entirely by the parent class
-    (:meth:`LLMServerManager.add_replica` / :meth:`remove_replica`),
-    which only updates the global ``ServerHandleRegistry`` +
-    ``GlobalRequestLoadBalancer`` — **no per-client/worker notification needed**.
+    Elastic replica lifecycle is managed here via :meth:`add_replica` /
+    :meth:`remove_replica`, which atomically update the
+    ``GlobalRequestLoadBalancer`` (which also holds the handle registry) —
+    **no per-client/worker notification needed**.
     """
 
     def __init__(
@@ -601,7 +516,7 @@ class FullyAsyncLLMServerManager(LLMServerManager):
         After init_hybrid() the replica is immediately put to sleep so that
         The replica is stored in
         elastic_replicas keyed by "elastic_{i}" (0-indexed within
-        the elastic group) and can be activated later via add_elastic_replica().
+        the elastic group) and can be activated later via add_replica().
 
         Args:
             worker_group: Worker group whose workers back the elastic
@@ -670,11 +585,12 @@ class FullyAsyncLLMServerManager(LLMServerManager):
 
         return num_replicas
 
-    async def add_elastic_replica(self, resource_id: str) -> bool:
+    async def add_replica(self, resource_id: str) -> bool:
         """Activate a pre-registered elastic hybrid replica.
 
-        Delegates to parent :meth:`LLMServerManager.add_replica` which only
-        updates the global Registry + LoadBalancer.  No worker notification needed.
+        Atomically registers the handle **and** adds the server to the load
+        balancer in a single ``add_server(handle=…)`` call (the LB now holds
+        the merged registry).  No per-client / per-worker notification required.
         """
         if resource_id in self.alive_replicas:
             logger.warning("[FullyAsyncLLMServerManager] Replica '%s' already active, skipping", resource_id)
@@ -694,8 +610,14 @@ class FullyAsyncLLMServerManager(LLMServerManager):
         server_handle = replica._server_handle
 
         try:
-            # Delegate to parent: only updates Registry + LB, no worker notification.
-            await self.add_replica(server_address=server_address, server_handle=server_handle, replica=replica)
+            # Single atomic RPC: register handle + add to LB pool.
+            await self.global_load_balancer.add_server.remote(server_id=server_address, handle=server_handle)
+            # Also track locally for introspection / Prometheus.
+            if server_address not in self.server_addresses:
+                self.server_handles.append(server_handle)
+                self.server_addresses.append(server_address)
+            if replica not in self.rollout_replicas:
+                self.rollout_replicas.append(replica)
 
             self.alive_replicas[resource_id] = replica
             self.alive_addresses[resource_id] = server_address
@@ -711,11 +633,12 @@ class FullyAsyncLLMServerManager(LLMServerManager):
             logger.error("[FullyAsyncLLMServerManager] Failed to activate replica '%s': %s", resource_id, e)
             return False
 
-    async def remove_elastic_replica(self, resource_id: str) -> bool:
+    async def remove_replica(self, resource_id: str) -> bool:
         """Deactivate an active elastic hybrid replica.
 
-        Delegates to parent :meth:`LLMServerManager.remove_replica` which
-        handles two-phase removal (mark → cleanup).  No worker notification needed.
+        A single ``remove_server()`` call atomically removes the server from
+        the LB pool **and** purges its handle from the internal registry
+        (no separate deregister RPC needed).
 
         Note: The actual ``abort_all_requests()`` and ``sleep()`` are called by
         the Trainer AFTER this method returns.
@@ -728,8 +651,15 @@ class FullyAsyncLLMServerManager(LLMServerManager):
         replica = self.alive_replicas[resource_id]
 
         try:
-            # Delegate to parent: two-phase removal from Registry + LB.
-            await self.remove_replica(server_address=server_address, replica=replica)
+            # Single atomic RPC: remove from LB pool + purge handle registry.
+            await self.global_load_balancer.remove_server.remote(server_id=server_address)
+            # Clean up local tracking lists.
+            if server_address in self.server_addresses:
+                idx = self.server_addresses.index(server_address)
+                self.server_addresses.pop(idx)
+                self.server_handles.pop(idx)
+            if replica in self.rollout_replicas:
+                self.rollout_replicas.remove(replica)
 
             self.alive_replicas.pop(resource_id)
             self.alive_addresses.pop(resource_id)

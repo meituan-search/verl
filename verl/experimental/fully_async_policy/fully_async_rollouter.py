@@ -411,9 +411,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         - Phase 1: elastic hybrid replicas on trainer GPUs (sleeping)
         - Phase 2: fixed standalone replicas on rollout GPUs
 
-        The ``ServerHandleRegistry`` + ``GlobalRequestLoadBalancer`` serve as the
-        single source of truth for handle mapping and routing.  Clients look up
-        handles remotely — no per-worker notification needed on elastic add/remove.
+        The ``GlobalRequestLoadBalancer`` (which also holds the server-handle
+        registry) serves as the single source of truth for handle mapping and
+        routing.  Clients look up handles atomically — no per-worker notification
+        needed on elastic add/remove.
         """
         # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
         # agent_reward_loop: streaming reward computation with actor rollout
@@ -429,7 +430,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         self.async_rollout_mode = True
         # Use FullyAsyncLLMServerManager for two-phase (elastic + fixed) init.
-        # It creates ServerHandleRegistry + GlobalRequestLoadBalancer internally.
+        # It creates GlobalRequestLoadBalancer (with merged handle registry) internally.
         self.llm_server_manager = await FullyAsyncLLMServerManager.create(
             config=self.config,
             worker_group=self.get_elastic_worker_group(),
@@ -764,13 +765,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     # Elastic replica management – thin delegation to llm_server_manager
     # (FullyAsyncLLMServerManager owns elastic lifecycle)
     # -------------------------------------------------------------------------
-    async def add_elastic_replica(self, resource_id: str):
+    async def add_replica(self, resource_id: str):
         """Activate a pre-registered elastic hybrid replica."""
-        await self.llm_server_manager.add_elastic_replica(resource_id)
+        await self.llm_server_manager.add_replica(resource_id)
 
-    async def remove_elastic_replica(self, resource_id: str):
+    async def remove_replica(self, resource_id: str):
         """Deactivate an active elastic hybrid replica."""
-        await self.llm_server_manager.remove_elastic_replica(resource_id)
+        await self.llm_server_manager.remove_replica(resource_id)
 
     def get_elastic_replica(self, resource_id: str):
         """Return the RolloutReplica object for a registered elastic resource."""

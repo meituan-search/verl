@@ -551,7 +551,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         elastic_replicas_dict = ray.get(self.rollouter.get_all_elastic_replicas.remote())
         elastic_resource_ids = list(elastic_replicas_dict.keys())
         for resource_id in elastic_resource_ids:
-            ray.get(self.rollouter.add_elastic_replica.remote(resource_id))
+            ray.get(self.rollouter.add_replica.remote(resource_id))
         await self.checkpoint_manager.resume_generation_replicas()
         await self.hybrid_checkpoint_manager.resume_generation_replicas()
         print(f"[FullyAsyncTrainer] Phase 1 done ({time.time() - phase_1_start:.2f}s)")
@@ -570,7 +570,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         await self.checkpoint_manager.abort_replicas()
         await self.hybrid_checkpoint_manager.abort_replicas()
         for resource_id in elastic_resource_ids:
-            ray.get(self.rollouter.remove_elastic_replica.remote(resource_id))
+            ray.get(self.rollouter.remove_replica.remote(resource_id))
         await self.hybrid_checkpoint_manager.sleep_replicas()
         await self.checkpoint_manager.resume_generation_replicas()
         await self.hybrid_checkpoint_manager.resume_generation_replicas()
