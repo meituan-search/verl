@@ -21,6 +21,7 @@ Utility classes for manage and request LLM servers:
 import asyncio
 import logging
 import os
+import time
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -40,6 +41,45 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
+
+
+@ray.remote
+class ServerHandleRegistry:
+    """Global registry mapping server_id → ray.actor.ActorHandle.
+
+    Single source of truth for server handles.  Clients no longer maintain
+    their own ``_server_id_to_handle`` cache — they look up handles here
+    on every request via ``get_handle()``.
+
+    This enables elastic scaling: adding or removing a replica only requires
+    updating the LoadBalancer + this Registry, with zero per-client
+    notification overhead.
+    """
+
+    def __init__(self, servers: dict[str, ray.actor.ActorHandle]):
+        """Initialize with initial server pool."""
+        if not servers:
+            raise ValueError("servers must be non-empty")
+        self._servers: dict[str, ray.actor.ActorHandle] = dict(servers)
+
+    def register(self, server_id: str, handle: ray.actor.ActorHandle) -> None:
+        """Register (or update) a server handle."""
+        self._servers[server_id] = handle
+
+    def deregister(self, server_id: str) -> None:
+        """Remove a server handle."""
+        self._servers.pop(server_id, None)
+
+    def get_handle(self, server_id: str) -> ray.actor.ActorHandle:
+        """Get the actor handle for a server_id."""
+        handle = self._servers.get(server_id)
+        if handle is None:
+            raise RuntimeError(f"[ServerHandleRegistry] Unknown server_id: {server_id}")
+        return handle
+
+    def get_all(self) -> dict[str, ray.actor.ActorHandle]:
+        """Return a copy of all registered servers."""
+        return dict(self._servers)
 
 
 @ray.remote
@@ -145,30 +185,32 @@ class LLMServerClient:
     A class to manage multiple OpenAI compatible LLM servers. This class provides
     - Load balance: least in-flight requests load balancing via global coordination
     - Sticky session: send multi-turn chat completions to same server for automatic prefix caching
+
+    Server handles are looked up remotely from ``ServerHandleRegistry`` on every
+    request, enabling elastic replica add/remove without any per-client notification.
     """
 
     def __init__(
         self,
         config: DictConfig,
-        servers: dict[str, ray.actor.ActorHandle],
         load_balancer_handle: ray.actor.ActorHandle,
+        registry_handle: ray.actor.ActorHandle,
+        **kwargs,
     ):
         """Initialize the LLMServerClient.
 
         Args:
             config (DictConfig): whole config for main entrypoint.
-            servers (dict[str, ray.actor.ActorHandle]): handle for each LLM server.
             load_balancer_handle (ray.actor.ActorHandle): shared global load balancer actor.
+            registry_handle (ray.actor.ActorHandle): shared global server handle registry actor.
         """
         self.config = config
         self._load_balancer = load_balancer_handle
-        self._server_id_to_handle: dict[str, ray.actor.ActorHandle] = servers
+        self._registry = registry_handle
 
     async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
         server_id = await self._load_balancer.acquire_server.remote(request_id=request_id)
-        handle = self._server_id_to_handle.get(server_id)
-        if handle is None:
-            raise RuntimeError(f"Unknown server_id returned by load balancer: {server_id}")
+        handle = await self._registry.get_handle.remote(server_id)
         return server_id, handle
 
     def _release_server(self, server_id: str) -> None:
@@ -212,7 +254,7 @@ class LLMServerClient:
             self._release_server(server_id)
 
 
-class FullyLLMServerClient(LLMServerClient):
+class FullyAsyncLLMServerClient(LLMServerClient):
     """FullyLLMServerClient supports resume generation on partial rollout, making rollout interruption
     invisible to the AgentLoop.
     """
@@ -299,6 +341,9 @@ class FullyLLMServerClient(LLMServerClient):
             # 4. check stop reason
             if output.stop_reason not in ("aborted", "abort") or not self.config.async_training.partial_rollout:
                 break
+
+            await asyncio.sleep(1)
+
         final_output.extra_fields["global_steps"] = global_steps
         final_output.extra_fields["min_global_steps"] = min_global_steps
         final_output.extra_fields["max_global_steps"] = max_global_steps
@@ -393,24 +438,71 @@ class LLMServerManager:
             update_prometheus_config(self.rollout_config.prometheus, self.server_addresses, self.rollout_config.name)
 
     async def _init_global_load_balancer(self) -> None:
+        server_map = dict(zip(self.server_addresses, self.server_handles, strict=True))
         self.global_load_balancer = GlobalRequestLoadBalancer.remote(
-            servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
+            servers=server_map,
             max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
         )
+        # Create global handle registry as the single source of truth for server handles.
+        self.handle_registry = ServerHandleRegistry.remote(servers=server_map)
 
-    def get_client(self, fully_async: bool = False) -> LLMServerClient:
+    def get_client(self, client_cls=LLMServerClient, **kwargs) -> LLMServerClient:
         """Get the LLMServerClient to request LLM server replicas.
 
         Args:
-            fully_async (bool): Whether to return the FullyLLMServerClient.
+            client_cls: The client class to instantiate (default: ``LLMServerClient``).
+                Pass ``FullyAsyncLLMServerClient`` for abort-resume support.
+            *args, **kwargs: Forwarded to the client constructor.
         """
-        servers = dict(zip(self.server_addresses, self.server_handles, strict=True))
-        if not fully_async:
-            return LLMServerClient(config=self.config, servers=servers, load_balancer_handle=self.global_load_balancer)
-        else:
-            return FullyLLMServerClient(
-                config=self.config, servers=servers, load_balancer_handle=self.global_load_balancer
-            )
+        return client_cls(
+            config=self.config,
+            load_balancer_handle=self.global_load_balancer,
+            registry_handle=self.handle_registry,
+            **kwargs,
+        )
+
+    # ── Elastic replica management ──
+
+    async def add_replica(
+        self,
+        server_address: str,
+        server_handle: ray.actor.ActorHandle,
+        replica: RolloutReplica = None,
+    ) -> None:
+        """Add a replica to the active pool.
+
+        Only needs to update the two global actors (Registry + LB).
+        No per-client / per-worker notification required.
+        """
+        await self.handle_registry.register.remote(server_address, server_handle)
+        await self.global_load_balancer.add_server.remote(server_id=server_address)
+        if server_address not in self.server_addresses:
+            self.server_handles.append(server_handle)
+            self.server_addresses.append(server_address)
+        if replica is not None and replica not in self.rollout_replicas:
+            self.rollout_replicas.append(replica)
+        logger.info("[LLMServerManager] Added replica: %s", server_address)
+
+    async def remove_replica(
+        self,
+        server_address: str,
+        replica: RolloutReplica = None,
+    ) -> None:
+        """Remove a replica from the active pool (two-phase removal).
+
+        Phase 1: mark as removed in LB (no new requests routed).
+        Phase 2: cleanup after draining.
+        """
+        await self.global_load_balancer.remove_server.remote(server_id=server_address)
+        await self.handle_registry.deregister.remote(server_address)
+        await self.global_load_balancer.cleanup_removed_server.remote(server_id=server_address)
+        if server_address in self.server_addresses:
+            idx = self.server_addresses.index(server_address)
+            self.server_addresses.pop(idx)
+            self.server_handles.pop(idx)
+        if replica is not None and replica in self.rollout_replicas:
+            self.rollout_replicas.remove(replica)
+        logger.info("[LLMServerManager] Removed replica: %s", server_address)
 
     def get_addresses(self) -> list[str]:
         """Get the OpenAI chat completion API http addresses of the LLM server replicas."""
@@ -434,3 +526,254 @@ class LLMServerManager:
     async def stop_profile(self):
         """Stop profiling on all rollout replicas."""
         await asyncio.gather(*[replica.stop_profile() for replica in self.rollout_replicas])
+
+
+class FullyAsyncLLMServerManager(LLMServerManager):
+    """Lightweight extension of :class:`LLMServerManager` for fully async training.
+
+    Overrides ``_initialize_llm_servers()`` to perform two-phase init:
+    Phase 1 (elastic): init_hybrid on trainer GPUs → sleep.
+    Phase 2 (fixed):  init_standalone on rollout GPUs.
+
+    Elastic replica add/remove is handled entirely by the parent class
+    (:meth:`LLMServerManager.add_replica` / :meth:`remove_replica`),
+    which only updates the global ``ServerHandleRegistry`` +
+    ``GlobalRequestLoadBalancer`` — **no per-client/worker notification needed**.
+    """
+
+    def __init__(
+        self,
+        config: DictConfig,
+        worker_group: RayWorkerGroup = None,
+        rollout_resource_pool: RayResourcePool = None,
+    ):
+        super().__init__(config, worker_group, rollout_resource_pool)
+        # Pre-registered elastic replicas: bound at init time but still sleeping.
+        # Keyed by resource_id; populated during _initialize_llm_servers().
+        self.elastic_replicas: dict[str, RolloutReplica] = {}
+        # Currently active (awake + in LB) subset of elastic replicas.
+        self.alive_replicas: dict[str, RolloutReplica] = {}
+        # resource_id → server_address for alive elastic replicas.
+        self.alive_addresses: dict[str, str] = {}
+        # Prometheus server addresses
+        self.prometheus_server_addresses = []
+
+        # Timing / counters
+        self.last_elastic_add_time: float = 0.0
+        self.last_elastic_remove_time: float = 0.0
+
+    async def _initialize_llm_servers(self):
+        # ── Step 1: elastic replicas first (replica_rank 0 … N_e-1) ──────────
+        # Initialise and immediately sleep them so the training engine can
+        # reclaim GPU memory.  Starting from rank 0 gives elastic actors the
+        # lowest-numbered placement-group bundles which are co-located with the
+        # training engine, maximising GPU affinity on multi-node deployments.
+        num_elastic = 0
+        if self.worker_group is not None:
+            num_elastic = await self._initialize_replicas(start_rank=0, worker_group=self.worker_group)
+
+        # ── Step 2: fixed replicas (replica_rank N_e … N_e+N_f-1) ───────────
+        # start_rank=num_elastic ensures the Ray actor names (e.g.
+        # server_{rank}_{node}) are globally unique and never collide
+        # with the elastic actors created above.
+        await self._initialize_replicas(start_rank=num_elastic)
+
+        print(
+            f"[FullyAsyncLLMServerManager] Created: "
+            f"{len(self.rollout_replicas)} fixed replicas (rank {num_elastic}+), "
+            f"{num_elastic} elastic replicas registered (sleeping, rank 0-{num_elastic - 1})"
+        )
+
+    async def _initialize_replicas(
+        self,
+        start_rank: int = 0,
+        worker_group: RayWorkerGroup = None,
+    ) -> int:
+        """
+        Create, initialise (init_hybrid), and sleep elastic hybrid replicas.
+
+        Called internally by create() when elastic_worker_group is provided.
+        Each replica is assigned a contiguous slice of workers from
+        elastic_worker_group, and its ``replica_rank`` starts at ``start_rank``
+        so that it is globally unique across both elastic and fixed replicas
+        (avoiding Ray named-actor collisions such as ``sglang_server_0_0``).
+
+        After init_hybrid() the replica is immediately put to sleep so that
+        The replica is stored in
+        elastic_replicas keyed by "elastic_{i}" (0-indexed within
+        the elastic group) and can be activated later via add_elastic_replica().
+
+        Args:
+            worker_group: Worker group whose workers back the elastic
+                hybrid replicas.  Must already be fully initialised.
+            start_rank: First global ``replica_rank`` to assign.  Pass 0 so
+                that elastic actors occupy the lowest-numbered Ray actor names
+                and therefore the best GPU affinity in multi-node deployments.
+
+        Returns:
+            Number of elastic replicas created (so the caller can pass
+            ``start_rank=num_elastic`` to ``_initialize_llm_servers``).
+        """
+        rollout_world_size = (
+            self.rollout_config.tensor_model_parallel_size
+            * self.rollout_config.data_parallel_size
+            * self.rollout_config.pipeline_model_parallel_size
+        )
+
+        world_size = (
+            worker_group.world_size
+            if worker_group
+            else self.rollout_config.n_gpus_per_node * self.rollout_config.nnodes
+        )
+
+        num_replicas = world_size // rollout_world_size
+
+        tmp_replicas = [
+            self.rollout_replica_class(
+                replica_rank=start_rank + i,
+                config=self.rollout_config,
+                model_config=self.model_config,
+                gpus_per_node=self.rollout_config.n_gpus_per_node,
+            )
+            for i in range(num_replicas)
+        ]
+
+        if worker_group:
+            await asyncio.gather(*[replica.init_hybrid(worker_group) for replica in tmp_replicas])
+            # Register elastic replicas.
+            for i, replica in enumerate(tmp_replicas):
+                resource_id = f"elastic_{i}"
+                self.elastic_replicas[resource_id] = replica
+                print(
+                    f"[FullyAsyncAgentLoopManager] Elastic replica '{resource_id}' "
+                    f"(rank={start_rank + i}) initialised at {replica._server_address} "
+                )
+            elastic_addresses = [replica._server_address for replica in tmp_replicas]
+            self.prometheus_server_addresses.extend(elastic_addresses)
+            print(f"AgentLoopManager Elastic: {elastic_addresses}")
+        else:
+            self.rollout_replicas = tmp_replicas
+            await asyncio.gather(*[replica.init_standalone() for replica in self.rollout_replicas])
+            self.server_handles = [replica._server_handle for replica in self.rollout_replicas]
+            self.server_addresses = [replica._server_address for replica in self.rollout_replicas]
+            self.prometheus_server_addresses.extend(self.server_addresses)
+            print(f"AgentLoopManager Standalone: {self.server_addresses}")
+
+        # Update Prometheus configuration with server addresses
+        if self.rollout_config.prometheus.enable:
+            if self.rollout_config.disable_log_stats:
+                raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
+            print(f"Prometheus: {self.prometheus_server_addresses}")
+            update_prometheus_config(
+                self.rollout_config.prometheus, self.prometheus_server_addresses, self.rollout_config.name
+            )
+
+        return num_replicas
+
+    async def add_elastic_replica(self, resource_id: str) -> bool:
+        """Activate a pre-registered elastic hybrid replica.
+
+        Delegates to parent :meth:`LLMServerManager.add_replica` which only
+        updates the global Registry + LoadBalancer.  No worker notification needed.
+        """
+        if resource_id in self.alive_replicas:
+            logger.warning("[FullyAsyncLLMServerManager] Replica '%s' already active, skipping", resource_id)
+            return False
+
+        replica = self.elastic_replicas.get(resource_id)
+        if replica is None:
+            logger.error(
+                "[FullyAsyncLLMServerManager] Replica '%s' is not registered. "
+                "Elastic replicas are created inside FullyAsyncLLMServerManager.create() "
+                "via worker_group; ensure that argument was provided.",
+                resource_id,
+            )
+            return False
+
+        server_address = replica._server_address
+        server_handle = replica._server_handle
+
+        try:
+            # Delegate to parent: only updates Registry + LB, no worker notification.
+            await self.add_replica(server_address=server_address, server_handle=server_handle, replica=replica)
+
+            self.alive_replicas[resource_id] = replica
+            self.alive_addresses[resource_id] = server_address
+            self.last_elastic_add_time = time.time()
+
+            print(
+                f"[FullyAsyncLLMServerManager] Replica '{resource_id}' added at {server_address}. "
+                f"Active elastic replicas: {len(self.alive_replicas)}"
+            )
+            return True
+
+        except Exception as e:
+            logger.error("[FullyAsyncLLMServerManager] Failed to activate replica '%s': %s", resource_id, e)
+            return False
+
+    async def remove_elastic_replica(self, resource_id: str) -> bool:
+        """Deactivate an active elastic hybrid replica.
+
+        Delegates to parent :meth:`LLMServerManager.remove_replica` which
+        handles two-phase removal (mark → cleanup).  No worker notification needed.
+
+        Note: The actual ``abort_all_requests()`` and ``sleep()`` are called by
+        the Trainer AFTER this method returns.
+        """
+        if resource_id not in self.alive_replicas:
+            logger.warning("[FullyAsyncLLMServerManager] Replica %s not found, skipping", resource_id)
+            return False
+
+        server_address = self.alive_addresses[resource_id]
+        replica = self.alive_replicas[resource_id]
+
+        try:
+            # Delegate to parent: two-phase removal from Registry + LB.
+            await self.remove_replica(server_address=server_address, replica=replica)
+
+            self.alive_replicas.pop(resource_id)
+            self.alive_addresses.pop(resource_id)
+            self.last_elastic_remove_time = time.time()
+
+            print(
+                f"[FullyAsyncLLMServerManager] Replica {resource_id} at {server_address} removed. "
+                f"Total elastic: {len(self.alive_replicas)}"
+            )
+            return True
+
+        except Exception as e:
+            logger.error("[FullyAsyncLLMServerManager] Failed to remove replica %s: %s", resource_id, e)
+            return False
+
+    # -------------------------------------------------------------------------
+    # Statistics / introspection
+    # -------------------------------------------------------------------------
+    def get_num_elastic_replicas(self) -> int:
+        """Return the number of currently active elastic replicas."""
+        return len(self.alive_replicas)
+
+    def get_elastic_replicas_info(self) -> list[dict]:
+        """Return metadata for all active elastic replicas."""
+        return [{"resource_id": rid, "server_address": addr} for rid, addr in self.alive_addresses.items()]
+
+    def get_elastic_statistics(self) -> dict:
+        """Return elastic-specific counters for monitoring."""
+        return {
+            "elastic/num_elastic_replicas": len(self.alive_replicas),
+            "elastic/last_add_time": self.last_elastic_add_time,
+            "elastic/last_remove_time": self.last_elastic_remove_time,
+        }
+
+    def get_active_server_count(self) -> int:
+        """Total active rollout servers (fixed + elastic)."""
+        return len(self.rollout_replicas) + len(self.alive_replicas)
+
+    def get_server_info(self) -> list[dict]:
+        """Metadata for all active rollout servers."""
+        servers = [
+            {"address": getattr(r, "_server_address", "unknown"), "type": "fixed", "is_elastic": False}
+            for r in self.rollout_replicas
+        ]
+        for rid, address in self.alive_addresses.items():
+            servers.append({"address": address, "resource_id": rid, "type": "elastic", "is_elastic": True})
+        return servers
