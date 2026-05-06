@@ -412,6 +412,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             mapping[Role.TeacherModel] = "teacher_pool"
 
             resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+            resource_pool_manager.create_resource_pool()
             teacher_resource_pool = resource_pool_manager.get_resource_pool(Role.TeacherModel)
 
             loop = asyncio.get_running_loop()
