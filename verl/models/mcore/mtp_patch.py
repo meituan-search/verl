@@ -28,6 +28,7 @@ from megatron.core.transformer.multi_token_prediction import (
 
 try:
     from megatron.core.transformer.multi_token_prediction import process_mtp_loss as _process_mtp_loss
+
     _HAS_PROCESS_MTP_LOSS = True
 except ImportError:
     _HAS_PROCESS_MTP_LOSS = False
@@ -121,12 +122,10 @@ def _megatron_gptmodel_postprocess(
         if _HAS_PROCESS_MTP_LOSS:
             # New Megatron API (>= verl megatron fork with process_mtp_loss):
             # process_mtp_loss handles chunking, rolling, loss scaling all internally.
-            cp_group = getattr(self, 'cp_group', None) or (
-                self.pg_collection.cp if hasattr(self, 'pg_collection') else None
+            cp_group = getattr(self, "cp_group", None) or (
+                self.pg_collection.cp if hasattr(self, "pg_collection") else None
             )
-            scale_logits_fn = (
-                self._scale_logits if (hasattr(self, '_scale_logits') and self.config.use_mup) else None
-            )
+            scale_logits_fn = self._scale_logits if (hasattr(self, "_scale_logits") and self.config.use_mup) else None
             hidden_states = _process_mtp_loss(
                 hidden_states=hidden_states,
                 labels=labels,
@@ -148,7 +147,7 @@ def _megatron_gptmodel_postprocess(
             hidden_states = hidden_states_list[0]
             if loss_mask is None:
                 loss_mask = torch.ones_like(mtp_labels)
-            cp_group = getattr(self, 'cp_group', None)
+            cp_group = getattr(self, "cp_group", None)
             for mtp_layer_number in range(self.config.mtp_num_layers):
                 mtp_labels, _ = roll_tensor(
                     mtp_labels,
@@ -187,9 +186,7 @@ def _megatron_gptmodel_postprocess(
                 if self.config.calculate_per_token_loss:
                     hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * mtp_loss)
                 else:
-                    hidden_states = MTPLossAutoScaler.apply(
-                        hidden_states, mtp_loss_scale * mtp_loss / num_tokens
-                    )
+                    hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * mtp_loss / num_tokens)
 
     logits, _ = self.output_layer(hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output)
     # [s b h] => [b s h]
