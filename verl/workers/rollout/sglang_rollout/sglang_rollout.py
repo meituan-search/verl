@@ -22,11 +22,9 @@ from dataclasses import asdict
 from typing import Generator
 
 import ray
+import sglang.srt.entrypoints.engine
 import torch
 from peft import LoraConfig
-from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-
-import sglang.srt.entrypoints.engine
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -37,6 +35,8 @@ from sglang.srt.utils import (
 )
 from sglang.srt.weight_sync.utils import _preprocess_tensor_for_update_weights
 from sglang.srt.weight_sync.utils import update_weights as sgl_update_weights
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
@@ -109,9 +109,8 @@ class ServerAdapter(BaseRollout):
     ):
         super().__init__(config, model_config, device_mesh)
         if self.config.get("quantization", None) == "fp8":
-            from packaging import version
-
             import sglang
+            from packaging import version
 
             assert version.parse(sglang.__version__) >= version.parse("0.5.5"), (
                 "sglang>=0.5.5 is required for FP8 quantization"

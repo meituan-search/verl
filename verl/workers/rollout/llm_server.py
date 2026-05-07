@@ -705,13 +705,3 @@ class FullyAsyncLLMServerManager(LLMServerManager):
     def get_active_server_count(self) -> int:
         """Total active rollout servers (fixed + elastic)."""
         return len(self.rollout_replicas) + len(self.alive_replicas)
-
-    def get_server_info(self) -> list[dict]:
-        """Metadata for all active rollout servers."""
-        servers = [
-            {"address": getattr(r, "_server_address", "unknown"), "type": "fixed", "is_elastic": False}
-            for r in self.rollout_replicas
-        ]
-        for rid, address in self.alive_addresses.items():
-            servers.append({"address": address, "resource_id": rid, "type": "elastic", "is_elastic": True})
-        return servers
