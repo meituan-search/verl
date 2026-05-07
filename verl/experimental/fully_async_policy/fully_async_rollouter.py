@@ -250,7 +250,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     def get_replicas(self):
         """Get rollout worker group"""
-        return self.llm_server_manager.get_replicas()
+        return self.llm_server_manager.get_replicas() + self.llm_server_manager.get_engine_replicas_for_weight_sync()
 
     def get_max_queue_size(self):
         return self.max_queue_size

@@ -142,6 +142,7 @@ class LLMServerClient:
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
+        kwargs.pop("validate", None)  # consumed by FullyLLMServerClient; strip before forwarding to server
         server_id, server = await self._acquire_server(request_id)
         try:
             output: TokenOutput = await server.generate.remote(
@@ -162,6 +163,16 @@ class FullyLLMServerClient(LLMServerClient):
     invisible to the AgentLoop.
     """
 
+    def __init__(
+        self,
+        config: DictConfig,
+        servers: dict[str, ray.actor.ActorHandle],
+        load_balancer_handle: ray.actor.ActorHandle,
+        model_engine_server_manager=None,
+    ):
+        super().__init__(config=config, servers=servers, load_balancer_handle=load_balancer_handle)
+        self.model_engine_server_manager = model_engine_server_manager
+
     @rollout_trace_op
     async def generate(
         self,
@@ -171,6 +182,7 @@ class FullyLLMServerClient(LLMServerClient):
         sampling_params: dict[str, Any],
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
+        **kwargs: Any,
     ) -> TokenOutput:
         """Generate tokens from prompt ids.
 
@@ -184,6 +196,7 @@ class FullyLLMServerClient(LLMServerClient):
         Returns:
             TokenOutput: token output
         """
+        validate = kwargs.pop("validate", False)
         prompt_ids = normalize_token_ids(prompt_ids)
 
         limit_key = None
@@ -210,6 +223,27 @@ class FullyLLMServerClient(LLMServerClient):
                 video_data=video_data,
             )
 
+            # Skip old log prob computation during validation
+            if not validate:
+                current_prompt_ids = prompt_ids + final_output.token_ids
+                current_temperature = sampling_params.get("temperature", 1.0)
+                output = await self._compute_log_probs(output, current_prompt_ids, current_temperature)
+                if output.extra_fields.get("engine_server_logprobs") is not None:
+                    final_output.extra_fields.setdefault("engine_server_logprobs", [])
+                    final_output.extra_fields["engine_server_logprobs"].extend(
+                        output.extra_fields["engine_server_logprobs"]
+                    )
+                if output.extra_fields.get("engine_server_entropys") is not None:
+                    final_output.extra_fields.setdefault("engine_server_entropys", [])
+                    final_output.extra_fields["engine_server_entropys"].extend(
+                        output.extra_fields["engine_server_entropys"]
+                    )
+                if output.extra_fields.get("ref_logprobs") is not None:
+                    final_output.extra_fields.setdefault("ref_logprobs", [])
+                    final_output.extra_fields["ref_logprobs"].extend(output.extra_fields["ref_logprobs"])
+                if output.extra_fields.get("ref_entropys") is not None:
+                    final_output.extra_fields.setdefault("ref_entropys", [])
+                    final_output.extra_fields["ref_entropys"].extend(output.extra_fields["ref_entropys"])
             # 2. merge output into final_output
             final_output.token_ids.extend(output.token_ids)
             if output.log_probs is not None:
@@ -249,6 +283,30 @@ class FullyLLMServerClient(LLMServerClient):
         final_output.extra_fields["max_global_steps"] = max_global_steps
         return final_output
 
+    async def _compute_log_probs(self, output: TokenOutput, context_prompt_ids, temperature: float):
+        if self.model_engine_server_manager is None:
+            return output
+
+        # Only recompute log_probs for newly generated tokens in this turn.
+        if len(output.token_ids) == 0:
+            output.extra_fields["engine_server_logprobs"] = []
+            output.extra_fields["engine_server_entropys"] = []
+            if self.model_engine_server_manager._has_ref_instance:
+                output.extra_fields["ref_logprobs"] = []
+                output.extra_fields["ref_entropys"] = []
+            return output
+
+        results = await self.model_engine_server_manager.compute_log_probs(
+            context_prompt_ids, output.token_ids, temperature
+        )
+        if "old_log_probs" in results:
+            output.extra_fields["engine_server_logprobs"] = results["old_log_probs"]
+            output.extra_fields["engine_server_entropys"] = results["old_entropys"]
+        if "ref_log_probs" in results:
+            output.extra_fields["ref_logprobs"] = results["ref_log_probs"]
+            output.extra_fields["ref_entropys"] = results["ref_entropys"]
+        return output
+
 
 class LLMServerManager:
     """LLMServerManager is responsible for:
@@ -277,6 +335,8 @@ class LLMServerManager:
 
         assert worker_group is not None or self.rollout_config.nnodes > 0, "nnodes must be > 0 in standalone mode"
 
+        self.model_engine_server_manager = None
+
         # for recipe to change
         if not hasattr(self, "rollout_replica_class"):
             self.rollout_replica_class = get_rollout_replica_class(self.rollout_config.name)
@@ -288,6 +348,10 @@ class LLMServerManager:
         instance = cls(*args, **kwargs)
         await instance._initialize_llm_servers()
         await instance._init_global_load_balancer()
+        if getattr(instance.config, "model_engine_server", None) and instance.config.model_engine_server.get(
+            "enable", False
+        ):
+            await instance._init_model_engine_replica()
         return instance
 
     async def _initialize_llm_servers(self):
@@ -337,6 +401,21 @@ class LLMServerManager:
                 raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
             update_prometheus_config(self.rollout_config.prometheus, self.server_addresses, self.rollout_config.name)
 
+    async def _init_model_engine_replica(self):
+        """Initialize ModelEngineServerManager."""
+        from verl.workers.rollout.model_engine_server import ModelEngineServerManager
+
+        self.model_engine_server_manager = ModelEngineServerManager(full_config=self.config)
+        await self.model_engine_server_manager.initialize()
+
+    def get_engine_replicas_for_weight_sync(self) -> list:
+        """Return model engine replicas that need to participate in CheckpointEngine weight sync."""
+        if self.model_engine_server_manager is None:
+            return []
+        if self.model_engine_server_manager._has_old_instance:
+            return [self.model_engine_server_manager._old_instance]
+        return []
+
     async def _init_global_load_balancer(self) -> None:
         self.global_load_balancer = GlobalRequestLoadBalancer.remote(
             servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
@@ -354,7 +433,10 @@ class LLMServerManager:
             return LLMServerClient(config=self.config, servers=servers, load_balancer_handle=self.global_load_balancer)
         else:
             return FullyLLMServerClient(
-                config=self.config, servers=servers, load_balancer_handle=self.global_load_balancer
+                config=self.config,
+                servers=servers,
+                load_balancer_handle=self.global_load_balancer,
+                model_engine_server_manager=self.model_engine_server_manager,
             )
 
     def get_addresses(self) -> list[str]:

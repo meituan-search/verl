@@ -666,25 +666,24 @@ class ModelEngineServerManager:
             )
             await self._ref_instance.init_standalone()
 
-    async def compute_log_probs(self, data, **kwargs) -> dict:
+    async def compute_log_probs(self, prompt_ids: list[int], response_ids: list[int], temperature: float) -> dict:
         """Compute log probabilities for configured instances in parallel.
 
         Returns dict with keys: old_log_probs, old_entropys, ref_log_probs, ref_entropys
         (only keys for enabled instances are present).
         """
-        import asyncio
 
         tasks, labels = [], []
         if self._has_old_instance:
-            tasks.append(self._old_instance.servers[0].compute_log_prob.remote(data, **kwargs))
+            tasks.append(self._old_instance.servers[0].compute_log_prob.remote(prompt_ids, response_ids, temperature))
             labels.append("old")
         if self._has_ref_instance:
-            tasks.append(self._ref_instance.servers[0].compute_log_prob.remote(data, **kwargs))
+            tasks.append(self._ref_instance.servers[0].compute_log_prob.remote(prompt_ids, response_ids, temperature))
             labels.append("ref")
 
         results = await asyncio.gather(*tasks)
         output = {}
         for label, result in zip(labels, results, strict=False):
             output[f"{label}_log_probs"] = result["log_probs"]
-            output[f"{label}_entropys"] = result["entropys"]
+            output[f"{label}_entropys"] = result["entropy"]
         return output
