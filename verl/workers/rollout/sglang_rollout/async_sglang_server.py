@@ -22,11 +22,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 import ray
-import sglang
-import sglang.srt.entrypoints.engine
 import torch
 from packaging import version
 from ray.actor import ActorHandle
+
+import sglang
+import sglang.srt.entrypoints.engine
 from sglang.srt.entrypoints.http_server import (
     ServerArgs,
     _GlobalState,
@@ -41,7 +42,6 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
 )
 from sglang.srt.managers.tokenizer_manager import ServerStatus
-
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_visible_devices_keyword
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
@@ -181,10 +181,6 @@ class SGLangHttpServer:
         # used for http server
         self._server_address = ray.util.get_node_ip_address().strip("[]")
         self._server_port = None
-
-        # State flag to track if server is in aborted state
-        # When True, generate() will return immediately with stop_reason="aborted"
-        self._is_aborted = False
 
         # used for controlling sglang server profiler
         profiler_config = self.config.profiler
@@ -508,14 +504,6 @@ class SGLangHttpServer:
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
     ) -> TokenOutput:
-        # If server is in aborted state, return immediately without processing
-        if self._is_aborted:
-            return TokenOutput(
-                token_ids=[],
-                log_probs=None,
-                routed_experts=None,
-                stop_reason="aborted",
-            )
         # PD top-level dispatch: prefill mints a bootstrap_room and fans out
         # paired local-prefill + remote-decode calls; decode returns the tokens
         # (prefill only materialises KV and pushes via NIXL). Random peer
@@ -679,13 +667,11 @@ class SGLangHttpServer:
     async def abort_all_requests(self):
         if self.node_rank != 0:
             return
-        self._is_aborted = True
         await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="abort"))
 
     async def resume_generation(self):
         if self.node_rank != 0:
             return
-        self._is_aborted = False
         await self.tokenizer_manager.continue_generation(ContinueGenerationReqInput())
 
     async def start_profile(self, **kwargs):

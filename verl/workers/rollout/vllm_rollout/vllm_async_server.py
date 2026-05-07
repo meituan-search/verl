@@ -139,10 +139,6 @@ class vLLMHttpServer:
         self._server_address = ray.util.get_node_ip_address().strip("[]")
         self._server_port = None
 
-        # State flag to track if server is in aborted state
-        # When True, generate() will return immediately with stop_reason="aborted"
-        self._is_aborted = False
-
         # used for controlling vllm server profiler
         profiler_config = self.config.profiler
         tool_config = None
@@ -457,15 +453,6 @@ class vLLMHttpServer:
         priority: int = 0,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
-        # If server is in aborted state, return immediately without processing
-        if self._is_aborted:
-            return TokenOutput(
-                token_ids=[],
-                log_probs=None,
-                routed_experts=None,
-                stop_reason="aborted",
-            )
-
         prompt_ids = normalize_token_ids(prompt_ids)
 
         # Calculate the maximum possible new tokens based on available context space
@@ -672,7 +659,6 @@ class vLLMHttpServer:
                 - aborted_count: Number of requests aborted
                 - request_ids: List of aborted request IDs
         """
-        self._is_aborted = True
         try:
             if _VLLM_VERSION >= version.parse("0.12.0"):
                 # Snapshot request IDs before pausing for reporting
@@ -727,7 +713,6 @@ class vLLMHttpServer:
         Only effective on vLLM >= 0.12.0 where pause_generation is used.
         No-op on older versions.
         """
-        self._is_aborted = False
         if self.node_rank != 0:
             return
         if _VLLM_VERSION >= version.parse("0.12.0"):
@@ -742,7 +727,6 @@ class vLLMHttpServer:
         Returns:
             dict[str, Any]: Dictionary containing abort result.
         """
-        self._is_aborted = True
         try:
             request_states = self.engine.output_processor.request_states
             req_state = request_states.get(request_id)
