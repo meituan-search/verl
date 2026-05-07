@@ -363,13 +363,13 @@ class TestLoadBalancerRouting:
         assert s2 != s3
 
     def test_release_invalid_server_silently_ignored(self, ray_for_lb):
-        """Releasing a nonexistent server is silently ignored (elastic-safe)."""
+        """Releasing a nonexistent server is silently ignored (hybrid-safe)."""
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None})
         # Should not raise
         ray.get(lb.release_server.remote(server_id="nonexistent"))
 
     def test_release_without_inflight_silently_ignored(self, ray_for_lb):
-        """Releasing a server with no inflight requests is silently ignored (elastic-safe)."""
+        """Releasing a server with no inflight requests is silently ignored (hybrid-safe)."""
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None})
         # Should not raise even though s1 has 0 inflight
         ray.get(lb.release_server.remote(server_id="s1"))
@@ -386,8 +386,8 @@ class TestLoadBalancerStickySession:
         assert s0 == s1
 
 
-class TestLoadBalancerElastic:
-    """Dynamic server add/remove for elastic scaling."""
+class TestLoadBalancerHybrid:
+    """Dynamic server add/remove for hybrid scaling."""
 
     def test_add_server(self, ray_for_lb):
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None})

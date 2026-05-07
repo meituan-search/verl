@@ -57,7 +57,7 @@ class GlobalRequestLoadBalancer:
     - **Least-loaded Selection**: When no sticky session exists, selects the
       server with the fewest in-flight requests.
     - **Dynamic Server Management**: Supports add/remove servers at runtime
-      for elastic scaling.
+      for hybrid scaling.
     """
 
     def __init__(self, servers: dict[str, ray.actor.ActorHandle], max_cache_size: int = DEFAULT_ROUTING_CACHE_SIZE):
@@ -462,7 +462,7 @@ class LLMServerManager:
 
 
 class FullyAsyncLLMServerManager(LLMServerManager):
-    """Extension of :class:`LLMServerManager` for fully async training with elastic scaling."""
+    """Extension of :class:`LLMServerManager` for fully async training with hybrid scaling."""
 
     def __init__(
         self,
@@ -471,40 +471,40 @@ class FullyAsyncLLMServerManager(LLMServerManager):
         rollout_resource_pool: RayResourcePool = None,
     ):
         super().__init__(config, worker_group, rollout_resource_pool)
-        # Pre-registered elastic replicas: bound at init time but still sleeping.
+        # Pre-registered hybrid replicas: bound at init time but still sleeping.
         # Keyed by resource_id; populated during _initialize_llm_servers().
-        self.elastic_replicas: dict[str, RolloutReplica] = {}
-        # Currently active (awake + in LB) subset of elastic replicas.
+        self.hybrid_replicas: dict[str, RolloutReplica] = {}
+        # Currently active (awake + in LB) subset of hybrid replicas.
         self.alive_replicas: dict[str, RolloutReplica] = {}
-        # resource_id → server_address for alive elastic replicas.
+        # resource_id → server_address for alive hybrid replicas.
         self.alive_addresses: dict[str, str] = {}
         # Prometheus server addresses
         self.prometheus_server_addresses = []
 
         # Timing / counters
-        self.last_elastic_add_time: float = 0.0
-        self.last_elastic_remove_time: float = 0.0
+        self.last_hybrid_add_time: float = 0.0
+        self.last_hybrid_remove_time: float = 0.0
 
     async def _initialize_llm_servers(self):
-        # ── Step 1: elastic replicas first (replica_rank 0 … N_e-1) ──────────
+        # ── Step 1: hybrid replicas first (replica_rank 0 … N_e-1) ──────────
         # Initialise and immediately sleep them so the training engine can
-        # reclaim GPU memory.  Starting from rank 0 gives elastic actors the
+        # reclaim GPU memory.  Starting from rank 0 gives hybrid actors the
         # lowest-numbered placement-group bundles which are co-located with the
         # training engine, maximising GPU affinity on multi-node deployments.
-        num_elastic = 0
+        num_hybrid = 0
         if self.worker_group is not None:
-            num_elastic = await self._initialize_replicas(start_rank=0, worker_group=self.worker_group)
+            num_hybrid = await self._initialize_replicas(start_rank=0, worker_group=self.worker_group)
 
-        # ── Step 2: fixed replicas (replica_rank N_e … N_e+N_f-1) ───────────
-        # start_rank=num_elastic ensures the Ray actor names (e.g.
+        # ── Step 2: standalone replicas (replica_rank N_e … N_e+N_f-1) ───────────
+        # start_rank=num_hybrid ensures the Ray actor names (e.g.
         # server_{rank}_{node}) are globally unique and never collide
-        # with the elastic actors created above.
-        await self._initialize_replicas(start_rank=num_elastic)
+        # with the hybrid actors created above.
+        await self._initialize_replicas(start_rank=num_hybrid)
 
         print(
             f"[FullyAsyncLLMServerManager] Created: "
-            f"{len(self.rollout_replicas)} fixed replicas (rank {num_elastic}+), "
-            f"{num_elastic} elastic replicas registered (sleeping, rank 0-{num_elastic - 1})"
+            f"{len(self.rollout_replicas)} standalone replicas (rank {num_hybrid}+), "
+            f"{num_hybrid} hybrid replicas registered (sleeping, rank 0-{num_hybrid - 1})"
         )
 
     async def _initialize_replicas(
@@ -513,29 +513,29 @@ class FullyAsyncLLMServerManager(LLMServerManager):
         worker_group: RayWorkerGroup = None,
     ) -> int:
         """
-        Create, initialise (init_hybrid), and sleep elastic hybrid replicas.
+        Create, initialise (init_hybrid), and sleep hybrid replicas.
 
-        Called internally by create() when elastic_worker_group is provided.
+        Called internally by create() when hybrid_worker_group is provided.
         Each replica is assigned a contiguous slice of workers from
-        elastic_worker_group, and its ``replica_rank`` starts at ``start_rank``
-        so that it is globally unique across both elastic and fixed replicas
+        hybrid_worker_group, and its ``replica_rank`` starts at ``start_rank``
+        so that it is globally unique across both hybrid and standalone replicas
         (avoiding Ray named-actor collisions such as ``sglang_server_0_0``).
 
         After init_hybrid() the replica is immediately put to sleep so that
         The replica is stored in
-        elastic_replicas keyed by "elastic_{i}" (0-indexed within
-        the elastic group) and can be activated later via add_replica().
+        hybrid_replicas keyed by "hybrid_{i}" (0-indexed within
+        the hybrid group) and can be activated later via add_replica().
 
         Args:
-            worker_group: Worker group whose workers back the elastic
+            worker_group: Worker group whose workers back the hybrid
                 hybrid replicas.  Must already be fully initialised.
             start_rank: First global ``replica_rank`` to assign.  Pass 0 so
-                that elastic actors occupy the lowest-numbered Ray actor names
+                that hybrid actors occupy the lowest-numbered Ray actor names
                 and therefore the best GPU affinity in multi-node deployments.
 
         Returns:
-            Number of elastic replicas created (so the caller can pass
-            ``start_rank=num_elastic`` to ``_initialize_llm_servers``).
+            Number of hybrid replicas created (so the caller can pass
+            ``start_rank=num_hybrid`` to ``_initialize_llm_servers``).
         """
         rollout_world_size = (
             self.rollout_config.tensor_model_parallel_size
@@ -563,17 +563,17 @@ class FullyAsyncLLMServerManager(LLMServerManager):
 
         if worker_group:
             await asyncio.gather(*[replica.init_hybrid(worker_group) for replica in tmp_replicas])
-            # Register elastic replicas.
+            # Register hybrid replicas.
             for i, replica in enumerate(tmp_replicas):
-                resource_id = f"elastic_{i}"
-                self.elastic_replicas[resource_id] = replica
+                resource_id = f"hybrid_{i}"
+                self.hybrid_replicas[resource_id] = replica
                 print(
-                    f"[FullyAsyncAgentLoopManager] Elastic replica '{resource_id}' "
+                    f"[FullyAsyncAgentLoopManager] Hybrid replica '{resource_id}' "
                     f"(rank={start_rank + i}) initialised at {replica._server_address} "
                 )
-            elastic_addresses = [replica._server_address for replica in tmp_replicas]
-            self.prometheus_server_addresses.extend(elastic_addresses)
-            print(f"AgentLoopManager Elastic: {elastic_addresses}")
+            hybrid_addresses = [replica._server_address for replica in tmp_replicas]
+            self.prometheus_server_addresses.extend(hybrid_addresses)
+            print(f"AgentLoopManager Hybrid: {hybrid_addresses}")
         else:
             self.rollout_replicas = tmp_replicas
             await asyncio.gather(*[replica.init_standalone() for replica in self.rollout_replicas])
@@ -594,7 +594,7 @@ class FullyAsyncLLMServerManager(LLMServerManager):
         return num_replicas
 
     async def add_replica(self, resource_id: str) -> bool:
-        """Activate a pre-registered elastic hybrid replica.
+        """Activate a pre-registered hybrid replica.
 
         Atomically registers the handle **and** adds the server to the load
         balancer in a single ``add_server(handle=…)`` call (the LB now holds
@@ -604,11 +604,11 @@ class FullyAsyncLLMServerManager(LLMServerManager):
             logger.warning("[FullyAsyncLLMServerManager] Replica '%s' already active, skipping", resource_id)
             return False
 
-        replica = self.elastic_replicas.get(resource_id)
+        replica = self.hybrid_replicas.get(resource_id)
         if replica is None:
             logger.error(
                 "[FullyAsyncLLMServerManager] Replica '%s' is not registered. "
-                "Elastic replicas are created inside FullyAsyncLLMServerManager.create() "
+                "Hybrid replicas are created inside FullyAsyncLLMServerManager.create() "
                 "via worker_group; ensure that argument was provided.",
                 resource_id,
             )
@@ -629,11 +629,11 @@ class FullyAsyncLLMServerManager(LLMServerManager):
 
             self.alive_replicas[resource_id] = replica
             self.alive_addresses[resource_id] = server_address
-            self.last_elastic_add_time = time.time()
+            self.last_hybrid_add_time = time.time()
 
             print(
                 f"[FullyAsyncLLMServerManager] Replica '{resource_id}' added at {server_address}. "
-                f"Active elastic replicas: {len(self.alive_replicas)}"
+                f"Active hybrid replicas: {len(self.alive_replicas)}"
             )
             return True
 
@@ -642,7 +642,7 @@ class FullyAsyncLLMServerManager(LLMServerManager):
             return False
 
     async def remove_replica(self, resource_id: str) -> bool:
-        """Deactivate an active elastic hybrid replica.
+        """Deactivate an active hybrid replica.
 
         A single ``remove_server()`` call atomically removes the server from
         the LB pool **and** purges its handle from the internal registry
@@ -671,11 +671,11 @@ class FullyAsyncLLMServerManager(LLMServerManager):
 
             self.alive_replicas.pop(resource_id)
             self.alive_addresses.pop(resource_id)
-            self.last_elastic_remove_time = time.time()
+            self.last_hybrid_remove_time = time.time()
 
             print(
                 f"[FullyAsyncLLMServerManager] Replica {resource_id} at {server_address} removed. "
-                f"Total elastic: {len(self.alive_replicas)}"
+                f"Total hybrid: {len(self.alive_replicas)}"
             )
             return True
 
@@ -686,22 +686,22 @@ class FullyAsyncLLMServerManager(LLMServerManager):
     # -------------------------------------------------------------------------
     # Statistics / introspection
     # -------------------------------------------------------------------------
-    def get_num_elastic_replicas(self) -> int:
-        """Return the number of currently active elastic replicas."""
+    def get_num_hybrid_replicas(self) -> int:
+        """Return the number of currently active hybrid replicas."""
         return len(self.alive_replicas)
 
-    def get_elastic_replicas_info(self) -> list[dict]:
-        """Return metadata for all active elastic replicas."""
+    def get_hybrid_replicas_info(self) -> list[dict]:
+        """Return metadata for all active hybrid replicas."""
         return [{"resource_id": rid, "server_address": addr} for rid, addr in self.alive_addresses.items()]
 
-    def get_elastic_statistics(self) -> dict:
-        """Return elastic-specific counters for monitoring."""
+    def get_hybrid_statistics(self) -> dict:
+        """Return hybrid-specific counters for monitoring."""
         return {
-            "elastic/num_elastic_replicas": len(self.alive_replicas),
-            "elastic/last_add_time": self.last_elastic_add_time,
-            "elastic/last_remove_time": self.last_elastic_remove_time,
+            "hybrid/num_hybrid_replicas": len(self.alive_replicas),
+            "hybrid/last_add_time": self.last_hybrid_add_time,
+            "hybrid/last_remove_time": self.last_hybrid_remove_time,
         }
 
     def get_active_server_count(self) -> int:
-        """Total active rollout servers (fixed + elastic)."""
+        """Total active rollout servers (standalone + hybrid)."""
         return len(self.rollout_replicas) + len(self.alive_replicas)

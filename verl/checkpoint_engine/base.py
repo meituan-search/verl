@@ -418,27 +418,12 @@ class CheckpointEngineManager:
 
     @auto_await
     async def abort_replicas(self):
-        """Abort all in-flight requests on every replica.
-
-        Must be called **before** ``sleep_replicas()`` to ensure KV cache
-        allocations are in a clean (drained) state.  Without this, SGLang's
-        ``release_memory_occupation`` will fail with::
-
-            Cannot pause allocation that is not active
-
-        because the torch_memory_saver cannot pause an allocation that still
-        has active requests attached.
-        """
+        """Abort all in-flight requests on every replica."""
         await asyncio.gather(*[r.abort_all_requests() for r in self.replicas])
 
     @auto_await
     async def resume_generation_replicas(self):
-        """Resume generation on all replicas after abort_all_requests.
-
-        Used to re-enable request processing on standalone/fixed servers after
-        elastic replicas have been removed and slept.  Aborted partial-rollout
-        requests will be re-routed to the now-active servers.
-        """
+        """Resume generation on all replicas after abort_all_requests."""
         await asyncio.gather(*[r.resume_generation() for r in self.replicas])
 
     @auto_await

@@ -74,11 +74,11 @@ class FullyAsyncTaskRunner:
         self.components["role_worker_mapping"] = role_worker_mapping
         self.components["ray_worker_group_cls"] = ray_worker_group_cls
 
-        print("[ASYNC MAIN] Creating FullyAsyncTrainer first (needed for elastic worker group injection)...")
+        print("[ASYNC MAIN] Creating FullyAsyncTrainer first (needed for hybrid worker group injection)...")
         self._create_trainer(config)
 
-        print("[ASYNC MAIN] Injecting trainer's worker group into rollouter for elastic replicas...")
-        self._setup_elastic_worker_group(config)
+        print("[ASYNC MAIN] Injecting trainer's worker group into rollouter for hybrid replicas...")
+        self._setup_hybrid_worker_group(config)
 
         print("[ASYNC MAIN] Creating FullyAsyncRollouter...")
         self._create_rollouter(config)
@@ -123,11 +123,11 @@ class FullyAsyncTaskRunner:
             device_name=config.trainer.device,
         )
 
-        # set_elastic_worker_group must be called BEFORE init_workers() so that
-        # _init_async_rollout_manager can pass the elastic WG to ALM.create().
-        if "elastic_worker_group" in self.components:
-            ray.get(rollouter.set_elastic_worker_group.remote(self.components["elastic_worker_group"]))
-            print("[ASYNC MAIN] Elastic worker group injected into rollouter")
+        # set_hybrid_worker_group must be called BEFORE init_workers() so that
+        # _init_async_rollout_manager can pass the hybrid WG to ALM.create().
+        if "hybrid_worker_group" in self.components:
+            ray.get(rollouter.set_hybrid_worker_group.remote(self.components["hybrid_worker_group"]))
+            print("[ASYNC MAIN] Hybrid worker group injected into rollouter")
 
         ray.get(rollouter.init_workers.remote())
         ray.get(rollouter.set_max_required_samples.remote())
@@ -156,22 +156,22 @@ class FullyAsyncTaskRunner:
         self.components["trainer"] = trainer
         print("[ASYNC MAIN] FullyAsyncTrainer created and initialized successfully")
 
-    def _setup_elastic_worker_group(self, config) -> None:
+    def _setup_hybrid_worker_group(self, config) -> None:
         """
         Extract the trainer's actor_rollout_wg and store it for later injection
-        into the rollouter. This WG backs the elastic hybrid rollout replicas
+        into the rollouter. This WG backs the hybrid rollout replicas
         used during trainer-side validation (use_trainer_do_validate).
         """
         trainer = self.components["trainer"]
         if config.async_training.use_trainer_do_validate:
             trainer_wg = ray.get(trainer.get_actor_wg.remote())
-            self.components["elastic_worker_group"] = trainer_wg
+            self.components["hybrid_worker_group"] = trainer_wg
             print(
-                f"[ASYNC MAIN] Elastic worker group extracted from trainer "
+                f"[ASYNC MAIN] Hybrid worker group extracted from trainer "
                 f"(world_size={getattr(trainer_wg, 'world_size', '?')})"
             )
         else:
-            print("[ASYNC MAIN] use_trainer_do_validate=False, skipping elastic worker group setup")
+            print("[ASYNC MAIN] use_trainer_do_validate=False, skipping hybrid worker group setup")
 
     def _run_training_loop(self):
         self.running = True

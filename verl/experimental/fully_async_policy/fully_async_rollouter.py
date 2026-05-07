@@ -151,9 +151,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         self.async_rollout_manager = None
 
-        # Elastic worker group (injected via set_elastic_worker_group before init_workers)
-        # When set, its GPUs back elastic hybrid replicas for trainer-side validation.
-        self._elastic_worker_group = None
+        # Elastic worker group (injected via set_hybrid_worker_group before init_workers)
+        # When set, its GPUs back hybrid replicas for trainer-side validation.
+        self._hybrid_worker_group = None
 
         # Config
         self.staleness_threshold: float = config.async_training.get("staleness_threshold", 1)
@@ -443,13 +443,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         Create the server manager and agent loop manager for fully async training.
 
         Uses :class:`FullyAsyncLLMServerManager` which supports two-phase init:
-        - Phase 1: elastic hybrid replicas on trainer GPUs (sleeping)
-        - Phase 2: fixed standalone replicas on rollout GPUs
+        - Phase 1: hybrid replicas on trainer GPUs (sleeping)
+        - Phase 2: standalone replicas on rollout GPUs
 
         The ``GlobalRequestLoadBalancer`` (which also holds the server-handle
         registry) serves as the single source of truth for handle mapping and
         routing.  Clients look up handles atomically — no per-worker notification
-        needed on elastic add/remove.
+        needed on hybrid add/remove.
         """
         # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
         # agent_reward_loop: streaming reward computation with actor rollout
@@ -464,11 +464,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         assert self.config.actor_rollout_ref.rollout.mode == "async"
 
         self.async_rollout_mode = True
-        # Use FullyAsyncLLMServerManager for two-phase (elastic + fixed) init.
+        # Use FullyAsyncLLMServerManager for two-phase (hybrid + standalone) init.
         # It creates GlobalRequestLoadBalancer (with merged handle registry) internally.
         self.llm_server_manager = await FullyAsyncLLMServerManager.create(
             config=self.config,
-            worker_group=self.get_elastic_worker_group(),
+            worker_group=self.get_hybrid_worker_group(),
         )
         self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
             config=self.config,
@@ -789,50 +789,50 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     # -------------------------------------------------------------------------
     # Elastic worker group injection
     # -------------------------------------------------------------------------
-    def set_elastic_worker_group(self, worker_group: RayWorkerGroup):
-        """Inject the elastic worker group."""
-        self._elastic_worker_group = worker_group
+    def set_hybrid_worker_group(self, worker_group: RayWorkerGroup):
+        """Inject the hybrid worker group."""
+        self._hybrid_worker_group = worker_group
 
-    def get_elastic_worker_group(self):
-        """Return the worker group for elastic hybrid replicas."""
-        return self._elastic_worker_group
+    def get_hybrid_worker_group(self):
+        """Return the worker group for hybrid replicas."""
+        return self._hybrid_worker_group
 
     # -------------------------------------------------------------------------
     # Elastic replica management – thin delegation to llm_server_manager
-    # (FullyAsyncLLMServerManager owns elastic lifecycle)
+    # (FullyAsyncLLMServerManager owns hybrid lifecycle)
     # -------------------------------------------------------------------------
     async def add_replica(self, resource_id: str):
-        """Activate a pre-registered elastic hybrid replica."""
+        """Activate a pre-registered hybrid replica."""
         await self.llm_server_manager.add_replica(resource_id)
 
     async def remove_replica(self, resource_id: str):
-        """Deactivate an active elastic hybrid replica."""
+        """Deactivate an active hybrid replica."""
         await self.llm_server_manager.remove_replica(resource_id)
 
-    def get_elastic_replica(self, resource_id: str):
-        """Return the RolloutReplica object for a registered elastic resource."""
-        return self.llm_server_manager.elastic_replicas.get(resource_id)
+    def get_hybrid_replica(self, resource_id: str):
+        """Return the RolloutReplica object for a registered hybrid resource."""
+        return self.llm_server_manager.hybrid_replicas.get(resource_id)
 
-    def get_all_elastic_replicas(self) -> dict:
-        """Return all registered elastic replicas (sleeping + active)."""
-        return dict(self.llm_server_manager.elastic_replicas)
+    def get_all_hybrid_replicas(self) -> dict:
+        """Return all registered hybrid replicas (sleeping + active)."""
+        return dict(self.llm_server_manager.hybrid_replicas)
 
     # -------------------------------------------------------------------------
     # Statistics / introspection – delegate to llm_server_manager
     # -------------------------------------------------------------------------
-    async def get_elastic_statistics(self) -> dict:
-        """Combined rollout + elastic statistics."""
+    async def get_hybrid_statistics(self) -> dict:
+        """Combined rollout + hybrid statistics."""
         base_stats = await self.get_statistics()
-        elastic_stats = self.llm_server_manager.get_elastic_statistics()
-        return {**base_stats, **elastic_stats}
+        hybrid_stats = self.llm_server_manager.get_hybrid_statistics()
+        return {**base_stats, **hybrid_stats}
 
     def get_num_active_replicas(self) -> int:
-        """Total active rollout replicas (fixed + elastic)."""
+        """Total active rollout replicas (standalone + hybrid)."""
         return self.llm_server_manager.get_active_server_count()
 
-    def get_elastic_replicas_info(self) -> list[dict]:
-        """Metadata for all active elastic replicas."""
-        return self.llm_server_manager.get_elastic_replicas_info()
+    def get_hybrid_replicas_info(self) -> list[dict]:
+        """Metadata for all active hybrid replicas."""
+        return self.llm_server_manager.get_hybrid_replicas_info()
 
     def get_total_produced_samples(self) -> int:
         """Total samples produced (uses base class counter)."""

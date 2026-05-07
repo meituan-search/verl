@@ -158,7 +158,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.checkpoint_manager = None
 
         # Hybrid checkpoint manager for trainer-side validation (use_trainer_do_validate)
-        # Uses naive backend to sync weights from trainer to elastic rollout replicas.
+        # Uses naive backend to sync weights from trainer to hybrid rollout replicas.
         # Initialized in _setup_hybrid_checkpoint_manager_and_sleep() via set_rollouter().
         self.hybrid_checkpoint_manager = None
 
@@ -172,18 +172,18 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         print("[FullyAsyncTrainer] Checkpoint manager initialized")
 
     async def _setup_hybrid_checkpoint_manager(self):
-        """Setup hybrid checkpoint manager and perform initial sleep of elastic replicas.
+        """Setup hybrid checkpoint manager and perform initial sleep of hybrid replicas.
 
         When use_trainer_do_validate is enabled:
           1. Creates a CheckpointEngineManager with naive backend for trainer-side
-             weight sync to elastic rollout replicas.
-          2. Fetches elastic replicas from the rollouter's ALM (created during
+             weight sync to hybrid rollout replicas.
+          2. Fetches hybrid replicas from the rollouter's ALM (created during
              rollouter.init_workers()).
           3. Registers them with the hybrid CP manager and calls sleep_replicas()
              to release GPU memory for training.
 
         Must be called AFTER set_rollouter() so that self.rollouter is available,
-        and AFTER rollouter.init_workers() so that elastic replicas exist.
+        and AFTER rollouter.init_workers() so that hybrid replicas exist.
         This mirrors the colocate pattern in ray_trainer.py:882-889 but fetches
         replicas from the rollouter's ALM via RPC since they live on the rollout side.
         """
@@ -212,20 +212,19 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         print("[FullyAsyncTrainer] Hybrid checkpoint manager initialized (naive backend)")
 
-        # --- Part 2: Fetch elastic replicas from rollouter's ALM ---
-        print("[FullyAsyncTrainer] Fetching elastic replicas from rollouter...")
-        elastic_replicas_dict = ray.get(self.rollouter.get_all_elastic_replicas.remote())
+        # --- Part 2: Fetch hybrid replicas from rollouter's ALM ---
+        print("[FullyAsyncTrainer] Fetching hybrid replicas from rollouter...")
+        hybrid_replicas_dict = ray.get(self.rollouter.get_all_hybrid_replicas.remote())
         print(
-            f"[FullyAsyncTrainer] Got {len(elastic_replicas_dict)} elastic replicas: "
-            f"{list(elastic_replicas_dict.keys())}"
+            f"[FullyAsyncTrainer] Got {len(hybrid_replicas_dict)} hybrid replicas: {list(hybrid_replicas_dict.keys())}"
         )
 
-        if not elastic_replicas_dict:
-            print("[FullyAsyncTrainer] No elastic replicas found, skipping initial sleep")
+        if not hybrid_replicas_dict:
+            print("[FullyAsyncTrainer] No hybrid replicas found, skipping initial sleep")
             return
 
         # --- Part 3: Register replicas and perform initial sleep ---
-        for resource_id, replica in elastic_replicas_dict.items():
+        for resource_id, replica in hybrid_replicas_dict.items():
             self.hybrid_checkpoint_manager.replicas.append(replica)
             print(
                 f"[FullyAsyncTrainer] Registered '{resource_id}' "
@@ -233,7 +232,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 f"addr={getattr(replica, '_server_address', '?')})"
             )
 
-        # Step 3: Sleep all elastic replicas
+        # Step 3: Sleep all hybrid replicas
         print(
             f"[FullyAsyncTrainer] Calling sleep_replicas() on "
             f"{len(self.hybrid_checkpoint_manager.replicas)} replicas..."
@@ -546,7 +545,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self.logger.log(data=val_metrics, step=self.current_param_version)
 
     async def _trainer_side_validate(self):
-        """Run trainer-side validation using elastic rollout replicas."""
+        """Run trainer-side validation using hybrid rollout replicas."""
         print("[FullyAsyncTrainer] _trainer_side_validate === START ===")
         validate_start = time.time()
         # ================================================================
@@ -557,9 +556,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         await self.hybrid_checkpoint_manager.update_weights(global_steps=self.current_param_version)
         await self.checkpoint_manager.abort_replicas()
         await self.hybrid_checkpoint_manager.abort_replicas()
-        elastic_replicas_dict = ray.get(self.rollouter.get_all_elastic_replicas.remote())
-        elastic_resource_ids = list(elastic_replicas_dict.keys())
-        for resource_id in elastic_resource_ids:
+        hybrid_replicas_dict = ray.get(self.rollouter.get_all_hybrid_replicas.remote())
+        hybrid_resource_ids = list(hybrid_replicas_dict.keys())
+        for resource_id in hybrid_resource_ids:
             ray.get(self.rollouter.add_replica.remote(resource_id))
         await self.checkpoint_manager.resume_generation_replicas()
         await self.hybrid_checkpoint_manager.resume_generation_replicas()
@@ -573,12 +572,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.logger.log(data=val_metrics, step=self.current_param_version)
 
         # ================================================================
-        # Phase 3: Switch elastic GPUs back to TRAIN mode
+        # Phase 3: Switch hybrid GPUs back to TRAIN mode
         # ================================================================
-        print("[FullyAsyncTrainer] Phase 3: Switching elastic GPUs back to TRAIN mode")
+        print("[FullyAsyncTrainer] Phase 3: Switching hybrid GPUs back to TRAIN mode")
         await self.checkpoint_manager.abort_replicas()
         await self.hybrid_checkpoint_manager.abort_replicas()
-        for resource_id in elastic_resource_ids:
+        for resource_id in hybrid_resource_ids:
             ray.get(self.rollouter.remove_replica.remote(resource_id))
         await self.hybrid_checkpoint_manager.sleep_replicas()
         await self.checkpoint_manager.resume_generation_replicas()
