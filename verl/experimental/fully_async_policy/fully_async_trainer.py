@@ -162,9 +162,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # Initialized in _setup_hybrid_checkpoint_manager_and_sleep() via set_rollouter().
         self.hybrid_checkpoint_manager = None
 
-    def _setup_checkpoint_manager(self):
+    async def _setup_checkpoint_manager(self):
         """Setup checkpoint manager after rollouter is initialized"""
-        replicas = ray.get(self.rollouter.get_replicas.remote())
+        replicas = await self.rollouter.get_replicas.remote()
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
         self.checkpoint_manager = CheckpointEngineManager(
             config=checkpoint_engine_config, trainer=self.actor_wg, replicas=replicas
@@ -248,7 +248,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         """Set rollouter reference and initialize all checkpoint managers."""
         self.rollouter = rollouter
         # Setup checkpoint manager after rollouter is set
-        self._setup_checkpoint_manager()
+        await self._setup_checkpoint_manager()
         await self._setup_hybrid_checkpoint_manager()
 
     def set_total_train_steps(self, total_training_steps):
@@ -541,7 +541,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         if self.config.async_training.use_trainer_do_validate:
             await self._trainer_side_validate()
         else:
-            val_metrics = ray.get(self.rollouter.do_validate.remote())
+            val_metrics = await self.rollouter.do_validate.remote()
             self.logger.log(data=val_metrics, step=self.current_param_version)
 
     async def _trainer_side_validate(self):
@@ -556,9 +556,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         await self.hybrid_checkpoint_manager.update_weights(global_steps=self.current_param_version)
         await self.checkpoint_manager.abort_replicas()
         await self.hybrid_checkpoint_manager.abort_replicas()
-        hybrid_replicas_dict = ray.get(self.rollouter.get_all_hybrid_replicas.remote())
+        hybrid_replicas_dict = await self.rollouter.get_all_hybrid_replicas.remote()
         hybrid_resource_ids = list(hybrid_replicas_dict.keys())
-        ray.get(self.rollouter.add_replicas.remote(hybrid_resource_ids))
+        await self.rollouter.add_replicas.remote(hybrid_resource_ids)
         await self.checkpoint_manager.resume_generation_replicas()
         await self.hybrid_checkpoint_manager.resume_generation_replicas()
         print(f"[FullyAsyncTrainer] Phase 1 done ({time.time() - phase_1_start:.2f}s)")
@@ -567,7 +567,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # Phase 2: Run validation via RPC to rollouter
         # ================================================================
         print("[FullyAsyncTrainer] Phase 2: Running validation")
-        val_metrics = ray.get(self.rollouter.do_validate.remote())
+        val_metrics = await self.rollouter.do_validate.remote()
         self.logger.log(data=val_metrics, step=self.current_param_version)
 
         # ================================================================
@@ -577,7 +577,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         await self.checkpoint_manager.abort_replicas()
         await self.hybrid_checkpoint_manager.abort_replicas()
         # Batch remove all hybrid replicas from the load balancer in a single RPC.
-        ray.get(self.rollouter.remove_replicas.remote(hybrid_resource_ids))
+        await self.rollouter.remove_replicas.remote(hybrid_resource_ids)
         await self.hybrid_checkpoint_manager.sleep_replicas()
         await self.checkpoint_manager.resume_generation_replicas()
         await self.hybrid_checkpoint_manager.resume_generation_replicas()

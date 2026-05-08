@@ -17,10 +17,12 @@ import logging
 import os
 import time
 from pprint import pformat
+from typing import Any, Optional
 
 import numpy as np
 import ray
 import torch
+from omegaconf import DictConfig
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager
 from verl.experimental.fully_async_policy.detach_utils import (
@@ -31,15 +33,331 @@ from verl.experimental.fully_async_policy.detach_utils import (
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.protocol import DataProto
-from verl.single_controller.ray import RayWorkerGroup, ResourcePoolManager
+from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, ResourcePoolManager
 from verl.trainer.ppo.utils import need_reward_model
+from verl.utils import normalize_token_ids
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.profiler import marked_timer
+from verl.utils.rollout_trace import rollout_trace_op
 from verl.utils.tracking import ValidationGenerationsLogger
-from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient, FullyAsyncLLMServerManager
+from verl.workers.rollout.llm_server import LLMServerClient, LLMServerManager
+from verl.workers.rollout.replica import RolloutReplica, TokenOutput
+from verl.workers.rollout.utils import update_prometheus_config
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+class FullyAsyncLLMServerClient(LLMServerClient):
+    """FullyLLMServerClient supports resume generation on partial rollout, making rollout interruption
+    invisible to the AgentLoop.
+    """
+
+    @rollout_trace_op
+    async def generate(
+        self,
+        request_id,
+        *,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
+    ) -> TokenOutput:
+        """Generate tokens from prompt ids.
+
+        Args:
+            request_id (str): request id for sticky session.
+            prompt_ids (List[int]): List of prompt token ids.
+            sampling_params (Dict[str, Any]): Sampling parameters for the chat completion.
+            image_data (Optional[List[Any]]): Image data for the chat completion.
+            video_data (Optional[List[Any]]): Video data for the chat completion.
+
+        Returns:
+            TokenOutput: token output
+        """
+        prompt_ids = normalize_token_ids(prompt_ids)
+
+        limit_key = None
+        if "max_tokens" in sampling_params:
+            limit_key = "max_tokens"
+        elif "max_new_tokens" in sampling_params:
+            limit_key = "max_new_tokens"
+        original_max_tokens = sampling_params.get(limit_key) if limit_key else None
+
+        final_output = TokenOutput(
+            token_ids=[],
+            log_probs=[],
+            num_preempted=0,
+        )
+        min_global_steps, max_global_steps = None, None
+
+        while True:
+            # 1. generate tokens
+            output = await super().generate(
+                request_id=request_id,
+                prompt_ids=prompt_ids + final_output.token_ids,
+                sampling_params=sampling_params,
+                image_data=image_data,
+                video_data=video_data,
+            )
+
+            # 2. merge output into final_output
+            final_output.token_ids.extend(output.token_ids)
+            if output.log_probs is not None:
+                final_output.log_probs.extend(output.log_probs)
+            # On partial rollout resume the model version may differ, so keep
+            # existing routing and only append routing for newly generated tokens.
+            if output.routed_experts is not None and len(output.token_ids) > 0:
+                if final_output.routed_experts is None:
+                    final_output.routed_experts = output.routed_experts
+                else:
+                    final_output.routed_experts = torch.cat(
+                        [final_output.routed_experts, output.routed_experts[-len(output.token_ids) :]],
+                        dim=0,
+                    )
+            if output.num_preempted is not None:
+                final_output.num_preempted += output.num_preempted
+            final_output.stop_reason = output.stop_reason
+
+            # update model weights version
+            global_steps = output.extra_fields.get("global_steps", None)
+            if min_global_steps is None:
+                min_global_steps = global_steps
+            max_global_steps = global_steps
+
+            # 3. update max_new_tokens
+            if original_max_tokens is not None:
+                sampling_params[limit_key] = original_max_tokens - len(final_output.token_ids)
+                if len(final_output.token_ids) >= original_max_tokens:
+                    final_output.stop_reason = "length"
+                    break
+
+            # 4. check stop reason
+            if output.stop_reason not in ("aborted", "abort") or not self.config.async_training.partial_rollout:
+                break
+
+            await asyncio.sleep(1)
+
+        final_output.extra_fields["global_steps"] = global_steps
+        final_output.extra_fields["min_global_steps"] = min_global_steps
+        final_output.extra_fields["max_global_steps"] = max_global_steps
+        return final_output
+
+
+class FullyAsyncLLMServerManager(LLMServerManager):
+    """Extension of :class:`LLMServerManager` for fully async training with hybrid scaling."""
+
+    def __init__(
+        self,
+        config: DictConfig,
+        worker_group: RayWorkerGroup = None,
+        rollout_resource_pool: RayResourcePool = None,
+    ):
+        super().__init__(config, worker_group, rollout_resource_pool)
+        # Pre-registered hybrid replicas: bound at init time but still sleeping.
+        # Keyed by resource_id; populated during _initialize_llm_servers().
+        self.hybrid_replicas: dict[str, RolloutReplica] = {}
+        # Currently active (awake + in LB) subset of hybrid replicas.
+        self.alive_replicas: dict[str, RolloutReplica] = {}
+        # resource_id → server_address for alive hybrid replicas.
+        self.alive_addresses: dict[str, str] = {}
+        # Prometheus server addresses
+        self.prometheus_server_addresses = []
+
+        # Timing / counters
+        self.last_hybrid_add_time: float = 0.0
+        self.last_hybrid_remove_time: float = 0.0
+
+    async def _initialize_llm_servers(self, start_rank: int = 0):
+        # ── Step 1: hybrid replicas first (replica_rank 0 … N_e-1) ──────────
+        # Use parent class to create + init_hybrid all hybrid replicas, then
+        # migrate them from rollup_replicas → hybrid_replicas (sleeping, not
+        # yet in the load balancer).  Starting from rank 0 gives hybrid actors
+        # the lowest-numbered placement-group bundles which are co-located with
+        # the training engine, maximising GPU affinity on multi-node deployments.
+        num_hybrid = 0
+        if self.worker_group is not None:
+            await super()._initialize_llm_servers(start_rank=0)
+            num_hybrid = len(self.rollout_replicas)
+            # Migrate hybrid replicas out of the parent's tracking lists.
+            for i, replica in enumerate(self.rollout_replicas):
+                resource_id = f"hybrid_{i}"
+                self.hybrid_replicas[resource_id] = replica
+                print(
+                    f"[FullyAsyncAgentLoopManager] Hybrid replica '{resource_id}' "
+                    f"(rank={i}) initialised at {replica._server_address} "
+                )
+            self.prometheus_server_addresses.extend(self.server_addresses)
+            print(f"AgentLoopManager Hybrid: {self.server_addresses}")
+            # Clear parent state so Step 2 starts clean.
+            self.rollout_replicas = []
+            self.server_handles = []
+            self.server_addresses = []
+
+        # ── Step 2: standalone replicas via parent class ─────────────────────
+        # Temporarily clear worker_group so that super()._initialize_llm_servers()
+        # takes the standalone branch (init_standalone).  Pass start_rank=num_hybrid
+        # so that Ray actor names remain globally unique and never collide with the
+        # hybrid actors created above.
+        saved_worker_group = self.worker_group
+        self.worker_group = None
+        try:
+            await super()._initialize_llm_servers(start_rank=num_hybrid)
+        finally:
+            self.worker_group = saved_worker_group
+
+        # Update Prometheus with the final (standalone) addresses.
+        if self.rollout_config.prometheus.enable:
+            if self.rollout_config.disable_log_stats:
+                raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
+            all_addresses = self.prometheus_server_addresses + self.server_addresses
+            update_prometheus_config(self.rollout_config.prometheus, all_addresses, self.rollout_config.name)
+
+        print(
+            f"[FullyAsyncLLMServerManager] Created: "
+            f"{len(self.rollout_replicas)} standalone replicas (rank {num_hybrid}+), "
+            f"{num_hybrid} hybrid replicas registered (sleeping, rank 0-{num_hybrid - 1})"
+        )
+
+    async def add_replicas(self, resource_ids: list[str]) -> int:
+        """Activate multiple pre-registered hybrid replicas in a single batch RPC.
+
+        Uses ``batch_add_servers`` on the GlobalRequestLoadBalancer for atomic
+        bulk registration, which is more efficient than calling :meth:`add_replica`
+        in a loop.
+
+        Args:
+            resource_ids: List of resource identifiers to activate.
+
+        Returns:
+            Number of successfully activated replicas.
+        """
+        # Filter out already-active and missing replicas.
+        servers_to_add: dict[str, ray.actor.ActorHandle] = {}
+        valid_resource_ids: list[str] = []
+        for rid in resource_ids:
+            if rid in self.alive_replicas:
+                logger.warning("[FullyAsyncLLMServerManager] Replica '%s' already active, skipping", rid)
+                continue
+            replica = self.hybrid_replicas.get(rid)
+            if replica is None:
+                logger.error(
+                    "[FullyAsyncLLMServerManager] Replica '%s' is not registered, skipping",
+                    rid,
+                )
+                continue
+            servers_to_add[replica._server_address] = replica._server_handle
+            valid_resource_ids.append(rid)
+
+        if not servers_to_add:
+            return 0
+
+        try:
+            # Single atomic batch RPC: register all handles + add all to LB pool.
+            await self.global_load_balancer.add_servers.remote(servers=servers_to_add)
+
+            # Track locally for introspection / Prometheus.
+            for rid in valid_resource_ids:
+                replica = self.hybrid_replicas[rid]
+                server_address = replica._server_address
+                server_handle = replica._server_handle
+                if server_address not in self.server_addresses:
+                    self.server_handles.append(server_handle)
+                    self.server_addresses.append(server_address)
+                if replica not in self.rollout_replicas:
+                    self.rollout_replicas.append(replica)
+                self.alive_replicas[rid] = replica
+                self.alive_addresses[rid] = server_address
+
+            self.last_hybrid_add_time = time.time()
+
+            print(
+                f"[FullyAsyncLLMServerManager] added {len(valid_resource_ids)} replicas: {valid_resource_ids}. "
+                f"Active hybrid replicas ({len(self.alive_replicas)}): {list(self.alive_replicas.keys())}"
+            )
+            return len(valid_resource_ids)
+
+        except Exception as e:
+            logger.error("[FullyAsyncLLMServerManager] Failed to batch activate replicas: %s", e)
+            return 0
+
+    async def remove_replicas(self, resource_ids: list[str]) -> int:
+        """Deactivate multiple active hybrid replicas in a single batch RPC.
+
+        Uses ``batch_remove_servers`` on the GlobalRequestLoadBalancer for atomic
+        bulk removal, which is more efficient than calling :meth:`remove_replica`
+        in a loop.
+
+        Args:
+            resource_ids: List of resource identifiers to deactivate.
+
+        Returns:
+            Number of successfully deactivated replicas.
+        """
+        # Filter out missing replicas and collect server addresses.
+        server_ids_to_remove: list[str] = []
+        valid_resource_ids: list[str] = []
+        for rid in resource_ids:
+            if rid not in self.alive_replicas:
+                logger.warning("[FullyAsyncLLMServerManager] Replica '%s' not active, skipping", rid)
+                continue
+            server_ids_to_remove.append(self.alive_addresses[rid])
+            valid_resource_ids.append(rid)
+
+        if not server_ids_to_remove:
+            return 0
+
+        try:
+            # Single atomic batch RPC: remove all from LB pool + purge handles.
+            await self.global_load_balancer.remove_servers.remote(server_ids=server_ids_to_remove)
+
+            # Clean up local tracking lists.
+            for rid in valid_resource_ids:
+                server_address = self.alive_addresses[rid]
+                replica = self.alive_replicas[rid]
+                if server_address in self.server_addresses:
+                    idx = self.server_addresses.index(server_address)
+                    self.server_addresses.pop(idx)
+                    self.server_handles.pop(idx)
+                if replica in self.rollout_replicas:
+                    self.rollout_replicas.remove(replica)
+                self.alive_replicas.pop(rid)
+                self.alive_addresses.pop(rid)
+
+            self.last_hybrid_remove_time = time.time()
+
+            print(
+                f"[FullyAsyncLLMServerManager] removed {len(valid_resource_ids)} replicas: {valid_resource_ids}. "
+                f"Remaining hybrid replicas ({len(self.alive_replicas)}): {list(self.alive_replicas.keys())}"
+            )
+            return len(valid_resource_ids)
+
+        except Exception as e:
+            logger.error("[FullyAsyncLLMServerManager] Failed to batch remove replicas: %s", e)
+            return 0
+
+    # -------------------------------------------------------------------------
+    # Statistics / introspection
+    # -------------------------------------------------------------------------
+    def get_num_hybrid_replicas(self) -> int:
+        """Return the number of currently active hybrid replicas."""
+        return len(self.alive_replicas)
+
+    def get_hybrid_replicas_info(self) -> list[dict]:
+        """Return metadata for all active hybrid replicas."""
+        return [{"resource_id": rid, "server_address": addr} for rid, addr in self.alive_addresses.items()]
+
+    def get_hybrid_statistics(self) -> dict:
+        """Return hybrid-specific counters for monitoring."""
+        return {
+            "hybrid/num_hybrid_replicas": len(self.alive_replicas),
+            "hybrid/last_add_time": self.last_hybrid_add_time,
+            "hybrid/last_remove_time": self.last_hybrid_remove_time,
+        }
+
+    def get_active_server_count(self) -> int:
+        """Total active rollout servers (standalone + hybrid)."""
+        return len(self.rollout_replicas) + len(self.alive_replicas)
 
 
 class FullyAsyncAgentLoopManager(AgentLoopManager):
