@@ -108,14 +108,24 @@ class GlobalRequestLoadBalancer:
             handle: Optional actor handle.  If provided, also registers it
                 in the internal handle table
         """
-        if server_id in self._inflight_requests:
-            # Still update the handle if a newer one is supplied.
-            if handle is not None:
-                self._servers[server_id] = handle
-            return
         self._inflight_requests[server_id] = 0
         self._servers[server_id] = handle
         logger.info(f"[GlobalLoadBalancer] Added server: {server_id}")
+
+    def batch_add_servers(self, servers: dict[str, ray.actor.ActorHandle]) -> None:
+        """Atomically add multiple servers to the load balancer pool.
+
+        This is more efficient than calling :meth:`add_server` in a loop
+        because it performs a single bulk update on the internal state.
+
+        Args:
+            servers: Dict mapping server_id → actor_handle for all servers
+                to register.
+        """
+        for sid, handle in servers.items():
+            self._inflight_requests[sid] = 0
+            self._servers[sid] = handle
+        logger.info(f"[GlobalLoadBalancer] added {len(servers)} servers")
 
     def remove_server(self, server_id: str) -> None:
         """Remove a server from the load balancer pool.
@@ -128,6 +138,19 @@ class GlobalRequestLoadBalancer:
         self._inflight_requests.pop(server_id, None)
         self._servers.pop(server_id, None)
         logger.info(f"[GlobalLoadBalancer] Removed server: {server_id}")
+
+    def batch_remove_servers(self, server_ids: list[str]) -> None:
+        """Atomically remove multiple servers from the load balancer pool.
+
+        More efficient than calling :meth:`remove_server` in a loop.
+
+        Args:
+            server_ids: List of server identifiers to remove.
+        """
+        for sid in server_ids:
+            self._inflight_requests.pop(sid, None)
+            self._servers.pop(sid, None)
+        logger.info(f"[GlobalLoadBalancer] removed {len(server_ids)} servers")
 
     def get_inflight_count(self, server_id: str) -> int:
         """Get number of in-flight requests for a server."""
@@ -593,95 +616,122 @@ class FullyAsyncLLMServerManager(LLMServerManager):
 
         return num_replicas
 
-    async def add_replica(self, resource_id: str) -> bool:
-        """Activate a pre-registered hybrid replica.
+    async def add_replicas(self, resource_ids: list[str]) -> int:
+        """Activate multiple pre-registered hybrid replicas in a single batch RPC.
 
-        Atomically registers the handle **and** adds the server to the load
-        balancer in a single ``add_server(handle=…)`` call (the LB now holds
-        the merged registry).  No per-client / per-worker notification required.
+        Uses ``batch_add_servers`` on the GlobalRequestLoadBalancer for atomic
+        bulk registration, which is more efficient than calling :meth:`add_replica`
+        in a loop.
+
+        Args:
+            resource_ids: List of resource identifiers to activate.
+
+        Returns:
+            Number of successfully activated replicas.
         """
-        if resource_id in self.alive_replicas:
-            logger.warning("[FullyAsyncLLMServerManager] Replica '%s' already active, skipping", resource_id)
-            return False
+        # Filter out already-active and missing replicas.
+        servers_to_add: dict[str, ray.actor.ActorHandle] = {}
+        valid_resource_ids: list[str] = []
+        for rid in resource_ids:
+            if rid in self.alive_replicas:
+                logger.warning("[FullyAsyncLLMServerManager] Replica '%s' already active, skipping", rid)
+                continue
+            replica = self.hybrid_replicas.get(rid)
+            if replica is None:
+                logger.error(
+                    "[FullyAsyncLLMServerManager] Replica '%s' is not registered, skipping",
+                    rid,
+                )
+                continue
+            servers_to_add[replica._server_address] = replica._server_handle
+            valid_resource_ids.append(rid)
 
-        replica = self.hybrid_replicas.get(resource_id)
-        if replica is None:
-            logger.error(
-                "[FullyAsyncLLMServerManager] Replica '%s' is not registered. "
-                "Hybrid replicas are created inside FullyAsyncLLMServerManager.create() "
-                "via worker_group; ensure that argument was provided.",
-                resource_id,
-            )
-            return False
-
-        server_address = replica._server_address
-        server_handle = replica._server_handle
+        if not servers_to_add:
+            return 0
 
         try:
-            # Single atomic RPC: register handle + add to LB pool.
-            await self.global_load_balancer.add_server.remote(server_id=server_address, handle=server_handle)
-            # Also track locally for introspection / Prometheus.
-            if server_address not in self.server_addresses:
-                self.server_handles.append(server_handle)
-                self.server_addresses.append(server_address)
-            if replica not in self.rollout_replicas:
-                self.rollout_replicas.append(replica)
+            # Single atomic batch RPC: register all handles + add all to LB pool.
+            await self.global_load_balancer.batch_add_servers.remote(servers=servers_to_add)
 
-            self.alive_replicas[resource_id] = replica
-            self.alive_addresses[resource_id] = server_address
+            # Track locally for introspection / Prometheus.
+            for rid in valid_resource_ids:
+                replica = self.hybrid_replicas[rid]
+                server_address = replica._server_address
+                server_handle = replica._server_handle
+                if server_address not in self.server_addresses:
+                    self.server_handles.append(server_handle)
+                    self.server_addresses.append(server_address)
+                if replica not in self.rollout_replicas:
+                    self.rollout_replicas.append(replica)
+                self.alive_replicas[rid] = replica
+                self.alive_addresses[rid] = server_address
+
             self.last_hybrid_add_time = time.time()
 
             print(
-                f"[FullyAsyncLLMServerManager] Replica '{resource_id}' added at {server_address}. "
-                f"Active hybrid replicas: {len(self.alive_replicas)}"
+                f"[FullyAsyncLLMServerManager] added {len(valid_resource_ids)} replicas: {valid_resource_ids}. "
+                f"Active hybrid replicas ({len(self.alive_replicas)}): {list(self.alive_replicas.keys())}"
             )
-            return True
+            return len(valid_resource_ids)
 
         except Exception as e:
-            logger.error("[FullyAsyncLLMServerManager] Failed to activate replica '%s': %s", resource_id, e)
-            return False
+            logger.error("[FullyAsyncLLMServerManager] Failed to batch activate replicas: %s", e)
+            return 0
 
-    async def remove_replica(self, resource_id: str) -> bool:
-        """Deactivate an active hybrid replica.
+    async def remove_replicas(self, resource_ids: list[str]) -> int:
+        """Deactivate multiple active hybrid replicas in a single batch RPC.
 
-        A single ``remove_server()`` call atomically removes the server from
-        the LB pool **and** purges its handle from the internal registry
-        (no separate deregister RPC needed).
+        Uses ``batch_remove_servers`` on the GlobalRequestLoadBalancer for atomic
+        bulk removal, which is more efficient than calling :meth:`remove_replica`
+        in a loop.
 
-        Note: The actual ``abort_all_requests()`` and ``sleep()`` are called by
-        the Trainer AFTER this method returns.
+        Args:
+            resource_ids: List of resource identifiers to deactivate.
+
+        Returns:
+            Number of successfully deactivated replicas.
         """
-        if resource_id not in self.alive_replicas:
-            logger.warning("[FullyAsyncLLMServerManager] Replica %s not found, skipping", resource_id)
-            return False
+        # Filter out missing replicas and collect server addresses.
+        server_ids_to_remove: list[str] = []
+        valid_resource_ids: list[str] = []
+        for rid in resource_ids:
+            if rid not in self.alive_replicas:
+                logger.warning("[FullyAsyncLLMServerManager] Replica '%s' not active, skipping", rid)
+                continue
+            server_ids_to_remove.append(self.alive_addresses[rid])
+            valid_resource_ids.append(rid)
 
-        server_address = self.alive_addresses[resource_id]
-        replica = self.alive_replicas[resource_id]
+        if not server_ids_to_remove:
+            return 0
 
         try:
-            # Single atomic RPC: remove from LB pool + purge handle registry.
-            await self.global_load_balancer.remove_server.remote(server_id=server_address)
-            # Clean up local tracking lists.
-            if server_address in self.server_addresses:
-                idx = self.server_addresses.index(server_address)
-                self.server_addresses.pop(idx)
-                self.server_handles.pop(idx)
-            if replica in self.rollout_replicas:
-                self.rollout_replicas.remove(replica)
+            # Single atomic batch RPC: remove all from LB pool + purge handles.
+            await self.global_load_balancer.batch_remove_servers.remote(server_ids=server_ids_to_remove)
 
-            self.alive_replicas.pop(resource_id)
-            self.alive_addresses.pop(resource_id)
+            # Clean up local tracking lists.
+            for rid in valid_resource_ids:
+                server_address = self.alive_addresses[rid]
+                replica = self.alive_replicas[rid]
+                if server_address in self.server_addresses:
+                    idx = self.server_addresses.index(server_address)
+                    self.server_addresses.pop(idx)
+                    self.server_handles.pop(idx)
+                if replica in self.rollout_replicas:
+                    self.rollout_replicas.remove(replica)
+                self.alive_replicas.pop(rid)
+                self.alive_addresses.pop(rid)
+
             self.last_hybrid_remove_time = time.time()
 
             print(
-                f"[FullyAsyncLLMServerManager] Replica {resource_id} at {server_address} removed. "
-                f"Total hybrid: {len(self.alive_replicas)}"
+                f"[FullyAsyncLLMServerManager] removed {len(valid_resource_ids)} replicas: {valid_resource_ids}. "
+                f"Remaining hybrid replicas ({len(self.alive_replicas)}): {list(self.alive_replicas.keys())}"
             )
-            return True
+            return len(valid_resource_ids)
 
         except Exception as e:
-            logger.error("[FullyAsyncLLMServerManager] Failed to remove replica %s: %s", resource_id, e)
-            return False
+            logger.error("[FullyAsyncLLMServerManager] Failed to batch remove replicas: %s", e)
+            return 0
 
     # -------------------------------------------------------------------------
     # Statistics / introspection

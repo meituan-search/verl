@@ -797,17 +797,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         """Return the worker group for hybrid replicas."""
         return self._hybrid_worker_group
 
-    # -------------------------------------------------------------------------
-    # Elastic replica management – thin delegation to llm_server_manager
-    # (FullyAsyncLLMServerManager owns hybrid lifecycle)
-    # -------------------------------------------------------------------------
-    async def add_replica(self, resource_id: str):
-        """Activate a pre-registered hybrid replica."""
-        await self.llm_server_manager.add_replica(resource_id)
+    async def add_replicas(self, resource_ids: list[str]) -> int:
+        return await self.llm_server_manager.add_replicas(resource_ids)
 
-    async def remove_replica(self, resource_id: str):
-        """Deactivate an active hybrid replica."""
-        await self.llm_server_manager.remove_replica(resource_id)
+    async def remove_replicas(self, resource_ids: list[str]) -> int:
+        return await self.llm_server_manager.remove_replicas(resource_ids)
 
     def get_hybrid_replica(self, resource_id: str):
         """Return the RolloutReplica object for a registered hybrid resource."""

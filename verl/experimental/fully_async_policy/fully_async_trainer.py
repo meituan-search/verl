@@ -558,8 +558,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         await self.hybrid_checkpoint_manager.abort_replicas()
         hybrid_replicas_dict = ray.get(self.rollouter.get_all_hybrid_replicas.remote())
         hybrid_resource_ids = list(hybrid_replicas_dict.keys())
-        for resource_id in hybrid_resource_ids:
-            ray.get(self.rollouter.add_replica.remote(resource_id))
+        ray.get(self.rollouter.add_replicas.remote(hybrid_resource_ids))
         await self.checkpoint_manager.resume_generation_replicas()
         await self.hybrid_checkpoint_manager.resume_generation_replicas()
         print(f"[FullyAsyncTrainer] Phase 1 done ({time.time() - phase_1_start:.2f}s)")
@@ -577,8 +576,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         print("[FullyAsyncTrainer] Phase 3: Switching hybrid GPUs back to TRAIN mode")
         await self.checkpoint_manager.abort_replicas()
         await self.hybrid_checkpoint_manager.abort_replicas()
-        for resource_id in hybrid_resource_ids:
-            ray.get(self.rollouter.remove_replica.remote(resource_id))
+        # Batch remove all hybrid replicas from the load balancer in a single RPC.
+        ray.get(self.rollouter.remove_replicas.remote(hybrid_resource_ids))
         await self.hybrid_checkpoint_manager.sleep_replicas()
         await self.checkpoint_manager.resume_generation_replicas()
         await self.hybrid_checkpoint_manager.resume_generation_replicas()
