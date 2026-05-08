@@ -100,19 +100,7 @@ class GlobalRequestLoadBalancer:
         if self._inflight_requests[server_id] > 0:
             self._inflight_requests[server_id] -= 1
 
-    def add_server(self, server_id: str, handle: ray.actor.ActorHandle) -> None:
-        """Add a new server to the load balancer pool.
-
-        Args:
-            server_id: Server identifier (typically the server address).
-            handle: Optional actor handle.  If provided, also registers it
-                in the internal handle table
-        """
-        self._inflight_requests[server_id] = 0
-        self._servers[server_id] = handle
-        logger.info(f"[GlobalLoadBalancer] Added server: {server_id}")
-
-    def batch_add_servers(self, servers: dict[str, ray.actor.ActorHandle]) -> None:
+    def add_servers(self, servers: dict[str, ray.actor.ActorHandle]) -> None:
         """Atomically add multiple servers to the load balancer pool.
 
         This is more efficient than calling :meth:`add_server` in a loop
@@ -127,19 +115,7 @@ class GlobalRequestLoadBalancer:
             self._servers[sid] = handle
         logger.info(f"[GlobalLoadBalancer] added {len(servers)} servers")
 
-    def remove_server(self, server_id: str) -> None:
-        """Remove a server from the load balancer pool.
-
-        Immediately removes the server.  Also removes the
-        associated handle from the internal registry.  In-flight requests
-        that finish after removal will be silently ignored by
-        :meth:`release_server`.
-        """
-        self._inflight_requests.pop(server_id, None)
-        self._servers.pop(server_id, None)
-        logger.info(f"[GlobalLoadBalancer] Removed server: {server_id}")
-
-    def batch_remove_servers(self, server_ids: list[str]) -> None:
+    def remove_servers(self, server_ids: list[str]) -> None:
         """Atomically remove multiple servers from the load balancer pool.
 
         More efficient than calling :meth:`remove_server` in a loop.
@@ -377,8 +353,16 @@ class LLMServerManager:
         await instance._init_global_load_balancer()
         return instance
 
-    async def _initialize_llm_servers(self):
-        """Initialize the LLM server replicas."""
+    async def _initialize_llm_servers(self, start_rank: int = 0):
+        """Initialize the LLM server replicas.
+
+        Args:
+            start_rank: First ``replica_rank`` to assign.  Defaults to 0 so that
+                existing callers are unaffected.  Subclasses (e.g.
+                ``FullyAsyncLLMServerManager``) may pass a non-zero value to avoid
+                Ray named-actor collisions when hybrid and standalone replicas
+                coexist.
+        """
         rollout_world_size = (
             self.rollout_config.tensor_model_parallel_size
             * self.rollout_config.data_parallel_size
@@ -409,7 +393,7 @@ class LLMServerManager:
 
         self.rollout_replicas = [
             self.rollout_replica_class(
-                replica_rank=replica_rank,
+                replica_rank=start_rank + replica_rank,
                 config=self.rollout_config,
                 model_config=self.model_config,
                 gpus_per_node=self.rollout_config.n_gpus_per_node,
@@ -469,11 +453,6 @@ class LLMServerManager:
         return self.rollout_replicas
 
     @auto_await
-    async def clear_kv_cache(self):
-        """Clear all rollout kv cache, but don`t sleep."""
-        await asyncio.gather(*[replica.clear_kv_cache() for replica in self.rollout_replicas])
-
-    @auto_await
     async def start_profile(self, **kwargs):
         """Start profiling on all rollout replicas."""
         await asyncio.gather(*[replica.start_profile(**kwargs) for replica in self.rollout_replicas])
@@ -508,113 +487,56 @@ class FullyAsyncLLMServerManager(LLMServerManager):
         self.last_hybrid_add_time: float = 0.0
         self.last_hybrid_remove_time: float = 0.0
 
-    async def _initialize_llm_servers(self):
+    async def _initialize_llm_servers(self, start_rank: int = 0):
         # ── Step 1: hybrid replicas first (replica_rank 0 … N_e-1) ──────────
-        # Initialise and immediately sleep them so the training engine can
-        # reclaim GPU memory.  Starting from rank 0 gives hybrid actors the
-        # lowest-numbered placement-group bundles which are co-located with the
-        # training engine, maximising GPU affinity on multi-node deployments.
+        # Use parent class to create + init_hybrid all hybrid replicas, then
+        # migrate them from rollup_replicas → hybrid_replicas (sleeping, not
+        # yet in the load balancer).  Starting from rank 0 gives hybrid actors
+        # the lowest-numbered placement-group bundles which are co-located with
+        # the training engine, maximising GPU affinity on multi-node deployments.
         num_hybrid = 0
         if self.worker_group is not None:
-            num_hybrid = await self._initialize_replicas(start_rank=0, worker_group=self.worker_group)
+            await super()._initialize_llm_servers(start_rank=0)
+            num_hybrid = len(self.rollout_replicas)
+            # Migrate hybrid replicas out of the parent's tracking lists.
+            for i, replica in enumerate(self.rollout_replicas):
+                resource_id = f"hybrid_{i}"
+                self.hybrid_replicas[resource_id] = replica
+                print(
+                    f"[FullyAsyncAgentLoopManager] Hybrid replica '{resource_id}' "
+                    f"(rank={i}) initialised at {replica._server_address} "
+                )
+            self.prometheus_server_addresses.extend(self.server_addresses)
+            print(f"AgentLoopManager Hybrid: {self.server_addresses}")
+            # Clear parent state so Step 2 starts clean.
+            self.rollout_replicas = []
+            self.server_handles = []
+            self.server_addresses = []
 
-        # ── Step 2: standalone replicas (replica_rank N_e … N_e+N_f-1) ───────────
-        # start_rank=num_hybrid ensures the Ray actor names (e.g.
-        # server_{rank}_{node}) are globally unique and never collide
-        # with the hybrid actors created above.
-        await self._initialize_replicas(start_rank=num_hybrid)
+        # ── Step 2: standalone replicas via parent class ─────────────────────
+        # Temporarily clear worker_group so that super()._initialize_llm_servers()
+        # takes the standalone branch (init_standalone).  Pass start_rank=num_hybrid
+        # so that Ray actor names remain globally unique and never collide with the
+        # hybrid actors created above.
+        saved_worker_group = self.worker_group
+        self.worker_group = None
+        try:
+            await super()._initialize_llm_servers(start_rank=num_hybrid)
+        finally:
+            self.worker_group = saved_worker_group
+
+        # Update Prometheus with the final (standalone) addresses.
+        if self.rollout_config.prometheus.enable:
+            if self.rollout_config.disable_log_stats:
+                raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
+            all_addresses = self.prometheus_server_addresses + self.server_addresses
+            update_prometheus_config(self.rollout_config.prometheus, all_addresses, self.rollout_config.name)
 
         print(
             f"[FullyAsyncLLMServerManager] Created: "
             f"{len(self.rollout_replicas)} standalone replicas (rank {num_hybrid}+), "
             f"{num_hybrid} hybrid replicas registered (sleeping, rank 0-{num_hybrid - 1})"
         )
-
-    async def _initialize_replicas(
-        self,
-        start_rank: int = 0,
-        worker_group: RayWorkerGroup = None,
-    ) -> int:
-        """
-        Create, initialise (init_hybrid), and sleep hybrid replicas.
-
-        Called internally by create() when hybrid_worker_group is provided.
-        Each replica is assigned a contiguous slice of workers from
-        hybrid_worker_group, and its ``replica_rank`` starts at ``start_rank``
-        so that it is globally unique across both hybrid and standalone replicas
-        (avoiding Ray named-actor collisions such as ``sglang_server_0_0``).
-
-        After init_hybrid() the replica is immediately put to sleep so that
-        The replica is stored in
-        hybrid_replicas keyed by "hybrid_{i}" (0-indexed within
-        the hybrid group) and can be activated later via add_replica().
-
-        Args:
-            worker_group: Worker group whose workers back the hybrid
-                hybrid replicas.  Must already be fully initialised.
-            start_rank: First global ``replica_rank`` to assign.  Pass 0 so
-                that hybrid actors occupy the lowest-numbered Ray actor names
-                and therefore the best GPU affinity in multi-node deployments.
-
-        Returns:
-            Number of hybrid replicas created (so the caller can pass
-            ``start_rank=num_hybrid`` to ``_initialize_llm_servers``).
-        """
-        rollout_world_size = (
-            self.rollout_config.tensor_model_parallel_size
-            * self.rollout_config.data_parallel_size
-            * self.rollout_config.pipeline_model_parallel_size
-        )
-
-        world_size = (
-            worker_group.world_size
-            if worker_group
-            else self.rollout_config.n_gpus_per_node * self.rollout_config.nnodes
-        )
-
-        num_replicas = world_size // rollout_world_size
-
-        tmp_replicas = [
-            self.rollout_replica_class(
-                replica_rank=start_rank + i,
-                config=self.rollout_config,
-                model_config=self.model_config,
-                gpus_per_node=self.rollout_config.n_gpus_per_node,
-            )
-            for i in range(num_replicas)
-        ]
-
-        if worker_group:
-            await asyncio.gather(*[replica.init_hybrid(worker_group) for replica in tmp_replicas])
-            # Register hybrid replicas.
-            for i, replica in enumerate(tmp_replicas):
-                resource_id = f"hybrid_{i}"
-                self.hybrid_replicas[resource_id] = replica
-                print(
-                    f"[FullyAsyncAgentLoopManager] Hybrid replica '{resource_id}' "
-                    f"(rank={start_rank + i}) initialised at {replica._server_address} "
-                )
-            hybrid_addresses = [replica._server_address for replica in tmp_replicas]
-            self.prometheus_server_addresses.extend(hybrid_addresses)
-            print(f"AgentLoopManager Hybrid: {hybrid_addresses}")
-        else:
-            self.rollout_replicas = tmp_replicas
-            await asyncio.gather(*[replica.init_standalone() for replica in self.rollout_replicas])
-            self.server_handles = [replica._server_handle for replica in self.rollout_replicas]
-            self.server_addresses = [replica._server_address for replica in self.rollout_replicas]
-            self.prometheus_server_addresses.extend(self.server_addresses)
-            print(f"AgentLoopManager Standalone: {self.server_addresses}")
-
-        # Update Prometheus configuration with server addresses
-        if self.rollout_config.prometheus.enable:
-            if self.rollout_config.disable_log_stats:
-                raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
-            print(f"Prometheus: {self.prometheus_server_addresses}")
-            update_prometheus_config(
-                self.rollout_config.prometheus, self.prometheus_server_addresses, self.rollout_config.name
-            )
-
-        return num_replicas
 
     async def add_replicas(self, resource_ids: list[str]) -> int:
         """Activate multiple pre-registered hybrid replicas in a single batch RPC.
@@ -651,7 +573,7 @@ class FullyAsyncLLMServerManager(LLMServerManager):
 
         try:
             # Single atomic batch RPC: register all handles + add all to LB pool.
-            await self.global_load_balancer.batch_add_servers.remote(servers=servers_to_add)
+            await self.global_load_balancer.add_servers.remote(servers=servers_to_add)
 
             # Track locally for introspection / Prometheus.
             for rid in valid_resource_ids:
@@ -706,7 +628,7 @@ class FullyAsyncLLMServerManager(LLMServerManager):
 
         try:
             # Single atomic batch RPC: remove all from LB pool + purge handles.
-            await self.global_load_balancer.batch_remove_servers.remote(server_ids=server_ids_to_remove)
+            await self.global_load_balancer.remove_servers.remote(server_ids=server_ids_to_remove)
 
             # Clean up local tracking lists.
             for rid in valid_resource_ids:
