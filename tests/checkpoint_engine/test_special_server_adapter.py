@@ -21,12 +21,13 @@ from transformers import PreTrainedTokenizer
 
 from tests.checkpoint_engine.test_utils import create_trainer_worker_group
 from verl.checkpoint_engine import CheckpointEngineManager
+from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncLLMServerClient
 from verl.single_controller.ray import (
     RayResourcePool,
 )
 from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config import CheckpointEngineConfig, HFModelConfig
-from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient, LLMServerClient, LLMServerManager
+from verl.workers.rollout.llm_server import LLMServerClient, LLMServerManager
 
 
 @pytest.fixture
