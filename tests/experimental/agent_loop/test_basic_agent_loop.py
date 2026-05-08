@@ -477,14 +477,14 @@ class TestLoadBalancerHybrid:
 
     def test_add_server(self, ray_for_lb):
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None})
-        ray.get(lb.add_server.remote(server_id="s2", handle=None))
+        ray.get(lb.add_servers.remote(servers={"s2": None}))
         status = ray.get(lb.get_status.remote())
         assert "s2" in status["servers"]
         assert status["servers"]["s2"] == 0
 
     def test_remove_server_purges_handle(self, ray_for_lb):
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None})
-        ray.get(lb.remove_server.remote(server_id="s1"))
+        ray.get(lb.remove_servers.remote(server_ids=["s1"]))
         # remove_server now purges from both _inflight_requests and _servers
         status = ray.get(lb.get_status.remote())
         assert "s1" not in status["servers"]
@@ -503,15 +503,15 @@ class TestLoadBalancerHybrid:
         assert s1 == "s1"
         ray.get(lb.release_server.remote(server_id=s1))
         # Remove s1
-        ray.get(lb.remove_server.remote(server_id="s1"))
+        ray.get(lb.remove_servers.remote(server_ids=["s1"]))
         # Sticky session should be invalidated and reroute to s0
         s_new = ray.get(lb.acquire_server.remote(request_id="sticky-req"))[0]
         assert s_new == "s0"
 
     def test_remove_server_also_purges_registry(self, ray_for_lb):
-        """remove_server atomically purges from both LB pool and handle registry."""
+        """remove_servers atomically purges from both LB pool and handle registry."""
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None})
-        ray.get(lb.remove_server.remote(server_id="s1"))
+        ray.get(lb.remove_servers.remote(server_ids=["s1"]))
         status = ray.get(lb.get_status.remote())
         # Both _inflight_requests and _servers are cleaned up (no separate cleanup step needed)
         assert "s1" not in status["servers"]
@@ -519,7 +519,7 @@ class TestLoadBalancerHybrid:
 
     def test_get_all_servers_excludes_removed(self, ray_for_lb):
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None, "s2": None})
-        ray.get(lb.remove_server.remote(server_id="s1"))
+        ray.get(lb.remove_servers.remote(server_ids=["s1"]))
         all_servers = ray.get(lb.get_all_servers.remote())
         assert "s0" in all_servers
         assert "s2" in all_servers
@@ -527,19 +527,18 @@ class TestLoadBalancerHybrid:
 
     def test_no_available_servers_raises(self, ray_for_lb):
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None})
-        ray.get(lb.remove_server.remote(server_id="s0"))
-        ray.get(lb.remove_server.remote(server_id="s1"))
+        ray.get(lb.remove_servers.remote(server_ids=["s0", "s1"]))
         with pytest.raises(ray.exceptions.RayTaskError, match="No available servers"):
             ray.get(lb.acquire_server.remote(request_id="r1"))
 
     def test_add_server_readds_previously_removed(self, ray_for_lb):
         """Re-adding a previously removed server makes it routable again."""
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None})
-        ray.get(lb.remove_server.remote(server_id="s1"))
+        ray.get(lb.remove_servers.remote(server_ids=["s1"]))
         # s1 is removed, only s0 is available
         assert ray.get(lb.acquire_server.remote(request_id="r1"))[0] == "s0"
         # Re-add s1
-        ray.get(lb.add_server.remote(server_id="s1", handle=None))
+        ray.get(lb.add_servers.remote(servers={"s1": None}))
         # Now both s0 and s1 should be available
         s = ray.get(lb.acquire_server.remote(request_id="r2"))[0]
         assert s in ("s0", "s1")
@@ -552,7 +551,7 @@ class TestLoadBalancerHybrid:
 
     def test_get_status_reports_active_correctly(self, ray_for_lb):
         lb = GlobalRequestLoadBalancer.remote(servers={"s0": None, "s1": None, "s2": None})
-        ray.get(lb.remove_server.remote(server_id="s1"))
+        ray.get(lb.remove_servers.remote(server_ids=["s1"]))
         status = ray.get(lb.get_status.remote())
         assert status["active_servers"] == 2  # s0 and s2
         assert status["total_inflight"] == 0
