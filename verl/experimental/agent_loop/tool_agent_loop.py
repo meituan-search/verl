@@ -16,7 +16,7 @@ import json
 import logging
 import os
 from enum import Enum
-from typing import Any
+from typing import Any, Optional
 from uuid import uuid4
 
 import torch
@@ -25,11 +25,13 @@ from PIL import Image
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopBase,
     AgentLoopOutput,
+    FunctionToolListWrap,
     register,
 )
 from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
 from verl.experimental.agent_loop.utils import build_gpt_oss_tool_response_text
 from verl.tools.schemas import ToolResponse
+from verl.tools.utils.function_tool import FunctionTool, normalize_function_tool_return
 from verl.tools.utils.tool_registry import initialize_tools_from_config
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
@@ -87,7 +89,15 @@ class AgentData:
 
 @register("tool_agent")
 class ToolAgentLoop(AgentLoopBase):
-    def __init__(self, *args, **kwargs):
+    # TODO: all tools should be initialized in agent loop worker once
+    def __init__(self, *args, function_tools: Optional[FunctionToolListWrap] = None, **kwargs):
+        """Initialize the tool-agent loop.
+
+        Args:
+            function_tools: Function-based tools from
+                ``rollout.multi_turn.function_tool_path``, wrapped in
+                :class:`FunctionToolListWrap`.
+        """
         super().__init__(*args, **kwargs)
 
         # Initialize tools from config file
@@ -98,6 +108,17 @@ class ToolAgentLoop(AgentLoopBase):
         self.tool_response_truncate_side = self.rollout_config.multi_turn.tool_response_truncate_side
         tool_config_path = self.rollout_config.multi_turn.tool_config_path
         tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
+        function_tool_list = function_tools.function_tools if function_tools else []
+        # TODO: move this to agent loop worker after refactoring native/mcp tools
+        if function_tool_list:
+            existing_names = {tool.name for tool in tool_list}
+            collisions = sorted(t.name for t in function_tool_list if t.name in existing_names)
+            assert not collisions, (
+                f"Function tool name(s) {collisions} collide with tools already declared in "
+                f"'{tool_config_path}'. Each tool name must be unique across `tool_config_path` "
+                f"and `function_tool_path`; rename one of them."
+            )
+            tool_list.extend(function_tool_list)
         self.tools = {tool.name: tool for tool in tool_list}
         self.tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list]
         self.tool_parser = ToolParser.get_tool_parser(self.rollout_config.multi_turn.format, self.tokenizer)
@@ -356,7 +377,13 @@ class ToolAgentLoop(AgentLoopBase):
     async def _call_tool(
         self, tool_call: FunctionCall, tools_kwargs: dict[str, Any], agent_data: AgentData
     ) -> tuple[ToolResponse, float, dict]:
-        """Call tool and return tool response."""
+        """Call tool and return tool response.
+
+        Dispatches between two contracts:
+        - ``FunctionTool``: stateless function-based tool. Invoked directly with
+          parsed arguments; no lifecycle.
+        - ``BaseTool`` subclass: stateful tool with full lifecycle.
+        """
         active_tools = getattr(agent_data, "_active_tools", self.tools)
 
         # Validate tool name
@@ -379,16 +406,27 @@ class ToolAgentLoop(AgentLoopBase):
         tool, instance_id = None, None
         try:
             tool = active_tools[tool_name]
-            kwargs = tools_kwargs.get(tool_name, {})
-            instance_id, _ = await tool.create(create_kwargs=kwargs.get("create_kwargs", {}))
-            tool_execution_response, tool_reward, res = await tool.execute(
-                instance_id, tool_args, agent_data=agent_data
-            )
+
+            if isinstance(tool, FunctionTool):
+                # Function-based tools have no lifecycle; call directly.
+                # Note: tools_kwargs (create_kwargs / release_kwargs) is intentionally
+                # ignored here. Function tools are stateless and per-trajectory state
+                # injection is not supported by design; use a BaseTool subclass instead.
+                raw = await tool.call(tool_args)
+                tool_execution_response, tool_reward, res = normalize_function_tool_return(raw)
+            else:
+                # BaseTool subclass
+                kwargs = tools_kwargs.get(tool_name, {})
+                instance_id, _ = await tool.create(create_kwargs=kwargs.get("create_kwargs", {}))
+                tool_execution_response, tool_reward, res = await tool.execute(
+                    instance_id, tool_args, agent_data=agent_data
+                )
         except Exception as e:
             logger.warning(f"Error executing tool '{tool_name}': {e}")
             return ToolResponse(text=f"Error executing tool '{tool_name}': {e}"), 0.0, {}
         finally:
-            if tool and instance_id:
+            # Only BaseTool instances need release (function tools never set instance_id).
+            if tool and instance_id and not isinstance(tool, FunctionTool):
                 await tool.release(instance_id)
 
         tool_response_text = tool_execution_response.text

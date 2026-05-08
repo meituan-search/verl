@@ -93,7 +93,7 @@ permissions:
   contents: read
 
 env:
-  IMAGE: "verl-ci-cn-beijing.cr.volces.com/verlai/verl:trtllm1.3.0rc13"
+  IMAGE: "verl-ci-cn-beijing.cr.volces.com/verlai/verl:trtllm1.3.0rc13-20250504"
   DYNAMIC_RUNNER_ENDPOINT: "https://sd10g3clalm04ug7alq90.apigateway-cn-beijing.volceapi.com/runner"
 
 jobs:
@@ -222,6 +222,8 @@ jobs:
         run: |
           pip3 install -r requirements-test.txt
           pip3 install --no-deps -e .
+          # WAR: CI image predates mbridge cf71117 (removes `imp` for Python 3.12). Drop this line after CI image is refreshed.
+          pip3 install --force-reinstall --no-deps --no-build-isolation git+https://github.com/ISEEKYAN/mbridge.git
       - name: Prepare GSM8K dataset
         run: |
           python3 examples/data_preprocess/gsm8k.py --local_dataset_path ${HOME}/models/hf_data/gsm8k --local_save_dir ${PWD}/data/gsm8k
@@ -273,23 +275,33 @@ jobs:
         run: |
           pip3 install -r requirements-test.txt
           pip3 install --no-deps -e .
-          pip3 install qwen_vl_utils 
+          pip3 install qwen_vl_utils
           pip3 install mathruler
+          # WAR: CI image predates mbridge cf71117 (removes `imp` for Python 3.12). Drop this line after CI image is refreshed.
+          pip3 install --force-reinstall --no-deps --no-build-isolation git+https://github.com/ISEEKYAN/mbridge.git
       - name: Prepare GEO3K dataset
         run: |
           python3 examples/data_preprocess/geo3k.py --local_dataset_path ${HOME}/models/hf_data/hiyouga/geometry3k --local_save_dir ${PWD}/data/geo3k
-      # FIXME: timeout in 30 minutes
-      # - name: Running GEO3K E2E training tests with FSDP on 8 L20 GPUs (VLM)
-      #   run: |
-      #     ray stop --force
-      #     ROLLOUT_TP=2 \
-      #     INFER_BACKEND=trtllm \
-      #     MODEL_PATH="${HOME}/models/Qwen/Qwen3-VL-2B-Instruct" \
-      #       bash examples/grpo_trainer/run_qwen2_5_vl_7b_fsdp.sh \
-      #       trainer.total_training_steps=1 \
-      #       data.train_files="['${PWD}/data/geo3k/train.parquet']" \
-      #       data.val_files="['${PWD}/data/geo3k/test.parquet']" \
-      #       trainer.logger='["console"]'
+      - name: Running GEO3K E2E training tests with FSDP on 8 L20 GPUs (VLM)
+        run: |
+          ray stop --force
+          ROLLOUT_TP=2 \
+          INFER_BACKEND=trtllm \
+          MODEL_PATH="${HOME}/models/Qwen/Qwen3-VL-2B-Instruct" \
+            bash examples/grpo_trainer/run_qwen2_5_vl_7b_fsdp.sh \
+            trainer.total_training_steps=1 \
+            data.train_batch_size=8 \
+            data.max_response_length=64 \
+            actor_rollout_ref.actor.ppo_mini_batch_size=8 \
+            actor_rollout_ref.actor.ppo_max_token_len_per_gpu=2048 \
+            actor_rollout_ref.rollout.n=2 \
+            actor_rollout_ref.rollout.gpu_memory_utilization=0.35 \
+            actor_rollout_ref.rollout.max_model_len=2048 \
+            actor_rollout_ref.rollout.max_num_seqs=16 \
+            actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=2048 \
+            data.train_files="['${PWD}/data/geo3k/train.parquet']" \
+            data.val_files="['${PWD}/data/geo3k/test.parquet']" \
+            trainer.logger='["console"]'
       - name: clean up
         run: |
           rm -rf checkpoints
