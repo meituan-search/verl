@@ -399,6 +399,19 @@ class TRTLLMHttpServer:
         """Invalidate prefix cache entries after weight update."""
         await self.llm.collective_rpc("reset_prefix_cache")
 
+    async def release_kv_cache(self):
+        """Release only kv_cache GPU memory, keeping model weights intact.
+
+        This is used during weight sync to free GPU memory for new weights.
+        """
+        if not self.config.free_cache_engine:
+            return
+        await self.llm.release(tags=["kv_cache"])
+
+    async def resume_kv_cache(self):
+        """Restore kv_cache GPU memory after a weight sync. Counterpart to release_kv_cache()."""
+        await self.llm.resume(tags=["kv_cache"])
+
     async def wake_up(self):
         from verl.workers.rollout.trtllm_rollout.trtllm_rollout import ServerAdapter
 
