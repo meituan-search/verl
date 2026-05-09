@@ -352,6 +352,17 @@ actor_rollout_ref:
       transfer_backend: nixl
       bootstrap_port: null
       ib_device: null
+    load_balance:
+      _target_: verl.workers.config.LoadBalanceConfig
+      strategy: least_inflight
+      router:
+        _target_: verl.workers.config.SGLangRouterConfig
+        policy: cache_aware
+        cache_threshold: 0.3
+        balance_abs_threshold: 64
+        balance_rel_threshold: 1.5
+        health_check_interval_secs: 60
+        decode_policy: power_of_two
   model:
     _target_: verl.workers.config.HFModelConfig
     path: ~/models/deepseek-llm-7b-chat

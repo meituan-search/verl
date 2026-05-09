@@ -24,6 +24,7 @@ import os
 from typing import Any, Optional
 from uuid import uuid4
 
+import aiohttp
 import ray
 import torch
 from cachetools import LRUCache
@@ -85,29 +86,112 @@ class GlobalRequestLoadBalancer:
         raise NotImplementedError("Not implemented")
 
 
-class LLMServerClient:
+def _parse_token_output(data: dict) -> TokenOutput:
+    """Parse a sglang /generate HTTP response dict into a TokenOutput.
+
+    sglang response shape::
+
+        {
+          "output_ids": [101, 202, ...],
+          "meta_info": {
+            "finish_reason": {"type": "stop"},
+            "output_token_logprobs": [[logprob, token_id, rank], ...],
+            "num_preempted": 0,
+            "routed_experts": null,
+            "global_steps": 42,
+            "input_token_logprobs": [...],
+            "input_top_logprobs": [...]
+          }
+        }
     """
-    A class to manage multiple OpenAI compatible LLM servers. This class provides
-    - Load balance: least in-flight requests load balancing via global coordination
-    - Sticky session: send multi-turn chat completions to same server for automatic prefix caching
+    meta_info = data.get("meta_info", {})
+    token_ids = list(data.get("output_ids", []))
+
+    log_probs = None
+    output_token_logprobs = meta_info.get("output_token_logprobs") or []
+    if output_token_logprobs and len(output_token_logprobs) == len(token_ids):
+        log_probs = [float(lp) for lp, _, _ in output_token_logprobs]
+
+    finish_reason = meta_info.get("finish_reason")
+    stop_reason = finish_reason["type"] if finish_reason else None
+
+    routed_experts = meta_info.get("routed_experts")
+    if routed_experts is not None:
+        routed_experts = torch.tensor(routed_experts)
+
+    num_preempted = meta_info.get("num_preempted", 0)
+
+    extra_fields: dict[str, Any] = {}
+    global_steps = meta_info.get("global_steps")
+    if global_steps is not None:
+        extra_fields["global_steps"] = global_steps
+
+    return TokenOutput(
+        token_ids=token_ids,
+        log_probs=log_probs,
+        routed_experts=routed_experts,
+        stop_reason=stop_reason,
+        num_preempted=num_preempted,
+        extra_fields=extra_fields,
+    )
+
+
+class LLMServerClient:
+    """Proxy client for one or more sglang servers.
+
+    Supports two routing modes selected at construction time:
+
+    * **least_inflight** (default): routes via ``GlobalRequestLoadBalancer`` Ray actor
+      using in-flight request counts + LRU sticky session.
+    * **sglang_router**: routes via the sgl-model-gateway Rust Router HTTP endpoint;
+      sticky session is handled by the Router's prefix-cache-aware policy.
     """
 
     def __init__(
         self,
         config: DictConfig,
-        servers: dict[str, ray.actor.ActorHandle],
-        load_balancer_handle: ray.actor.ActorHandle,
+        # least_inflight mode
+        servers: Optional[dict[str, ray.actor.ActorHandle]] = None,
+        load_balancer_handle: Optional[ray.actor.ActorHandle] = None,
+        # sglang_router mode
+        router_address: Optional[str] = None,
     ):
-        """Initialize the LLMServerClient.
-
-        Args:
-            config (DictConfig): whole config for main entrypoint.
-            servers (dict[str, ray.actor.ActorHandle]): handle for each LLM server.
-            load_balancer_handle (ray.actor.ActorHandle): shared global load balancer actor.
-        """
         self.config = config
+        # sglang_router path
+        self._router_address = router_address
+        # least_inflight path
         self._load_balancer = load_balancer_handle
-        self._server_id_to_handle: dict[str, ray.actor.ActorHandle] = servers
+        self._server_id_to_handle: dict[str, ray.actor.ActorHandle] = servers or {}
+        # aiohttp session for Router path (lazy-initialised inside async context)
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._session_lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------
+    # aiohttp session helpers (Router path only)
+    # ------------------------------------------------------------------
+
+    async def _get_or_create_session(self) -> aiohttp.ClientSession:
+        async with self._session_lock:
+            if self._session is None or self._session.closed:
+                connector = aiohttp.TCPConnector(
+                    limit=2000,
+                    limit_per_host=500,
+                    ttl_dns_cache=300,
+                )
+                self._session = aiohttp.ClientSession(
+                    connector=connector,
+                    timeout=aiohttp.ClientTimeout(total=600.0),
+                )
+        return self._session
+
+    async def close(self) -> None:
+        """Close the aiohttp session. Call from LLMServerManager on shutdown."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    # ------------------------------------------------------------------
+    # least_inflight path helpers
+    # ------------------------------------------------------------------
 
     async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
         server_id = await self._load_balancer.acquire_server.remote(request_id=request_id)
@@ -118,8 +202,102 @@ class LLMServerClient:
 
     def _release_server(self, server_id: str) -> None:
         # Fire-and-forget: release is just a counter decrement, no need to await.
-        # Awaiting here risks blocking the finally clause if the LB actor is unresponsive.
         self._load_balancer.release_server.remote(server_id=server_id)
+
+    # ------------------------------------------------------------------
+    # Router path: HTTP generate
+    # ------------------------------------------------------------------
+
+    async def _generate_via_router(
+        self,
+        request_id: str,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        image_data: Optional[list[Any]],
+        video_data: Optional[list[Any]],
+        **kwargs: Any,
+    ) -> TokenOutput:
+        url = f"{self._router_address}/generate"
+
+        # Translate vLLM-style prompt_logprobs / logprobs to sglang params before
+        # building the payload so the keys are never forwarded raw.
+        sampling_params = dict(sampling_params)  # shallow copy – do not mutate caller's dict
+        prompt_logprobs = sampling_params.pop("prompt_logprobs", None)
+        return_logprob = sampling_params.pop("logprobs", False)
+        if prompt_logprobs is not None:
+            return_logprob = True
+
+        payload: dict[str, Any] = {
+            "rid": uuid4().hex,  # fresh per-hop id; Router generates its own
+            "input_ids": prompt_ids,
+            "sampling_params": sampling_params,
+            "return_logprob": return_logprob,
+        }
+        if prompt_logprobs is not None:
+            payload["logprob_start_len"] = 0
+            if prompt_logprobs > 0:
+                payload["top_logprobs_num"] = prompt_logprobs
+        if image_data:
+            payload["image_data"] = image_data
+        # video_data not yet supported by sglang HTTP /generate
+        payload.update({k: v for k, v in kwargs.items() if v is not None})
+
+        headers = {
+            "x-verl-request-id": request_id,  # Router sticky-session key
+            "Content-Type": "application/json",
+        }
+
+        session = await self._get_or_create_session()
+        last_exc: Exception = RuntimeError("unreachable")
+        for attempt in range(3):
+            try:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json(content_type=None)
+                    return _parse_token_output(data)
+            except aiohttp.ClientResponseError as exc:
+                if exc.status < 500:
+                    raise  # 4xx – caller error, do not retry
+                logger.warning("Router returned HTTP %d, attempt %d/3", exc.status, attempt + 1)
+                last_exc = exc
+            except (aiohttp.ClientConnectorError, asyncio.TimeoutError) as exc:
+                logger.warning("Router connection error: %s, attempt %d/3", exc, attempt + 1)
+                last_exc = exc
+            if attempt < 2:
+                await asyncio.sleep(0.5 * (2**attempt))
+
+        raise RuntimeError(f"generate via Router failed after 3 attempts for request {request_id}") from last_exc
+
+    # ------------------------------------------------------------------
+    # least_inflight path: Ray RPC generate (original behaviour)
+    # ------------------------------------------------------------------
+
+    async def _generate_via_ray(
+        self,
+        request_id: str,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        image_data: Optional[list[Any]],
+        video_data: Optional[list[Any]],
+        **kwargs: Any,
+    ) -> TokenOutput:
+        server_id, server = await self._acquire_server(request_id)
+        try:
+            output: TokenOutput = await server.generate.remote(
+                request_id=uuid4().hex,  # new id for each turn
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                image_data=image_data,
+                video_data=video_data,
+                **kwargs,
+            )
+            return output
+        finally:
+            self._release_server(server_id)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     @rollout_trace_op
     async def generate(
@@ -135,26 +313,19 @@ class LLMServerClient:
         """Generate tokens from prompt ids.
 
         Args:
-            request_id (str): request id for sticky session.
-            prompt_ids (List[int]): List of prompt token ids.
-            sampling_params (Dict[str, Any]): Sampling parameters for the chat completion.
+            request_id: Sticky-session key; multi-turn calls with the same id
+                are routed to the same replica (for KV-cache reuse).
+            prompt_ids: Input token ids.
+            sampling_params: Sampling parameters forwarded to the engine.
 
         Returns:
-            TokenOutput | DiffusionOutput: token or diffusion output
+            TokenOutput with generated token ids and optional log-probs.
         """
-        server_id, server = await self._acquire_server(request_id)
-        try:
-            output: TokenOutput = await server.generate.remote(
-                request_id=uuid4().hex,  # use new request_id for each turn
-                prompt_ids=prompt_ids,
-                sampling_params=sampling_params,
-                image_data=image_data,
-                video_data=video_data,
-                **kwargs,
+        if self._router_address:
+            return await self._generate_via_router(
+                request_id, prompt_ids, sampling_params, image_data, video_data, **kwargs
             )
-            return output
-        finally:
-            self._release_server(server_id)
+        return await self._generate_via_ray(request_id, prompt_ids, sampling_params, image_data, video_data, **kwargs)
 
 
 class FullyLLMServerClient(LLMServerClient):
@@ -357,24 +528,88 @@ class LLMServerManager:
             update_prometheus_config(self.rollout_config.prometheus, self.server_addresses, self.rollout_config.name)
 
     async def _init_global_load_balancer(self) -> None:
-        self.global_load_balancer = GlobalRequestLoadBalancer.remote(
-            servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
-            max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
+        """Initialise the load-balancing layer.
+
+        Chooses between the Rust Router sidecar (strategy=sglang_router) and the
+        original GlobalRequestLoadBalancer Ray actor (strategy=least_inflight).
+        Falls back to least_inflight when load_balance is absent from config.
+        """
+        lb_cfg = getattr(self.rollout_config, "load_balance", None)
+        strategy = getattr(lb_cfg, "strategy", "least_inflight") if lb_cfg is not None else "least_inflight"
+        use_router = strategy == "sglang_router" and self.rollout_config.name == "sglang"
+
+        if use_router:
+            await self._init_sglang_router(lb_cfg)
+        else:
+            self.global_load_balancer = GlobalRequestLoadBalancer.remote(
+                servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
+                max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
+            )
+            self.router_address: Optional[str] = None
+            self.router_actor = None
+
+    async def _init_sglang_router(self, lb_cfg) -> None:
+        """Start a sgl-model-gateway Rust Router and register all replica addresses."""
+        from verl.utils.net_utils import get_free_port
+        from verl.workers.rollout.sglang_router_actor import SGLangRouterActor
+
+        router_cfg = getattr(lb_cfg, "router", None)
+
+        router_port = get_free_port()
+        actor_options: dict[str, Any] = {"num_cpus": 1}
+
+        # In STANDALONE mode pin the Router to the first rollout node to minimise
+        # cross-node hops for the generate path.
+        if not self.worker_group:
+            try:
+                rollout_node_id = await self.server_handles[0].get_node_id.remote()
+                actor_options["scheduling_strategy"] = ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                    node_id=rollout_node_id, soft=True
+                )
+            except Exception:
+                pass  # best-effort placement; don't fail startup
+
+        self.router_actor = SGLangRouterActor.options(**actor_options).remote(
+            worker_urls=self.server_addresses,
+            host="0.0.0.0",
+            port=router_port,
+            policy=getattr(router_cfg, "policy", "cache_aware") if router_cfg else "cache_aware",
+            cache_threshold=getattr(router_cfg, "cache_threshold", 0.3) if router_cfg else 0.3,
+            balance_abs_threshold=getattr(router_cfg, "balance_abs_threshold", 64) if router_cfg else 64,
+            balance_rel_threshold=getattr(router_cfg, "balance_rel_threshold", 1.5) if router_cfg else 1.5,
+            request_id_headers=["x-verl-request-id"],
+            health_check_interval_secs=getattr(router_cfg, "health_check_interval_secs", 60) if router_cfg else 60,
         )
+        await self.router_actor.start.remote()
+        await self.router_actor.wait_until_ready.remote(timeout=120.0)
+        self.router_address = await self.router_actor.get_address.remote()
+        self.global_load_balancer = None
+
+        logger.info("LLMServerManager: Rust Router started at %s", self.router_address)
 
     def get_client(self, fully_async: bool = False) -> LLMServerClient:
-        """Get the LLMServerClient to request LLM server replicas.
+        """Return an LLMServerClient configured for the active routing mode.
 
         Args:
-            fully_async (bool): Whether to return the FullyLLMServerClient.
+            fully_async: When True, returns a FullyLLMServerClient that handles
+                partial-rollout resume transparently.
         """
-        servers = dict(zip(self.server_addresses, self.server_handles, strict=True))
-        if not fully_async:
-            return LLMServerClient(config=self.config, servers=servers, load_balancer_handle=self.global_load_balancer)
-        else:
-            return FullyLLMServerClient(
-                config=self.config, servers=servers, load_balancer_handle=self.global_load_balancer
+        client_cls = FullyLLMServerClient if fully_async else LLMServerClient
+
+        if getattr(self, "router_address", None):
+            # sglang_router path: generate via Rust Router HTTP endpoint
+            return client_cls(
+                config=self.config,
+                router_address=self.router_address,
             )
+
+        # least_inflight path: original Ray-actor-based routing
+        servers = dict(zip(self.server_addresses, self.server_handles, strict=True))
+        return client_cls(
+            config=self.config,
+            servers=servers,
+            load_balancer_handle=self.global_load_balancer,
+        )
 
     def get_addresses(self) -> list[str]:
         """Get the OpenAI chat completion API http addresses of the LLM server replicas."""

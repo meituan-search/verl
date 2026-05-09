@@ -478,3 +478,45 @@ disaggregation:
 
   # InfiniBand device (required for mooncake over RDMA).
   ib_device: null
+
+# Load balancing configuration for multi-replica rollout servers.
+# Only effective when rollout.name=sglang and multiple replicas are used
+# (data_parallel_size > 1 or multiple standalone nodes).
+load_balance:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs.
+  _target_: verl.workers.config.LoadBalanceConfig
+
+  # Load balancing strategy.
+  # - least_inflight: default; least in-flight requests — current behaviour, no extra deps.
+  # - sglang_router:  delegate to sgl-model-gateway Rust Router (requires sglang_router pkg).
+  strategy: least_inflight
+
+  # sglang_router strategy settings (only used when strategy=sglang_router).
+  router:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs.
+    _target_: verl.workers.config.SGLangRouterConfig
+
+    # Routing policy for the worker pool.
+    # Options: cache_aware, round_robin, consistent_hashing, prefix_hash
+    # cache_aware is recommended for RLHF where system prompts repeat heavily.
+    policy: cache_aware
+
+    # cache_aware: route to a replica when its prefix-match rate exceeds this threshold.
+    cache_threshold: 0.3
+
+    # cache_aware: switch to load-balance when (max_load - min_load) > this value.
+    balance_abs_threshold: 64
+
+    # cache_aware: switch to load-balance when max_load > min_load * this value.
+    balance_rel_threshold: 1.5
+
+    # How often the Router pings each worker's /health endpoint (seconds).
+    health_check_interval_secs: 60
+
+    # PD disaggregation: routing policy for the decode pool.
+    # Only used when disaggregation.enabled=True.
+    # power_of_two: pick best of 2 random decode workers by in-flight count.
+    # Options: power_of_two, round_robin, random
+    decode_policy: power_of_two

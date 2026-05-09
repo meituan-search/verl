@@ -20,6 +20,7 @@ from omegaconf import MISSING
 from verl.base_config import BaseConfig
 from verl.utils.profiler import ProfilerConfig
 from verl.workers.config.disaggregation import DisaggregationConfig
+from verl.workers.config.load_balance import LoadBalanceConfig
 from verl.workers.config.model import MtpConfig
 
 __all__ = [
@@ -281,6 +282,8 @@ class RolloutConfig(BaseConfig):
 
     disaggregation: DisaggregationConfig = field(default_factory=DisaggregationConfig)
 
+    load_balance: LoadBalanceConfig = field(default_factory=LoadBalanceConfig)
+
     def __post_init__(self):
         """Validate the rollout config"""
         # Deprecation warning for mode field - only async mode is supported
@@ -350,4 +353,21 @@ class RolloutConfig(BaseConfig):
             raise ValueError(
                 f"rollout.disaggregation.enabled=True is currently only supported with "
                 f"rollout.name='sglang'; got {self.name!r}. (vLLM PD is a tracked follow-up.)"
+            )
+
+        # Coerce load_balance from dict / DictConfig (Hydra passes dicts).
+        if isinstance(self.load_balance, dict):
+            object.__setattr__(self, "load_balance", LoadBalanceConfig(**self.load_balance))
+        elif not isinstance(self.load_balance, LoadBalanceConfig):
+            from omegaconf import DictConfig, OmegaConf
+
+            if not isinstance(self.load_balance, DictConfig):
+                raise TypeError(
+                    f"rollout.load_balance must be dict, DictConfig, or LoadBalanceConfig; "
+                    f"got {type(self.load_balance).__name__}."
+                )
+            object.__setattr__(
+                self,
+                "load_balance",
+                LoadBalanceConfig(**OmegaConf.to_container(self.load_balance, resolve=True)),
             )
