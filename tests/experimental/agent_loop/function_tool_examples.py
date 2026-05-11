@@ -19,7 +19,7 @@ Includes both sync and async functions to exercise the dispatcher's
 
 import asyncio
 
-from verl.tools.utils.function_tool import function_tool
+from verl.tools.function_tool import function_tool
 
 
 @function_tool

@@ -173,9 +173,9 @@ multi_turn:
   # null for no limit (default max_length // 3)
   max_assistant_turns: null
 
-  # YAML config for stateful tools that subclass ``BaseTool`` (also covers MCP tools).
+  # YAML config for stateful tools that subclass ``BaseTool``.
   # Use this when a tool needs per-trajectory state, async ``create``/``release``
-  # lifecycle hooks, custom rewards, or external server config (e.g. MCP).
+  # lifecycle hooks, or custom rewards.
   # null disables this code path.
   tool_config_path: null
 
