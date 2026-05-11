@@ -605,21 +605,11 @@ class vLLMHttpServer:
         Implementation: sleep(level=1) offloads weights and discards kv_cache,
         then wake_up(weights) restores weights, leaving kv_cache memory free.
         """
-        if self.node_rank != 0 or not self.config.free_cache_engine:
-            return
-
-        # sleep(level=1): offload weights to CPU, discard kv_cache
-        await self.engine.sleep(level=1)
-        # wake_up(weights): restore weights to GPU, kv_cache remains free
-        await self.engine.wake_up(tags=["weights"])
+        pass
 
     async def resume_kv_cache(self):
         """Restore kv_cache GPU memory after a weight sync. Counterpart to release_kv_cache()."""
-        if self.node_rank != 0:
-            return
-
-        # wake_up(kv_cache): allocate and restore kv_cache memory
-        await self.engine.wake_up(tags=["kv_cache"])
+        pass
 
     async def start_profile(self, **kwargs):
         if (
