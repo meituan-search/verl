@@ -605,11 +605,21 @@ class vLLMHttpServer:
         Implementation: sleep(level=1) offloads weights and discards kv_cache,
         then wake_up(weights) restores weights, leaving kv_cache memory free.
         """
-        pass
+        if self.node_rank != 0 or not self.config.free_cache_engine:
+            return
+
+        # sleep(level=1): offload weights to CPU, discard kv_cache
+        await self.engine.sleep(level=1)
+        # wake_up(weights): restore weights to GPU, kv_cache remains free
+        await self.engine.wake_up(tags=["weights"])
 
     async def resume_kv_cache(self):
         """Restore kv_cache GPU memory after a weight sync. Counterpart to release_kv_cache()."""
-        pass
+        if self.node_rank != 0:
+            return
+
+        # wake_up(kv_cache): allocate and restore kv_cache memory
+        await self.engine.wake_up(tags=["kv_cache"])
 
     async def start_profile(self, **kwargs):
         if (
@@ -1047,6 +1057,12 @@ class vLLMReplica(RolloutReplica):
                 return r
 
         return {"aborted": False, "request_id": request_id, "error": "Request not found on any server"}
+
+    async def release_kv_cache(self):
+        # Drain all in-flight requests so that vLLM worker threads go idle
+        # before we touch engine.release_kv_cache()
+        await self.servers[0].wait_for_requests_to_drain.remote()
+        await asyncio.gather(*[server.release_kv_cache.remote() for server in self.servers])
 
     # -----------------------------------------------------------------------
     # Hook methods for subclass overrides
