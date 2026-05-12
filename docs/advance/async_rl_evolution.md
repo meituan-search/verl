@@ -6,7 +6,8 @@ Last updated: 05/12/2026.
 
 ## 概述
 
-本文档系统梳理了 verl 框架中异步强化学习（Async RL）技术的演进历程，从最初的 co-locate 同步训练到完全异步的流式训练（Fully Async Policy），涵盖每个关键 PR 的设计动机、技术决策和架构影响。
+本文档系统梳理了 verl 框架中异步强化学习（Async RL）技术的演进历程，从最初的 co-locate 同步训练到完全异步的流式训练（Fully
+Async Policy），涵盖每个关键 PR 的设计动机、技术决策和架构影响。
 
 ### 技术演进的驱动力
 
@@ -16,16 +17,16 @@ Last updated: 05/12/2026.
 flowchart LR
     A[Rollout<br/>等待最长样本完成] --> B[Compute Advantages]
     B --> C[Update Actor]
-
-    style A fill:#ff9999
-    style C fill:#99ff99
+    style A fill: #ff9999
+    style C fill: #99ff99
 ```
 
 **传统同步模式**: Step N: `Rollout → Compute Advantages → Update Actor`
 
 这种模式存在两个核心瓶颈：
 
-1. **长尾效应（Long-tail Problem）**：Rollout 阶段必须等待最长序列生成完成才能进入训练阶段。在长候选场景（如数学推理 20K+ tokens），短序列完成后 GPU 空闲等待，资源利用率严重下降。
+1. **长尾效应（Long-tail Problem）**：Rollout 阶段必须等待最长序列生成完成才能进入训练阶段。在长候选场景（如数学推理 20K+
+   tokens），短序列完成后 GPU 空闲等待，资源利用率严重下降。
 2. **资源耦合**：Trainer 和 Rollout 共享资源池，无法独立扩展，资源分配不灵活。
 
 > 在 DAPO 32B 训练中，Rollout 阶段约占总时间的 70%，且增加 Rollout 资源无法有效缩短该阶段耗时。
@@ -41,31 +42,107 @@ timeline
     title Verl 异步强化学习技术演进时间线
 
     section 第一阶段：异步训练起源 (2025.06 - 2025.10)
-        PR #2231 : One Step Off Policy 异步训练 Recipe<br/>首个异步训练实现：FSDP+vLLM, NCCL 权重同步
-        PR #2981 : Fully Async Training Recipe<br/>Trainer/Rollouter 分离 + MessageQueue 数据传输
+        PR@2231 : One Step Off Policy 异步训练 Recipe<br/>首个异步训练实现：FSDP+vLLM, NCCL 权重同步
+        PR@2981 : Fully Async Training Recipe<br/>Trainer/Rollouter 分离 + MessageQueue 数据传输
 
     section 第二阶段：基础设施重构 (2025.11 - 2026.04)
-        PR #4280 : vLLM 分进程架构重构<br/>单进程 → 多进程，CUDA IPC 权重同步
-        PR #5031 : CheckpointEngineManager 引入<br/>统一参数同步抽象层
-        PR #5029 : Fully Async / One-Step-Off 接入 Checkpoint Engine<br/>支持多后端：NCCL/NIXL/Naive/HCCL/Mooncake
-        PR #5071 : Rollout Abort/Resume 接口<br/>Partial Rollout 基础设施
-        PR #5184 : Trainer 重构（SeparateRayPPOTrainer）<br/>fit 各阶段代码复用
-        PR #5269 : Train 支持 Engine Worker 模式<br/>Fully Async 基于 SeparateRayTrainer 重构
-        PR #5430 : FullyAsyncLLMServerManager Auto Resume<br/>Gateway 模式 + Partial Rollout 对 AgentLoop 透明
-        PR #5487 : 清理 AgentLoop 中 partial 相关逻辑<br/>解耦工具调用与 Rollout 过程
-        PR #6129 : 解耦 AgentLoopManager 与 LLMServerManager<br/>LLM Server 管理独立为 llm_server.py 模块
+        PR@4280 : vLLM 分进程架构重构<br/>单进程 → 多进程，CUDA IPC 权重同步
+        PR@5031 : CheckpointEngineManager 引入<br/>统一参数同步抽象层
+        PR@5029 : Fully Async / One-Step-Off 接入 Checkpoint Engine<br/>支持多后端：NCCL/NIXL/Naive/HCCL/Mooncake
+        PR@5071 : Rollout Abort/Resume 接口<br/>Partial Rollout 基础设施
+        PR@5184 : Trainer 重构（SeparateRayPPOTrainer）<br/>fit 各阶段代码复用
+        PR@5269 : Train 支持 Engine Worker 模式<br/>Fully Async 基于 SeparateRayTrainer 重构
+        PR@5430 : FullyAsyncLLMServerManager Auto Resume<br/>Gateway 模式 + Partial Rollout 对 AgentLoop 透明
+        PR@5487 : 清理 AgentLoop 中 partial 相关逻辑<br/>解耦工具调用与 Rollout 过程
+        PR@6129 : 解耦 AgentLoopManager 与 LLMServerManager<br/>LLM Server 管理独立为 llm_server.py 模块
 
     section 第三阶段：生态扩展 (2026.04 - 未来)
-        PR #5401 : TransferQueue 同步模式集成<br/>Collocated TQ Trainer，64节点1024卡DAPO验证
-        PR #6056 : Online Policy Distillation (OPD) 集成到 Fully Async
-        PR #6271 : Multi-Trajectory in One Rollout（开发中）
-        Issue #5790 : [RFC] Agent Gateway（规划中）
-        PR #6076 : 弹性调度基础设施（开发中）
-        elastic_scheduling_v2 : 完整弹性调度系统（开发中）<br/>GPU运行时Train/Rollout动态切换
-        PR #5990 : Model Engine Server（Standalone Old Log Prob Support）
-        verl-recipe #96 : Colocate Partial Rollout（APRIL风格同步训练）
+        PR@5401 : TransferQueue 同步模式集成<br/>Collocated TQ Trainer，64节点1024卡DAPO验证
+        PR@6056 : Online Policy Distillation (OPD) 集成到 Fully Async
+        PR@6271 : Multi-Trajectory in One Rollout（开发中）
+        Issue#5790 : [RFC] Agent Gateway（规划中）
+        PR@6076 : 弹性调度基础设施（开发中）
+        elastic_scheduling_v2: 完整弹性调度系统（开发中）<br/>GPU运行时Train/Rollout动态切换
+        PR@5990 : Model Engine Server（Standalone Old Log Prob Support）
+        verl-recipe#96 : Colocate Partial Rollout（APRIL风格同步训练）
 ```
 
+
+
+```
+═══════════════════════════════════════════════════════════════════════
+                     第一阶段：异步训练的起源 (2025.06 - 2025.10)
+═══════════════════════════════════════════════════════════════════════
+
+2025-06  PR #2231  ──► One Step Off Policy 异步训练 Recipe
+   │                    （首个异步训练实现：FSDP+vLLM, NCCL 权重同步）
+   │
+2025-08  PR #2981  ──► Fully Async Training Recipe
+                        （Trainer/Rollouter 分离 + MessageQueue 数据传输）
+
+═══════════════════════════════════════════════════════════════════════
+                   第二阶段：基础设施重构 (2025.11 - 2026.04)
+═══════════════════════════════════════════════════════════════════════
+
+2025-11  PR #4280  ──► vLLM 分进程架构重构
+   │                    （单进程 → 多进程，CUDA IPC 权重同步）
+   │
+2026-01  PR #5031  ──► CheckpointEngineManager 引入
+   │                    （统一参数同步抽象层）
+   │
+2026-01  PR #5029 ──► Fully Async / One-Step-Off 接入 Checkpoint Engine
+   │                    （支持多后端：NCCL/NIXL/Naive/HCCL/Mooncake）
+   │
+2026-01  PR #5071  ──► Rollout Abort/Resume 接口
+   │                    （Partial Rollout 基础设施）
+   │
+2026-02  PR #5184  ──► Trainer 重构（SeparateRayPPOTrainer）
+   │                    （fit 各阶段代码复用）
+   │
+2026-02  PR #5269  ──► Train 支持 Engine Worker 模式
+   │                    （Fully Async 基于 SeparateRayTrainer 重构）
+   │
+2026-02  PR #5430  ──► FullyAsyncLLMServerManager Auto Resume
+   │                    （Gateway 模式 + Partial Rollout 对 AgentLoop 透明）
+   │
+2026-03  PR #5487  ──► 清理 AgentLoop 中 partial 相关逻辑
+   │                    （解耦工具调用与 Rollout 过程）
+   │
+2026-04  PR #6129  ──► 解耦 AgentLoopManager 与 LLMServerManager
+                        （LLM Server 管理独立为 llm_server.py 模块）
+                        （支持第三方 Agent 框架接入）
+
+═══════════════════════════════════════════════════════════════════════
+                      第三阶段：生态扩展 (2026.04 - 未来)
+═══════════════════════════════════════════════════════════════════════
+
+2026-04  PR #5401  ──► TransferQueue 同步模式集成: main_ppo_sync.py + tqbridge
+   │                    （Collocated TQ Trainer，64 节点 1024 卡 DAPO 验证）
+   │
+2026-04  PR #6056  ──► Online Policy Distillation (OPD) 集成到 Fully Async
+   │                    （异步训练中支持在线策略蒸馏）
+   │
+2026-05  PR #6271  ──► Multi-Trajectory in One Rollout（开发中）
+   │                    （Agent Loop 单次 rollout 支持多轨迹输出）
+   │
+         Issue #5790 ──► [RFC] Agent Gateway（规划中）
+           │              （Agent 抽象 + Trajectory Gateway 子系统）
+           │
+         PR #6076  ──► 弹性调度基础设施（开发中）
+   │                    （Hybrid Replica + LB Handle Registry + Validation）
+   │
+    elastic_scheduling_v2 → 完整弹性调度系统（开发中）
+                          （GPU 运行时 Train/Rollout 动态切换）
+                          （DP Rebuild + 双路参数同步 + EMA 调度）
+
+2026-05  PR #5990  ──► Model Engine Server（Standalone Old Log Prob Support）
+   │                    （独立 log_prob 计算服务器，解耦 rollout 推理与概率计算）
+   │
+
+2026-05  verl-recipe #96 ──► Colocate Partial Rollout（APRIL 风格同步训练）
+                         （跨 step 中断+续跑缓解长尾，2×3090 验证 −29% gen time）
+
+```
 ---
 
 # 第一阶段：异步训练的起源 (2025.06 - 2025.10)
@@ -98,9 +175,9 @@ flowchart LR
         O2[Rollout<br/>异步生成step N+1样本]
     end
 
-    style O1 fill:#99ff99
-    style O2 fill:#99ccff
-    style T1 fill:#ffcccc
+    style O1 fill: #99ff99
+    style O2 fill: #99ccff
+    style T1 fill: #ffcccc
 ```
 
 ### 关键实现
@@ -149,7 +226,8 @@ while batch_data_future is not None:
 **PR 标题**: `[trainer, recipe] feat: fully async training recipe`
 **状态**: Merged (2025-10-17) | [+6292/-35] | 39 files
 
-在 PR #2231 的 One Step Off 基础上，进一步将训练过程拆分为完全独立的 **Trainer** 和 **Rollouter**，通过 **MessageQueue** 进行数据传输。
+在 PR #2231 的 One Step Off 基础上，进一步将训练过程拆分为完全独立的 **Trainer** 和 **Rollouter**，通过 **MessageQueue**
+进行数据传输。
 
 ### 从 One-Step-Off 到 Fully Async 的演进
 
@@ -167,23 +245,25 @@ while batch_data_future is not None:
 flowchart LR
     R[Rollouter<br/>流式生成] -->|sample| MQ[MessageQueue<br/>Ray Actor, deque缓冲]
     MQ -->|batch| T[Trainer<br/>消费 + 训练]
-
-    style R fill:#99ccff
-    style MQ fill:#ffcc99
-    style T fill:#99ff99
+    style R fill: #99ccff
+    style MQ fill: #ffcc99
+    style T fill: #99ff99
 ```
 
-这是 verl 异步训练从"概念验证"走向"生产级架构"的关键一步。后续的所有基础设施重构（CheckpointEngine、分进程 vLLM、Partial Rollout 等）都是在此基础上进行的。
+这是 verl 异步训练从"概念验证"走向"生产级架构"的关键一步。后续的所有基础设施重构（CheckpointEngine、分进程 vLLM、Partial
+Rollout 等）都是在此基础上进行的。
 
 ---
 
 # 第二阶段：基础设施重构 (2025.11 - 2026.04)
 
-本阶段的核心目标是构建生产级异步训练所需的基础设施：分进程架构解耦、统一参数同步层、Partial Rollout 中断恢复机制、Trainer 代码复用重构，以及 LLM Server 管理解耦。这些工作为第三阶段的生态扩展奠定了坚实基础。
+本阶段的核心目标是构建生产级异步训练所需的基础设施：分进程架构解耦、统一参数同步层、Partial Rollout 中断恢复机制、Trainer
+代码复用重构，以及 LLM Server 管理解耦。这些工作为第三阶段的生态扩展奠定了坚实基础。
 
 ## 2.1 vLLM 分进程架构重构（PR #4280）
 
-**PR 标题**: `[BREAKING][worker, rollout, vllm] feat: implement vLLM colocated training-inference rollout with process separation`
+**PR 标题**:
+`[BREAKING][worker, rollout, vllm] feat: implement vLLM colocated training-inference rollout with process separation`
 **状态**: Merged (2026-01-23) | [+527/-520] | 37 files
 
 ### 动机
@@ -206,9 +286,8 @@ flowchart TB
     end
 
     Comm[通信方式: ExternalZeroMQDistributedExecutor<br/>init_worker, load_model, generate via ZMQ<br/>wake_up, sleep, weight_updates 直接调用]
-
-    style SP fill:#ffcccc
-    style Comm fill:#f0f0f0
+    style SP fill: #ffcccc
+    style Comm fill: #f0f0f0
 ```
 
 **After（多进程架构）：**
@@ -227,9 +306,8 @@ flowchart LR
     TP <-->|ZMQ + CUDA IPC| IP
     SA --> ME
     VS --> ME2
-
-    style TP fill:#99ccff
-    style IP fill:#99ff99
+    style TP fill: #99ccff
+    style IP fill: #99ff99
 ```
 
 ### 关键组件变更
@@ -288,7 +366,8 @@ class BucketedWeightReceiver:
 
 ### 动机
 
-PR #4280 的分进程重构破坏了 `one-step-off-policy` 和 `fully-async` 的参数同步路径。需要一个统一的抽象层来协调 Trainer 和多个 Rollout Replica 之间的权重同步，并支持多种通信后端。
+PR #4280 的分进程重构破坏了 `one-step-off-policy` 和 `fully-async` 的参数同步路径。需要一个统一的抽象层来协调 Trainer 和多个
+Rollout Replica 之间的权重同步，并支持多种通信后端。
 
 ### 架构设计
 
@@ -324,10 +403,9 @@ flowchart TB
         end
     end
 
-    TrainerSide <-->|nccl / nixl / ...| RolloutSide
-
-    style TrainerSide fill:#99ccff
-    style RolloutSide fill:#99ff99
+    TrainerSide <-->|nccl / nixl / . . .| RolloutSide
+    style TrainerSide fill: #99ccff
+    style RolloutSide fill: #99ff99
 ```
 
 - **ME** (Model Engine): FSDP, Megatron, VeOmni 等，导出 `get_per_tensor_param()` 全张量生成器
@@ -386,7 +464,8 @@ class CheckpointEngineManager:
 
 ## 2.3 Fully Async 接入多后端 Checkpoint Engine（PR #5029）
 
-**PR 标题**: `[fsdp, megatron] feat: refactor fully-async and one-step-off training to support multiple checkpoint engine backends`
+**PR 标题**:
+`[fsdp, megatron] feat: refactor fully-async and one-step-off training to support multiple checkpoint engine backends`
 **状态**: Merged (2026-02-26) | [+510/-2393] | 71 files
 
 ### 动机
@@ -444,14 +523,16 @@ class RolloutReplica(ABC):
 **PR 标题**: `[recipe] refactor: refactor ray trainer for separate recipe use`
 **状态**: Merged (2026-02-06) | [+1553/-1432] | 37 files
 
-引入 `SeparateRayPPOTrainer` 基类，将 fit 的各阶段逻辑（init_workers, create_dataloader, compute_advantages, update_actor等）抽取为可复用的方法，同时修复 fully-async / one-step-off 的 CI 问题。
+引入 `SeparateRayPPOTrainer` 基类，将 fit 的各阶段逻辑（init_workers, create_dataloader, compute_advantages,
+update_actor等）抽取为可复用的方法，同时修复 fully-async / one-step-off 的 CI 问题。
 
 ### PR #5269: Train 支持 Engine Worker 模式
 
 **PR 标题**: `[fsdp, megatron] refactor: Refactor Fully Async Implementation via Engine Workers`
 **状态**: Merged (2026-02-11) | [+482/-31] | 4 files
 
-将 Fully Async Worker 重构为基于 `SeparateRayPPOTrainer` 的 Engine Worker 模式，使 fully_async 能够复用 trainer 的核心训练逻辑，减少代码重复。
+将 Fully Async Worker 重构为基于 `SeparateRayPPOTrainer` 的 Engine Worker 模式，使 fully_async 能够复用 trainer
+的核心训练逻辑，减少代码重复。
 
 ---
 
@@ -489,15 +570,17 @@ class RolloutReplica(ABC):
 
 `AgentLoopManager` 是 verl 中一种特定的 Agent 框架实现，设计上应可被其他 Agent 框架完全替代：
 
-| 目标 Agent 框架 | 关联 Issue/PR | 状态 |
-|----------------|--------------|------|
-| NVIDIA NeMo-Gym | [#5787](https://github.com/verl-project/verl/pull/5787) | 已集成 |
-| AWS Bedrock AgentCore | [#4216](https://github.com/verl-project/verl/pull/4216) | RFC |
-| RemoteAgentLoop | [#5737](https://github.com/verl-project/verl/issues/5737) | Feature Request |
-| SWE-agent | - | 规划中 |
-| 任意黑盒 Agent 框架 | [#5790](https://github.com/verl-project/verl/issues/5790) | RFC |
+| 目标 Agent 框架           | 关联 Issue/PR                                               | 状态              |
+|-----------------------|-----------------------------------------------------------|-----------------|
+| NVIDIA NeMo-Gym       | [#5787](https://github.com/verl-project/verl/pull/5787)   | 已集成             |
+| AWS Bedrock AgentCore | [#4216](https://github.com/verl-project/verl/pull/4216)   | RFC             |
+| RemoteAgentLoop       | [#5737](https://github.com/verl-project/verl/issues/5737) | Feature Request |
+| SWE-agent             | -                                                         | 规划中             |
+| 任意黑盒 Agent 框架         | [#5790](https://github.com/verl-project/verl/issues/5790) | RFC             |
 
-**重构前的问题**：LLM Server 的生命周期管理（启动/销毁/负载均衡/Profiling/KV-Cache 清理）由 `AgentLoopManager` 持有，导致每个替代 Agent 框架必须：
+**重构前的问题**：LLM Server 的生命周期管理（启动/销毁/负载均衡/Profiling/KV-Cache 清理）由 `AgentLoopManager` 持有，导致每个替代
+Agent 框架必须：
+
 - 要么继承 `AgentLoopManager`（引入大量无关依赖）
 - 要么重新实现 Rollout Server 的管理逻辑（重复代码）
 
@@ -509,18 +592,18 @@ class RolloutReplica(ABC):
 
 ```mermaid
 flowchart TB
-    subgraph ALM[AgentLoopManager]
-        direction LR
-        SM[AsyncLLMServerMgr<br/>server lifecycle<br/>├─ launch replicas<br/>├─ load balancer<br/>├─ profiling<br/>└─ kv_cache clear]
-        ALW[AgentLoopWorker<br/>agent logic<br/>generate / tool_call / reward]
-        ALW -->|内部依赖| SM
-    end
-    Ext[第三方 Agent 框架] -->|必须继承整个<br/>AgentLoopManager| ALM
-    ALM -.->|无法复用 Server 管理<br/>→ 重复实现或强制继承| Ext
+subgraph ALM[AgentLoopManager]
+direction LR
+SM[AsyncLLMServerMgr<br/>server lifecycle<br/>├─ launch replicas<br/>├─ load balancer<br/>├─ profiling<br/>└─ kv_cache clear]
+ALW[AgentLoopWorker<br/>agent logic<br/>generate / tool_call / reward]
+ALW -->|内部依赖|SM
+end
+Ext[第三方 Agent 框架] -->|必须继承整个<br/>AgentLoopManager|ALM
+ALM -.->|无法复用 Server 管理<br/>→ 重复实现或强制继承|Ext
 
-    style ALM fill:#ffcccc
-    style SM fill:#ffe0e0
-    style ALW fill:#ffe0e0
+style ALM fill: #ffcccc
+style SM fill: #ffe0e0
+style ALW fill: #ffe0e0
 ```
 
 **After（解耦架构）**：
@@ -535,27 +618,27 @@ flowchart LR
         L4[profiling / kv_cache]
         GC[get_client]
     end
-    subgraph ALM[AgentLoopManager 纯 Agent 调度]
-        direction TB
-        ALW[AgentLoopWorker<br/>持有 LLMServerClient<br/>├─ generate<br/>├─ tool_call<br/>└─ reward]
-    end
-    GC -->|LLMServerClient| ALW
-    Ext[第三方 Agent 框架] -.->|只需消费<br/>LLMServerClient| GC
+subgraph ALM[AgentLoopManager 纯 Agent 调度]
+direction TB
+ALW[AgentLoopWorker<br/>持有 LLMServerClient<br/>├─ generate<br/>├─ tool_call<br/>└─ reward]
+end
+GC -->|LLMServerClient|ALW
+Ext[第三方 Agent 框架] -.->|只需消费<br/>LLMServerClient|GC
 
-    style LSM fill:#99ccff
-    style ALM fill:#99ff99
+style LSM fill: #99ccff
+style ALM fill: #99ff99
 ```
 
 #### 五大核心类
 
 新模块位于 `verl/workers/rollout/llm_server.py`（~464 行），包含以下核心类：
 
-| 类名 | 角色 | 说明 |
-|------|------|------|
-| **`GlobalRequestLoadBalancer`** | Ray Actor | 全局粘性会话 + 最小负载均衡器 |
-| **`LLMServerClient`** | 客户端代理 | 向 AgentLoopWorker 提供统一的 `generate()` 接口 |
-| **`FullyLLMServerClient`** | 客户端代理（增强版） | 继承 `LLMServerClient`，支持 Partial Rollout 自动恢复 + MES log_prob 计算 |
-| **`LLMServerManager`** | 服务端管理器 | 负责 Replica 启动/销毁、Load Balancer 创建、MES 初始化 |
+| 类名                              | 角色         | 说明                                                             |
+|---------------------------------|------------|----------------------------------------------------------------|
+| **`GlobalRequestLoadBalancer`** | Ray Actor  | 全局粘性会话 + 最小负载均衡器                                               |
+| **`LLMServerClient`**           | 客户端代理      | 向 AgentLoopWorker 提供统一的 `generate()` 接口                        |
+| **`FullyLLMServerClient`**      | 客户端代理（增强版） | 继承 `LLMServerClient`，支持 Partial Rollout 自动恢复 + MES log_prob 计算 |
+| **`LLMServerManager`**          | 服务端管理器     | 负责 Replica 启动/销毁、Load Balancer 创建、MES 初始化                      |
 
 ##### GlobalRequestLoadBalancer
 
@@ -565,9 +648,9 @@ class GlobalRequestLoadBalancer:
     """全局 sticky-session + in-flight 负载均衡器，所有 AgentLoopWorker 共享。"""
 
     def __init__(self, servers: dict[str, ray.actor.ActorHandle], max_cache_size: int = 10000):
-        self._server = servers                          # server_id → ActorHandle
-        self._inflight_requests: dict[str, int] = ...   # server_id → 进行中请求数
-        self._request_id_to_server: LRUCache = ...      # request_id → server_id (sticky)
+        self._server = servers  # server_id → ActorHandle
+        self._inflight_requests: dict[str, int] = ...  # server_id → 进行中请求数
+        self._request_id_to_server: LRUCache = ...  # request_id → server_id (sticky)
 
     def acquire_server(self, request_id: str) -> str:
         """获取 server：优先 sticky 命中，否则最小负载路由"""
@@ -582,6 +665,7 @@ class GlobalRequestLoadBalancer:
 ```
 
 **关键特性**：
+
 - **Sticky Session**：同一 `request_id`（多轮对话）始终路由到同一个 Server，利用 Prefix Caching 加速
 - **Least In-Flight Load Balancing**：新请求分配到当前负载最轻的 Server
 - **LRU Cache**：路由缓存自动淘汰，防止内存泄漏
@@ -598,14 +682,14 @@ class LLMServerClient:
     """
 
     async def generate(
-        self,
-        request_id,
-        *,
-        prompt_ids: list[int],
-        sampling_params: dict[str, Any],
-        image_data=None,
-        video_data=None,
-        **kwargs,
+            self,
+            request_id,
+            *,
+            prompt_ids: list[int],
+            sampling_params: dict[str, Any],
+            image_data=None,
+            video_data=None,
+            **kwargs,
     ) -> TokenOutput:
         """从 prompt_ids 生成 tokens"""
         server_id, server = await self._acquire_server(request_id)
@@ -661,7 +745,7 @@ class LLMServerManager:
     @auto_await
     async def create(cls, config, worker_group=None, rollout_resource_pool=None):
         instance = cls(config, worker_group, rollout_resource_pool)
-        await instance._initialize_llm_servers()    # init hybrid / standalone / trtllm
+        await instance._initialize_llm_servers()  # init hybrid / standalone / trtllm
         await instance._init_global_load_balancer()
         if model_engine_server.enabled:
             await instance._init_model_engine_replica()
@@ -676,9 +760,14 @@ class LLMServerManager:
     def get_engine_replicas_for_weight_sync(self) -> list:
         """返回参与 CheckpointEngine 权重同步的 MES Replica"""
 
-    async def clear_kv_cache(self): ...
-    async def start_profile(self): ...
-    async def stop_profile(self): ...
+    async def clear_kv_cache(self):
+        ...
+
+    async def start_profile(self):
+        ...
+
+    async def stop_profile(self):
+        ...
 ```
 
 #### 数据流变化
@@ -689,7 +778,7 @@ class LLMServerManager:
 # Step 1: 创建 LLMServerManager（独立于 AgentLoop）
 self.llm_server_manager = await LLMServerManager.create(
     config=self.config,
-    worker_group=self.actor_rollout_wg,          # hybrid mode: 复用 trainer worker group
+    worker_group=self.actor_rollout_wg,  # hybrid mode: 复用 trainer worker group
 )
 
 # Step 2: 从 Manager 获取 Client，注入到 AgentLoopManager
@@ -723,43 +812,42 @@ sequenceDiagram
     participant LB as GlobalRequestLoadBalancer
     participant Rep as RolloutReplicaActor<br/>(vLLM/SGLang)
     participant MES as ModelEngineServerManager
-
-    ALW->>ALB: run()
-    ALB->>LSC: generate(prompt_ids, sampling_params)
-    LSC->>LB: acquire_server(request_id)
+    ALW ->> ALB: run()
+    ALB ->> LSC: generate(prompt_ids, sampling_params)
+    LSC ->> LB: acquire_server(request_id)
     Note right of LB: sticky + least-loaded
-    LB-->>LSC: server_id
-    LSC->>Rep: generate.remote(...) [Ray RPC]
-    Rep-->>LSC: TokenOutput
-    LSC->>LB: release_server(server_id)
+    LB -->> LSC: server_id
+    LSC ->> Rep: generate.remote(...) [Ray RPC]
+    Rep -->> LSC: TokenOutput
+    LSC ->> LB: release_server(server_id)
     Note right of LB: fire-and-forget
     opt FullyLLMServerClient only
-        LSC->>MES: compute_log_probs(...)
-        MES-->>LSC: old / ref log probs
+        LSC ->> MES: compute_log_probs(...)
+        MES -->> LSC: old / ref log probs
     end
-    LSC-->>ALB: TokenOutput
-    ALB-->>ALW: result
+    LSC -->> ALB: TokenOutput
+    ALB -->> ALW: result
 ```
 
 #### 对各组件的影响
 
-| 组件 | 变化 |
-|------|------|
-| **`AgentLoopBase`** | `__init__` 参数名 `server_manager` 不变（类型为 `LLMServerClient`），**无破坏性变更** |
-| **`AgentLoopWorker`** | 构造函数接收 `llm_client: LLMServerClient`（而非之前的内部创建） |
-| **`AgentLoopManager`** | 构造函数接收 `llm_client: LLMServerClient`，不再持有任何 Server 生命周期逻辑 |
-| **`FullyAsyncTrainer`** | 先创建 `LLMServerManager`，再将其 `get_client()` 结果传入 `AgentLoopManager` |
+| 组件                        | 变化                                                                    |
+|---------------------------|-----------------------------------------------------------------------|
+| **`AgentLoopBase`**       | `__init__` 参数名 `server_manager` 不变（类型为 `LLMServerClient`），**无破坏性变更**  |
+| **`AgentLoopWorker`**     | 构造函数接收 `llm_client: LLMServerClient`（而非之前的内部创建）                       |
+| **`AgentLoopManager`**    | 构造函数接收 `llm_client: LLMServerClient`，不再持有任何 Server 生命周期逻辑             |
+| **`FullyAsyncTrainer`**   | 先创建 `LLMServerManager`，再将其 `get_client()` 结果传入 `AgentLoopManager`     |
 | **`FullyAsyncRollouter`** | 同上，standalone 模式下 `LLMServerManager.create(config)` 无需 `worker_group` |
 
 #### Breaking Change & 迁移指南
 
 > ⚠️ **Breaking Change** for out-of-tree agent frameworks
 
-| 旧导入路径 | 新导入路径 | 新名称 |
-|-----------|-----------|--------|
-| `verl.experimental.agent_loop.AsyncLLMServerManager` | `verl.workers.rollout.llm_server.LLMServerManager` | `LLMServerManager` |
+| 旧导入路径                                                     | 新导入路径                                                  | 新名称                    |
+|-----------------------------------------------------------|--------------------------------------------------------|------------------------|
+| `verl.experimental.agent_loop.AsyncLLMServerManager`      | `verl.workers.rollout.llm_server.LLMServerManager`     | `LLMServerManager`     |
 | `verl.experimental.agent_loop.FullyAsyncLLMServerManager` | `verl.workers.rollout.llm_server.FullyLLMServerClient` | `FullyLLMServerClient` |
-| `AgentLoopManager.create(...)` 内部创建 Server | `AgentLoopManager.create(llm_client=...)` 外部注入 Client | — |
+| `AgentLoopManager.create(...)` 内部创建 Server                | `AgentLoopManager.create(llm_client=...)` 外部注入 Client  | —                      |
 
 **迁移示例**：
 
@@ -793,8 +881,10 @@ agent_loop_mgr = await AgentLoopManager.create(
 
 本次解耦是 **Issue #5790 (Agent Gateway RFC)** 的关键前置步骤：
 
-1. **Server 管理与 Agent 调度彻底分离**：任何第三方 Agent 框架（NeMo-Gym、Bedrock、SWE-agent）只需消费 `LLMServerClient` 即可使用 verl 的推理基础设施
-2. **为 AgentGateway 铺路**：未来 Gateway 模式下，`LLMServerManager` 可以直接服务于外部 Agent 进程，无需经过 `AgentLoopManager`
+1. **Server 管理与 Agent 调度彻底分离**：任何第三方 Agent 框架（NeMo-Gym、Bedrock、SWE-agent）只需消费 `LLMServerClient` 即可使用
+   verl 的推理基础设施
+2. **为 AgentGateway 铺路**：未来 Gateway 模式下，`LLMServerManager` 可以直接服务于外部 Agent 进程，无需经过
+   `AgentLoopManager`
 3. **弹性调度兼容**：`LLMServerManager` 的 `add_replica()` / `remove_replica()` 预留接口可直接对接 Elastic Scheduling v2
 
 ---
@@ -815,18 +905,21 @@ agent_loop_mgr = await AgentLoopManager.create(
 ```mermaid
 flowchart LR
     R[Rollout 全部完成<br/>必须等待最长样本（长尾）] --> Bub[GPU 空闲气泡]
-    Bub --> T[Train]
+Bub --> T[Train]
 
-    style R fill:#ffcccc
-    style Bub fill:#fff2cc
-    style T fill:#d4edda
+style R fill: #ffcccc
+style Bub fill: #fff2cc
+style T fill: #d4edda
 ```
 
-当数据集存在**长尾响应长度分布**时（少量超长样本拖慢整批 step），GPU 利用率严重下降。Fully Async 框架通过 Trainer/Rollout 解耦解决了这个问题，但引入了较高的架构复杂度。
+当数据集存在**长尾响应长度分布**时（少量超长样本拖慢整批 step），GPU 利用率严重下降。Fully Async 框架通过 Trainer/Rollout
+解耦解决了这个问题，但引入了较高的架构复杂度。
 
-**verl-recipe #96 提出了一种轻量级替代方案**：在同步训练框架内，对长尾样本做 **跨 step 中断+续跑（Partial Rollout）**，以 APRIL（[paper](https://arxiv.org/pdf/2509.18521)）风格回收 GPU 气泡。
+**verl-recipe #96 提出了一种轻量级替代方案**：在同步训练框架内，对长尾样本做 **跨 step 中断+续跑（Partial Rollout）**，以
+APRIL（[paper](https://arxiv.org/pdf/2509.18521)）风格回收 GPU 气泡。
 
-> ⚠️ **不要与 Fully Async 的 Partial Rollout 混淆**：本方案仍走同步循环「rollout → 等 batch 齐 → train」，只是允许中断长尾样本跨 step 续跑。Trainer 与 Rollout 之间是串行的。Fully Async 的 Partial Rollout 则是在 Trainer/Rollout 完全异步并行环境下的中断恢复机制。
+> ⚠️ **不要与 Fully Async 的 Partial Rollout 混淆**：本方案仍走同步循环「rollout → 等 batch 齐 → train」，只是允许中断长尾样本跨
+> step 续跑。Trainer 与 Rollout 之间是串行的。Fully Async 的 Partial Rollout 则是在 Trainer/Rollout 完全异步并行环境下的中断恢复机制。
 
 ### 核心思想：SSIM（Sample Supplementation + Interruption Mechanism）
 
@@ -837,72 +930,73 @@ gantt
     axisFormat %s
 
     section 传统同步 Step
-    prompt_1 (1000 tokens, 短)        :done, p1, 0, 1000
-    prompt_2 (4000 tokens, 长尾)      :crit, p2, 0, 4000
-    prompt_3 (1200 tokens)            :done, p3, 0, 1200
-    GPU bubble (等长尾)               :crit, bub, 1200, 4000
-    Train                              :active, tr, 4000, 4500
+        prompt_1 (1000 tokens, 短): done, p1, 0, 1000
+        prompt_2 (4000 tokens, 长尾): crit, p2, 0, 4000
+        prompt_3 (1200 tokens): done, p3, 0, 1200
+        GPU bubble (等长尾): crit, bub, 1200, 4000
+        Train: active, tr, 4000, 4500
 
     section Partial Rollout Step N
-    prompt_1 done → batch              :done, q1, 0, 1000
-    prompt_2 abort@1500 (暂存)         :active, q2, 0, 1500
-    prompt_3 done → batch              :done, q3, 0, 1200
-    Train (短样本先训)                  :active, tr1, 1500, 2000
+        prompt_1 done → batch: done, q1, 0, 1000
+        prompt_2 abort@1500 (暂存): active, q2, 0, 1500
+        prompt_3 done → batch: done, q3, 0, 1200
+        Train (短样本先训): active, tr1, 1500, 2000
 
     section Partial Rollout Step N+1
-    prompt_2 resume@1500 → done        :done, r2, 2000, 4500
-    new prompt_4                       :done, r4, 2000, 3000
-    new prompt_5                       :done, r5, 2000, 3200
-    Train                              :active, tr2, 4500, 5000
+        prompt_2 resume@1500 → done: done, r2, 2000, 4500
+        new prompt_4: done, r4, 2000, 3000
+        new prompt_5: done, r5, 2000, 3200
+        Train: active, tr2, 4500, 5000
 ```
 
-> 传统同步模式中，长尾 prompt_2 造成大量 GPU bubble；Partial Rollout 在 Step N 中断 prompt_2，让短样本先训练，长尾在 Step N+1 从第 1500 个 token 续跑，有效回收气泡。
+> 传统同步模式中，长尾 prompt_2 造成大量 GPU bubble；Partial Rollout 在 Step N 中断 prompt_2，让短样本先训练，长尾在 Step
+> N+1 从第 1500 个 token 续跑，有效回收气泡。
 
 ### 架构设计
 
 ```mermaid
 flowchart TB
     Trainer[PRv3RayPPOTrainer]
-    subgraph Mgr["RolloutPromptManager (Ray Actor)"]
-        direction LR
-        Pending[("pending queue<br/>等待 rollout")]
-        Ongoing[("ongoing<br/>generating")]
-        Done[("done<br/>output")]
-        Pending -->|pull_prompts| Ongoing
-        Ongoing -->|done| Done
-        Ongoing -.->|aborted (appendleft)| Pending
-    end
-    Trainer -->|push_batch / pull_batch| Mgr
-    Done -->|pull_batch| Trainer
+subgraph Mgr["RolloutPromptManager (Ray Actor)"]
+direction LR
+Pending[("pending queue<br/>等待 rollout")]
+Ongoing[("ongoing<br/>generating")]
+Done[("done<br/>output")]
+Pending -->|pull_prompts|Ongoing
+Ongoing -->|done|Done
+Ongoing -.->|aborted (appendleft )|Pending
+end
+Trainer -->|push_batch / pull_batch|Mgr
+Done -->|pull_batch|Trainer
 
-    Mgr -->|pull_prompts| Workers[PRv3AgentLoopWorker ×N]
-    Workers -->|push_results| Mgr
-    Workers <-->|HTTP generate / cancel / resume| Servers[PRv3vLLMHttpServer ×replicas]
+Mgr -->|pull_prompts|Workers[PRv3AgentLoopWorker ×N]
+Workers -->|push_results|Mgr
+Workers <-->|HTTP generate / cancel / resume|Servers[PRv3vLLMHttpServer ×replicas]
 
-    style Pending fill:#fff2cc
-    style Ongoing fill:#cfe2ff
-    style Done fill:#d4edda
-    style Mgr fill:#f5f5f5
+style Pending fill: #fff2cc
+style Ongoing fill: #cfe2ff
+style Done fill: #d4edda
+style Mgr fill: #f5f5f5
 ```
 
 #### 三队列调度模型
 
 `RolloutPromptManager` 是核心调度器（Ray Actor），维护三个队列：
 
-| 队列 | 状态 | 说明 |
-|------|------|------|
-| **pending** | 等待 rollout | 新 prompt 或被 abort 后需续跑的 prompt |
-| **ongoing** | 正在生成中 | 已发给 vLLM Server，等待返回 |
-| **done** | 生成完成（含 abort） | 可被 Trainer pull 的完整/部分结果 |
+| 队列          | 状态            | 说明                             |
+|-------------|---------------|--------------------------------|
+| **pending** | 等待 rollout    | 新 prompt 或被 abort 后需续跑的 prompt |
+| **ongoing** | 正在生成中         | 已发给 vLLM Server，等待返回           |
+| **done**    | 生成完成（含 abort） | 可被 Trainer pull 的完整/部分结果       |
 
 **状态转换规则**：
 
 ```mermaid
 stateDiagram-v2
     [*] --> pending: 新 prompt 入队
-    pending --> ongoing: pull_prompts()
-    ongoing --> done: push(done)<br/>正常完成
-    ongoing --> pending: appendleft(aborted)<br/>回到队列头部续跑
+    pending --> ongoing: pull_prompts
+    ongoing --> done: push done / 正常完成
+    ongoing --> pending: appendleft aborted / 回到队列头部续跑
     done --> [*]: pull_batch 被 Trainer 消费
 
     note right of ongoing
@@ -913,14 +1007,14 @@ stateDiagram-v2
 
 #### 六大核心组件
 
-| 组件 | 文件 | 角色 |
-|------|------|------|
-| **PRv3RayPPOTrainer** | `ray_trainer.py` | 主训练循环。`_fit_generate` 将 prompt 推入 Manager，异步等待一批结果后执行 log_prob / advantage / update |
-| **RolloutPromptManager** | `prompt_manager.py` | Ray Actor，持有 pending/ongoing/done 三队列。`pull_batch` 基于 `asyncio.Event` 驱动（无忙轮询） |
-| **PRv3AgentLoopManager/Worker** | `agent_loop/agent_loop.py` | 调度和驱动 vLLM cancel/resume；Worker 按 trajectory 预算（非 prompt 数）消费 prompt |
-| **PRv3SingleTurnAgentLoop** | `agent_loop/single_turn_agent_loop.py` | 检查 `last_agent_loop_output`：已完成则透传，aborted 则从断点续跑 |
-| **PRv3ToolAgentLoop** | `agent_loop/tool_agent_loop.py` | 多轮 tool-call 场景的 partial-rollout 版本 |
-| **PRv3vLLMHttpServer** | `vllm_rollout/vllm_async_server.py` | 扩展上游 vLLM HTTP Server，新增 `cancel()` / `resume()` + `paused` 门控 |
+| 组件                              | 文件                                     | 角色                                                                                  |
+|---------------------------------|----------------------------------------|-------------------------------------------------------------------------------------|
+| **PRv3RayPPOTrainer**           | `ray_trainer.py`                       | 主训练循环。`_fit_generate` 将 prompt 推入 Manager，异步等待一批结果后执行 log_prob / advantage / update |
+| **RolloutPromptManager**        | `prompt_manager.py`                    | Ray Actor，持有 pending/ongoing/done 三队列。`pull_batch` 基于 `asyncio.Event` 驱动（无忙轮询）      |
+| **PRv3AgentLoopManager/Worker** | `agent_loop/agent_loop.py`             | 调度和驱动 vLLM cancel/resume；Worker 按 trajectory 预算（非 prompt 数）消费 prompt                |
+| **PRv3SingleTurnAgentLoop**     | `agent_loop/single_turn_agent_loop.py` | 检查 `last_agent_loop_output`：已完成则透传，aborted 则从断点续跑                                   |
+| **PRv3ToolAgentLoop**           | `agent_loop/tool_agent_loop.py`        | 多轮 tool-call 场景的 partial-rollout 版本                                                 |
+| **PRv3vLLMHttpServer**          | `vllm_rollout/vllm_async_server.py`    | 扩展上游 vLLM HTTP Server，新增 `cancel()` / `resume()` + `paused` 门控                      |
 
 #### vLLM Cancel/Resume 机制
 
@@ -947,13 +1041,13 @@ class PRv3vLLMHttpServer:
 
 **对比原始 APR (#58) 方案**：
 
-| 维度 | verl-recipe#58 (APR) | PR #96 (PRv3) | 原因 |
-|------|---------------------|---------------|------|
-| vLLM cancel | per-request `asyncio.Event` dict + `Lock` | 引擎级 `paused` flag + `abort_all_requests()` | 单次引擎调用 vs 逐请求 fan-out，避免 Actor 争用 |
-| Inflight 预算单位 | prompt 数 | **trajectory 数** | 部分完成的 prompt 只消耗剩余 traj 预算，非完整 n |
-| Worker 补给计算 | `len(done) × n` | `sum(consumed_traj for done)` | 匹配 traj-count 预算 |
-| 数据流 | Manager 持有 StatefulDataLoader | Trainer 持有 dataloader，push batch 进 Manager | Manager 无需复制 epoch/iter 游标逻辑 |
-| 调度优先级 | 多维度排序 (unfinished/length/staleness) | FIFO + aborted prompt `appendleft`（缓存局部性） | 续跑时 KV cache 可能仍在 Server 上 |
+| 维度            | verl-recipe#58 (APR)                      | PR #96 (PRv3)                              | 原因                                |
+|---------------|-------------------------------------------|--------------------------------------------|-----------------------------------|
+| vLLM cancel   | per-request `asyncio.Event` dict + `Lock` | 引擎级 `paused` flag + `abort_all_requests()` | 单次引擎调用 vs 逐请求 fan-out，避免 Actor 争用 |
+| Inflight 预算单位 | prompt 数                                  | **trajectory 数**                           | 部分完成的 prompt 只消耗剩余 traj 预算，非完整 n  |
+| Worker 补给计算   | `len(done) × n`                           | `sum(consumed_traj for done)`              | 匹配 traj-count 预算                  |
+| 数据流           | Manager 持有 StatefulDataLoader             | Trainer 持有 dataloader，push batch 进 Manager | Manager 无需复制 epoch/iter 游标逻辑      |
+| 调度优先级         | 多维度排序 (unfinished/length/staleness)       | FIFO + aborted prompt `appendleft`（缓存局部性）  | 续跑时 KV cache 可能仍在 Server 上        |
 
 #### 关键不变量
 
@@ -965,33 +1059,35 @@ class PRv3vLLMHttpServer:
 
 ### 实验验证
 
-**实验环境**：2× RTX 3090, Qwen3-0.6B, GSM8K, GRPO + token-level rollout-IS, `max_response_length=4096`, batch=8, TP=1, 934 steps/epoch
+**实验环境**：2× RTX 3090, Qwen3-0.6B, GSM8K, GRPO + token-level rollout-IS, `max_response_length=4096`, batch=8, TP=1,
+934 steps/epoch
 
-| 指标 | Baseline (vanilla GRPO) | Partial Rollout (PR #96) | 提升 |
-|------|------------------------|--------------------------|------|
-| **timing_s/gen (avg)** | 26.1s | **18.5s** | **−29%** |
-| **perf/throughput (tok/s/GPU)** | 851 | **1060** | **+24%** |
-| **timing_s/step (avg)** | ~45s | ~35s | −16% |
-| critic/rewards/mean | ~0.7–0.9 (收敛) | ~0.7–0.9 (收敛) | **无偏移** ✓ |
-| response_length/mean | ~1100 | ~1142 | 噪声范围内 ✓ |
-| actor/entropy | 0.4 → 0.15 | 0.4 → 0.15 | **轨迹重合** ✓ |
+| 指标                              | Baseline (vanilla GRPO) | Partial Rollout (PR #96) | 提升         |
+|---------------------------------|-------------------------|--------------------------|------------|
+| **timing_s/gen (avg)**          | 26.1s                   | **18.5s**                | **−29%**   |
+| **perf/throughput (tok/s/GPU)** | 851                     | **1060**                 | **+24%**   |
+| **timing_s/step (avg)**         | ~45s                    | ~35s                     | −16%       |
+| critic/rewards/mean             | ~0.7–0.9 (收敛)           | ~0.7–0.9 (收敛)            | **无偏移** ✓  |
+| response_length/mean            | ~1100                   | ~1142                    | 噪声范围内 ✓    |
+| actor/entropy                   | 0.4 → 0.15              | 0.4 → 0.15               | **轨迹重合** ✓ |
 
 **结论**：
+
 - ✅ **持续加速**：gen time 差距从 step 5 出现并持续 900+ steps 非 warmup 效应
 - ✅ **每步 PR ≤ baseline**：`timing_s/gen` 曲线几乎不交叉（除共享 validation spike）
 - ✅ **学习曲线像素级重合**：speedup 不是来自"偷工减料"，而是真正回收了 long-tail bubble
 
 ### 与 Fully Async Partial Rollout 的对比
 
-| 维度 | Colocate PR (#96) | Fully Async (PR #5071/#5430) |
-|------|-------------------|------------------------------|
-| **训练模式** | 同步（rollout → wait → train） | 异步（rollout ∥ train 并行） |
-| **中断触发** | Step 边界时间到 | CheckpointEngine 参数同步 |
-| **架构复杂度** | 低（三队列 + Ray Actor 调度器） | 高（CheckpointEngine + Abort/Resume 接口链） |
-| **适用场景** | 少量 GPU、不想引入 Fully Async 复杂度 | 大规模集群、需要最大化利用率 |
-| **Off-policy 程度** | 中等（跨 1-N 步） | 可配置（staleness_threshold 控制） |
-| **依赖** | PR #6129 (LLMServerManager 解耦) | PR #5029 (CE) + PR #5071 (Abort/Resume) |
-| **IS 修正** | 必须（token-level 推荐） | 可选（MES 可精确计算 old log prob） |
+| 维度                | Colocate PR (#96)              | Fully Async (PR #5071/#5430)            |
+|-------------------|--------------------------------|-----------------------------------------|
+| **训练模式**          | 同步（rollout → wait → train）     | 异步（rollout ∥ train 并行）                  |
+| **中断触发**          | Step 边界时间到                     | CheckpointEngine 参数同步                   |
+| **架构复杂度**         | 低（三队列 + Ray Actor 调度器）         | 高（CheckpointEngine + Abort/Resume 接口链）  |
+| **适用场景**          | 少量 GPU、不想引入 Fully Async 复杂度    | 大规模集群、需要最大化利用率                          |
+| **Off-policy 程度** | 中等（跨 1-N 步）                    | 可配置（staleness_threshold 控制）             |
+| **依赖**            | PR #6129 (LLMServerManager 解耦) | PR #5029 (CE) + PR #5071 (Abort/Resume) |
+| **IS 修正**         | 必须（token-level 推荐）             | 可选（MES 可精确计算 old log prob）              |
 
 ### 使用方式
 
@@ -1009,11 +1105,11 @@ bash recipe/partial_rollout/run_qwen3-0.6b_gsm8k_grpo_baseline.sh
 
 **关键 Hydra 配置**：
 
-| 配置项 | 推荐值 | 说明 |
-|--------|--------|------|
-| `actor_rollout_ref.rollout.agent.default_agent_loop` | `prv3_single_turn_agent` / `prv3_tool_agent` | 必须使用 `prv3_` 前缀 agent loop |
-| `algorithm.rollout_correction.rollout_is` | `token` (推荐) / `sequence` | Token-level IS 避免 exp(±20) 安全钳位 |
-| `algorithm.rollout_correction.rollout_is_threshold` | `2.0` | IS 上界 |
+| 配置项                                                  | 推荐值                                          | 说明                              |
+|------------------------------------------------------|----------------------------------------------|---------------------------------|
+| `actor_rollout_ref.rollout.agent.default_agent_loop` | `prv3_single_turn_agent` / `prv3_tool_agent` | 必须使用 `prv3_` 前缀 agent loop      |
+| `algorithm.rollout_correction.rollout_is`            | `token` (推荐) / `sequence`                    | Token-level IS 避免 exp(±20) 安全钳位 |
+| `algorithm.rollout_correction.rollout_is_threshold`  | `2.0`                                        | IS 上界                           |
 
 ---
 
@@ -1043,11 +1139,10 @@ flowchart LR
 
     ALM -->|put sample| Q
     Q -->|get batch| SRT
-    CEM -.->|Parameter Sync<br/>NCCL / NIXL / ...| LSM
-
-    style Rollouter fill:#cfe2ff
-    style MQ fill:#fff2cc
-    style Trainer fill:#d4edda
+    CEM -.->|Parameter Sync<br/>NCCL / NIXL / . . .| LSM
+    style Rollouter fill: #cfe2ff
+    style MQ fill: #fff2cc
+    style Trainer fill: #d4edda
 ```
 
 ### 数据流
@@ -1156,11 +1251,13 @@ class AsyncTokenBucket:
 
 # 第三阶段：生态扩展 (2026.04 - 未来)
 
-第二阶段完成了基础设施的重构与解耦，第三阶段的目标是在此基础上扩展生态边界：高性能数据传输层（TransferQueue）、在线策略蒸馏（OPD）、多轨迹输出（Multi-Trajectory）、独立概率计算服务（Model Engine Server）、弹性调度系统，以及面向未来的 Agent Gateway。
+第二阶段完成了基础设施的重构与解耦，第三阶段的目标是在此基础上扩展生态边界：高性能数据传输层（TransferQueue）、在线策略蒸馏（OPD）、多轨迹输出（Multi-Trajectory）、独立概率计算服务（Model
+Engine Server）、弹性调度系统，以及面向未来的 Agent Gateway。
 
 ## 3.1 TransferQueue: 高性能数据传输层（已集成）
 
-TransferQueue 是一个高性能异步流式数据管理和传输模块，作为 MessageQueue 的升级替代方案，已在 **64 节点 1024 卡** 上通过 DAPO 训练验证。
+TransferQueue 是一个高性能异步流式数据管理和传输模块，作为 MessageQueue 的升级替代方案，已在 **64 节点 1024 卡** 上通过
+DAPO 训练验证。
 
 > 详细设计文档：`docs/advance/tq.md` |
 > 外部项目：[github.com/Ascend/TransferQueue](https://github.com/Ascend/TransferQueue)
@@ -1174,7 +1271,8 @@ TransferQueue 是一个高性能异步流式数据管理和传输模块，作为
 - 存储后端不可插拔：仅支持内存存储
 - 序列化开销大：完整 pickle 序列化/反序列化
 
-> TQ 由 AsyncFlow 论文作者团队（华为 Ascend）贡献，核心思想是**解耦控制流与数据流**——元数据走 Control Plane，Tensor 数据走 Data Plane 零拷贝传输。
+> TQ 由 AsyncFlow 论文作者团队（华为 Ascend）贡献，核心思想是**解耦控制流与数据流**——元数据走 Control Plane，Tensor 数据走
+> Data Plane 零拷贝传输。
 
 ### TransferQueue 架构
 
@@ -1198,9 +1296,9 @@ flowchart TB
         CP <-.->|metadata| DP
     end
 
-    style CP fill:#cfe2ff
-    style DP fill:#d4edda
-    style UI fill:#fff2cc
+    style CP fill: #cfe2ff
+    style DP fill: #d4edda
+    style UI fill: #fff2cc
 ```
 
 ### TQ 在同步训练中的角色：零拷贝数据通道
@@ -1244,7 +1342,8 @@ Dataloader → AgentLoopWorkerTQ (fire-and-forget)
 | 多轨迹支持      | 固定 batch 对齐          | 逐样本写入，padding 动态补齐         |
 | Bridge 机制  | 无                    | `@tqbridge` 装饰器透明桥接        |
 
-**tqbridge 透明桥接**（`verl/utils/transferqueue_utils.py`）使得 Single Controller 的 `register` 装饰器链函数无需修改内部逻辑即可使用 TQ：函数接收的是普通 `TensorDict`，读写由装饰器自动处理。
+**tqbridge 透明桥接**（`verl/utils/transferqueue_utils.py`）使得 Single Controller 的 `register` 装饰器链函数无需修改内部逻辑即可使用
+TQ：函数接收的是普通 `TensorDict`，读写由装饰器自动处理。
 
 ### TQ 在异步训练中的角色与规划
 
@@ -1252,7 +1351,8 @@ Dataloader → AgentLoopWorkerTQ (fire-and-forget)
 
 **当前状态 — Path A: Collocated TQ（已实现）**
 
-`main_ppo_sync.py` 本质上仍是 Collocated 架构（Trainer/Rollout 共享进程），TQ 替代了 MessageQueue 但未改变部署拓扑。这是 TQ 验证正确性的第一阶段。
+`main_ppo_sync.py` 本质上仍是 Collocated 架构（Trainer/Rollout 共享进程），TQ 替代了 MessageQueue 但未改变部署拓扑。这是 TQ
+验证正确性的第一阶段。
 
 **目标架构 — Path B: Distributed TQ Fully Async（开发中）**
 
@@ -1287,21 +1387,20 @@ flowchart LR
     end
 
     A -.->|演进| B
-
-    style A fill:#ffe0e0
-    style B fill:#d4edda
-    style A_MQ fill:#ffcccc
-    style B_TQ fill:#99ff99
+    style A fill: #ffe0e0
+    style B fill: #d4edda
+    style A_MQ fill: #ffcccc
+    style B_TQ fill: #99ff99
 ```
 
 **关键变化**：
 
-| 维度 | 当前 Fully Async (MessageQueue) | 目标 Fully Async (TransferQueue) |
+| 维度   | 当前 Fully Async (MessageQueue) | 目标 Fully Async (TransferQueue) |
 |------|-------------------------------|--------------------------------|
-| 存储 | ❌ MessageQueue 单点 | ✅ TQ 分布式存储 |
-| 数据路径 | ❌ Rollouter 中转全部数据 | ✅ Server 直连 TQ |
-| 调度 | ❌ Worker 被动调度 | ✅ Worker 主动拉取（事件循环） |
-| 流控 | ❌ 全局 staleness 计数 | ✅ Slot 背压机制 |
+| 存储   | ❌ MessageQueue 单点             | ✅ TQ 分布式存储                     |
+| 数据路径 | ❌ Rollouter 中转全部数据            | ✅ Server 直连 TQ                 |
+| 调度   | ❌ Worker 被动调度                 | ✅ Worker 主动拉取（事件循环）            |
+| 流控   | ❌ 全局 staleness 计数             | ✅ Slot 背压机制                    |
 
 **Path B 与现有异步组件的协同规划**：
 
@@ -1341,7 +1440,8 @@ flowchart LR
 **PR 标题**: `[fully_async, rollout] feat: enable online policy distillation in fully async training`
 **状态**: Merged (2026-05-06) | [+438/-1] | 6 files
 
-将在线策略蒸馏（Online Policy Distillation, OPD）能力集成到 Fully Async 训练模式中，使异步训练流水线支持 Teacher-Student 知识迁移。
+将在线策略蒸馏（Online Policy Distillation, OPD）能力集成到 Fully Async 训练模式中，使异步训练流水线支持 Teacher-Student
+知识迁移。
 
 ### 核心变更
 
@@ -1370,7 +1470,8 @@ flowchart LR
 
 ### 动机
 
-当前 verl 中 `rollout.n` 的实现方式是对同一个 prompt 重复调用 `n` 次 LLM 推理。PR #6271 将其改为在 Agent Loop 内部一次 rollout 生成多条轨迹，减少 LLM 调用开销并支持更灵活的轨迹生成策略。
+当前 verl 中 `rollout.n` 的实现方式是对同一个 prompt 重复调用 `n` 次 LLM 推理。PR #6271 将其改为在 Agent Loop 内部一次
+rollout 生成多条轨迹，减少 LLM 调用开销并支持更灵活的轨迹生成策略。
 
 ### 关联 Issue
 
@@ -1397,7 +1498,8 @@ class AgentFramework(ABC):
         """处理 trainer batch 并返回训练数据"""
 ```
 
-统一的 Agent 接口，内部实现可以是 coroutine、subprocess 或远程调用。框架层只关心 `generate_sequences` 的输入输出，不关心 Agent 内部执行结构。
+统一的 Agent 接口，内部实现可以是 coroutine、subprocess 或远程调用。框架层只关心 `generate_sequences` 的输入输出，不关心
+Agent 内部执行结构。
 
 **2. AgentGateway — Serving 侧 Trajectory 收集子系统**
 
@@ -1420,10 +1522,9 @@ flowchart TB
     end
     Root --> AF
     Root --> SR
-
-    style AF fill:#cfe2ff
-    style SR fill:#d4edda
-    style GM fill:#fff2cc
+    style AF fill: #cfe2ff
+    style SR fill: #d4edda
+    style GM fill: #fff2cc
 ```
 
 AgentGateway 作为 serving 层的子系统，拦截 Agent 的 OpenAI Chat Completions API 调用：
@@ -1447,7 +1548,8 @@ AgentGateway 作为 serving 层的子系统，拦截 Agent 的 OpenAI Chat Compl
 **分支**: `standalone_old_log_prob_support`
 **状态**: 开发中
 
-Model Engine Server 是 verl 异步训练中的关键基础设施组件，解决了一个核心问题：**如何准确计算 old log probability（旧策略概率）**。
+Model Engine Server 是 verl 异步训练中的关键基础设施组件，解决了一个核心问题：**如何准确计算 old log probability（旧策略概率）
+**。
 
 ### 背景与动机
 
@@ -1458,52 +1560,54 @@ Model Engine Server 是 verl 异步训练中的关键基础设施组件，解决
 | **rollout_log_probs** | 当前 rollout 模型（可能已 stale）生成的 token 概率 | vLLM/SGLang 推理时返回的 `logprobs` |
 | **old_log_probs**     | 上一步参数更新前的模型对生成序列的概率                  | 需要用**旧参数**重新前向传播              |
 
-问题在于：vLLM 推理引擎返回的是**当前模型参数**下的 log probs（即 `rollout_log_probs`），而非训练步开始时的参数。在异步训练中，rollout 可能使用 stale 参数（`staleness_threshold > 0`），导致两者不一致。
+问题在于：vLLM 推理引擎返回的是**当前模型参数**下的 log probs（即 `rollout_log_probs`），而非训练步开始时的参数。在异步训练中，rollout
+可能使用 stale 参数（`staleness_threshold > 0`），导致两者不一致。
 
-> **解决方案**：引入独立的 Model Engine Server，使用与 Trainer 相同的训练引擎（FSDP/Megatron）精确计算 old log probabilities。
+> **解决方案**：引入独立的 Model Engine Server，使用与 Trainer 相同的训练引擎（FSDP/Megatron）精确计算 old log
+> probabilities。
 
 ### 架构设计
 
 ```mermaid
 flowchart TB
-    subgraph Pipe[Fully Async Training Pipeline]
-        direction TB
-        Rollout[Rollout<br/>vLLM / SGLang]
-        MQ[(MessageQueue)]
-        Trainer[Trainer<br/>compute_advantage<br/>update_actor]
-        FLSM[FullyLLMServerManager<br/>generate 完成后调用<br/>_compute_log_probs]
-        subgraph MES[ModelEngineServer Ray Actor]
-            direction TB
-            BC[Batch Consumer asyncio<br/>收集请求 → 超时/满批 → dispatch → 返回结果]
-            subgraph WG[ModelEngineWorkerGroup RayWorkerGroup]
-                direction LR
-                W0[Worker 0<br/>Training Engine<br/>Megatron / FSDP]
-                W1[Worker 1<br/>Training Engine<br/>Megatron / FSDP]
-                WN[Worker N<br/>Training Engine<br/>Megatron / FSDP]
-            end
-            BC --> WG
-        end
-        CE[CheckpointEngine<br/>从 Trainer 同步旧参数]
+subgraph Pipe[Fully Async Training Pipeline]
+direction TB
+Rollout[Rollout<br/>vLLM / SGLang]
+MQ[(MessageQueue)]
+Trainer[Trainer<br/>compute_advantage<br/>update_actor]
+FLSM[FullyLLMServerManager<br/>generate 完成后调用<br/>_compute_log_probs]
+subgraph MES[ModelEngineServer Ray Actor]
+direction TB
+BC[Batch Consumer asyncio<br/>收集请求 → 超时/满批 → dispatch → 返回结果]
+subgraph WG[ModelEngineWorkerGroup RayWorkerGroup]
+direction LR
+W0[Worker 0<br/>Training Engine<br/>Megatron / FSDP]
+W1[Worker 1<br/>Training Engine<br/>Megatron / FSDP]
+WN[Worker N<br/>Training Engine<br/>Megatron / FSDP]
+end
+BC --> WG
+end
+CE[CheckpointEngine<br/>从 Trainer 同步旧参数]
 
-        Rollout -->|sample| MQ
-        MQ -->|batch| Trainer
-        Rollout -->|rollout_log_probs<br/>from vLLM inference| FLSM
-        FLSM -->|prompt_ids + response_ids| MES
-        MES -->|engine_server_logprobs| FLSM
-        Trainer -.->|NCCL sync| CE
-        CE -.->|NCCL 权重同步| MES
-    end
+Rollout -->|sample|MQ
+MQ -->|batch|Trainer
+Rollout -->|rollout_log_probs<br/>from vLLM inference|FLSM
+FLSM -->|prompt_ids + response_ids| MES
+MES -->|engine_server_logprobs|FLSM
+Trainer -.->|NCCL sync|CE
+CE -.->|NCCL 权重同步|MES
+end
 
-    style Rollout fill:#cfe2ff
-    style Trainer fill:#d4edda
-    style MES fill:#fff2cc
-    style FLSM fill:#ffe4b5
-    style CE fill:#f5d0fe
+style Rollout fill: #cfe2ff
+style Trainer fill: #d4edda
+style MES fill: #fff2cc
+style FLSM fill:#ffe4b5
+style CE fill: #f5d0fe
 ```
 
 ### 五大核心类
 
-| 类名                             | 角色                |说明                                                                  |
+| 类名                             | 角色                | 说明                                                                  |
 |--------------------------------|-------------------|---------------------------------------------------------------------|
 | **`ModelEngineServerAdapter`** | BaseRollout 适配器   | 包装 `TrainingWorker`，提供 `compute_log_prob()` 和 `update_weights()` 接口 |
 | **`ModelEngineWorker`**        | Ray Worker        | 继承 `CheckpointEngineWorker` + `DistProfilerExtension`，持有训练引擎实例      |
@@ -1603,7 +1707,7 @@ actor_rollout_ref:
   actor:
     use_rollout_log_probs: True # 训练使用 rollout log probs (或 engine_server_logprobs)
 
-# Shell 脚本中启用:
+  # Shell 脚本中启用:
   model_engine_server.enable=True
   model_engine_server.enable_old_mode=True
   model_engine_server.nnodes=${NNODES_LOG_PROB}    # 独立节点
@@ -1649,9 +1753,12 @@ verl/trainer/config/model_engine_server/
 
 这是弹性调度的**前置基础设施 PR**，为后续完整弹性调度系统奠定基础。核心贡献包括：
 
-1. **Handle Registry 合入 GlobalRequestLoadBalancer**：将原来分散在各 Client 的本地 server handle 缓存集中到 LB，使 elastic add/remove 只需 **一次 Ray RPC**，无需广播通知所有 client/worker
-2. **FullyAsyncLLMServerManager 两阶段初始化 + 弹性生命周期**：支持 Hybrid Replica（trainer GPU 上运行）+ Standalone Replica（专用 rollout GPU），运行时动态 `add_replica()` / `remove_replica()`
-3. **Trainer 侧 Validation (`use_trainer_do_validate=True`)**：通过三阶段验证循环在 fully-async 模式下复用 trainer GPU 做 validation
+1. **Handle Registry 合入 GlobalRequestLoadBalancer**：将原来分散在各 Client 的本地 server handle 缓存集中到 LB，使
+   elastic add/remove 只需 **一次 Ray RPC**，无需广播通知所有 client/worker
+2. **FullyAsyncLLMServerManager 两阶段初始化 + 弹性生命周期**：支持 Hybrid Replica（trainer GPU 上运行）+ Standalone
+   Replica（专用 rollout GPU），运行时动态 `add_replica()` / `remove_replica()`
+3. **Trainer 侧 Validation (`use_trainer_do_validate=True`)**：通过三阶段验证循环在 fully-async 模式下复用 trainer GPU 做
+   validation
 4. **KV-Cache-Only 权重同步优化**：vLLM `sleep(level=1)` 模式下只释放 kv_cache 保留 weights，减少内存压力
 5. **Abort 状态追踪**：vLLM/SGLang server 追踪 `_is_aborted` flag，防止 post-abort 处理错误
 
@@ -1675,32 +1782,32 @@ verl/trainer/config/model_engine_server/
 
 ```mermaid
 flowchart TB
-    subgraph Cluster[GPU Cluster]
-        direction TB
-        subgraph Resources[资源层]
-            direction LR
-            Fixed[固定 Rollout 资源<br/>Standalone Replica<br/>始终活跃<br/>vLLM / SGLang Server]
-            Elastic[弹性资源 单一大 wg<br/>elastic_0: TRAIN / ROLLOUT<br/>elastic_1: TRAIN / ROLLOUT<br/>elastic_N: ...]
-        end
-        ER[ElasticRollouter<br/>样本生产]
-        ET[ElasticTrainer<br/>模型训练]
-        MQ[(MessageQueue)]
-        Coord[ElasticCoordinator<br/>Ray Actor / 调度决策大脑<br/>监控速率 · 决策切换<br/>延迟到训练边界执行]
+subgraph Cluster[GPU Cluster]
+direction TB
+subgraph Resources[资源层]
+direction LR
+Fixed[固定 Rollout 资源<br/>Standalone Replica<br/>始终活跃<br/>vLLM / SGLang Server]
+Elastic[弹性资源 单一大 wg<br/>elastic_0: TRAIN / ROLLOUT<br/>elastic_1: TRAIN / ROLLOUT<br/>elastic_N: ...]
+end
+ER[ElasticRollouter<br/>样本生产]
+ET[ElasticTrainer<br/>模型训练]
+MQ[(MessageQueue)]
+Coord[ElasticCoordinator<br/>Ray Actor / 调度决策大脑<br/>监控速率 · 决策切换<br/>延迟到训练边界执行]
 
-        Fixed --> ER
-        Elastic --> ER
-        Elastic --> ET
-        ER --> MQ
-        MQ --> ET
-        MQ -.->|队列利用率| Coord
-        Coord -.->|switch decision| Elastic
-    end
+Fixed --> ER
+Elastic --> ER
+Elastic --> ET
+ER --> MQ
+MQ --> ET
+MQ -.->|队列利用率|Coord
+Coord -.->|switch decision|Elastic
+end
 
-    style Fixed fill:#cfe2ff
-    style Elastic fill:#fff2cc
-    style ER fill:#d4edda
-    style ET fill:#d4edda
-    style Coord fill:#f5d0fe
+style Fixed fill: #cfe2ff
+style Elastic fill: #fff2cc
+style ER fill: #d4edda
+style ET fill: #d4edda
+style Coord fill:#f5d0fe
 ```
 
 #### 资源划分模型
@@ -1722,13 +1829,11 @@ stateDiagram-v2
     INIT --> TRAIN: 初始化进入训练
     TRAIN --> ROLLOUT: switch_elastic_to_rollout()
     ROLLOUT --> TRAIN: switch_elastic_to_train()
-
     note left of TRAIN
         Actor Engine 在 GPU
         Rollout Engine 休眠
         (kv_cache + weights 已释放)
     end note
-
     note right of ROLLOUT
         Rollout Engine 在 GPU
         Actor Engine 在 CPU (offload)
@@ -1740,10 +1845,10 @@ stateDiagram-v2
 ```mermaid
 flowchart LR
     A[① remove_elastic_actor<br/>DP rebuild 排除此 ranks] --> B[② worker.switch_to_rollout<br/>actor.offload_to_cpu 释放 GPU]
-    B --> C[③ rollouter.add_elastic_replica<br/>wake_up + 加入 LB 池]
-    style A fill:#ffe0e0
-    style B fill:#fff2cc
-    style C fill:#d4edda
+B --> C[③ rollouter.add_elastic_replica<br/>wake_up + 加入 LB 池]
+style A fill:#ffe0e0
+style B fill: #fff2cc
+style C fill: #d4edda
 ```
 
 **Rollout → Train 切换步骤**：
@@ -1751,10 +1856,10 @@ flowchart LR
 ```mermaid
 flowchart LR
     A[① rollouter.remove_elastic_replica<br/>sleep + abort in-flight] --> B[② worker.switch_to_train<br/>actor.load_to_gpu]
-    B --> C[③ add_elastic_actor<br/>DP rebuild 纳入此 ranks]
-    style A fill:#ffe0e0
-    style B fill:#fff2cc
-    style C fill:#d4edda
+B --> C[③ add_elastic_actor<br/>DP rebuild 纳入此 ranks]
+style A fill: #ffe0e0
+style B fill: #fff2cc
+style C fill: #d4edda
 ```
 
 #### 五大核心组件
@@ -1777,7 +1882,8 @@ Phase 4: 训练计算(GPU繁忙)               ← compute_reward / update_actor
 Phase 5: _fit_update_weights()           ← 参数同步(Path A NCCL + Path B Naive)
 ```
 
-> **为什么切换必须在拉数据之前**：切换改变 DP size → `required_samples` 和 `mini_batch_size` 随之变化。先拉数据再切换会导致 batch 大小与新 DP size 不整除。
+> **为什么切换必须在拉数据之前**：切换改变 DP size → `required_samples` 和 `mini_batch_size` 随之变化。先拉数据再切换会导致
+> batch 大小与新 DP size 不整除。
 
 #### DP Rebuild（Megatron & FSDP2 支持）
 
@@ -1791,15 +1897,14 @@ sequenceDiagram
     participant Old as 老成员 ranks
     participant New as 新成员 ranks
     participant Excl as 被排除 ranks
-
     Note over All: Step 1: capture_state_to_cpu()<br/>每个 rank 独立快照到 CPU<br/>（零网络通信）
     Note over All: Step 2: _destroy_parallel_groups()<br/>销毁旧 TP / PP / DP 通信组
-    All->>All: Step 3: dist.new_group(new_ranks)<br/>所有 rank 必须参与（含被排除者，防死锁）
-    All->>All: Step 4: dist.barrier()
-    Excl-->>Excl: Step 5: 新成员之外的被排除 ranks return 退出
-    Old->>Old: Step 6: _restore_state_from_cpu()<br/>老成员从 CPU 恢复
-    Old->>New: Step 7: _sync_params_to_new_members()<br/>broadcast(src=rank0) 覆盖新成员权重
-    Old->>New: Step 8: dist.barrier()
+    All ->> All: Step 3: dist.new_group(new_ranks)<br/>所有 rank 必须参与（含被排除者，防死锁）
+    All ->> All: Step 4: dist.barrier()
+    Excl -->> Excl: Step 5: 新成员之外的被排除 ranks return 退出
+    Old ->> Old: Step 6: _restore_state_from_cpu()<br/>老成员从 CPU 恢复
+    Old ->> New: Step 7: _sync_params_to_new_members()<br/>broadcast(src=rank0) 覆盖新成员权重
+    Old ->> New: Step 8: dist.barrier()
 ```
 
 **FSDP2 DP 重建流程**：类似，但需先 `unwrap FSDP → to_local() → CPU拷贝`，再重新包装 FSDP2（新 device_mesh）。
@@ -1883,24 +1988,24 @@ timeline
     title verl 异步强化学习路线图
 
     section 现在 (2026.05)
-        Fully Async 2.35x 加速 : Trainer / Rollout 完全异步并行
-        OPD 集成 (PR #6056) : Online Policy Distillation 接入 Fully Async
-        Model Engine Server (PR #5990) : 独立 old / ref log prob 计算
-        弹性调度基础 (PR #6076) : Handle Registry / 两阶段初始化
-        TQ Path A ✓ : Collocated TransferQueue 落地
-        1024 卡验证 : 64 节点 DAPO 训练规模化
+        Fully Async 2.35x 加速: Trainer / Rollout 完全异步并行
+        OPD 集成 (PR@6056) : Online Policy Distillation 接入 Fully Async
+        Model Engine Server (PR@5990) : 独立 old / ref log prob 计算
+        弹性调度基础 (PR@6076) : Handle Registry / 两阶段初始化
+        TQ Path A ✓: Collocated TransferQueue 落地
+        1024 卡验证: 64 节点 DAPO 训练规模化
 
     section 近期 (2026 H1)
-        Multi-Trajectory (PR #6271) : Agent Loop 一次 rollout 多轨迹
-        TQ 生产化深化 : Server 直连 TQ
-        Elastic TQ 调度 : TQ partition 支持弹性分区
-        TQ + MES 协同 : MES 输出经 TQ 字段传递
+        Multi-Trajectory (PR@6271) : Agent Loop 一次 rollout 多轨迹
+        TQ 生产化深化: Server 直连 TQ
+        Elastic TQ 调度: TQ partition 支持弹性分区
+        TQ + MES 协同: MES 输出经 TQ 字段传递
 
     section 中远期 (2026 H2+)
-        Agent Gateway (RFC #5790) : AgentFramework 抽象 + Trajectory Gateway / 任意 Agent 接入
-        Elastic Scheduling v2 : GPU 动态 Train / Rollout 切换
-        DP Rebuild + 双路同步 : Megatron / FSDP2 弹性 DP
-        TQ 作为调度数据源 : kv_list 作为利用率信号
+        Agent Gateway (RFC#5790) : AgentFramework 抽象 + Trajectory Gateway / 任意 Agent 接入
+        Elastic Scheduling v2: GPU 动态 Train / Rollout 切换
+        DP Rebuild + 双路同步: Megatron / FSDP2 弹性 DP
+        TQ 作为调度数据源: kv_list 作为利用率信号
 ```
 
 ---
@@ -1946,13 +2051,13 @@ timeline
 
 ### Rollout 相关
 
-| 模块                  | 路径                                                              |说明                                |
-|---------------------|-----------------------------------------------------------------|-----------------------------------|
-| **LLM Server**       | **`verl/workers/rollout/llm_server.py`**                        | **LLM Server 管理器 + Client 代理 + 全局 LB（PR #6129 抽取）** |
-| vLLM Async Server   | `verl/workers/rollout/vllm_rollout/vllm_async_server.py`        | vLLM 异步服务端                        |
-| vLLM Rollout        | `verl/workers/rollout/vllm_rollout/vllm_rollout.py`             | vLLM Rollout 适配器（含 weight update） |
-| Bucketed Transfer   | `verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py` | ZMQ + CUDA IPC 分桶传输               |
-| SGLang Async Server | `verl/workers/rollout/sglang_rollout/async_sglang_server.py`    | SGLang 异步服务端                      |
-| Rollout Replica     | `verl/workers/rollout/replica.py`                               | Rollout Replica 抽象（abort/resume）  |
+| 模块                  | 路径                                                              | 说明                                                  |
+|---------------------|-----------------------------------------------------------------|-----------------------------------------------------|
+| **LLM Server**      | **`verl/workers/rollout/llm_server.py`**                        | **LLM Server 管理器 + Client 代理 + 全局 LB（PR #6129 抽取）** |
+| vLLM Async Server   | `verl/workers/rollout/vllm_rollout/vllm_async_server.py`        | vLLM 异步服务端                                          |
+| vLLM Rollout        | `verl/workers/rollout/vllm_rollout/vllm_rollout.py`             | vLLM Rollout 适配器（含 weight update）                   |
+| Bucketed Transfer   | `verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py` | ZMQ + CUDA IPC 分桶传输                                 |
+| SGLang Async Server | `verl/workers/rollout/sglang_rollout/async_sglang_server.py`    | SGLang 异步服务端                                        |
+| Rollout Replica     | `verl/workers/rollout/replica.py`                               | Rollout Replica 抽象（abort/resume）                    |
 
 ````
