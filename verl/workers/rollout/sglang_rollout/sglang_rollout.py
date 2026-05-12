@@ -266,6 +266,8 @@ class ServerAdapter(BaseRollout):
             return
         if self._is_server_tp_leader() and self.config.free_cache_engine:
             await self._engine.resume_memory_occupation(tags=tags)
+            if "kv_cache" in tags and self.server_actor is not None:
+                await self.server_actor.mark_awake.remote()
 
     async def release(self):
         """Release weights and kv cache in GPU memory.

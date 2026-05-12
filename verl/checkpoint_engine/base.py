@@ -354,6 +354,7 @@ class CheckpointEngineManager:
         config: CheckpointEngineConfig,
         trainer: RayWorkerGroup,
         replicas: list[RolloutReplica],
+        llm_server_manager=None,
     ) -> None:
         self.config = config
         self.backend = config.backend
@@ -361,6 +362,7 @@ class CheckpointEngineManager:
         self.backend_cls = CheckpointEngineRegistry.get(config.backend)
         self.trainer = trainer
         self.replicas = replicas
+        self._llm_server_manager = llm_server_manager
 
     def build_process_group(self, rollout: RayWorkerGroup):
         """Build process group for trainer and rollout replicas."""
@@ -409,12 +411,16 @@ class CheckpointEngineManager:
     @auto_await
     async def sleep_replicas(self):
         """Sleep all rollout replicas: free weight and kv_cache device memory."""
+        if self._llm_server_manager is not None:
+            await self._llm_server_manager.router_sleep()
         await asyncio.gather(*[r.sleep() for r in self.replicas])
 
     @auto_await
     async def wake_up_replicas(self):
         """Resume all rollout replicas: recover kv_cache and weights device memory."""
         await asyncio.gather(*[r.wake_up() for r in self.replicas])
+        if self._llm_server_manager is not None:
+            await self._llm_server_manager.router_wake_up()
 
     @auto_await
     async def update_weights(self, global_steps: int = None):

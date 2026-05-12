@@ -181,6 +181,7 @@ class SGLangHttpServer:
         # used for http server
         self._server_address = ray.util.get_node_ip_address().strip("[]")
         self._server_port = None
+        self._is_sleeping = False
 
         # used for controlling sglang server profiler
         profiler_config = self.config.profiler
@@ -386,12 +387,17 @@ class SGLangHttpServer:
         elif version.parse(sglang.__version__) >= version.parse("0.5.7"):
             from sglang.srt.entrypoints.http_server import _launch_subprocesses
 
-            self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
+            self.tokenizer_manager, self.template_manager, scheduler_info_or_list, _ = _launch_subprocesses(
                 server_args=server_args,
                 init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
                 run_scheduler_process_func=sglang.srt.entrypoints.engine.run_scheduler_process,
                 run_detokenizer_process_func=sglang.srt.entrypoints.engine.run_detokenizer_process,
             )
+
+            if isinstance(scheduler_info_or_list, list):
+                self.scheduler_info = scheduler_info_or_list[0]
+            else:
+                self.scheduler_info = scheduler_info_or_list
         else:
             from sglang.srt.entrypoints.http_server import _launch_subprocesses
 
@@ -431,6 +437,9 @@ class SGLangHttpServer:
         if self.node_rank != 0:
             return
 
+        if not self._is_sleeping:
+            return
+
         if self.rollout_mode == RolloutMode.HYBRID:
             # In hybrid mode, rollout is wake up in `update_weights`
             raise ValueError(f"wake_up not support rollout_mode {self.rollout_mode}")
@@ -444,6 +453,15 @@ class SGLangHttpServer:
             obj = ResumeMemoryOccupationReqInput(tags=["kv_cache"])
             await self.tokenizer_manager.resume_memory_occupation(obj, None)
             await self.tokenizer_manager.flush_cache()
+        self._is_sleeping = False
+
+    async def mark_awake(self):
+        """Reset the sleeping flag without touching sglang memory state.
+
+        Called by ActorRolloutRefWorker.update_weights() after rollout.resume()
+        completes in HYBRID mode, where wake_up() is not invoked.
+        """
+        self._is_sleeping = False
 
     @property
     def lora_as_adapter(self) -> bool:
@@ -453,6 +471,9 @@ class SGLangHttpServer:
 
     async def sleep(self):
         if self.node_rank != 0 or not self.config.free_cache_engine:
+            return
+
+        if self._is_sleeping:
             return
 
         # When using LoRA as adapter (merge=False), only release kv_cache —
@@ -473,6 +494,7 @@ class SGLangHttpServer:
             # In standalone mode, resume kv_cache if free_cache_engine is enabled
             obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
             await self.tokenizer_manager.release_memory_occupation(obj, None)
+        self._is_sleeping = True
 
     async def clear_kv_cache(self):
         if self.node_rank == 0:

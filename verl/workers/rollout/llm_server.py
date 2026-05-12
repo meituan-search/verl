@@ -218,27 +218,45 @@ class LLMServerClient:
         **kwargs: Any,
     ) -> TokenOutput:
         url = f"{self._router_address}/generate"
+        rollout_cfg = self.config.actor_rollout_ref.rollout
 
-        # Translate vLLM-style prompt_logprobs / logprobs to sglang params before
-        # building the payload so the keys are never forwarded raw.
         sampling_params = dict(sampling_params)  # shallow copy – do not mutate caller's dict
-        prompt_logprobs = sampling_params.pop("prompt_logprobs", None)
+
+        # --- max_new_tokens: mirror SGLangHttpServer.generate() logic ---
+        max_model_len = rollout_cfg.get("max_model_len") or 0
+        max_possible_tokens = max_model_len - len(prompt_ids) - 1 if max_model_len else None
+        if "max_new_tokens" in sampling_params:
+            max_new_tokens = sampling_params.pop("max_new_tokens")
+        elif "max_tokens" in sampling_params:
+            max_new_tokens = sampling_params.pop("max_tokens")
+        else:
+            max_new_tokens = min(
+                rollout_cfg.response_length,
+                rollout_cfg.prompt_length + rollout_cfg.response_length - len(prompt_ids),
+            )
+        if max_possible_tokens is not None:
+            max_new_tokens = max(0, min(max_new_tokens, max_possible_tokens))
+        sampling_params["max_new_tokens"] = max_new_tokens
+
+        # --- logprobs / prompt_logprobs → sglang API fields ---
         return_logprob = sampling_params.pop("logprobs", False)
+        prompt_logprobs = sampling_params.pop("prompt_logprobs", None)
         if prompt_logprobs is not None:
             return_logprob = True
 
         payload: dict[str, Any] = {
-            "rid": uuid4().hex,  # fresh per-hop id; Router generates its own
+            "rid": uuid4().hex,
             "input_ids": prompt_ids,
             "sampling_params": sampling_params,
             "return_logprob": return_logprob,
+            "image_data": image_data,
         }
         if prompt_logprobs is not None:
             payload["logprob_start_len"] = 0
             if prompt_logprobs > 0:
                 payload["top_logprobs_num"] = prompt_logprobs
-        if image_data:
-            payload["image_data"] = image_data
+        if rollout_cfg.get("enable_rollout_routing_replay"):
+            payload["return_routed_experts"] = True
         # video_data not yet supported by sglang HTTP /generate
         payload.update({k: v for k, v in kwargs.items() if v is not None})
 
@@ -247,6 +265,13 @@ class LLMServerClient:
             "Content-Type": "application/json",
         }
 
+        logger.debug(
+            "router req rid=%s fields=%s prompt_ids_len=%d max_new_tokens=%s return_logprob=%s",
+            request_id, list(payload.keys()), len(prompt_ids),
+            payload.get("sampling_params", {}).get("max_new_tokens"),
+            payload.get("return_logprob"),
+        )
+
         session = await self._get_or_create_session()
         last_exc: Exception = RuntimeError("unreachable")
         for attempt in range(3):
@@ -254,6 +279,13 @@ class LLMServerClient:
                 async with session.post(url, json=payload, headers=headers) as resp:
                     resp.raise_for_status()
                     data = await resp.json(content_type=None)
+                    logger.debug(
+                        "router resp rid=%s top_fields=%s meta_fields=%s output_ids_len=%d finish_reason=%s",
+                        request_id, list(data.keys()),
+                        list(data.get("meta_info", {}).keys()),
+                        len(data.get("output_ids", [])),
+                        data.get("meta_info", {}).get("finish_reason"),
+                    )
                     return _parse_token_output(data)
             except aiohttp.ClientResponseError as exc:
                 if exc.status < 500:
@@ -284,7 +316,7 @@ class LLMServerClient:
         server_id, server = await self._acquire_server(request_id)
         try:
             output: TokenOutput = await server.generate.remote(
-                request_id=uuid4().hex,  # new id for each turn
+                request_id=uuid4().hex,
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
                 image_data=image_data,
@@ -550,12 +582,10 @@ class LLMServerManager:
 
     async def _init_sglang_router(self, lb_cfg) -> None:
         """Start a sgl-model-gateway Rust Router and register all replica addresses."""
-        from verl.utils.net_utils import get_free_port
         from verl.workers.rollout.sglang_router_actor import SGLangRouterActor
 
         router_cfg = getattr(lb_cfg, "router", None)
 
-        router_port = get_free_port()
         actor_options: dict[str, Any] = {"num_cpus": 1}
 
         # In STANDALONE mode pin the Router to the first rollout node to minimise
@@ -569,10 +599,11 @@ class LLMServerManager:
             except Exception:
                 pass  # best-effort placement; don't fail startup
 
+        worker_urls = [
+            addr if addr.startswith(("http://", "https://")) else f"http://{addr}" for addr in self.server_addresses
+        ]
         self.router_actor = SGLangRouterActor.options(**actor_options).remote(
-            worker_urls=self.server_addresses,
-            host="0.0.0.0",
-            port=router_port,
+            worker_urls=worker_urls,
             policy=getattr(router_cfg, "policy", "cache_aware") if router_cfg else "cache_aware",
             cache_threshold=getattr(router_cfg, "cache_threshold", 0.3) if router_cfg else 0.3,
             balance_abs_threshold=getattr(router_cfg, "balance_abs_threshold", 64) if router_cfg else 64,
@@ -580,12 +611,16 @@ class LLMServerManager:
             request_id_headers=["x-verl-request-id"],
             health_check_interval_secs=getattr(router_cfg, "health_check_interval_secs", 60) if router_cfg else 60,
         )
-        await self.router_actor.start.remote()
-        await self.router_actor.wait_until_ready.remote(timeout=120.0)
-        self.router_address = await self.router_actor.get_address.remote()
+        self.router_address = await self.router_actor.start_and_wait.remote(timeout=120.0)
+        print(f"LLMServerManager: Rust Router started at {self.router_address}", flush=True)
         self.global_load_balancer = None
-
         logger.info("LLMServerManager: Rust Router started at %s", self.router_address)
+
+    async def router_sleep(self) -> None:
+        """No-op: workers stay registered; Router health checks are disabled."""
+
+    async def router_wake_up(self) -> None:
+        """No-op: workers were registered at Router startup and stay permanently."""
 
     def get_client(self, fully_async: bool = False) -> LLMServerClient:
         """Return an LLMServerClient configured for the active routing mode.
@@ -633,3 +668,4 @@ class LLMServerManager:
     async def stop_profile(self):
         """Stop profiling on all rollout replicas."""
         await asyncio.gather(*[replica.stop_profile() for replica in self.rollout_replicas])
+

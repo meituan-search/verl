@@ -880,6 +880,7 @@ class RayPPOTrainer:
             config=checkpoint_engine_config,
             trainer=self.actor_rollout_wg,
             replicas=self.llm_server_manager.get_replicas(),
+            llm_server_manager=self.llm_server_manager,
         )
 
         # sleep all replicas to load checkpoint
