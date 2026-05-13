@@ -31,9 +31,9 @@ By deploying `ModelEngineServer`, a pipeline can be established among rollout, o
 
 Depending on the configuration, `ModelEngineServerManager` consists of `OldInstance` for calculating `old_log_prob` and `RefInstance` for calculating `ref_log_prob`. `OldInstance` receives and synchronizes actor weights through `CheckpointEngine`, while `RefInstance` has fixed weights and does not need synchronization.
 
-Each instance is an independent `ModelEngineReplica`, responsible for resource allocation (Ray resource pool) and internal component lifecycle management.
-
 ![model_engine_server_arch0](https://github.com/ArronHZG/verl-community/blob/main/docs/model_engine_server/model_engine_server_arch0.svg?raw=true)
+
+Each instance is an independent `ModelEngineReplica`, responsible for resource allocation (Ray resource pool) and internal component lifecycle management.
 
 ```
 ModelEngineServerManager
