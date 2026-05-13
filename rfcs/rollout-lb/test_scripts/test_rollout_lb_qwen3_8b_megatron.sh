@@ -14,6 +14,7 @@
 #   TRAIN_FILE   – parquet with training prompts
 #   TEST_FILE    – parquet with validation prompts
 #   NUM_GPUS     – total GPU count on this node (default: 8)
+# IMAGE: afo.docker.image.name": "registry-offlinebiz.sankuai.com/custom_prod/com.sankuai.data.hadoop.gpu/ai-search/training_ubuntu22_cuda12.9_python3.12_fp8e2e_a8708562:1.0.1
 
 set -xeuo pipefail
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -22,7 +23,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 # Configurable defaults
 # ---------------------------------------------------------------------------
 NUM_GPUS=${NUM_GPUS:-8}
-LB_STRATEGY=${LB_STRATEGY:-"least_inflight"}  # least_inflight | sglang_router | both
+LB_STRATEGY=${LB_STRATEGY:-"sglang_router"}  # least_inflight | sglang_router | both
 
 EXTRA_ARGS=("$@")
 
@@ -110,7 +111,7 @@ run_trial() {
         actor_rollout_ref.rollout.n=${rollout_n}
         actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
         actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}
-        actor_rollout_ref.rollout.checkpoint_engine.backend=nccl
+        actor_rollout_ref.rollout.checkpoint_engine.backend=naive
         actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=1024
         actor_rollout_ref.actor.optim.lr=${actor_lr}
         actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_batch_size}
@@ -156,7 +157,7 @@ run_trial() {
     python3 -X faulthandler -m verl.trainer.main_ppo \
         --config-name='ppo_megatron_trainer.yaml' \
         "${common_params[@]}" \
-        "${EXTRA_ARGS[@]}"
+        ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 
     echo "Trial [${exp_tag}] completed successfully."
 }
