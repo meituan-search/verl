@@ -1627,8 +1627,7 @@ def copy_megatron_model_to_cpu(models):
                 for buffer in buffers:
                     buffer_state = {}
 
-                    # Keep a CPU snapshot for current params. This follows offload/load
-                    # semantics and also supports already-offloaded param buffers.
+                    # Copy parameter data to CPU
                     if buffer.param_data.storage().size() > 0:
                         buffer_state["param_data"] = buffer.param_data.data.cpu().clone().pin_memory()
                     else:
@@ -1646,8 +1645,7 @@ def copy_megatron_model_to_cpu(models):
                 model_state[name] = param_state
 
             cpu_state[f"model_chunk_{model_idx}"] = {"model_state": model_state, "is_ddp": False}
-    gc.collect()
-    get_torch_device().empty_cache()
+
     return cpu_state
 
 
@@ -1687,6 +1685,4 @@ def restore_megatron_model_from_cpu(models, cpu_state):
             for name, param in model_chunk.named_parameters():
                 if name in model_state:
                     param_state = model_state[name]
-                    param.data.copy_(param_state["data"], non_blocking=True)
-    gc.collect()
-    get_torch_device().empty_cache()
+                    param.data.copy_(param_state["data"].to(param.device))
