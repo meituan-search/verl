@@ -181,15 +181,9 @@ class ToolAgentLoop(AgentLoopBase):
         if agent_data.audio_data is not None:
             multi_modal_data["audios"] = agent_data.audio_data
 
-        extra_fields = agent_data.extra_fields
         for key in ENGINE_SERVER_LOGPROB_KEYS:
-            if extra_fields.get(key):
-                extra_fields[key] = extra_fields[key][: self.response_length]
-
-        extra_fields = agent_data.extra_fields
-        for key in ENGINE_SERVER_LOGPROB_KEYS:
-            if extra_fields.get(key):
-                extra_fields[key] = extra_fields[key][: self.response_length]
+            if agent_data.extra_fields.get(key):
+                agent_data.extra_fields[key] = agent_data.extra_fields[key][: self.response_length]
 
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
@@ -207,7 +201,7 @@ class ToolAgentLoop(AgentLoopBase):
                 if agent_data.routed_experts is not None
                 else None
             ),
-            extra_fields=extra_fields,
+            extra_fields=agent_data.extra_fields,
         )
         output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
         return output

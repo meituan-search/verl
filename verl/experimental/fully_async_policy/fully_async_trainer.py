@@ -474,10 +474,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         then restore the parameters of the current version.
         """
         if "old_logprobs" in batch.batch:
-            batch_dict = {
-                "old_log_probs": batch.batch.pop("old_logprobs"),
-                "entropys": batch.batch.pop("old_entropys", None),
-            }
+            batch_dict = {"old_log_probs": batch.batch.pop("old_logprobs")}
+            if "old_entropys" in batch.batch:
+                batch_dict["entropys"] = batch.batch.pop("old_entropys")
             old_log_prob = DataProto.from_dict(batch_dict)
             return old_log_prob, 0.0
 

@@ -73,10 +73,9 @@ class SingleTurnAgentLoop(AgentLoopBase):
             metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
         response_mask = [1] * len(output.token_ids)
 
-        extra_fields = output.extra_fields
         for key in ENGINE_SERVER_LOGPROB_KEYS:
-            if extra_fields.get(key):
-                extra_fields[key] = extra_fields[key][: self.response_length]
+            if output.extra_fields.get(key):
+                output.extra_fields[key] = output.extra_fields[key][: self.response_length]
 
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
@@ -92,7 +91,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
             mm_processor_kwargs=mm_processor_kwargs,
             num_turns=2,
             metrics=metrics,
-            extra_fields=extra_fields,
+            extra_fields=output.extra_fields,
         )
 
         # keeping the schema consistent with tool_agent_loop
