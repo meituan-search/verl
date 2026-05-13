@@ -12,6 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""FullyAsyncTaskRunner: Unified entry point for fully async PPO training.
+
+Supports two data transfer backends (selected via config.async_training.use_tq):
+- use_tq=False (default): MessageQueue + FullyAsyncRollouter/FullyAsyncTrainer
+- use_tq=True:  TransferQueue + ReplayBuffer + TQFullyAsyncRollouter/TQFullyAsyncTrainer
+
+The only difference between the two modes is:
+1. Rollouter / Trainer class selection
+2. Data channel: MessageQueue vs ReplayBuffer (Ray Actor)
+"""
+
 import asyncio
 import os
 import socket
@@ -22,9 +33,6 @@ import hydra
 import ray
 from omegaconf import OmegaConf
 
-from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncRollouter
-from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
-from verl.experimental.fully_async_policy.message_queue import MessageQueue, MessageQueueClient
 from verl.experimental.reward_loop import migrate_legacy_reward_impl
 from verl.experimental.separation.utils import create_resource_pool_manager, create_role_worker_mapping
 from verl.trainer.ppo.utils import Role
@@ -36,15 +44,37 @@ from verl.utils.fs import copy_to_local
 class FullyAsyncTaskRunner:
     """
     Ray remote class for executing distributed PPO training tasks.
+
+    Supports both MessageQueue and TQ+ReplayBuffer backends via config.
     """
 
     def __init__(self):
         self.running = False
         self.components = {}
         self.shutdown_event = threading.Event()
+        self._use_tq = False
+        # Class references (resolved in run() based on use_tq)
+        self._rollouter_cls = None
+        self._trainer_cls = None
 
     def run(self, config):
-        print("[ASYNC MAIN] Starting fully async PPO training...")
+        # Detect backend mode from config and resolve class references
+        self._use_tq = getattr(config.async_training, "use_tq", False)
+        if self._use_tq:
+            from verl.experimental.fully_async_policy.fully_async_rollouter_tq import TQFullyAsyncRollouter
+            from verl.experimental.fully_async_policy.fully_async_trainer_tq import TQFullyAsyncTrainer
+
+            self._rollouter_cls = TQFullyAsyncRollouter
+            self._trainer_cls = TQFullyAsyncTrainer
+        else:
+            from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncRollouter
+            from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
+
+            self._rollouter_cls = FullyAsyncRollouter
+            self._trainer_cls = FullyAsyncTrainer
+
+        mode_label = "TQ" if self._use_tq else "MQ"
+        print(f"[ASYNC MAIN] Starting fully async PPO training (mode={mode_label})...")
         self._initialize_components(config)
         self._run_training_loop()
 
@@ -74,13 +104,13 @@ class FullyAsyncTaskRunner:
         self.components["role_worker_mapping"] = role_worker_mapping
         self.components["ray_worker_group_cls"] = ray_worker_group_cls
 
-        print("[ASYNC MAIN] Creating FullyAsyncTrainer first (needed for hybrid worker group injection)...")
+        print("[ASYNC MAIN] Creating Trainer first (needed for hybrid worker group injection)...")
         self._create_trainer(config)
 
         print("[ASYNC MAIN] Injecting trainer's worker group into rollouter for hybrid replicas...")
         self._setup_hybrid_worker_group(config)
 
-        print("[ASYNC MAIN] Creating FullyAsyncRollouter...")
+        print("[ASYNC MAIN] Creating Rollouter...")
         self._create_rollouter(config)
 
         print("[ASYNC MAIN] Setting up rollouter reference on trainer")
@@ -91,16 +121,8 @@ class FullyAsyncTaskRunner:
         print(f"total_train_steps {total_train_steps}")
         ray.get(self.components["trainer"].set_total_train_steps.remote(total_train_steps))
 
-        # max_queue_size
-        max_queue_size = ray.get(self.components["rollouter"].get_max_queue_size.remote())
-        print(f"[ASYNC MAIN] Creating MessageQueue... max_queue_size {max_queue_size}")
-        message_queue = MessageQueue.remote(config, max_queue_size)
-        message_queue_client = MessageQueueClient(message_queue)
-        self.components["message_queue"] = message_queue
-        self.components["message_queue_client"] = message_queue_client
-
-        ray.get(self.components["rollouter"].set_message_queue_client.remote(self.components["message_queue_client"]))
-        ray.get(self.components["trainer"].set_message_queue_client.remote(self.components["message_queue_client"]))
+        # ======== Create data channel (MQ or RB) ========
+        self._create_data_channel(config)
 
         # param_version resume from ckpt or default 0
         ray.get(self.components["trainer"].load_checkpoint.remote())
@@ -114,9 +136,45 @@ class FullyAsyncTaskRunner:
 
         print("[ASYNC MAIN] All components initialized successfully")
 
+    def _create_data_channel(self, config):
+        """Create the data channel: MessageQueue (default) or ReplayBuffer (TQ mode)."""
+        if self._use_tq:
+            self._create_replay_buffer(config)
+        else:
+            self._create_message_queue(config)
+
+    def _create_message_queue(self, config):
+        """Create MessageQueue + MessageQueueClient (original path)."""
+        from verl.experimental.fully_async_policy.message_queue import MessageQueue, MessageQueueClient
+
+        max_queue_size = ray.get(self.components["rollouter"].get_max_queue_size.remote())
+        print(f"[ASYNC MAIN] Creating MessageQueue... max_queue_size {max_queue_size}")
+        message_queue = MessageQueue.remote(config, max_queue_size)
+        message_queue_client = MessageQueueClient(message_queue)
+        self.components["message_queue"] = message_queue
+        self.components["message_queue_client"] = message_queue_client
+
+        ray.get(self.components["rollouter"].set_message_queue_client.remote(self.components["message_queue_client"]))
+        ray.get(self.components["trainer"].set_message_queue_client.remote(self.components["message_queue_client"]))
+
+    def _create_replay_buffer(self, config):
+        """Create ReplayBuffer Ray Actor (TQ mode)."""
+        from verl.experimental.fully_async_policy.replay_buffer import ReplayBuffer
+
+        max_required_samples = ray.get(self.components["rollouter"].get_max_pending_slots.remote())
+        max_pending_slots = max(max_required_samples, 256)
+        print(f"[ASYNC MAIN] Creating ReplayBuffer... max_pending_slots={max_pending_slots}")
+        replay_buffer = ReplayBuffer.remote(max_pending_slots=max_pending_slots)
+        self.components["replay_buffer"] = replay_buffer
+
+        ray.get(self.components["rollouter"].set_replay_buffer.remote(replay_buffer))
+        ray.get(self.components["trainer"].set_replay_buffer.remote(replay_buffer))
+
     def _create_rollouter(self, config) -> None:
+        """Create rollouter: FullyAsyncRollouter (default) or TQFullyAsyncRollouter (TQ mode)."""
         print("[ASYNC MAIN] Starting create rollouter...")
-        rollouter = FullyAsyncRollouter.remote(
+
+        rollouter = self._rollouter_cls.remote(
             config=config,
             tokenizer=self.components["tokenizer"],
             processor=self.components["processor"],
@@ -136,6 +194,7 @@ class FullyAsyncTaskRunner:
         print("[ASYNC MAIN] Rollouter created and initialized successfully")
 
     def _create_trainer(self, config) -> None:
+        """Create trainer: FullyAsyncTrainer (default) or TQFullyAsyncTrainer (TQ mode)."""
         print("[ASYNC MAIN] Starting create trainer...")
         trainer_role_mapping = {
             role: worker_cls
@@ -143,7 +202,7 @@ class FullyAsyncTaskRunner:
             if role != Role.Rollout
         }
 
-        trainer = FullyAsyncTrainer.remote(
+        trainer = self._trainer_cls.remote(
             config=config,
             tokenizer=self.components["tokenizer"],
             role_worker_mapping=trainer_role_mapping,
@@ -154,7 +213,7 @@ class FullyAsyncTaskRunner:
 
         ray.get(trainer.init_workers.remote())
         self.components["trainer"] = trainer
-        print("[ASYNC MAIN] FullyAsyncTrainer created and initialized successfully")
+        print("[ASYNC MAIN] Trainer created and initialized successfully")
 
     def _setup_hybrid_worker_group(self, config) -> None:
         """
@@ -205,7 +264,16 @@ class FullyAsyncTaskRunner:
                 ray.cancel(future)
             raise
         finally:
-            asyncio.run(self.components["message_queue_client"].clear_queue())
+            # Cleanup based on mode
+            if self._use_tq:
+                rb = self.components.get("replay_buffer")
+                if rb is not None:
+                    try:
+                        ray.get(rb.signal_finish.remote())
+                    except Exception:
+                        pass
+            else:
+                asyncio.run(self.components["message_queue_client"].clear_queue())
             print("[ASYNC MAIN] Training completed or interrupted")
 
 
