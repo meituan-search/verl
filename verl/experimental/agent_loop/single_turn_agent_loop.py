@@ -19,6 +19,7 @@ from uuid import uuid4
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
+from verl.workers.rollout.model_engine_server import ENGINE_SERVER_LOGPROB_KEYS
 from verl.workers.rollout.replica import TokenOutput
 
 logger = logging.getLogger(__file__)
@@ -67,10 +68,9 @@ class SingleTurnAgentLoop(AgentLoopBase):
         response_mask = [1] * len(output.token_ids)
 
         extra_fields = output.extra_fields
-        if extra_fields.get("engine_server_logprobs"):
-            extra_fields["engine_server_logprobs"] = extra_fields["engine_server_logprobs"][: self.response_length]
-        if extra_fields.get("engine_server_entropys"):
-            extra_fields["engine_server_entropys"] = extra_fields["engine_server_entropys"][: self.response_length]
+        for key in ENGINE_SERVER_LOGPROB_KEYS:
+            if extra_fields.get(key):
+                extra_fields[key] = extra_fields[key][: self.response_length]
 
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,

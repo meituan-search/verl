@@ -34,6 +34,7 @@ from verl.tools.function_tool import FunctionTool, normalize_function_tool_retur
 from verl.tools.schemas import ToolResponse
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
+from verl.workers.rollout.model_engine_server import ENGINE_SERVER_LOGPROB_KEYS
 from verl.workers.rollout.replica import TokenOutput
 
 logger = logging.getLogger(__file__)
@@ -146,7 +147,7 @@ class ToolAgentLoop(AgentLoopBase):
         else:
             agent_data._active_tools = self.tools
             agent_data._active_tool_schemas = self.tool_schemas
-        agent_data.extra_fields["validate"] = validate
+        agent_data._validate = validate
 
         # State machine loop
         state = AgentState.PENDING
@@ -171,10 +172,9 @@ class ToolAgentLoop(AgentLoopBase):
             multi_modal_data["videos"] = agent_data.video_data
 
         extra_fields = agent_data.extra_fields
-        if extra_fields.get("engine_server_logprobs"):
-            extra_fields["engine_server_logprobs"] = extra_fields["engine_server_logprobs"][: self.response_length]
-        if extra_fields.get("engine_server_entropys"):
-            extra_fields["engine_server_entropys"] = extra_fields["engine_server_entropys"][: self.response_length]
+        for key in ENGINE_SERVER_LOGPROB_KEYS:
+            if extra_fields.get(key):
+                extra_fields[key] = extra_fields[key][: self.response_length]
 
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
@@ -212,7 +212,7 @@ class ToolAgentLoop(AgentLoopBase):
         self, agent_data: AgentData, sampling_params: dict[str, Any], ignore_termination: bool = False
     ) -> AgentState:
         """Handle the generating state: generate model response and check for tool calls."""
-        extra_kwargs = {"validate": agent_data.extra_fields.get("validate", False)}
+        extra_kwargs = {"validate": getattr(agent_data, "_validate", False)}
         with simple_timer("generate_sequences", agent_data.metrics):
             output: TokenOutput = await self.server_manager.generate(
                 request_id=agent_data.request_id,
@@ -229,7 +229,7 @@ class ToolAgentLoop(AgentLoopBase):
         else:
             agent_data.metrics["num_preempted"] += output.num_preempted if output.num_preempted is not None else 0
 
-        _ACCUMULATED_KEYS = {"engine_server_logprobs", "engine_server_entropys"}
+        _ACCUMULATED_KEYS = set(ENGINE_SERVER_LOGPROB_KEYS)
         if not agent_data.extra_fields:
             agent_data.extra_fields.update({k: v for k, v in output.extra_fields.items() if k not in _ACCUMULATED_KEYS})
         else:
@@ -244,12 +244,10 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.response_mask += [1] * len(agent_data.response_ids)
         if output.log_probs:
             agent_data.response_logprobs += output.log_probs
-        if output.extra_fields.get("engine_server_logprobs"):
-            agent_data.extra_fields.setdefault("engine_server_logprobs", [])
-            agent_data.extra_fields["engine_server_logprobs"] += output.extra_fields["engine_server_logprobs"]
-        if output.extra_fields.get("engine_server_entropys"):
-            agent_data.extra_fields.setdefault("engine_server_entropys", [])
-            agent_data.extra_fields["engine_server_entropys"] += output.extra_fields["engine_server_entropys"]
+        for key in ENGINE_SERVER_LOGPROB_KEYS:
+            if output.extra_fields.get(key):
+                agent_data.extra_fields.setdefault(key, [])
+                agent_data.extra_fields[key] += output.extra_fields[key]
         if output.routed_experts is not None:
             agent_data.routed_experts = output.routed_experts
 
@@ -371,10 +369,9 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.response_mask += [0] * len(response_ids)
         if agent_data.response_logprobs:
             agent_data.response_logprobs += [0.0] * len(response_ids)
-        if agent_data.extra_fields.get("engine_server_logprobs"):
-            agent_data.extra_fields["engine_server_logprobs"] += [0.0] * len(response_ids)
-        if agent_data.extra_fields.get("engine_server_entropys"):
-            agent_data.extra_fields["engine_server_entropys"] += [0.0] * len(response_ids)
+        for key in ENGINE_SERVER_LOGPROB_KEYS:
+            if agent_data.extra_fields.get(key):
+                agent_data.extra_fields[key] += [0.0] * len(response_ids)
         agent_data.user_turns += 1
         return AgentState.GENERATING
 

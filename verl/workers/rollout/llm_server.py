@@ -196,7 +196,6 @@ class LLMServerClient:
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
-        kwargs.pop("validate", None)  # consumed by FullyLLMServerClient; strip before forwarding to server
         server_id, server = await self._acquire_server(request_id)
         try:
             output: TokenOutput = await server.generate.remote(
@@ -239,8 +238,6 @@ class LLMServerManager:
 
         assert worker_group is not None or self.rollout_config.nnodes > 0, "nnodes must be > 0 in standalone mode"
 
-        self.model_engine_server_manager = None
-
         # for recipe to change
         if not hasattr(self, "rollout_replica_class"):
             self.rollout_replica_class = get_rollout_replica_class(
@@ -255,10 +252,6 @@ class LLMServerManager:
         instance = cls(*args, **kwargs)
         await instance._initialize_llm_servers()
         await instance._init_global_load_balancer()
-        if getattr(instance.config, "model_engine_server", None) and instance.config.model_engine_server.get(
-            "enable", False
-        ):
-            await instance._init_model_engine_replica()
         return instance
 
     async def _initialize_llm_servers(self, start_rank: int = 0):
@@ -331,21 +324,6 @@ class LLMServerManager:
             if self.rollout_config.disable_log_stats:
                 raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
             update_prometheus_config(self.rollout_config.prometheus, self.server_addresses, self.rollout_config.name)
-
-    async def _init_model_engine_replica(self):
-        """Initialize ModelEngineServerManager."""
-        from verl.workers.rollout.model_engine_server import ModelEngineServerManager
-
-        self.model_engine_server_manager = ModelEngineServerManager(full_config=self.config)
-        await self.model_engine_server_manager.initialize()
-
-    def get_engine_replicas_for_weight_sync(self) -> list:
-        """Return model engine replicas that need to participate in CheckpointEngine weight sync."""
-        if self.model_engine_server_manager is None:
-            return []
-        if self.model_engine_server_manager._has_old_instance:
-            return [self.model_engine_server_manager._old_instance]
-        return []
 
     async def _init_global_load_balancer(self) -> None:
         self.global_load_balancer = GlobalRequestLoadBalancer.remote(

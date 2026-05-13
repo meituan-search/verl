@@ -65,6 +65,7 @@ from verl.workers.config import (
     RolloutConfig,
 )
 from verl.workers.rollout.llm_server import LLMServerClient
+from verl.workers.rollout.model_engine_server import ENGINE_SERVER_LOGPROB_KEYS
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -605,14 +606,11 @@ class AgentLoopWorker:
         if output.response_logprobs is not None:
             pad_size = self.rollout_config.response_length - len(output.response_logprobs)
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
-        _es_logprobs = output.extra_fields.pop("engine_server_logprobs", None)
-        if _es_logprobs is not None:
-            pad_size = self.rollout_config.response_length - len(_es_logprobs)
-            output.extra_fields["engine_server_logprobs"] = torch.tensor(_es_logprobs + [0.0] * pad_size).unsqueeze(0)
-        _es_entropys = output.extra_fields.pop("engine_server_entropys", None)
-        if _es_entropys is not None:
-            pad_size = self.rollout_config.response_length - len(_es_entropys)
-            output.extra_fields["engine_server_entropys"] = torch.tensor(_es_entropys + [0.0] * pad_size).unsqueeze(0)
+        for key in ENGINE_SERVER_LOGPROB_KEYS:
+            val = output.extra_fields.pop(key, None)
+            if val is not None:
+                pad_size = self.rollout_config.response_length - len(val)
+                output.extra_fields[key] = torch.tensor(val + [0.0] * pad_size).unsqueeze(0)
 
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
@@ -856,14 +854,9 @@ class AgentLoopWorker:
         optional_outputs = {}
         if inputs[0].response_logprobs is not None:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
-        if inputs[0].extra_fields.get("engine_server_logprobs") is not None:
-            optional_outputs["engine_server_logprobs"] = torch.cat(
-                [input.extra_fields.pop("engine_server_logprobs") for input in inputs], dim=0
-            )
-        if inputs[0].extra_fields.get("engine_server_entropys") is not None:
-            optional_outputs["engine_server_entropys"] = torch.cat(
-                [input.extra_fields.pop("engine_server_entropys") for input in inputs], dim=0
-            )
+        for key in ENGINE_SERVER_LOGPROB_KEYS:
+            if inputs[0].extra_fields.get(key) is not None:
+                optional_outputs[key] = torch.cat([inp.extra_fields.pop(key) for inp in inputs], dim=0)
         if inputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
@@ -986,7 +979,6 @@ class AgentLoopManager:
         self.llm_client = llm_client
         self.teacher_client = teacher_client
         self.reward_loop_worker_handles = reward_loop_worker_handles
-        self.model_engine_server_manager = None
 
         if not hasattr(self, "agent_loop_workers_class"):
             self.agent_loop_workers_class = ray.remote(AgentLoopWorker)
@@ -1018,7 +1010,6 @@ class AgentLoopManager:
                     self.llm_client,
                     self.teacher_client,
                     self.reward_loop_worker_handles,
-                    model_engine_server_manager=self.model_engine_server_manager,
                 )
             )
 

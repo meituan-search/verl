@@ -317,6 +317,7 @@ class TRTLLMHttpServer:
         request_id: str,
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
+        **kwargs,
     ) -> TokenOutput:
         from tensorrt_llm.llmapi import SamplingParams
 

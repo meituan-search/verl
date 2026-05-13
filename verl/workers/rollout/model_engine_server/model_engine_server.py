@@ -43,6 +43,9 @@ from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_pad
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
+# Keys written into TokenOutput.extra_fields by ModelEngineServer.
+ENGINE_SERVER_LOGPROB_KEYS = ("old_logprobs", "old_entropys", "ref_logprobs", "ref_entropys")
+
 
 class ModelEngineServerAdapter(BaseRollout):
     """BaseRollout adapter that wraps a TrainingWorker for old log probability computation."""
@@ -60,10 +63,8 @@ class ModelEngineServerAdapter(BaseRollout):
         self._training_worker: TrainingWorker = None
 
         rank = int(os.environ.get("RANK", 0))
-        world_size = int(os.environ.get("WORLD_SIZE", 1))
-        # replica_rank and is_leader_rank are consumed by CheckpointEngineWorker
-        self.replica_rank = rank // world_size
-        self.is_leader_rank = rank % world_size == 0
+        self.replica_rank = 0
+        self.is_leader_rank = rank == 0
 
         self.enable_routing_replay = (
             self._full_config.model_engine_server.strategy == "megatron"
@@ -629,6 +630,14 @@ class ModelEngineReplica(RolloutReplica):
     async def resume_generation(self):
         """No-op for ModelEngineReplica."""
         pass
+
+    async def release_kv_cache(self):
+        """Drain in-flight requests before weight sync; ModelEngineServer uses sleep() instead."""
+        await asyncio.gather(*[server.sleep.remote() for server in self.servers])
+
+    async def resume_kv_cache(self):
+        """Re-open request gate after weight sync; ModelEngineServer uses wake_up() instead."""
+        await asyncio.gather(*[server.wake_up.remote() for server in self.servers])
 
 
 class ModelEngineServerManager:
