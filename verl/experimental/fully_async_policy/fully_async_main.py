@@ -64,14 +64,14 @@ class FullyAsyncTaskRunner:
             from verl.experimental.fully_async_policy.fully_async_rollouter_tq import TQFullyAsyncRollouter
             from verl.experimental.fully_async_policy.fully_async_trainer_tq import TQFullyAsyncTrainer
 
-            self._rollouter_cls = TQFullyAsyncRollouter
-            self._trainer_cls = TQFullyAsyncTrainer
+            self._rollouter_cls = ray.remote(TQFullyAsyncRollouter).options(num_cpus=10, max_concurrency=100)
+            self._trainer_cls = ray.remote(TQFullyAsyncTrainer).options(num_cpus=10, max_concurrency=100)
         else:
             from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncRollouter
             from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
 
-            self._rollouter_cls = FullyAsyncRollouter
-            self._trainer_cls = FullyAsyncTrainer
+            self._rollouter_cls = ray.remote(FullyAsyncRollouter).options(num_cpus=10, max_concurrency=100)
+            self._trainer_cls = ray.remote(FullyAsyncTrainer).options(num_cpus=10, max_concurrency=100)
 
         mode_label = "TQ" if self._use_tq else "MQ"
         print(f"[ASYNC MAIN] Starting fully async PPO training (mode={mode_label})...")

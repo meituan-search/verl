@@ -36,7 +36,6 @@ from verl.utils.tracking import Tracking, ValidationGenerationsLogger
 logger = logging.getLogger(__name__)
 
 
-@ray.remote(num_cpus=10)
 class TQFullyAsyncTrainer(PPOTrainer, FullyAsyncTrainer):
     """
     Fully async PPO trainer via multi-inheritance.

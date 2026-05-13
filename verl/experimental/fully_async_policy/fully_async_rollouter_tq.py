@@ -52,7 +52,6 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-@ray.remote(num_cpus=10, max_concurrency=100)
 class TQFullyAsyncRollouter(FullyAsyncRollouter):
     """
     FullyAsyncRollouter variant that uses TransferQueue + ReplayBuffer instead of MessageQueue.
