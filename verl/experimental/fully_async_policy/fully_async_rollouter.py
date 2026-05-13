@@ -169,21 +169,12 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         self, output: TokenOutput, context_prompt_ids: list[int], sampling_params: dict
     ) -> None:
         if len(output.token_ids) == 0:
-            output.extra_fields["old_logprobs"] = []
-            output.extra_fields["old_entropys"] = []
-            if self._model_engine_manager._has_ref_instance:
-                output.extra_fields["ref_logprobs"] = []
-                output.extra_fields["ref_entropys"] = []
             return
-        full_ids = context_prompt_ids + output.token_ids
         temperature = sampling_params.get("temperature", 1.0)
-        results = await self._model_engine_manager.compute_log_probs(full_ids, output.token_ids, temperature)
-        if "old_log_probs" in results:
-            output.extra_fields["old_logprobs"] = results["old_log_probs"]
-            output.extra_fields["old_entropys"] = results["old_entropys"]
-        if "ref_log_probs" in results:
-            output.extra_fields["ref_logprobs"] = results["ref_log_probs"]
-            output.extra_fields["ref_entropys"] = results["ref_entropys"]
+        results = await self._model_engine_manager.compute_log_probs(context_prompt_ids, output.token_ids, temperature)
+        for key in ENGINE_SERVER_LOGPROB_KEYS:
+            if key in results:
+                output.extra_fields[key] = results[key]
 
 
 class FullyAsyncLLMServerManager(LLMServerManager):

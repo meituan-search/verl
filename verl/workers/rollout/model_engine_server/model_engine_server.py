@@ -693,6 +693,6 @@ class ModelEngineServerManager:
         results = await asyncio.gather(*tasks)
         output = {}
         for label, result in zip(labels, results, strict=False):
-            output[f"{label}_log_probs"] = result["log_probs"]
+            output[f"{label}_logprobs"] = result["log_probs"]
             output[f"{label}_entropys"] = result["entropy"]
         return output
