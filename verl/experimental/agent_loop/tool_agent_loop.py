@@ -57,6 +57,8 @@ class AgentData:
         messages: list[dict[str, Any]],
         image_data: list[Image.Image],
         video_data: list[tuple[torch.Tensor, dict[str, Any]]],
+        audio_data: Optional[list[Any]],
+        mm_processor_kwargs: Optional[dict[str, Any]],
         metrics: dict[str, Any],
         request_id: str,
         tools_kwargs: dict[str, Any],
@@ -64,6 +66,8 @@ class AgentData:
         self.messages = messages
         self.image_data = image_data
         self.video_data = video_data
+        self.audio_data = audio_data
+        self.mm_processor_kwargs = mm_processor_kwargs or {}
         self.metrics = metrics
         self.request_id = request_id
         self.tools_kwargs = tools_kwargs
@@ -117,10 +121,12 @@ class ToolAgentLoop(AgentLoopBase):
         validate = kwargs.pop("validate", False)
         messages = list(kwargs["raw_prompt"])
 
-        # extract images and videos from messages
-        multi_modal_data = await self.process_vision_info(messages)
+        # extract multimodal inputs from messages
+        multi_modal_data = await self.process_multi_modal_info(messages)
         images = multi_modal_data.get("images")
         videos = multi_modal_data.get("videos")
+        audios = multi_modal_data.get("audios")
+        mm_processor_kwargs = self._get_mm_processor_kwargs(audios)
 
         metrics = {}
         request_id = uuid4().hex
@@ -130,6 +136,8 @@ class ToolAgentLoop(AgentLoopBase):
             messages=messages,
             image_data=images,
             video_data=videos,
+            audio_data=audios,
+            mm_processor_kwargs=mm_processor_kwargs,
             metrics=metrics,
             request_id=request_id,
             tools_kwargs=tools_kwargs,
@@ -170,6 +178,13 @@ class ToolAgentLoop(AgentLoopBase):
             multi_modal_data["images"] = agent_data.image_data
         if agent_data.video_data is not None:
             multi_modal_data["videos"] = agent_data.video_data
+        if agent_data.audio_data is not None:
+            multi_modal_data["audios"] = agent_data.audio_data
+
+        extra_fields = agent_data.extra_fields
+        for key in ENGINE_SERVER_LOGPROB_KEYS:
+            if extra_fields.get(key):
+                extra_fields[key] = extra_fields[key][: self.response_length]
 
         extra_fields = agent_data.extra_fields
         for key in ENGINE_SERVER_LOGPROB_KEYS:
@@ -181,6 +196,7 @@ class ToolAgentLoop(AgentLoopBase):
             response_ids=response_ids[: self.response_length],
             response_mask=agent_data.response_mask[: self.response_length],
             multi_modal_data=multi_modal_data,
+            mm_processor_kwargs=agent_data.mm_processor_kwargs,
             response_logprobs=agent_data.response_logprobs[: self.response_length]
             if agent_data.response_logprobs
             else None,
@@ -204,6 +220,8 @@ class ToolAgentLoop(AgentLoopBase):
             tools=schemas,
             images=agent_data.image_data,
             videos=agent_data.video_data,
+            audios=agent_data.audio_data,
+            mm_processor_kwargs=agent_data.mm_processor_kwargs,
         )
         agent_data.prompt_ids = prompt_ids
         return AgentState.GENERATING
@@ -220,6 +238,8 @@ class ToolAgentLoop(AgentLoopBase):
                 sampling_params=sampling_params,
                 image_data=agent_data.image_data,
                 video_data=agent_data.video_data,
+                audio_data=agent_data.audio_data,
+                mm_processor_kwargs=agent_data.mm_processor_kwargs,
                 **extra_kwargs,
             )
         # first time to set num_preempted
