@@ -48,6 +48,8 @@ except ImportError:
     print("Please install TQ by calling `pip install TransferQueue==0.1.6` and try again.")
     from verl.utils.transferqueue_utils import tq
 
+from verl.trainer.main_ppo_sync import list_of_dict_to_tensordict
+
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -114,6 +116,7 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
         to pending_queue. This blocks the dataloader when too many samples are
         in-flight, replacing the need for _should_pause_generation().
         """
+        print("[TQFullyAsyncRollouter][_feed_samples] STARTING", flush=True)
         continuous_iterator = self._create_continuous_iterator()
         feed_count = 0
 
@@ -122,6 +125,7 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
             # This replaces _should_pause_generation() backpressure.
             # When RB.pending_slots >= max_pending_slots, this blocks.
             if self.replay_buffer is not None:
+                print(f"[TQFullyAsyncRollouter][Feed] Acquiring slot for sample {feed_count}...", flush=True)
                 acquired = await asyncio.wrap_future(self.replay_buffer.acquire_slot.remote(timeout=None).future())
                 if not acquired:
                     print(
@@ -143,6 +147,10 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
 
             await self.pending_queue.put(rollout_sample)
             feed_count += 1
+            print(
+                f"[TQFullyAsyncRollouter][Feed] Put sample {feed_count - 1} to pending_queue (total={feed_count})",
+                flush=True,
+            )
 
             # Check if have reached the last step
             if self.global_steps >= self.total_rollout_steps:
@@ -174,6 +182,8 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
         - KEPT: paused drain logic (still needed for parameter sync)
         - REMOVED: `self.staleness_samples += 1` (managed by RB)
         """
+        print("[TQFullyAsyncRollouter][_processor_worker] STARTING", flush=True)
+        proc_count = 0
         while True:
             # ★ CHANGED: only check paused (for param sync drain), NOT _should_pause_generation
             if self.paused:
@@ -217,6 +227,12 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
             # Get sample from pending_queue
             rollout_sample = await self.pending_queue.get()
             self.pending_queue.task_done()
+            proc_count += 1
+            sample_id_str = rollout_sample.sample_id if rollout_sample else "END"
+            print(
+                f"[TQFullyAsyncRollouter][Processor] Got sample #{proc_count}: {sample_id_str}",
+                flush=True,
+            )
 
             # ★ REMOVED: self.staleness_samples += 1 (RB manages this now)
 
@@ -265,35 +281,182 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
         - RB's poll thread will detect finish and auto-release slot.
         """
         # Generate via AgentLoopManager (UNCHANGED from base class)
+        print(
+            f"[TQFullyAsyncRollouter][_process_single] Starting generate for {rollout_sample.sample_id}...", flush=True
+        )
         ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
+        print(
+            f"[TQFullyAsyncRollouter][_process_single] generate done for {rollout_sample.sample_id}, writing to TQ...",
+            flush=True,
+        )
         rollout_sample.full_batch = ret
         rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
         )
-        rollout_sample.rollout_status = await self.get_statistics()
+        # Skip get_statistics() in TQ mode — it calls message_queue_client.get_statistics()
+        # which is not available (replaced by ReplayBuffer). Use lightweight stats instead.
+        # rollout_sample.rollout_status = await self.get_statistics()
+        rollout_sample.rollout_status = {
+            "monitor/active_tasks_size": len(self.active_tasks) if hasattr(self, "active_tasks") else 0,
+            "count/total_generated_samples": self.total_generated_samples,
+        }
 
         # ★ CORE CHANGE: Write to TQ instead of MessageQueue
-        key = rollout_sample.sample_id  # e.g. "sample_0_42"
+        # Follow AgentLoopWorkerTQ._agent_loop_postprocess pattern:
+        # - Use async_kv_batch_put (not blocking kv_batch_put)
+        # - Split 2D [bsz, seq] batch into per-sample 1D dicts, then list_of_dict_to_tensordict
+        #   This is critical because TQ's jagged layout requires each sample to be a 1-D tensor
+        #   (matching AgentLoopWorkerTQ where output.as_dict() yields 1-D prompts/responses).
+        base_key = rollout_sample.sample_id  # e.g. "sample_0_42"
+        full_batch = rollout_sample.full_batch  # DataProto
 
         try:
-            tq.kv_batch_put(
-                keys=[key],
-                partition_id="train",
-                fields=[rollout_sample],  # Full RolloutSample as field data
-                tags=[
+            batch = full_batch.batch if hasattr(full_batch, "batch") else full_batch
+            non_tensor = full_batch.non_tensor_batch if hasattr(full_batch, "non_tensor_batch") else {}
+
+            # Determine batch size from tensor fields
+            bsz = len(full_batch) if hasattr(full_batch, "__len__") else 1
+            if "input_ids" in batch:
+                bsz = batch["input_ids"].shape[0]
+            elif "prompts" in batch:
+                bsz = batch["prompts"].shape[0]
+
+            # Tensor keys to extract per-sample (2D → 1D unbind along dim=0)
+            per_sample_tensor_keys = [
+                "input_ids",
+                "attention_mask",
+                "position_ids",
+                "response_mask",
+                "prompts",
+                "responses",
+                "loss_mask",
+            ]
+            # Non-tensor / score keys to index per-sample
+            per_sample_nt_keys = [
+                "uid",
+                "reward_score",
+                "rm_scores",
+                "rollout_log_probs",
+                "old_log_probs",
+                "ref_log_prob",
+                "log_probs",
+                "entropy",
+            ]
+
+            keys, fields, tags = [], [], []
+            for idx in range(bsz):
+                sample_key = f"{base_key}_{idx}" if bsz > 1 else base_key
+                field = {}
+
+                # Unbind 2D tensors along batch dimension → 1D per sample
+                for tkey in per_sample_tensor_keys:
+                    if tkey in batch:
+                        field[tkey] = batch[tkey][idx]
+
+                # Index non-tensor arrays along batch dimension
+                for ntkey in per_sample_nt_keys:
+                    if ntkey in non_tensor:
+                        val = non_tensor[ntkey]
+                        # Handle numpy arrays: index element-wise
+                        if isinstance(val, np.ndarray):
+                            field[ntkey] = val[idx]
+                        elif isinstance(val, list) and len(val) > idx:
+                            field[ntkey] = val[idx]
+                        else:
+                            field[ntkey] = val
+                    elif ntkey in batch:
+                        field[ntkey] = batch[ntkey][idx]
+
+                # Per-sample metadata (scalar, same for all samples in this batch)
+                field["global_steps"] = self.global_steps
+                field["start_model_version"] = self.current_param_version
+                field["end_model_version"] = self.current_param_version
+
+                # Ensure loss_mask exists (required by _update_actor pipeline).
+                # In AgentLoopWorkerTQ._agent_loop_postprocess: field["loss_mask"] = field["response_mask"]
+                # The rollout output batch typically does NOT contain loss_mask, so we derive it from response_mask.
+                # Use .clone() to avoid potential shared-memory issues with jagged/nested tensors.
+                if "response_mask" in field:
+                    if "loss_mask" not in field:
+                        field["loss_mask"] = (
+                            field["response_mask"].clone()
+                            if hasattr(field["response_mask"], "clone")
+                            else field["response_mask"]
+                        )
+                    lm_shape = field["loss_mask"].shape
+                    print(
+                        f"[RollouterTQ] {sample_key}: loss_mask set, shape={lm_shape}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[TQFullyAsyncRollouter][_process_single] WARNING: {sample_key} no response_mask/loss_mask!",
+                        flush=True,
+                    )
+
+                # Compute seq_len from 1-D prompts/responses (same as AgentLoopWorkerTQ)
+                prompts_1d = field.get("prompts")
+                responses_1d = field.get("responses")
+                prompt_len = prompts_1d.size(0) if (prompts_1d is not None and hasattr(prompts_1d, "size")) else 1
+                response_len = (
+                    responses_1d.size(0) if (responses_1d is not None and hasattr(responses_1d, "size")) else 0
+                )
+                seq_len = prompt_len + response_len
+
+                keys.append(sample_key)
+                fields.append(field)
+                tags.append(
                     {
                         "current_status": "finish",
-                        "uid": key,
+                        "uid": sample_key,
                         "start_model_version": self.current_param_version,
                         "end_model_version": self.current_param_version,
-                        "prompt_len": 0,  # TODO: extract from ret if needed
-                        "response_len": 0,  # TODO: extract from ret if needed
+                        "prompt_len": int(prompt_len),
+                        "response_len": int(response_len),
+                        "seq_len": int(seq_len),
                     }
-                ],
+                )
+
+            # Convert list of per-sample dicts → TensorDict (handles jagged correctly)
+            print(
+                f"[TQFullyAsyncRollouter][_process_single] Preparing TQ write for {base_key}, bsz={bsz}",
+                flush=True,
             )
-            self.total_generated_samples += 1
+            td_fields = list_of_dict_to_tensordict(fields)
+            td_keys_str = list(td_fields.keys())
+            print(
+                f"[RollouterTQ] TensorDict ready for {base_key}, keys={td_keys_str}, bsz={td_fields.batch_size}",
+                flush=True,
+            )
+
+            t_write_start = time.time()
+            await tq.async_kv_batch_put(
+                keys=keys,
+                fields=td_fields,
+                tags=tags,
+                partition_id="train",
+            )
+            t_write_end = time.time()
+            self.total_generated_samples += bsz
+            keys_str = ", ".join(keys[:3]) + ("..." if len(keys) > 3 else "")
+            wt = t_write_end - t_write_start
+            total_gen = self.total_generated_samples
+            print(
+                f"[RollouterTQ] Wrote {bsz} samples [{keys_str}] to TQ ({total_gen} total, {wt:.2f}s)",
+                flush=True,
+            )
+
+            # Notify RB that all samples are finished (replaces _poll_from_tq for cross-process TQ)
+            if self.replay_buffer is not None:
+                for sample_key, tag in zip(keys, tags, strict=False):
+                    finish_meta = dict(tag)
+                    await asyncio.wrap_future(
+                        self.replay_buffer.mark_finish.remote(
+                            key=sample_key, partition_id="train", meta=finish_meta
+                        ).future()
+                    )
         except Exception as e:
-            logger.error(f"[TQFullyAsyncRollouter] Failed to write {key} to TQ: {e}")
+            logger.exception(f"[TQFullyAsyncRollouter] Failed to write {base_key} to TQ: {e}")
             # Release slot on error so we don't leak
             if self.replay_buffer is not None:
                 ray.get(self.replay_buffer.release_slot.remote())
@@ -311,10 +474,14 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
         if self.async_rollout_manager is None:
             await self._init_async_rollout_manager()
 
-        print(f"[TQFullyAsyncRollouter] Start streaming mode, max concurrent: {self.max_concurrent_samples}")
+        print(
+            f"[TQFullyAsyncRollouter] Start streaming mode, max concurrent: {self.max_concurrent_samples}", flush=True
+        )
 
         # Start feed and processor tasks (same as base class)
+        print("[TQFullyAsyncRollouter] Starting feed_task...", flush=True)
         self.feed_task = safe_create_task(self._feed_samples(), name="feed_task")
+        print("[TQFullyAsyncRollouter] Starting processor_task...", flush=True)
         self.processor_task = safe_create_task(self._processor_worker(), name="processor_task")
 
         try:
@@ -401,15 +568,28 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
 
         Delegates to ReplayBuffer.reset_staleness() which manages version tracking
         centrally. Also wakes up the processor if paused.
+
+        IMPORTANT: Uses asyncio.wrap_future(.future()) instead of ray.get() to avoid
+        blocking the event loop inside this async actor, which would cause deadlocks
+        when the RB actor is also serving other concurrent calls (e.g., acquire_slot).
         """
+        print("[TQFullyAsyncRollouter][reset_staleness] STARTING", flush=True)
         async with self.lock:
             self.paused = False
             self._resume_event.set()
+        print("[TQFullyAsyncRollouter][reset_staleness] lock acquired & released", flush=True)
 
-        # Delegate staleness tracking to RB
+        # Delegate staleness tracking to RB (async — avoid ray.get deadlock)
         if self.replay_buffer is not None:
             active_task_count = len(self.active_tasks)
-            timing_raw = ray.get(self.replay_buffer.reset_staleness.remote(active_task_count=active_task_count))
+            print(
+                f"[RollouterTQ][reset_staleness] calling RB.reset_staleness (tasks={active_task_count})",
+                flush=True,
+            )
+            timing_raw = await asyncio.wrap_future(
+                self.replay_buffer.reset_staleness.remote(active_task_count=active_task_count).future()
+            )
+            print("[TQFullyAsyncRollouter][reset_staleness] RB.reset_staleness DONE", flush=True)
         else:
             # Fallback if RB not set (shouldn't happen in normal operation)
             timing_raw = {}

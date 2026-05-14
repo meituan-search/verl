@@ -12,6 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""TQFullyAsyncTrainer: Multi-inheritance trainer combining PPOTrainer's KVBatchMeta pipeline
+with FullyAsyncTrainer's async infrastructure.
+
+MRO: TQFullyAsyncTrainer → PPOTrainer → FullyAsyncTrainer → SeparateRayPPOTrainer → ...
+
+Data flow:
+    TQFullyAsyncRollouter --(tq.kv_batch_put)--> TransferQueue (status=finish)
+        |
+    TQFullyAsyncTrainer <-(RB.wait_and_sample)--+--(KVBatchMeta)--> [PPOTrainer pipeline]
+                                                    |
+                                              update_actor(KVBatchMeta)
+"""
+
 import asyncio
 import logging
 import time
@@ -27,6 +40,7 @@ from verl.experimental.fully_async_policy.fully_async_trainer import (
     FullyAsyncTrainer,
     TrainingStopException,
 )
+from verl.single_controller.ray import RayWorkerGroup
 from verl.trainer.main_ppo_sync import PPOTrainer
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.utils import Role, WorkerType
@@ -34,6 +48,13 @@ from verl.utils.debug import marked_timer
 from verl.utils.tracking import Tracking, ValidationGenerationsLogger
 
 logger = logging.getLogger(__name__)
+
+try:
+    import transfer_queue as tq
+    from transfer_queue import KVBatchMeta
+except ImportError:
+    print("Please install TQ by calling `pip install TransferQueue==0.1.6` and try again.")
+    from verl.utils.transferqueue_utils import KVBatchMeta, tq
 
 
 class TQFullyAsyncTrainer(PPOTrainer, FullyAsyncTrainer):
@@ -60,7 +81,22 @@ class TQFullyAsyncTrainer(PPOTrainer, FullyAsyncTrainer):
             role_worker_mapping=role_worker_mapping,
             resource_pool_manager=resource_pool_manager,
         )
+        # PPOTrainer doesn't accept device_name/ray_worker_group_cls, set them manually
+        # These are required by FullyAsyncTrainer(SeparateRayPPOTrainer) init_workers pipeline:
+        #   _init_resource_pools → _create_worker_classes → _init_worker_groups → _init_models
+        self.device_name = device_name
+        self.ray_worker_group_cls = ray_worker_group_cls or RayWorkerGroup
         self.tokenizer = tokenizer
+
+        # Additional attributes from SeparateRayPPOTrainer/RayPPOTrainer.__init__
+        # that PPOTrainer.__init__ doesn't set but _create_worker_classes / _init_models need:
+        from verl.trainer.ppo.utils import need_reward_model
+
+        self.use_rm = need_reward_model(self.config)
+        lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
+        if lora_rank <= 0:
+            lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
+        self.ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
 
         # ======== 2. FullyAsyncTrainer state fields ========
         # (mirrors FullyAsyncTrainer.__init__ lines 108-163)
@@ -117,7 +153,60 @@ class TQFullyAsyncTrainer(PPOTrainer, FullyAsyncTrainer):
     async def set_replay_buffer(self, replay_buffer):
         """Set ReplayBuffer Ray Actor handle."""
         self.replay_buffer = replay_buffer
+        self._pre_fit_reset_done = False  # Flag: main.py handles pre-fit RB.reset_staleness
         print("[TQFullyAsyncTrainer] ReplayBuffer handle set")
+
+    # ======== Override: _fit_update_weights — skip rollouter.reset_staleness in pre-fit ========
+
+    async def _fit_update_weights(self):
+        """Override to skip rollouter.reset_staleness during pre-fit phase.
+
+        In TQ mode, main.py calls RB.reset_staleness directly (synchronously from driver)
+        to avoid a deadlock where trainer → rollouter.reset_staleness competes with
+        rollouter.fit()'s event loop on the same async actor.
+
+        After the first call (pre-fit), subsequent calls in the training loop work normally
+        because rollouter's event loop is idle when reset_staleness arrives.
+        """
+        if self.local_trigger_step != 1:
+            return
+
+        import asyncio
+
+        from verl.utils.debug import marked_timer
+
+        with marked_timer("timing_s/param_sync", self.timing_raw):
+            await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
+        print(
+            f"[TQFullyAsyncTrainer] _fit_update_weights, "
+            f"timing_s/param_sync: {self.timing_raw['timing_s/param_sync']:.4f} seconds "
+            f"self.current_param_version: {self.current_param_version}",
+            flush=True,
+        )
+
+        # Skip rollouter.reset_staleness on first call (pre-fit).
+        # main.py handles it via direct ray.get(rb.reset_staleness.remote()).
+        if not self._pre_fit_reset_done:
+            print(
+                "[TQTrainer] _fit_update_weights: SKIPPING rollouter.reset_staleness (pre-fit)",
+                flush=True,
+            )
+            self._pre_fit_reset_done = True
+            return
+
+        # Normal training-loop path: call rollouter.reset_staleness (async, safe now)
+        timing_raw = await asyncio.wrap_future(self.rollouter.reset_staleness.remote().future())
+        self.logger.log(
+            data=timing_raw,
+            step=self.current_param_version,
+        )
+
+        # Log aggregated training metrics
+        self.logger.log(
+            data=self.metrics_aggregator.get_aggregated_metrics(),
+            step=self.current_param_version,
+        )
+        self.metrics_aggregator.reset()
 
     # ======== Core TQ-specific: data sourcing ========
     async def _get_kvbatch_from_rb(self) -> KVBatchMeta | None:
@@ -157,9 +246,47 @@ class TQFullyAsyncTrainer(PPOTrainer, FullyAsyncTrainer):
 
     # ======== Override: fit() — async RB consumption loop ========
 
+    # Override init_workers: use FullyAsyncTrainer's version (not PPOTrainer's)
+    # because PPOTrainer.init_workers() assumes ActorRollout resource pool exists,
+    # but in TQ fully-async mode the rollouter is a separate Ray actor.
+    async def init_workers(self):
+        """Initialize workers using FullyAsyncTrainer's pipeline (avoids ActorRollout pool dependency)."""
+        self._init_resource_pools()
+        self._create_worker_classes()
+        self._init_worker_groups()
+        self._init_models()
+
+        # Initialize reward_loop_manager (normally done in PPOTrainer.init_workers)
+        if not hasattr(self, "reward_loop_manager"):
+            from verl.experimental.reward_loop import RewardLoopManager
+
+            rm_resource_pool = (
+                self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+                if self.config.reward.reward_model.enable
+                else None
+            )
+            self.reward_loop_manager = RewardLoopManager(
+                config=self.config,
+                rm_resource_pool=rm_resource_pool,
+            )
+
+        # Initialize checkpoint_manager (normally done in PPOTrainer.init_workers)
+        if not hasattr(self, "checkpoint_manager"):
+            from verl.checkpoint_engine import CheckpointEngineManager
+
+            self.checkpoint_manager = CheckpointEngineManager(
+                config=self.config.trainer.checkpoint,
+                actor_rollout_wg=getattr(self, "actor_rollout_wg", None),
+                ref_wg=getattr(self, "ref_policy_wg", None),
+            )
+
     async def fit(self):
         """Main training loop: async RB consumption + PPOTrainer step() pipeline."""
-        print("[TQFullyAsyncTrainer] Starting fit (KVBatchMeta pipeline)...")
+        print("[TQFullyAsyncTrainer] Starting fit (KVBatchMeta pipeline)...", flush=True)
+        print(
+            f"[TQTrainer] fit(): rb={self.replay_buffer is not None}, rollouter={self.rollouter is not None}",
+            flush=True,
+        )
         if self.replay_buffer is None:
             raise ValueError("ReplayBuffer not set. Call set_replay_buffer() first.")
         if self.rollouter is None:
@@ -175,9 +302,16 @@ class TQFullyAsyncTrainer(PPOTrainer, FullyAsyncTrainer):
         except Exception as e:
             print(f"[TQFullyAsyncTrainer] TQ init warning: {e}")
 
+        step_count = 0
         while True:
             try:
+                print(
+                    f"[TQFullyAsyncTrainer] === Starting fit_step {step_count} (global_steps={self.global_steps}) ===",
+                    flush=True,
+                )
                 await self.fit_step()
+                print(f"[TQFullyAsyncTrainer] === fit_step {step_count} DONE ===", flush=True)
+                step_count += 1
             except TrainingStopException:
                 print("[TQFullyAsyncTrainer] Training stopped by termination signal")
                 break
@@ -194,7 +328,9 @@ class TQFullyAsyncTrainer(PPOTrainer, FullyAsyncTrainer):
         self.metrics = {"training/global_step": self.global_steps, "training/epoch": self.epoch}
         self.timing_raw = {}
 
-        self._fit_start_profile()
+        # Use PPOTrainer's _start_profiling (no args) instead of FullyAsyncTrainer's
+        # _fit_start_profile() which passes do_profile arg incompatible with PPOTrainer
+        self._start_profiling()
 
         with marked_timer("step", self.timing_raw):
             # ★ CORE: Get KVBatchMeta from RB (replaces generate_sequences + replay_buffer.sample)
@@ -208,19 +344,38 @@ class TQFullyAsyncTrainer(PPOTrainer, FullyAsyncTrainer):
             batch_meta.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
             # Sleep rollout replicas (PPOTrainer does this after sampling)
-            self.checkpoint_manager.sleep_replicas()
+            # In fully async mode, rollouter is a separate actor — sleep is a no-op if
+            # no rollout replicas are managed by trainer's checkpoint_manager.
+            # Check if sleep_replicas is async (TQ fully-async mode) or sync (colocated mode).
+            _sleep_result = self.checkpoint_manager.sleep_replicas()
+            if hasattr(_sleep_result, "__await__"):
+                await _sleep_result
 
             # 3. [OPTIONAL] compute reward score with colocated reward model
+            # In TQ fully-async mode, reward is computed by Rollouter's AgentLoop
+            # (via RewardLoopManager/DAPO) and stored in TQ as rm_scores.
+            # Skip _compute_reward_colocate which raises NotImplementedError.
             if self.reward_loop_manager.reward_loop_worker_handles is None:
-                with marked_timer("reward", timing_raw, color="yellow"):
-                    batch_meta = self._compute_reward_colocate(batch_meta, metrics=metrics)
+                print(
+                    "[TQTrainer] Skipping _compute_reward_colocate (TQ mode)",
+                    flush=True,
+                )
 
             # 4. balance batch_meta across data parallel groups
             batch_meta = self._balance_batch(batch_meta, metrics=metrics)
 
             # 5. compute old_log_prob
+            # NOTE: When rollout_correction.bypass_mode=True, _compute_old_log_prob returns None
+            # (missing return value in PPOTrainer's bypass path). Guard against this.
             with marked_timer("old_log_prob", timing_raw, color="blue"):
-                batch_meta = self._compute_old_log_prob(batch_meta, metrics=metrics)
+                old_log_prob_result = self._compute_old_log_prob(batch_meta, metrics=metrics)
+                if old_log_prob_result is not None:
+                    batch_meta = old_log_prob_result
+                else:
+                    print(
+                        "[TQTrainer] _compute_old_log_prob returned None (bypass mode)",
+                        flush=True,
+                    )
 
             # 6. [OPTIONAL] compute ref_log_prob
             if self.use_reference_policy:
@@ -257,7 +412,8 @@ class TQFullyAsyncTrainer(PPOTrainer, FullyAsyncTrainer):
         # Validation & checkpoint (inherited from FullyAsyncTrainer)
         await self._fit_validate()
         self._fit_save_checkpoint()
-        self._fit_stop_profile()
+        # Use PPOTrainer's _stop_profiling (no args) instead of FullyAsyncTrainer's
+        self._stop_profiling()
         self._fit_collect_metrics(batch_meta)
         self._fit_postprocess_step()
 

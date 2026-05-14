@@ -59,7 +59,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 StatusType = Literal["pending", "running", "partial", "finish"]
 
 
-@ray.remote
+@ray.remote(max_concurrency=100)
 class ReplayBuffer:
     """Ray Actor: metadata channel + slot-based flow control for TQ fully async training.
 
@@ -83,15 +83,38 @@ class ReplayBuffer:
         self._pending_slots = 0  # acquired but not yet finish
         self._slot_available = threading.Condition(self.lock)
 
-        # Background thread: sync meta from TQ kv_list
-        self._poll_thread = threading.Thread(target=self._poll_from_tq, daemon=True)
-        self._poll_thread.start()
+        # Background threads — lazy start via ensure_polling_started()
+        self._poll_thread = None
+        self._monitor_thread = None
+        self._poll_started = False
 
-        # Background thread: periodic statistics logging
-        self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
-        self._monitor_thread.start()
+        # Initialize TQ in this actor process so _poll_from_tq can call tq.kv_list()
+        try:
+            import transfer_queue as tq
+
+            tq.init()
+            print("[ReplayBuffer] TQ initialized in RB actor process", flush=True)
+        except Exception as e:
+            print(f"[ReplayBuffer] TQ init warning: {e}", flush=True)
 
         print(f"[ReplayBuffer] initialized with max_pending_slots={max_pending_slots}, poll_interval={poll_interval}")
+
+    def ensure_polling_started(self):
+        """Lazily start background threads after TQ is initialized.
+
+        Called from acquire_slot (first call from rollouter _feed_samples)
+        which happens after tq.init() in set_max_required_samples / fit().
+        """
+        with self.lock:
+            if self._poll_started:
+                return
+            self._poll_started = True
+
+        self._poll_thread = threading.Thread(target=self._poll_from_tq, daemon=True)
+        self._poll_thread.start()
+        self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._monitor_thread.start()
+        print("[ReplayBuffer] Background polling & monitor threads started")
 
     def _poll_from_tq(self):
         """Background thread that polls TQ for metadata updates.
@@ -99,9 +122,13 @@ class ReplayBuffer:
         Auto-releases slots when entries transition to 'finish'.
         This is the core mechanism that unblocks acquire_slot() in _feed_samples.
         """
+        poll_count = 0
         try:
             while True:
                 data = tq.kv_list()
+                poll_count += 1
+                if poll_count % 10 == 1:  # Log every 10 polls (~10s with 1s interval)
+                    print(f"[ReplayBuffer][_poll] poll #{poll_count}, data={data}", flush=True)
                 if data is not None:
                     for partition_id, items in data.items():
                         with self.lock:
@@ -116,16 +143,18 @@ class ReplayBuffer:
                                 # Detect status transitions: * -> finish => release slot
                                 if new_status == "finish" and prev_status != "finish":
                                     self._pending_slots = max(0, self._pending_slots - 1)
-                                    self._slot_available.notify()
-                                    logger.debug(
-                                        f"[ReplayBuffer] Slot released for {key} "
-                                        f"({prev_status}->finish), "
-                                        f"pending_slots={self._pending_slots}"
+                                    pd_slots = self._pending_slots
+                                    print(
+                                        f"[RB] Slot released for {key} ({prev_status}->finish), pending={pd_slots}",
+                                        flush=True,
                                     )
 
                 time.sleep(self.poll_interval)
         except Exception as e:
-            logger.error(f"[ReplayBuffer] _poll_from_tq error: {e}")
+            print(f"[ReplayBuffer] _poll_from_tq error: {e}", flush=True)
+            import traceback
+
+            traceback.print_exc()
             os._exit(1)
 
     def _monitor_loop(self):
@@ -152,35 +181,76 @@ class ReplayBuffer:
         the sample into pending_queue. This implements source-level flow control:
         when too many samples are in-flight, the dataloader blocks here.
 
+        Uses lock-free logic: Ray Actor methods are already serialized (one at a time
+        per actor), so no threading.Lock needed for simple attribute read/write.
+        Background _poll_from_tq thread is the only concurrent entity, and it only
+        modifies partitions dict and decrements _pending_slots — both are safe via
+        Python's GIL for simple integer ops and dict updates.
+
         Args:
             timeout: Max seconds to wait. None = block indefinitely.
 
         Returns:
             True if slot acquired, False if timed out or finished.
         """
-        with self._slot_available:
-            while self._pending_slots >= self.max_pending_slots:
-                if self._finished:
+        # Lazy-start background polling threads on first call (without lock)
+        if not getattr(self, "_poll_started", False):
+            self._poll_started = True
+            self._poll_thread = threading.Thread(target=self._poll_from_tq, daemon=True)
+            self._poll_thread.start()
+            self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+            self._monitor_thread.start()
+            print("[ReplayBuffer] Background polling & monitor threads started", flush=True)
+
+        # Lock-free slot acquisition with poll loop
+        import time as _time
+
+        _wait_forever = timeout is None
+        _deadline_abs = None if _wait_forever else (_time.monotonic() + timeout)
+        _poll_interval = 0.1
+
+        while True:
+            # Lock-free check (safe due to Ray actor serialization + GIL)
+            if self._finished:
+                return False
+            if self._pending_slots < self.max_pending_slots:
+                self._pending_slots += 1
+                return True
+
+            # Wait before retrying
+            if not _wait_forever:
+                remaining = _deadline_abs - _time.monotonic()
+                if remaining <= 0:
                     return False
-                if timeout is not None:
-                    if not self._slot_available.wait(timeout):
-                        return False
-                else:
-                    self._slot_available.wait()
-                    if self._finished:
-                        return False
-            self._pending_slots += 1
-            return True
+                _time.sleep(min(_poll_interval, remaining))
+            else:
+                _time.sleep(_poll_interval)
 
     def release_slot(self):
         """Manually release a slot (e.g., on error/drop).
 
-        Normally slots are auto-released by _poll_from_tq when it detects
-        status transition to 'finish'.
+        Normally slots are auto-released by mark_finish() when rollouter
+        calls it after writing to TQ.
         """
-        with self._slot_available:
-            self._pending_slots = max(0, self._pending_slots - 1)
-            self._slot_available.notify()
+        self._pending_slots = max(0, self._pending_slots - 1)
+        print(f"[ReplayBuffer][release_slot] pending={self._pending_slots}", flush=True)
+
+    def mark_finish(self, key: str, partition_id: str = "train", meta: dict | None = None):
+        """Mark a sample as finished (called by Rollouter after TQ write).
+
+        This replaces the _poll_from_tq mechanism for cross-process scenarios
+        where RB's tq.kv_list() cannot see data written by Rollouter's TQ instance.
+
+        Args:
+            key: Sample key (e.g. "sample_0_42")
+            partition_id: Partition name
+            meta: Optional metadata dict (tags)
+        """
+        if meta is None:
+            meta = {"current_status": "finish"}
+        self.partitions[partition_id][key] = meta
+        self._pending_slots = max(0, self._pending_slots - 1)
+        print(f"[ReplayBuffer][mark_finish] {key} in {partition_id}, pending={self._pending_slots}", flush=True)
 
     @property
     def pending_slots(self) -> int:
@@ -206,6 +276,9 @@ class ReplayBuffer:
         Called by TQFullyAsyncTrainer at the start of each training step.
         Returns keys whose metadata has current_status='finish'.
 
+        Uses lock-free reads (safe due to Ray actor serialization + GIL for simple ops).
+        mark_finish() is the writer and does not use lock either.
+
         Args:
             partition_id: Partition to sample from, e.g. "train".
             batch_size: Desired number of samples.
@@ -214,20 +287,33 @@ class ReplayBuffer:
             List of (key, meta) tuples. Length may be < batch_size when finished.
             Returns None if finished and no samples available.
         """
+        # Lazy-start background polling threads (without lock)
+        if not getattr(self, "_poll_started", False):
+            self._poll_started = True
+            self._poll_thread = threading.Thread(target=self._poll_from_tq, daemon=True)
+            self._poll_thread.start()
+            self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+            self._monitor_thread.start()
+
         while True:
-            with self.lock:
-                part = self.partitions.get(partition_id)
-                if part is None:
-                    # Partition not yet created (no samples written yet), keep waiting
-                    pass
-                else:
-                    ready = [(k, v) for k, v in part.items() if v.get("current_status") == "finish"]
+            # Lock-free read (safe: Ray serializes actor calls, GIL protects dict/int ops)
+            part = self.partitions.get(partition_id)
+            if part is not None:
+                ready = [(k, v) for k, v in part.items() if v.get("current_status") == "finish"]
 
-                    if len(ready) >= batch_size:
-                        return ready[:batch_size]
+                if len(ready) >= batch_size:
+                    print(
+                        f"[RB][wait_and_sample] Returning {len(ready[:batch_size])} samples from {partition_id}",
+                        flush=True,
+                    )
+                    return ready[:batch_size]
 
-                    if self._finished:
-                        return ready if ready else None
+                if self._finished:
+                    print(
+                        f"[ReplayBuffer][wait_and_sample] Finished, returning {len(ready) if ready else 0} remaining",
+                        flush=True,
+                    )
+                    return ready if ready else None
 
             time.sleep(self.poll_interval)
 
@@ -272,6 +358,7 @@ class ReplayBuffer:
         Returns:
             Dict with timing metrics for logging.
         """
+        print(f"[ReplayBuffer][reset_staleness] ENTER (active_tasks={active_task_count})", flush=True)
         with self.lock:
             # Count ready (finish) samples in RB
             ready_count = self.count_by_status("finish")

@@ -66,6 +66,19 @@ class FullyAsyncTaskRunner:
 
             self._rollouter_cls = ray.remote(TQFullyAsyncRollouter).options(num_cpus=10, max_concurrency=100)
             self._trainer_cls = ray.remote(TQFullyAsyncTrainer).options(num_cpus=10, max_concurrency=100)
+
+            # Initialize TQ in the main process FIRST with config.transfer_queue
+            # This ensures all subsequent tq.init() calls (in Rollouter, Trainer, RB actors)
+            # connect to the SAME shared TransferQueueController instance.
+            try:
+                import transfer_queue as tq
+
+                tq_config = OmegaConf.to_container(getattr(config, "transfer_queue", {}), resolve=True)
+                print(f"[ASYNC MAIN] Initializing TQ with config: {tq_config}", flush=True)
+                tq.init(tq_config)
+                print("[ASYNC MAIN] TQ initialized in main process", flush=True)
+            except Exception as e:
+                print(f"[ASYNC MAIN] TQ init warning: {e}", flush=True)
         else:
             from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncRollouter
             from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
@@ -130,6 +143,19 @@ class FullyAsyncTaskRunner:
 
         print("[ASYNC MAIN] Param sync before fit..")
         ray.get(self.components["trainer"]._fit_update_weights.remote())
+
+        # In TQ mode, also do a direct RB reset_staleness to ensure version tracking
+        # is initialized BEFORE rollouter.fit() starts producing samples.
+        # This avoids a deadlock where trainer._fit_update_weights → rollouter.reset_staleness
+        # competes with rollouter.fit()'s event loop for the same async actor.
+        # NOTE: We skip the actual RB call here because threading.Lock inside RB actor
+        # can cause scheduling deadlocks during initialization. The first training-loop
+        # reset_staleness (inside fit_step) will handle it properly.
+        if self._use_tq and "replay_buffer" in self.components:
+            print(
+                "[ASYNC MAIN] Skipping RB.reset_staleness in pre-fit (fit_step handles it)",
+                flush=True,
+            )
 
         if config.trainer.get("val_before_train", True):
             ray.get(self.components["trainer"]._fit_validate.remote(True))
@@ -199,7 +225,7 @@ class FullyAsyncTaskRunner:
         trainer_role_mapping = {
             role: worker_cls
             for role, worker_cls in self.components["role_worker_mapping"].items()
-            if role != Role.Rollout
+            if role not in (Role.Rollout, Role.ActorRollout)
         }
 
         trainer = self._trainer_cls.remote(
@@ -293,6 +319,15 @@ def main(config):
     config.actor_rollout_ref.rollout.nnodes = config.rollout.nnodes
     config.actor_rollout_ref.rollout.n_gpus_per_node = config.rollout.n_gpus_per_node
     config = migrate_legacy_reward_impl(config)
+
+    # Enable TransferQueue in config so run_ppo sets TRANSFER_QUEUE_ENABLE=1 in runtime_env.
+    # This ensures all Ray workers (Rollouter, Trainer, RB) have the correct env var.
+    if getattr(config.async_training, "use_tq", False):
+        from omegaconf import open_dict
+
+        with open_dict(config):
+            config.transfer_queue.enable = True
+
     run_ppo(config, task_runner_class=FullyAsyncTaskRunner)
     print(f"total time: {time() - start_time:.2f} seconds")
 
