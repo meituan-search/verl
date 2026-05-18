@@ -343,6 +343,18 @@ class TQFullyAsyncTrainer(PPOTrainer, FullyAsyncTrainer):
             timing_raw = self.timing_raw
             batch_meta.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
+            # Abort all in-flight rollout requests BEFORE sleeping replicas.
+            # This is critical for TQ fully-async mode where the rollouter is a
+            # separate Ray actor that may have ongoing generate_sequences requests
+            # to the SGLang server. Without aborting first, SGLang's
+            # release_memory_occupation() will fail with:
+            #   AssertionError: release_memory_occupation should be called only when no ongoing request
+            # See: FullyAsyncTrainer._trainer_side_validate() which follows the same
+            # abort → sleep → update_weights → resume pattern.
+            _abort_result = self.checkpoint_manager.abort_replicas()
+            if hasattr(_abort_result, "__await__"):
+                await _abort_result
+
             # Sleep rollout replicas (PPOTrainer does this after sampling)
             # In fully async mode, rollouter is a separate actor — sleep is a no-op if
             # no rollout replicas are managed by trainer's checkpoint_manager.
@@ -404,6 +416,13 @@ class TQFullyAsyncTrainer(PPOTrainer, FullyAsyncTrainer):
             # Param sync every trigger_parameter_sync_step (inherited from FullyAsyncTrainer)
             self._fit_update_local_step()
             await self._fit_update_weights()
+
+            # Resume generation on rollout replicas after weight sync completes.
+            # This is the counterpart to abort_replicas() called above, restoring
+            # the rollouter's ability to send generate_sequences requests to SGLang.
+            _resume_result = self.checkpoint_manager.resume_generation_replicas()
+            if hasattr(_resume_result, "__await__"):
+                await _resume_result
 
             # Cleanup consumed data from TQ + RB (TQ-specific)
             tq.kv_clear(keys=batch_meta.keys, partition_id=batch_meta.partition_id)
