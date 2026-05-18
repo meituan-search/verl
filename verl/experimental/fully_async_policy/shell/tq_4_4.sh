@@ -82,7 +82,10 @@ fully_async=(
   async_training.trigger_parameter_sync_step=4
   async_training.require_batches=1
   async_training.partial_rollout=True
-  async_training.use_tq=True
+)
+
+transfer_queue=(
+  transfer_queue.enable=True
 )
 
 python -m verl.experimental.fully_async_policy.fully_async_main \
@@ -158,4 +161,5 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     trainer.log_val_generations=10 \
     trainer.total_epochs=10 \
     "${mtp_params[@]}" \
-    "${fully_async[@]}"
+    "${fully_async[@]}" \
+    "${transfer_queue[@]}"

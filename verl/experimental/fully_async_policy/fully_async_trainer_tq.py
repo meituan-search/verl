@@ -256,20 +256,6 @@ class TQFullyAsyncTrainer(PPOTrainer, FullyAsyncTrainer):
         self._init_worker_groups()
         self._init_models()
 
-        # Initialize reward_loop_manager (normally done in PPOTrainer.init_workers)
-        if not hasattr(self, "reward_loop_manager"):
-            from verl.experimental.reward_loop import RewardLoopManager
-
-            rm_resource_pool = (
-                self.resource_pool_manager.get_resource_pool(Role.RewardModel)
-                if self.config.reward.reward_model.enable
-                else None
-            )
-            self.reward_loop_manager = RewardLoopManager(
-                config=self.config,
-                rm_resource_pool=rm_resource_pool,
-            )
-
         # Initialize checkpoint_manager (normally done in PPOTrainer.init_workers)
         if not hasattr(self, "checkpoint_manager"):
             from verl.checkpoint_engine import CheckpointEngineManager
@@ -367,11 +353,11 @@ class TQFullyAsyncTrainer(PPOTrainer, FullyAsyncTrainer):
             # In TQ fully-async mode, reward is computed by Rollouter's AgentLoop
             # (via RewardLoopManager/DAPO) and stored in TQ as rm_scores.
             # Skip _compute_reward_colocate which raises NotImplementedError.
-            if self.reward_loop_manager.reward_loop_worker_handles is None:
-                print(
-                    "[TQTrainer] Skipping _compute_reward_colocate (TQ mode)",
-                    flush=True,
-                )
+            # self.reward_loop_manager is None in TQ mode (owned by Rollouter).
+            print(
+                "[TQTrainer] Skipping _compute_reward_colocate (TQ mode)",
+                flush=True,
+            )
 
             # 4. balance batch_meta across data parallel groups
             batch_meta = self._balance_batch(batch_meta, metrics=metrics)
