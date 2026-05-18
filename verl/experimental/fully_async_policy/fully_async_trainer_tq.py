@@ -417,6 +417,15 @@ class TQFullyAsyncTrainer(PPOTrainer, FullyAsyncTrainer):
             self._fit_update_local_step()
             await self._fit_update_weights()
 
+            # Wake up rollout replicas to restore GPU memory (kv_cache + weights).
+            # This is the critical counterpart to sleep_replicas() called above.
+            # Without wake_up, SGLang's model weights remain on CPU and subsequent
+            # generate_sequences requests will fail with:
+            #   ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)
+            _wake_result = self.checkpoint_manager.wake_up_replicas()
+            if hasattr(_wake_result, "__await__"):
+                await _wake_result
+
             # Resume generation on rollout replicas after weight sync completes.
             # This is the counterpart to abort_replicas() called above, restoring
             # the rollouter's ability to send generate_sequences requests to SGLang.
