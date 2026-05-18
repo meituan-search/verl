@@ -309,24 +309,16 @@ class RewardLoopManager:
         for i in range(num_workers):
             # Round-robin scheduling over the all nodes
             node_id = node_ids[i % len(node_ids)]
-            actor_name = f"reward_loop_worker_{i}"
 
-            # Try to get existing actor first to avoid ActorAlreadyExistsError
-            try:
-                existing_actor = ray.get_actor(actor_name, namespace=None)
-                self.reward_loop_workers.append(existing_actor)
-                logger.info(f"Reusing existing reward loop worker: {actor_name}")
-            except ValueError:
-                # Actor doesn't exist, create new one
-                self.reward_loop_workers.append(
-                    self.reward_loop_workers_class.options(
-                        name=actor_name,
-                        scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
-                            node_id=node_id,
-                            soft=True,
-                        ),
-                    ).remote(self.config, self.reward_router_address)
-                )
+            self.reward_loop_workers.append(
+                self.reward_loop_workers_class.options(
+                    name=f"reward_loop_worker_{i}",
+                    scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                        node_id=node_id,
+                        soft=True,
+                    ),
+                ).remote(self.config, self.reward_router_address)
+            )
 
     def compute_rm_score(self, data: DataProto) -> DataProto:
         if self.reward_model_manager is not None:

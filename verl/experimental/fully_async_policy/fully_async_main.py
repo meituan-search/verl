@@ -14,13 +14,9 @@
 
 """FullyAsyncTaskRunner: Unified entry point for fully async PPO training.
 
-Supports two data transfer backends (selected via config.async_training.use_tq):
-- use_tq=False (default): MessageQueue + FullyAsyncRollouter/FullyAsyncTrainer
-- use_tq=True:  TransferQueue + ReplayBuffer + TQFullyAsyncRollouter/TQFullyAsyncTrainer
-
-The only difference between the two modes is:
-1. Rollouter / Trainer class selection
-2. Data channel: MessageQueue vs ReplayBuffer (Ray Actor)
+Supports two data transfer backends (selected via config.transfer_queue.enable):
+- transfer_queue.enable=False (default): MessageQueue + FullyAsyncRollouter/FullyAsyncTrainer
+- transfer_queue.enable=True:  TransferQueue + ReplayBuffer + TQFullyAsyncRollouter/TQFullyAsyncTrainer
 """
 
 import asyncio
@@ -44,8 +40,6 @@ from verl.utils.fs import copy_to_local
 class FullyAsyncTaskRunner:
     """
     Ray remote class for executing distributed PPO training tasks.
-
-    Supports both MessageQueue and TQ+ReplayBuffer backends via config.
     """
 
     def __init__(self):
@@ -53,13 +47,13 @@ class FullyAsyncTaskRunner:
         self.components = {}
         self.shutdown_event = threading.Event()
         self._use_tq = False
-        # Class references (resolved in run() based on use_tq)
+        # Class references (resolved in run() based on transfer_queue.enable)
         self._rollouter_cls = None
         self._trainer_cls = None
 
     def run(self, config):
         # Detect backend mode from config and resolve class references
-        self._use_tq = getattr(config.async_training, "use_tq", False)
+        self._use_tq = getattr(config.transfer_queue, "enable", False)
         if self._use_tq:
             from verl.experimental.fully_async_policy.fully_async_rollouter_tq import TQFullyAsyncRollouter
             from verl.experimental.fully_async_policy.fully_async_trainer_tq import TQFullyAsyncTrainer
@@ -144,19 +138,6 @@ class FullyAsyncTaskRunner:
         print("[ASYNC MAIN] Param sync before fit..")
         ray.get(self.components["trainer"]._fit_update_weights.remote())
 
-        # In TQ mode, also do a direct RB reset_staleness to ensure version tracking
-        # is initialized BEFORE rollouter.fit() starts producing samples.
-        # This avoids a deadlock where trainer._fit_update_weights → rollouter.reset_staleness
-        # competes with rollouter.fit()'s event loop for the same async actor.
-        # NOTE: We skip the actual RB call here because threading.Lock inside RB actor
-        # can cause scheduling deadlocks during initialization. The first training-loop
-        # reset_staleness (inside fit_step) will handle it properly.
-        if self._use_tq and "replay_buffer" in self.components:
-            print(
-                "[ASYNC MAIN] Skipping RB.reset_staleness in pre-fit (fit_step handles it)",
-                flush=True,
-            )
-
         if config.trainer.get("val_before_train", True):
             ray.get(self.components["trainer"]._fit_validate.remote(True))
 
@@ -225,7 +206,7 @@ class FullyAsyncTaskRunner:
         trainer_role_mapping = {
             role: worker_cls
             for role, worker_cls in self.components["role_worker_mapping"].items()
-            if role not in (Role.Rollout, Role.ActorRollout)
+            if role != Role.Rollout
         }
 
         trainer = self._trainer_cls.remote(
@@ -319,14 +300,6 @@ def main(config):
     config.actor_rollout_ref.rollout.nnodes = config.rollout.nnodes
     config.actor_rollout_ref.rollout.n_gpus_per_node = config.rollout.n_gpus_per_node
     config = migrate_legacy_reward_impl(config)
-
-    # Enable TransferQueue in config so run_ppo sets TRANSFER_QUEUE_ENABLE=1 in runtime_env.
-    # This ensures all Ray workers (Rollouter, Trainer, RB) have the correct env var.
-    if getattr(config.async_training, "use_tq", False):
-        from omegaconf import open_dict
-
-        with open_dict(config):
-            config.transfer_queue.enable = True
 
     run_ppo(config, task_runner_class=FullyAsyncTaskRunner)
     print(f"total time: {time() - start_time:.2f} seconds")

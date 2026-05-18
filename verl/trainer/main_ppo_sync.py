@@ -203,21 +203,6 @@ class ReplayBuffer:
 
         self.poll_interval = poll_interval
         self.lock = threading.Lock()
-        # Lazy init — thread started on first sample() call to avoid
-        # calling tq.kv_list() before tq.init() in TQ fully-async mode.
-        self.poll_thread = None
-        self._poll_started = False
-
-    def _ensure_polling_started(self):
-        """Lazily start the background TQ poll thread.
-
-        Must be called after tq.init() to avoid
-        'TransferQueueController has not been initialized yet' errors.
-        """
-        with self.lock:
-            if self._poll_started:
-                return
-            self._poll_started = True
         self.poll_thread = threading.Thread(target=self._poll_from_transfer_queue, daemon=True)
         self.poll_thread.start()
 
@@ -273,9 +258,6 @@ class ReplayBuffer:
         Returns:
             KVBatchMeta: A batch of data.
         """
-        # Lazily start the TQ poll thread on first access (after tq.init())
-        self._ensure_polling_started()
-
         assert (global_steps is not None or batch_size) and (not (global_steps is not None and batch_size)), (
             "Either global_steps or batch_size must be specified, but not both."
         )
@@ -1285,7 +1267,7 @@ class PPOTrainer:
             )
             data["old_log_probs"] = data.pop("rollout_log_probs")
             tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data)
-            return batch
+            return
 
         # 1. compute log probs
         batch.extra_info.update(
