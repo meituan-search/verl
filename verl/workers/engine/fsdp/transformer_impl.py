@@ -70,6 +70,7 @@ from verl.utils.ulysses import (
     ulysses_pad_and_slice_inputs,
 )
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig
+from verl.workers.utils.padding import build_attention_mask_from_nested
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
 from ..utils import enable_full_determinism, postprocess_batch_func, prepare_micro_batches
@@ -996,12 +997,10 @@ class FSDPEngineWithLMHead(FSDPEngine):
             if pad_mode == DatasetPadMode.NO_PADDING:
                 input_ids = micro_batch["input_ids"]
                 position_ids = micro_batch["position_ids"]
-                loss_mask = micro_batch["loss_mask"]
-
                 pad_token_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
                 batch_size = micro_batch.batch_size[0]
                 seq_len_effective = input_ids.offsets().diff()
-                max_seq_len = max(seq_len_effective)
+                max_seq_len = int(seq_len_effective.max().item())
 
                 input_ids_rmpad_rolled = torch.roll(input_ids.values(), shifts=-1, dims=0)
                 output_args["input_ids_rmpad_rolled"] = input_ids_rmpad_rolled
@@ -1021,10 +1020,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         position_ids, padding=0, output_size=(batch_size, max_seq_len)
                     )
 
-                attention_mask_list = [torch.ones_like(t, dtype=torch.int32) for t in loss_mask]
-                attention_mask = torch.nested.as_nested_tensor(attention_mask_list, layout=torch.jagged)
-                attention_mask = torch.nested.to_padded_tensor(
-                    attention_mask, padding=0, output_size=(batch_size, max_seq_len)
+                attention_mask = build_attention_mask_from_nested(
+                    input_ids=micro_batch["input_ids"], max_seq_len=max_seq_len
                 )
 
                 model_inputs = {
@@ -1040,6 +1037,14 @@ class FSDPEngineWithLMHead(FSDPEngine):
         if use_fused_kernels:
             extra_args["temperature"] = temperature_item
             extra_args["return_dict"] = True
+            if use_remove_padding:
+                # We have already computed `input_ids_rmpad_rolled` from the *full*
+                # global sequence and (when SP>1) SP-sliced it. Pass it into the model
+                # so the fused forward uses these labels verbatim instead of redoing
+                # `torch.roll` on the local SP shard, which would wrap around the
+                # shard boundary rather than the global sequence (issue #6068). This
+                # mirrors what the veomni engine already does for fused kernels.
+                extra_args["shift_labels"] = output_args["input_ids_rmpad_rolled"].unsqueeze(0)
 
         model_inputs.update(multi_modal_inputs)
         model_inputs.update(extra_args)
