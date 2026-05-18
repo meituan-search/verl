@@ -49,7 +49,6 @@ class TrainingStopException(Exception):
     pass
 
 
-@ray.remote(num_cpus=10)
 class FullyAsyncTrainer(SeparateRayPPOTrainer):
     """
     A fully asynchronous PPO trainer that obtains samples from a MessageQueue for training.
