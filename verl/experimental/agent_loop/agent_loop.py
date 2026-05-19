@@ -539,7 +539,10 @@ class AgentLoopWorker:
         outputs = await asyncio.gather(*tasks)
 
         output = self._postprocess(
-            outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
+            outputs,
+            input_non_tensor_batch=batch.non_tensor_batch,
+            validate=batch.meta_info.get("validate", False),
+            **kwargs,
         )
         return output
 
@@ -575,11 +578,10 @@ class AgentLoopWorker:
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
             )
-            kwargs["validate"] = trajectory["validate"]
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            return await self._agent_loop_postprocess(output, **kwargs)
+            return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
-    async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalAgentLoopOutput:
+    async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
 
@@ -642,11 +644,13 @@ class AgentLoopWorker:
         if output.response_logprobs is not None:
             pad_size = self.rollout_config.response_length - len(output.response_logprobs)
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
-        for key in ENGINE_SERVER_LOGPROB_KEYS:
-            val = output.extra_fields.pop(key, None)
-            if val is not None:
-                pad_size = self.rollout_config.response_length - len(val)
-                output.extra_fields[key] = torch.tensor(val + [0.0] * pad_size).unsqueeze(0)
+
+        if kwargs.get("use_engine_server", False):
+            for key in ENGINE_SERVER_LOGPROB_KEYS:
+                val = output.extra_fields.pop(key, None)
+                if val is not None:
+                    pad_size = self.rollout_config.response_length - len(val)
+                    output.extra_fields[key] = torch.tensor(val + [0.0] * pad_size).unsqueeze(0)
 
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
@@ -695,7 +699,7 @@ class AgentLoopWorker:
             output,
             prompt_ids=output.prompt_ids,
             response_ids=output.response_ids,
-            validate=kwargs.get("validate"),
+            validate=validate,
             sample_kwargs=kwargs,
         )
         teacher_ids, teacher_logprobs = (
@@ -905,6 +909,7 @@ class AgentLoopWorker:
         inputs: list[_InternalAgentLoopOutput],
         input_non_tensor_batch: dict | None = None,
         validate: bool = False,
+        **kwargs,
     ) -> DataProto:
         """Process the padded outputs from _run_agent_loop and combine them into a batch."""
         # Convert lists back to tensors and stack them to create a batch.
@@ -917,9 +922,10 @@ class AgentLoopWorker:
         optional_outputs = {}
         if inputs[0].response_logprobs is not None:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
-        for key in ENGINE_SERVER_LOGPROB_KEYS:
-            if inputs[0].extra_fields.get(key) is not None:
-                optional_outputs[key] = torch.cat([inp.extra_fields.pop(key) for inp in inputs], dim=0)
+        if kwargs.get("use_engine_server", False):
+            for key in ENGINE_SERVER_LOGPROB_KEYS:
+                if inputs[0].extra_fields.get(key) is not None:
+                    optional_outputs[key] = torch.cat([inp.extra_fields.pop(key) for inp in inputs], dim=0)
         if inputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:

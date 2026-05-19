@@ -118,7 +118,6 @@ class ToolAgentLoop(AgentLoopBase):
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
-        validate = kwargs.pop("validate", False)
         messages = list(kwargs["raw_prompt"])
 
         # extract multimodal inputs from messages
@@ -155,7 +154,6 @@ class ToolAgentLoop(AgentLoopBase):
         else:
             agent_data._active_tools = self.tools
             agent_data._active_tool_schemas = self.tool_schemas
-        agent_data._validate = validate
 
         # State machine loop
         state = AgentState.PENDING
@@ -163,9 +161,9 @@ class ToolAgentLoop(AgentLoopBase):
             if state == AgentState.PENDING:
                 state = await self._handle_pending_state(agent_data, sampling_params)
             elif state == AgentState.GENERATING:
-                state = await self._handle_generating_state(agent_data, sampling_params)
+                state = await self._handle_generating_state(agent_data, sampling_params, **kwargs)
             elif state == AgentState.PROCESSING_TOOLS:
-                state = await self._handle_processing_tools_state(agent_data)
+                state = await self._handle_processing_tools_state(agent_data, **kwargs)
             else:
                 logger.error(f"Invalid state: {state}")
                 state = AgentState.TERMINATED
@@ -180,10 +178,10 @@ class ToolAgentLoop(AgentLoopBase):
             multi_modal_data["videos"] = agent_data.video_data
         if agent_data.audio_data is not None:
             multi_modal_data["audios"] = agent_data.audio_data
-
-        for key in ENGINE_SERVER_LOGPROB_KEYS:
-            if agent_data.extra_fields.get(key):
-                agent_data.extra_fields[key] = agent_data.extra_fields[key][: self.response_length]
+        if kwargs.get("use_engine_server", False):
+            for key in ENGINE_SERVER_LOGPROB_KEYS:
+                if agent_data.extra_fields.get(key):
+                    agent_data.extra_fields[key] = agent_data.extra_fields[key][: self.response_length]
 
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
@@ -221,10 +219,13 @@ class ToolAgentLoop(AgentLoopBase):
         return AgentState.GENERATING
 
     async def _handle_generating_state(
-        self, agent_data: AgentData, sampling_params: dict[str, Any], ignore_termination: bool = False
+        self,
+        agent_data: AgentData,
+        sampling_params: dict[str, Any],
+        ignore_termination: bool = False,
+        **kwargs,
     ) -> AgentState:
         """Handle the generating state: generate model response and check for tool calls."""
-        extra_kwargs = {"validate": getattr(agent_data, "_validate", False)}
         with simple_timer("generate_sequences", agent_data.metrics):
             output: TokenOutput = await self.server_manager.generate(
                 request_id=agent_data.request_id,
@@ -234,7 +235,7 @@ class ToolAgentLoop(AgentLoopBase):
                 video_data=agent_data.video_data,
                 audio_data=agent_data.audio_data,
                 mm_processor_kwargs=agent_data.mm_processor_kwargs,
-                **extra_kwargs,
+                **kwargs,
             )
         # first time to set num_preempted
         if agent_data.metrics.get("num_preempted") is None:
@@ -258,10 +259,11 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.response_mask += [1] * len(agent_data.response_ids)
         if output.log_probs:
             agent_data.response_logprobs += output.log_probs
-        for key in ENGINE_SERVER_LOGPROB_KEYS:
-            if output.extra_fields.get(key):
-                agent_data.extra_fields.setdefault(key, [])
-                agent_data.extra_fields[key] += output.extra_fields[key]
+        if kwargs.get("use_engine_server", False):
+            for key in ENGINE_SERVER_LOGPROB_KEYS:
+                if output.extra_fields.get(key):
+                    agent_data.extra_fields.setdefault(key, [])
+                    agent_data.extra_fields[key] += output.extra_fields[key]
         if output.routed_experts is not None:
             agent_data.routed_experts = output.routed_experts
 
@@ -283,7 +285,7 @@ class ToolAgentLoop(AgentLoopBase):
         else:
             return AgentState.TERMINATED
 
-    async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
+    async def _handle_processing_tools_state(self, agent_data: AgentData, **kwargs) -> AgentState:
         """Handle the processing tools state: execute tool calls and prepare tool responses."""
         add_messages: list[dict[str, Any]] = []
         new_images_this_turn: list[Any] = []  # Local variable instead of agent_data attribute
@@ -383,9 +385,10 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.response_mask += [0] * len(response_ids)
         if agent_data.response_logprobs:
             agent_data.response_logprobs += [0.0] * len(response_ids)
-        for key in ENGINE_SERVER_LOGPROB_KEYS:
-            if agent_data.extra_fields.get(key):
-                agent_data.extra_fields[key] += [0.0] * len(response_ids)
+        if kwargs.get("use_engine_server", False):
+            for key in ENGINE_SERVER_LOGPROB_KEYS:
+                if agent_data.extra_fields.get(key):
+                    agent_data.extra_fields[key] += [0.0] * len(response_ids)
         agent_data.user_turns += 1
         return AgentState.GENERATING
 

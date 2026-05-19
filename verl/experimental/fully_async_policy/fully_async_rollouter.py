@@ -86,7 +86,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         Returns:
             TokenOutput: token output
         """
-        validate = kwargs.pop("validate", False)
+        use_engine_server = kwargs.pop("use_engine_server", False)
         prompt_ids = normalize_token_ids(prompt_ids)
 
         limit_key = None
@@ -116,7 +116,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             )
 
             # Compute log probs immediately after this chunk with current model weights.
-            if not validate and self._model_engine_manager is not None:
+            if use_engine_server and self._model_engine_manager is not None:
                 await self._compute_chunk_log_probs(output, context_prompt_ids, sampling_params)
 
             # 2. merge output into final_output
@@ -137,10 +137,11 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 final_output.num_preempted += output.num_preempted
             final_output.stop_reason = output.stop_reason
 
-            for key in ENGINE_SERVER_LOGPROB_KEYS:
-                if output.extra_fields.get(key) is not None:
-                    final_output.extra_fields.setdefault(key, [])
-                    final_output.extra_fields[key].extend(output.extra_fields[key])
+            if use_engine_server:
+                for key in ENGINE_SERVER_LOGPROB_KEYS:
+                    if output.extra_fields.get(key) is not None:
+                        final_output.extra_fields.setdefault(key, [])
+                        final_output.extra_fields[key].extend(output.extra_fields[key])
 
             global_steps = output.extra_fields.get("global_steps", None)
             if min_global_steps is None:
