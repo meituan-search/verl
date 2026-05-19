@@ -153,7 +153,7 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
         Key difference from base class:
         - Instead of message_queue_client.put_sample(ray.cloudpickle.dumps(...)),
           writes data to TQ with status=finish tag.
-        - RB's poll thread will detect finish and auto-release slot.
+        - Caller releases slot via release_slot() after successful TQ write.
         """
         print(
             f"[TQFullyAsyncRollouter][_process_single] Starting generate for {rollout_sample.sample_id}...", flush=True
@@ -321,19 +321,10 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
                 f"[RollouterTQ] Wrote {bsz} samples [{keys_str}] to TQ ({total_gen} total, {wt:.2f}s)",
                 flush=True,
             )
-
-            for sample_key, tag in zip(keys, tags, strict=False):
-                finish_meta = dict(tag)
-                await asyncio.wrap_future(
-                    self.replay_buffer.mark_finish.remote(
-                        key=sample_key, partition_id="train", meta=finish_meta
-                    ).future()
-                )
         except Exception as e:
             logger.exception(f"[TQFullyAsyncRollouter] Failed to write {base_key} to TQ: {e}")
-            # Release slot on error so we don't leak
-            if self.replay_buffer is not None:
-                ray.get(self.replay_buffer.release_slot.remote())
+        finally:
+            await self.replay_buffer.release_slot.remote()
 
         self.processed_sample_count += 1
 
