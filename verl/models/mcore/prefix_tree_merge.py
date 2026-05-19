@@ -51,6 +51,9 @@ _layer_tensors: dict = {}  # key -> Tensor on CPU
 # Set in model_forward.py before calling model(), cleared after.
 _active_magi_key: threading.local = threading.local()
 
+# Set to True during prefix-tree forward to bypass CP-rank-specific RoPE slicing.
+_magi_rope_bypass: threading.local = threading.local()
+
 
 # ---------------------------------------------------------------------------
 # flex_attention helper for prefix-tree
@@ -409,6 +412,8 @@ def apply_prefix_tree_patch() -> None:
 
     # ------------------------------------------------------------------
     # 6. GPTModel.forward — accept and pass magi/flex attention key.
+    #    Also sets _magi_rope_bypass.active=True so patch #7 below skips
+    #    the CP-rank-specific RoPE slicing for the duration of the call.
     # ------------------------------------------------------------------
     _orig_gpt_forward = GPTModel.forward
 
@@ -427,13 +432,46 @@ def apply_prefix_tree_patch() -> None:
                                          flex_attention_key=flex_attention_key, **kw)
 
         self.decoder.forward = _decoder_forward_with_key
+        _prev_rope_bypass = getattr(_magi_rope_bypass, 'active', False)
+        _magi_rope_bypass.active = True  # all prefix-tree paths bypass CP RoPE slicing
         try:
             out = _orig_gpt_forward(self, input_ids, position_ids, attention_mask, **kwargs)
         finally:
             self.decoder.forward = _real_decoder_forward
+            _magi_rope_bypass.active = _prev_rope_bypass
         return out
 
     GPTModel.forward = _gpt_forward
+
+    # ------------------------------------------------------------------
+    # 7. RotaryEmbedding.forward — bypass CP-rank RoPE slicing for prefix-tree.
+    #
+    # Root cause of CP>1 bug: with BSHD format (packed_seq=False), Megatron slices
+    # rotary position frequencies per CP rank via get_pos_emb_on_this_cp_rank.
+    # MAGI/flex prefix-tree passes the full T-token sequence to every CP rank;
+    # different per-rank RoPE rotations produce different Q/K values → wrong attention.
+    #
+    # Fix: when prefix-tree is active (_magi_rope_bypass.active=True), skip CP slicing
+    # and return the full-sequence frequencies.  Only positions [0..T-1] are applied
+    # in BSHD attention, so correctness is maintained regardless of CP rank.
+    # ------------------------------------------------------------------
+    from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+    _orig_rope_cached = RotaryEmbedding.forward           # lru_cache wrapper
+    _orig_rope_fn = RotaryEmbedding.forward.__wrapped__   # actual function body
+
+    def _rope_forward_pt(self, max_seq_len, offset=0, packed_seq=False, cp_group=None):
+        if getattr(_magi_rope_bypass, 'active', False):
+            # Bypass CP slice: return full-sequence freqs identical on all CP ranks.
+            # get_rotary_seq_len multiplies by cp_size (yielding 2T for CP=2), so we
+            # divide it back out here to get the true flat-sequence length T.
+            _cp = cp_group or getattr(self, 'cp_group', None)
+            _cp_size = _cp.size() if _cp is not None else 1
+            actual_seq_len = max_seq_len // _cp_size
+            return _orig_rope_fn(self, actual_seq_len, offset=offset, packed_seq=True, cp_group=None)
+        return _orig_rope_cached(self, max_seq_len, offset=offset,
+                                 packed_seq=packed_seq, cp_group=cp_group)
+
+    RotaryEmbedding.forward = _rope_forward_pt
 
     TEDotProductAttention._prefix_tree_patched = True
 

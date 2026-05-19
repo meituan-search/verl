@@ -84,6 +84,16 @@ Numerically equivalent ✓  Host migration bjgpu→8gpu confirmed working.
 
 TP=2 flex verified: `0.0733` vs FA3 `0.0715` (+3%). Magi TP=2 in progress.
 
+**CP=2 MAGI verified (2026-05-19, gsm8k_sft_10240, TP=4, CP=2, 8 GPUs, seed=42):**
+
+| Backend | train/loss@1 | diff vs FA3 |
+|---------|-------------|------------|
+| FA3 baseline | 0.0638 | — |
+| MAGI prefix-tree | 0.0653 | +2.3% ✅ |
+
+Fix for CP>1: `_magi_rope_bypass` thread-local in `prefix_tree_merge.py` bypasses
+`RotaryEmbedding`'s CP-rank-specific RoPE slicing during prefix-tree forward passes.
+
 **New param `data.prefix_tree_attention`:** `flex` (default, no MAGI dep) or `magi`.
 Implemented in `verl/models/mcore/prefix_tree_merge.py` (renamed from magi_patch.py).
 `magi_patch.py` is now a backward-compat shim.
