@@ -552,6 +552,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         """Get rollout worker group"""
         return self.llm_server_manager.get_replicas()
 
+    def get_max_concurrent_samples(self):
+        """Max simultaneous in-flight samples (physical slot limit for RB Layer 1)."""
+        return self.max_concurrent_samples
+
+    def get_max_required_samples(self):
+        """Max samples per model version (version window limit for RB Layer 2)."""
+        return self.max_required_samples
+
     def get_max_queue_size(self):
         return self.max_queue_size
 

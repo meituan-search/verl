@@ -165,12 +165,33 @@ class FullyAsyncTaskRunner:
         ray.get(self.components["trainer"].set_message_queue_client.remote(self.components["message_queue_client"]))
 
     def _create_replay_buffer(self, config):
-        """Create ReplayBuffer Ray Actor (TQ mode)."""
+        """Create ReplayBuffer Ray Actor (TQ mode) with dual-layer slot config.
+
+        Layer 1 (Physical): max_pending_slots = max_concurrent_samples
+            Limits simultaneous in-flight samples (OOM guard).
+            Maps to Rollouter's max_concurrent_samples (e.g. GPU / (TP * PP) * 16).
+
+        Layer 2 (Version window): max_version_slots = max_required_samples
+            Limits total slots per model version (staleness guard).
+            Maps to Rollouter's max_required_samples
+            (= required_samples * trigger_parameter_sync_step).
+        """
         from verl.experimental.fully_async_policy.replay_buffer import ReplayBuffer
 
-        max_required_samples = ray.get(self.components["rollouter"].get_max_queue_size.remote())
-        print(f"[ASYNC MAIN] Creating ReplayBuffer... max_pending_slots={max_required_samples}")
-        replay_buffer = ReplayBuffer.remote(max_pending_slots=max_required_samples)
+        # Layer 1: Physical concurrency limit
+        max_concurrent_samples = ray.get(self.components["rollouter"].get_max_concurrent_samples.remote())
+        # Layer 2: Version window (staleness) limit
+        max_required_samples = ray.get(self.components["rollouter"].get_max_required_samples.remote())
+
+        print(
+            f"[ASYNC MAIN] Creating ReplayBuffer... "
+            f"max_pending_slots(physical)={max_concurrent_samples}, "
+            f"max_version_slots(staleness)={max_required_samples}"
+        )
+        replay_buffer = ReplayBuffer.remote(
+            max_version_slots=max_required_samples,
+            max_pending_slots=max_concurrent_samples,
+        )
         self.components["replay_buffer"] = replay_buffer
 
         ray.get(self.components["rollouter"].set_replay_buffer.remote(replay_buffer))

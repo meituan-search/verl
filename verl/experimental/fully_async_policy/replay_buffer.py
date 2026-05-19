@@ -71,19 +71,36 @@ class ReplayBuffer:
     4. Version tracking: reset_staleness() for parameter sync coordination
     """
 
-    def __init__(self, max_pending_slots: int = 256, poll_interval: float = 1.0):
+    def __init__(
+        self,
+        max_version_slots: int,
+        max_pending_slots: int = 256,
+        poll_interval: float = 1.0,
+    ):
         # Partition -> {key: tags_dict}
         self.partitions: dict[str, dict[str, dict]] = defaultdict(dict)
         self.lock = threading.Lock()
         self.poll_interval = poll_interval
         self._finished = False
 
-        # Slot control for TQ request count (replaces MessageQueue.queue_size)
+        # ======== Layer 1: Physical slot control (concurrency / OOM guard) ========
+        # Limits simultaneous in-flight samples.
+        # Acquired in _feed_samples (Rollouter), released on finish (mark_finish / poll).
+        # Maps to: max_concurrent_samples (e.g. TP * PP * 16)
         self.max_pending_slots = max_pending_slots
         self._pending_slots = 0  # acquired but not yet finish
         self._slot_available = threading.Condition(self.lock)
 
-        # Background threads — lazy start via ensure_polling_started()
+        # ======== Layer 2: Version window control (staleness guard) ========
+        # Limits total slots issued per model version.
+        # When _version_slots >= max_version_slots, acquire_slot() blocks until
+        # reset_staleness() is called (after param sync).
+        # Maps to: max_required_samples (e.g. required_samples * trigger_parameter_sync_step)
+        self.max_version_slots = max_version_slots
+        self._version_slots = 0  # cumulative slots issued in current version
+        self._current_model_version = 0
+
+        # Background threads — lazy start via acquire_slot()
         self._poll_thread = None
         self._monitor_thread = None
         self._poll_started = False
@@ -97,7 +114,12 @@ class ReplayBuffer:
         except Exception as e:
             print(f"[ReplayBuffer] TQ init warning: {e}", flush=True)
 
-        print(f"[ReplayBuffer] initialized with max_pending_slots={max_pending_slots}, poll_interval={poll_interval}")
+        print(
+            f"[ReplayBuffer] initialized with "
+            f"max_pending_slots={max_pending_slots}, "
+            f"max_version_slots={max_version_slots}, "
+            f"poll_interval={poll_interval}"
+        )
 
     def ensure_polling_started(self):
         """Lazily start background threads after TQ is initialized.
@@ -178,14 +200,19 @@ class ReplayBuffer:
         """Acquire a slot before processing a dataloader sample.
 
         Called by TQFullyAsyncRollouter in _feed_samples(), BEFORE putting
-        the sample into pending_queue. This implements source-level flow control:
-        when too many samples are in-flight, the dataloader blocks here.
+        the sample into pending_queue. This implements **dual-layer flow control**:
 
-        Uses lock-free logic: Ray Actor methods are already serialized (one at a time
-        per actor), so no threading.Lock needed for simple attribute read/write.
-        Background _poll_from_tq thread is the only concurrent entity, and it only
-        modifies partitions dict and decrements _pending_slots — both are safe via
-        Python's GIL for simple integer ops and dict updates.
+        Layer 1 (Physical): ``_pending_slots < max_pending_slots``
+            Limits simultaneous in-flight samples to prevent OOM / GPU overload.
+            Slot is released when sample reaches status=finish (mark_finish or poll).
+
+        Layer 2 (Version window): ``_version_slots < max_version_slots``
+            Limits total slots issued per model version to control staleness.
+            When the version window is full, acquire_slot() blocks until
+            reset_staleness() is called after parameter synchronization.
+            Only enforced if max_version_slots is set (via set_version_config()).
+
+        Both conditions must be satisfied for a slot to be issued.
 
         Args:
             timeout: Max seconds to wait. None = block indefinitely.
@@ -202,7 +229,7 @@ class ReplayBuffer:
             self._monitor_thread.start()
             print("[ReplayBuffer] Background polling & monitor threads started", flush=True)
 
-        # Lock-free slot acquisition with poll loop
+        # Lock-free dual-condition slot acquisition with poll loop
         import time as _time
 
         _wait_forever = timeout is None
@@ -213,9 +240,33 @@ class ReplayBuffer:
             # Lock-free check (safe due to Ray actor serialization + GIL)
             if self._finished:
                 return False
-            if self._pending_slots < self.max_pending_slots:
+
+            # Layer 1: Physical concurrency limit
+            physical_ok = self._pending_slots < self.max_pending_slots
+
+            # Layer 2: Version window limit (staleness control)
+            # If max_version_slots is not yet set (None), skip this check
+            version_ok = self.max_version_slots is None or self._version_slots < self.max_version_slots
+
+            if physical_ok and version_ok:
                 self._pending_slots += 1
+                self._version_slots += 1
                 return True
+
+            # Diagnostic: log which condition blocked us (only once per block)
+            if not physical_ok:
+                print(
+                    f"[RB][acquire_slot] BLOCKED: physical full "
+                    f"(pending={self._pending_slots}/{self.max_pending_slots})",
+                    flush=True,
+                )
+            elif not version_ok:
+                print(
+                    f"[RB][acquire_slot] BLOCKED: version window full "
+                    f"(version_slots={self._version_slots}/{self.max_version_slots}, "
+                    f"version={self._current_model_version}) — waiting for reset_staleness",
+                    flush=True,
+                )
 
             # Wait before retrying
             if not _wait_forever:
@@ -387,43 +438,31 @@ class ReplayBuffer:
         with self.lock:
             return self._finished
 
-    # ======== Staleness / version tracking (called by Trainer after param sync) ========
+    # ======== Version window control (called by Trainer after param sync) ========
 
-    def reset_staleness(self, active_task_count: int = 0) -> dict:
-        """Reset staleness after parameter update.
+    def reset_staleness(self) -> dict:
+        """Reset the version window after parameter synchronization.
 
-        Called by TQFullyAsyncTrainer after checkpoint_manager.update_weights().
-        Increments current model version and computes timing metrics.
+        Called by TQFullyAsyncTrainer (via Rollouter) after
+        checkpoint_manager.update_weights(). This:
 
-        Args:
-            active_task_count: Number of currently active tasks in the rollouter
-                              (tasks that are in-flight but not yet written to TQ as finish).
+        1. Resets ``_version_slots = 0`` — unblocks acquire_slot() if it was
+           blocked on the version window being full.
+        2. Increments ``_current_model_version += 1``.
 
         Returns:
-            Dict with timing metrics for logging.
+            Dict with timing/metrics for logging.
         """
-        print(f"[ReplayBuffer][reset_staleness] ENTER (active_tasks={active_task_count})", flush=True)
-        print(
-            f"[ReplayBuffer][reset_staleness] "
-            f"Trying to acquire lock, _poll_started={self._poll_started}, lock_locked={self.lock.locked()}",
-            flush=True,
-        )
-        print(
-            f"[ReplayBuffer][reset_staleness] "
-            f"BEFORE LOCK pid={os.getpid()} thread={threading.current_thread().name} time={time.time():.2f}",
-            flush=True,
-        )
+        now = time.time()
         with self.lock:
-            print(f"[ReplayBuffer][reset_staleness] INSIDE LOCK pid={os.getpid()} time={time.time():.2f}", flush=True)
-            # Count ready (finish) samples in RB
-            ready_count = self.count_by_status("finish")
-            running_count = self.count_by_status("running") + self.count_by_status("partial")
-            pending_count = self.count_by_status("pending")
+            prev_version = self._current_model_version
+            prev_version_slots = self._version_slots
 
-            self._staleness_samples = active_task_count + ready_count + running_count + pending_count
+            # Core: reset version window to unblock acquire_slot()
+            self._version_slots = 0
+            self._current_model_version += 1
 
-            # Compute timing metrics
-            now = time.time()
+            # Timing metrics
             if not hasattr(self, "_last_reset_time"):
                 self._last_reset_time = now
             version_time = max(now - self._last_reset_time, 1e-6)
@@ -435,7 +474,6 @@ class ReplayBuffer:
                 active_time = version_time
                 idle_ratio = 0
 
-            self._current_model_version = getattr(self, "_current_model_version", 0) + 1
             self._last_reset_time = now
 
             timing_raw = {
@@ -446,11 +484,11 @@ class ReplayBuffer:
 
             print(
                 f"[ReplayBuffer][reset_staleness] "
-                f"model_version={self._current_model_version}, "
-                f"staleness_samples={self._staleness_samples}, "
-                f"ready={ready_count}, running={running_count}, pending={pending_count}, "
-                f"active_tasks={active_task_count}, "
-                f"idle_ratio={idle_ratio:.4f}"
+                f"version: {prev_version} -> {self._current_model_version}, "
+                f"version_slots: {prev_version_slots} -> 0, "
+                f"pending_slots: {self._pending_slots}, "
+                f"idle_ratio: {idle_ratio:.4f}",
+                flush=True,
             )
 
         return timing_raw
@@ -464,13 +502,7 @@ class ReplayBuffer:
     def current_model_version(self) -> int:
         """Current model version (incremented on each reset_staleness call)."""
         with self.lock:
-            return getattr(self, "_current_model_version", 0)
-
-    @property
-    def staleness_samples(self) -> int:
-        """Current staleness sample count (set by last reset_staleness call)."""
-        with self.lock:
-            return getattr(self, "_staleness_samples", 0)
+            return self._current_model_version
 
     # ======== Statistics ========
 
@@ -589,8 +621,15 @@ class ReplayBuffer:
                 "total_running": self.count_by_status("running") + self.count_by_status("partial"),
                 "total_ready": self.count_by_status("finish"),
                 "total_in_flight": self.total_in_flight,
+                # Layer 1: Physical slot control
                 "pending_slots": self._pending_slots,
                 "max_pending_slots": self.max_pending_slots,
-                "available_slots": max(0, self.max_pending_slots - self._pending_slots),
+                "available_physical_slots": max(0, self.max_pending_slots - self._pending_slots),
+                # Layer 2: Version window control
+                "version_slots": self._version_slots,
+                "max_version_slots": self.max_version_slots,
+                "available_version_slots": max(0, (self.max_version_slots or 0) - self._version_slots),
+                "current_model_version": self._current_model_version,
+                # Control
                 "finished": self._finished,
             }

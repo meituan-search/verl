@@ -108,63 +108,50 @@ graph TB
 
 ### 1. ReplayBuffer (Ray Actor)
 
-轻量级元数据通道 + Slot 流速控制。作为 Ray Actor 跨进程共享。
+轻量级元数据通道 + **Dual-Layer Slot 流速控制**。作为 Ray Actor 跨进程共享。
 
 ```python
 @ray.remote
 class ReplayBuffer:
-    """Ray Actor: 元数据通道 + Slot 流速控制"""
+    """Ray Actor: 元数据通道 + Dual-Layer Slot 流速控制"""
 
-    def __init__(self, max_pending_slots: int = 256, poll_interval: float = 1.0):
+    def __init__(
+        self,
+        max_pending_slots: int = 256,       # Layer 1: 物理限流
+        max_version_slots: int | None = None, # Layer 2: 陈旧度控制
+        poll_interval: float = 1.0,
+    ):
         self.partitions: dict[str, dict[str, dict]] = defaultdict(dict)
         self.lock = threading.Lock()
         self.poll_interval = poll_interval
         self._finished = False
 
-        # Slot 控制 (替代 MessageQueue 的 queue_size 限流)
+        # Layer 1: Physical slot control (物理限流)
         self.max_pending_slots = max_pending_slots
-        self._pending_slots = 0  # 已获取但未 finish 的 slot 数
-        self._slot_available = threading.Condition(self.lock)
+        self._pending_slots = 0
 
-        # 版本追踪 (替代 staleness_samples)
+        # Layer 2: Version window control (陈旧度控制)
+        self.max_version_slots = max_version_slots
+        self._version_slots = 0
         self._current_model_version = 0
-        self._staleness_samples = 0
 
-        # 后台线程: 轮询 TQ kv_list 同步状态
-        self._poll_thread = threading.Thread(target=self._poll_from_tq, daemon=True)
-        self._poll_thread.start()
+        # 后台线程: 轮询 TQ kv_list 同步状态 (lazy start via acquire_slot)
+        self._poll_thread = None
+        self._monitor_thread = None
 
     # ===== Rollouter 接口 =====
 
     def acquire_slot(self, timeout: float | None = None) -> bool:
-        """获取写入 slot (阻塞)。
+        """获取写入 slot (阻塞) — Dual-Layer 双条件检查。
 
-        在 _feed_samples (dataloader) 中调用。
-        当 pending_slots >= max_pending_slots 时阻塞，
-        实现"源头限流"，不需要额外的暂停/恢复逻辑。
+        Layer 1: _pending_slots < max_pending_slots  (物理限流)
+        Layer 2: _version_slots < max_version_slots   (陈旧度控制)
 
-        Returns:
-            True: 获取成功; False: timeout 或已 finished
+        两个条件都满足才发放 slot，任一不满足则阻塞等待。
         """
-        with self._slot_available:
-            while self._pending_slots >= self.max_pending_slots:
-                if self._finished:
-                    return False
-                if timeout is not None:
-                    if not self._slot_available.wait(timeout):
-                        return False
-                else:
-                    self._slot_available.wait()
-                    if self._finished:
-                        return False
-            self._pending_slots += 1
-            return True
 
     def release_slot(self):
-        """手动释放 slot (异常场景)。正常情况下由 poll 线程自动释放。"""
-        with self._slot_available:
-            self._pending_slots = max(0, self._pending_slots - 1)
-            self._slot_available.notify()
+        """手动释放 slot (异常场景)。正常情况下由 mark_finish/poll 自动释放。"""
 
     # ===== Trainer 接口 =====
 
@@ -195,33 +182,36 @@ class ReplayBuffer:
         ...
 ```
 
-#### Slot 控制机制
+#### Slot 控制机制 (Dual-Layer)
 
 ```mermaid
 stateDiagram-v2
     [*] --> Idle: 初始化
-    Idle --> Acquired: acquire_slot() 成功
+    Idle --> Acquired: acquire_slot() 双条件通过
     Acquired --> InFlight: 写入 TQ status=pending
     InFlight --> Done: poll 检测到 status=finish
-    Done --> Idle: 自动 release_slot()<br/>notify 等待者
+    Done --> Idle: Layer1: release_slot()<br/>Layer2: 版本窗口不变
 
     note right of Idle
-        pending_slots < max_pending_slots
+        L1: pending_slots < max_pending_slots
+        L2: _version_slots < max_version_slots
     end note
 
     note right of Acquired
         pending_slots++
+        version_slots++
         Rollouter 可以继续处理数据
     end note
 
     note right of InFlight
         正在生成中 (pending/running/partial)
+        Layer1 占用 1 个物理 slot
+        Layer2 占用 1 个版本槽位 (累计)
     end note
 
     note right of Done
-        pending_slots--
-        如果 acquire_slot 在等待,
-        此时会唤醒一个
+        Layer1: pending_slots-- (释放物理 slot)
+        Layer2: version_slots 不变 (只有 reset_staleness 归零)
     end note
 ```
 
@@ -626,33 +616,72 @@ sequenceDiagram
     RB->>RB: 更新 _current_model_version += 1
 ```
 
-### Staleness 与 Slot 协同
+### Dual-Layer Slot Control (流速 + 陈旧度)
+
+`acquire_slot()` 是 Rollouter 和 RB 之间的**唯一卡控接口**，同时承担两个职责：
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                    acquire_slot() 双条件检查                          │
+│                                                                      │
+│  Layer 1: Physical (物理限流)                                        │
+│    条件: _pending_slots < max_pending_slots                           │
+│    来源: max_concurrent_samples (如 TP×PP×16)                        │
+│    作用: 防 OOM / GPU 过载                                           │
+│    释放: mark_finish() 或 _poll_from_tq 检测到 status=finish          │
+│                                                                      │
+│  Layer 2: Version Window (陈旧度控制)                                │
+│    条件: _version_slots < max_version_slots                           │
+│    来源: max_required_samples (= required_samples × trigger_step)     │
+│    作用: 防止样本参数版本过旧                                         │
+│    释放: reset_staleness() 归零（Trainer 参数同步后调用）              │
+│                                                                      │
+│  ✅ 两个条件都满足 → 发放 slot (_pending_slots++, _version_slots++)  │
+│  ❌ 任一不满足   → 阻塞等待                                           │
+└──────────────────────────────────────────────────────────────────────┘
+```
 
 | 原概念 (fully_async_policy) | 新实现 (fully_async_policy_tq) |
 |---------------------------|-------------------------------|
-| `MessageQueue.queue_size` | `ReplayBuffer._pending_slots` (slot 机制) |
-| `max_queue_size` | `max_pending_slots` |
-| `_should_pause_generation()` | **删除** — `acquire_slot()` 阻塞即限流 |
-| `staleness_samples` (手动计数) | `RB._staleness_samples` (poll 自动统计) |
-| `max_required_samples` | `max_pending_slots` (统一为一个维度) |
-| `paused` + `drain` + `resume` | **大部分删除** — 仅保留参数同步时的 drain |
+| `MessageQueue.queue_size` | `RB._pending_slots` (Layer 1) |
+| `max_queue_size` | `max_pending_slots` (Layer 1) |
+| `_should_pause_generation()` | **删除** — `acquire_slot()` 双条件即限流 |
+| `staleness_samples` (手动计数) | `RB._version_slots` (Layer 2, 累计计数) |
+| `max_required_samples` | `max_version_slots` (Layer 2) |
+| `paused` + `drain` + `resume` | **保留但不再触发卡控** — 仅用于参数同步时的安全 drain |
 
-**Rollouter 限流变为单维度**:
+**改动前后的对比**:
 
 ```
-改动前 (双重限流):
-  1. _should_pause_generation(): queue_size >= max_queue_size → 暂停
-  2. _should_pause_generation(): staleness_samples >= max_required_samples → 暂停
-  → 需要 paused/drain/resume 复杂状态机
+改动前 (双重限流, 复杂状态机):
+  1. _should_pause_generation(): queue_size >= max_queue_size → pause
+  2. _should_pause_generation(): staleness_samples >= max_required_samples → pause
+  → 需要 paused/drain/resume 状态机
 
-改动后 (单一限流):
-  1. _feed_samples(): acquire_slot() → 阻塞直到有 slot
-  → 简洁的令牌桶语义，无需额外状态机
+改动后 (acquire_slot 单接口双条件):
+  1. _feed_samples(): acquire_slot()
+     → Layer 1 不满足? 阻塞 (物理满)
+     → Layer 2 不满足? 阻塞 (版本窗口满, 等 reset_staleness)
+     → 都满足? 放行
+  → 简洁的令牌桶语义, 无需额外状态机
+```
+
+**参数同步流程**:
+
+```
+Trainer fit_step:
+  1. wait_and_sample(batch_size) → 从 RB 获取 finish 样本
+  2. ... PPO 训练流程 ...
+  3. update_weights() → NCCL 同步权重到 Rollouter GPUs
+  4. rollouter.reset_staleness():
+       a. 基类: resume processor (un-pause + wake _resume_event)
+       b. RB:   _version_slots = 0, version++  → 解除 acquire_slot 的 Layer 2 阻塞
 ```
 
 **参数同步时的 drain 仍然保留**:
-- `reset_staleness()` 时需要等当前 active_tasks 完成
+- `reset_staleness()` 时需要等当前 active_tasks 完成（安全 drain）
 - 这部分 `paused` + drain 逻辑保留在 `_processor_worker` 中
+- 但它不再是"卡控"机制（卡控已由 RB acquire_slot 完成），而是参数同步的安全保障
 
 ## 文件结构
 

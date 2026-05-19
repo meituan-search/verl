@@ -102,7 +102,7 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
 
         for epoch, batch_dict in continuous_iterator:
             print(f"[TQFullyAsyncRollouter][Feed] Acquiring slot for sample {feed_count}...", flush=True)
-            acquired = await asyncio.wrap_future(self.replay_buffer.acquire_slot.remote(timeout=None).future())
+            acquired = await self.replay_buffer.acquire_slot.remote(timeout=None)
             if not acquired:
                 print(
                     f"[TQFullyAsyncRollouter][Feed] ReplayBuffer finished or closed, "
@@ -407,28 +407,16 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
             async with self.lock:
                 self.running = False
 
-    # ======== Override: reset_staleness — delegate to RB ========
+    # ======== Override: reset_staleness — resume + delegate to RB ========
 
     async def reset_staleness(self):
-        """Reset staleness after parameter update.
-
-        Delegates to ReplayBuffer.reset_staleness() which manages version tracking
-        centrally. Also wakes up the processor if paused.
-
-        IMPORTANT: Uses asyncio.wrap_future(.future()) instead of ray.get() to avoid
-        blocking the event loop inside this async actor, which would cause deadlocks
-        when the RB actor is also serving other concurrent calls (e.g., acquire_slot).
-        """
-        active_task_count = len(self.active_tasks)
-        print(
-            f"[RollouterTQ][reset_staleness] calling RB.reset_staleness (tasks={active_task_count})",
-            flush=True,
-        )
-        timing_raw = await asyncio.wrap_future(
-            self.replay_buffer.reset_staleness.remote(active_task_count=active_task_count).future()
-        )
-        print("[TQFullyAsyncRollouter][reset_staleness] RB.reset_staleness DONE", flush=True)
-        return timing_raw
+        """Reset version window after parameter update."""
+        # Reset RB version window (no longer passes active_task_count —
+        # RB's staleness control is purely via acquire_slot dual-condition)
+        print("[RollouterTQ][reset_staleness] calling RB.reset_staleness (version window reset)", flush=True)
+        rb_timing = await self.replay_buffer.reset_staleness.remote()
+        print(f"[TQFullyAsyncRollouter][reset_staleness] RB.reset_staleness DONE {rb_timing}", flush=True)
+        return rb_timing
 
     # ======== Override: get_statistics — source from RB instead of MQ ========
 
