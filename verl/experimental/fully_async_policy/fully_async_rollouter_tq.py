@@ -248,6 +248,17 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
                 field["start_model_version"] = non_tensor.get("min_global_steps", idx)[idx]
                 field["end_model_version"] = non_tensor.get("max_global_steps", idx)[idx]
 
+                # Fields required by _compute_metrics in main_ppo_sync.py
+                # num_turns: number of conversation turns (default 1 for single-turn)
+                if "num_turns" not in field:
+                    field["num_turns"] = 1
+                # token_level_rewards: defaults to rm_scores if not set by reward model
+                if "token_level_rewards" not in field:
+                    field["token_level_rewards"] = field.get("rm_scores", 0.0)
+                # returns: will be computed by trainer during PPO, provide placeholder
+                if "returns" not in field:
+                    field["returns"] = field.get("rm_scores", 0.0)
+
                 # Ensure loss_mask exists (required by _update_actor pipeline).
                 # In AgentLoopWorkerTQ._agent_loop_postprocess: field["loss_mask"] = field["response_mask"]
                 # The rollout output batch typically does NOT contain loss_mask, so we derive it from response_mask.

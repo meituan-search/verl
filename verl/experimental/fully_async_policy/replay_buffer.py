@@ -151,7 +151,7 @@ class ReplayBuffer:
                 data = tq.kv_list()
                 poll_count += 1
                 if poll_count % 10 == 1:  # Log every 10 polls (~10s with 1s interval)
-                    print(f"[ReplayBuffer][_poll] poll #{poll_count}, data={data}", flush=True)
+                    print(f"[ReplayBuffer][_poll] poll #{poll_count}", flush=True)
                 if data is not None:
                     for partition_id, items in data.items():
                         async with self._data_available:
@@ -350,6 +350,19 @@ class ReplayBuffer:
 
                 # Wait for _poll_from_tq to write new metadata or signal_finish
                 await self._data_available.wait()
+
+    async def remove(self, partition_id: str, keys: list[str]):
+        """Remove consumed samples from the metadata store.
+
+        Called by TQFullyAsyncTrainer after consuming samples via wait_and_sample()
+        and reading data from TQ. Cleans up self.partitions to prevent unbounded growth.
+        """
+        async with self._data_available:
+            part = self.partitions.get(partition_id)
+            if part is not None:
+                for key in keys:
+                    part.pop(key, None)
+        print(f"[ReplayBuffer][remove] Removed {len(keys)} keys from {partition_id}", flush=True)
 
     async def reset_staleness(self) -> dict:
         """Reset the version window after parameter synchronization.

@@ -30,7 +30,6 @@ import logging
 import time
 from typing import Any
 
-import ray
 import transfer_queue as tq
 from omegaconf import OmegaConf
 from transfer_queue import KVBatchMeta
@@ -259,31 +258,6 @@ class TQFullyAsyncTrainer(PPOTrainer, FullyAsyncTrainer):
             timing_raw = self.timing_raw
             batch_meta.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
-            # Abort all in-flight rollout requests BEFORE sleeping replicas.
-            # This is critical for TQ fully-async mode where the rollouter is a
-            # separate Ray actor that may have ongoing generate_sequences requests
-            # to the SGLang server. Without aborting first, SGLang's
-            # release_memory_occupation() will fail with:
-            #   AssertionError: release_memory_occupation should be called only when no ongoing request
-            # See: FullyAsyncTrainer._trainer_side_validate() which follows the same
-            # abort → sleep → update_weights → resume pattern.
-            _abort_result = self.checkpoint_manager.abort_replicas()
-            if hasattr(_abort_result, "__await__"):
-                await _abort_result
-
-            # Sleep rollout replicas (PPOTrainer does this after sampling)
-            # In fully async mode, rollouter is a separate actor — sleep is a no-op if
-            # no rollout replicas are managed by trainer's checkpoint_manager.
-            # Check if sleep_replicas is async (TQ fully-async mode) or sync (colocated mode).
-            _sleep_result = self.checkpoint_manager.sleep_replicas()
-            if hasattr(_sleep_result, "__await__"):
-                await _sleep_result
-
-            # 3. [OPTIONAL] compute reward score with colocated reward model
-            # In TQ fully-async mode, reward is computed by Rollouter's AgentLoop
-            # (via RewardLoopManager/DAPO) and stored in TQ as rm_scores.
-            # Skip _compute_reward_colocate which raises NotImplementedError.
-            # self.reward_loop_manager is None in TQ mode (owned by Rollouter).
             print(
                 "[TQTrainer] Skipping _compute_reward_colocate (TQ mode)",
                 flush=True,
@@ -333,26 +307,6 @@ class TQFullyAsyncTrainer(PPOTrainer, FullyAsyncTrainer):
             self._fit_update_local_step()
             await self._fit_update_weights()
 
-            # Wake up rollout replicas to restore GPU memory (kv_cache + weights).
-            # This is the critical counterpart to sleep_replicas() called above.
-            # Without wake_up, SGLang's model weights remain on CPU and subsequent
-            # generate_sequences requests will fail with:
-            #   ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)
-            _wake_result = self.checkpoint_manager.wake_up_replicas()
-            if hasattr(_wake_result, "__await__"):
-                await _wake_result
-
-            # Resume generation on rollout replicas after weight sync completes.
-            # This is the counterpart to abort_replicas() called above, restoring
-            # the rollouter's ability to send generate_sequences requests to SGLang.
-            _resume_result = self.checkpoint_manager.resume_generation_replicas()
-            if hasattr(_resume_result, "__await__"):
-                await _resume_result
-
-            # Cleanup consumed data from TQ + RB (TQ-specific)
-            tq.kv_clear(keys=batch_meta.keys, partition_id=batch_meta.partition_id)
-            ray.get(self.replay_buffer.remove.remote(batch_meta.partition_id, batch_meta.keys))
-
         # Validation & checkpoint (inherited from FullyAsyncTrainer)
         await self._fit_validate()
         self._fit_save_checkpoint()
@@ -360,6 +314,10 @@ class TQFullyAsyncTrainer(PPOTrainer, FullyAsyncTrainer):
         self._stop_profiling()
         self._fit_collect_metrics(batch_meta)
         self._fit_postprocess_step()
+
+        # Cleanup consumed data from TQ + RB (after _compute_metrics reads TQ via kv_batch_get)
+        tq.kv_clear(keys=batch_meta.keys, partition_id=batch_meta.partition_id)
+        await self.replay_buffer.remove.remote(batch_meta.partition_id, batch_meta.keys)
 
     def _fit_collect_metrics(self, batch: KVBatchMeta):
         """Collect metrics using PPOTrainer's _compute_metrics (expects KVBatchMeta)."""
