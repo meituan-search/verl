@@ -288,6 +288,8 @@ class SFTTrainer:
             "global_batch_size": self.global_batch_size,
             "pad_mode": self.config.data.pad_mode,
             "pad_token_id": self.model_config.tokenizer.pad_token_id,
+            "use_prefix_tree": self.config.data.get("use_prefix_tree", False),
+            "prefix_tree_attention": self.config.data.get("prefix_tree_attention", "flex"),
         }
 
         train_time = 0
