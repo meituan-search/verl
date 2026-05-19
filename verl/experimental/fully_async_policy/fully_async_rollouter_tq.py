@@ -17,8 +17,9 @@
 Key changes from base class (FullyAsyncRollouter):
 1. _feed_samples(): acquire_slot() before putting to pending_queue (source-level flow control)
 2. _process_single_sample_streaming(): write to TQ instead of MessageQueue
-3. _processor_worker(): remove _should_pause_generation() check (slot handles backpressure)
-4. Remove: _should_pause_generation(), max_queue_size, staleness_samples manual counting
+3. _should_pause_generation(): always returns False (slot-based flow control in _feed_samples
+   replaces queue-size / staleness backpressure; _processor_worker is reused from base class)
+4. _async_monitor_loop(): remove auto-resume based on _should_pause_generation()
 5. set_message_queue_client() → set_replay_buffer()
 6. reset_staleness() delegates to ReplayBuffer
 7. finish signal via ReplayBuffer.signal_finish() instead of MessageQueue.put_sample(None)
@@ -76,13 +77,7 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
         super().__init__(config=config, tokenizer=tokenizer, processor=processor, device_name=device_name)
 
         # ==================== TQ-specific overrides ====================
-        # Replace MessageQueue client with ReplayBuffer handle
         self.replay_buffer = None  # Ray Actor handle, set via set_replay_buffer()
-
-        # Remove MessageQueue-related fields (replaced by RB slot control)
-        # - self.message_queue_client: replaced by self.replay_buffer
-        # - self.max_queue_size: replaced by RB.max_pending_slots
-        # - self.staleness_samples: managed by RB.reset_staleness()
 
         # Track current param version for TQ tags
         self.current_param_version = 0
@@ -92,20 +87,12 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
     # ======== ReplayBuffer injection (replaces set_message_queue_client) ========
 
     async def set_replay_buffer(self, replay_buffer):
-        """Set ReplayBuffer Ray Actor handle.
-
-        Replaces set_message_queue_client() from base class.
-        """
+        """Set ReplayBuffer Ray Actor handle."""
         async with self.lock:
             self.replay_buffer = replay_buffer
-            # Also store in message_queue_client for base class compatibility
-            # (some base class methods may check for its existence)
-            self.message_queue_client = None  # Explicitly mark as unused
-        print("[TQFullyAsyncRollouter] ReplayBuffer handle set")
 
-    def get_max_pending_slots(self):
-        """Return max_pending_slots for main.py to create RB with correct size."""
-        return getattr(self, "max_required_samples", 256)
+            tq.init()
+            print("[TQFullyAsyncRollouter] TQ initialized in Rollouter actor process", flush=True)
 
     # ======== Override: _feed_samples — add acquire_slot() ========
 
@@ -122,8 +109,6 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
 
         for epoch, batch_dict in continuous_iterator:
             # ★ CORE CHANGE: acquire slot at dataloader source (blocking)
-            # This replaces _should_pause_generation() backpressure.
-            # When RB.pending_slots >= max_pending_slots, this blocks.
             if self.replay_buffer is not None:
                 print(f"[TQFullyAsyncRollouter][Feed] Acquiring slot for sample {feed_count}...", flush=True)
                 acquired = await asyncio.wrap_future(self.replay_buffer.acquire_slot.remote(timeout=None).future())
@@ -171,107 +156,12 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
         if self.replay_buffer is not None:
             ray.get(self.replay_buffer.signal_finish.remote())
 
-    # ======== Override: _processor_worker — remove _should_pause_generation ========
+    # ======== Override: _should_pause_generation — RB slot-based backpressure ========
 
-    async def _processor_worker(self):
-        """Streaming worker coroutine.
-
-        Key difference from base class:
-        - REMOVED: `await self._should_pause_generation()` check
-          (slot-based flow control in _feed_samples makes this unnecessary)
-        - KEPT: paused drain logic (still needed for parameter sync)
-        - REMOVED: `self.staleness_samples += 1` (managed by RB)
-        """
-        print("[TQFullyAsyncRollouter][_processor_worker] STARTING", flush=True)
-        proc_count = 0
-        while True:
-            # ★ CHANGED: only check paused (for param sync drain), NOT _should_pause_generation
-            if self.paused:
-                print(
-                    "[TQFullyAsyncRollouter][Processor] Received pause signal, waiting for remaining tasks to return..."
-                )
-                async with self.lock:
-                    self.paused = True
-                    self._resume_event.clear()
-
-                resume_future = asyncio.ensure_future(self._resume_event.wait())
-                try:
-                    # Drain: wait for active tasks or resume signal (same as base class)
-                    while self.active_tasks and not resume_future.done():
-                        wait_set = set(self.active_tasks) | {resume_future}
-                        done, _pending = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
-                        actual_done = done - {resume_future}
-                        if actual_done:
-                            async with self.lock:
-                                for task in actual_done:
-                                    self.active_tasks.discard(task)
-                                    await task
-                        if resume_future in done:
-                            print(
-                                "[TQFullyAsyncRollouter][Processor] "
-                                "Drain interrupted by resume signal, resuming generation early "
-                                f"(active tasks remaining: {len(self.active_tasks)})"
-                            )
-                            break
-
-                    # block until resuming
-                    if not resume_future.done():
-                        self.idle_start_time = time.time()
-                        await resume_future
-                finally:
-                    if not resume_future.done():
-                        resume_future.cancel()
-                        await asyncio.gather(resume_future, return_exceptions=True)
-                continue
-
-            # Get sample from pending_queue
-            rollout_sample = await self.pending_queue.get()
-            self.pending_queue.task_done()
-            proc_count += 1
-            sample_id_str = rollout_sample.sample_id if rollout_sample else "END"
-            print(
-                f"[TQFullyAsyncRollouter][Processor] Got sample #{proc_count}: {sample_id_str}",
-                flush=True,
-            )
-
-            # ★ REMOVED: self.staleness_samples += 1 (RB manages this now)
-
-            if rollout_sample is None:
-                print(
-                    "[TQFullyAsyncRollouter][Processor] Received end signal, waiting for remaining tasks to complete..."
-                )
-                while self.active_tasks:
-                    async with self.lock:
-                        if self.active_tasks:
-                            done_tasks, self.active_tasks = await asyncio.wait(
-                                self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-                            )
-                            for task in done_tasks:
-                                await task
-                break
-
-            # GPU concurrency limit (kept from base class)
-            while len(self.active_tasks) >= self.max_concurrent_samples:
-                async with self.lock:
-                    if self.active_tasks:
-                        done_tasks, self.active_tasks = await asyncio.wait(
-                            self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-                        )
-                        for task in done_tasks:
-                            await task
-
-            # Submit single sample processing
-            if self.paused:
-                await self._resume_event.wait()
-            async with self.lock:
-                task = safe_create_task(
-                    self._process_single_sample_streaming(rollout_sample),
-                    name=rollout_sample.sample_id,
-                    task_set=self.active_tasks,
-                )
+    async def _should_pause_generation(self) -> bool:
+        return False
 
     # ======== Override: _process_single_sample_streaming — MQ → TQ ========
-
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample: generate via ALM, then write to TQ.
 
@@ -280,7 +170,6 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
           writes data to TQ with status=finish tag.
         - RB's poll thread will detect finish and auto-release slot.
         """
-        # Generate via AgentLoopManager (UNCHANGED from base class)
         print(
             f"[TQFullyAsyncRollouter][_process_single] Starting generate for {rollout_sample.sample_id}...", flush=True
         )
@@ -579,41 +468,15 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
             self._resume_event.set()
         print("[TQFullyAsyncRollouter][reset_staleness] lock acquired & released", flush=True)
 
-        # Delegate staleness tracking to RB (async — avoid ray.get deadlock)
-        if self.replay_buffer is not None:
-            active_task_count = len(self.active_tasks)
-            print(
-                f"[RollouterTQ][reset_staleness] calling RB.reset_staleness (tasks={active_task_count})",
-                flush=True,
-            )
-            timing_raw = await asyncio.wrap_future(
-                self.replay_buffer.reset_staleness.remote(active_task_count=active_task_count).future()
-            )
-            print("[TQFullyAsyncRollouter][reset_staleness] RB.reset_staleness DONE", flush=True)
-        else:
-            # Fallback if RB not set (shouldn't happen in normal operation)
-            timing_raw = {}
-            rollout_version_time = max(time.time() - self.step_start_time, 1e-6)
-            if self.idle_start_time > self.step_start_time:
-                rollout_active_time = self.idle_start_time - self.step_start_time
-                idle_ratio = 1 - rollout_active_time / rollout_version_time
-            else:
-                rollout_active_time = rollout_version_time
-                idle_ratio = 0
-            timing_raw["fully_async/rollouter/active_time"] = rollout_active_time
-            timing_raw["fully_async/rollouter/version_time"] = rollout_version_time
-            timing_raw["fully_async/rollouter/idle_ratio"] = idle_ratio
-
-            self.current_param_version = getattr(self, "current_param_version", 0) + 1
-
-            print(
-                f"[TQFullyAsyncRollouter][reset_staleness] "
-                f"model_version={self.current_param_version}, "
-                f"idle_ratio={idle_ratio:.4f}"
-            )
-
-        self.step_start_time = time.time()
-
+        active_task_count = len(self.active_tasks)
+        print(
+            f"[RollouterTQ][reset_staleness] calling RB.reset_staleness (tasks={active_task_count})",
+            flush=True,
+        )
+        timing_raw = await asyncio.wrap_future(
+            self.replay_buffer.reset_staleness.remote(active_task_count=active_task_count).future()
+        )
+        print("[TQFullyAsyncRollouter][reset_staleness] RB.reset_staleness DONE", flush=True)
         return timing_raw
 
     # ======== Override: _async_monitor_loop — remove _should_pause_generation ========
@@ -643,14 +506,6 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
                 print(f"[TQFullyAsyncRollouter][MonitorLoop][Statistics] {pformat(stats)}")
                 last_stats_time = current_time
 
-            # ★ REMOVED: auto-resume based on _should_pause_generation()
-            # With slot-based flow control, we don't pause based on queue size.
-            # The paused state is only used for param-sync drain, which is handled
-            # by reset_staleness() setting _resume_event.
-
-    # ======== REMOVED: _should_pause_generation ========
-    # No longer needed — acquire_slot() in _feed_samples provides all necessary backpressure.
-
     # ======== Override: get_statistics — source from RB instead of MQ ========
 
     async def get_statistics(self) -> dict:
@@ -677,24 +532,3 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
         }
 
         return stats
-
-    # ======== Override: set_max_required_samples — also init TQ ========
-
-    async def set_max_required_samples(self):
-        """Set max required samples and initialize TQ."""
-        await super().set_max_required_samples()
-
-        # Initialize TQ on this worker
-        try:
-            tq.init()
-            print("[TQFullyAsyncRollouter] TQ initialized")
-        except Exception as e:
-            print(f"[TQFullyAsyncRollouter] TQ init warning (may already be initialized): {e}")
-
-        print(
-            f"[TQFullyAsyncRollouter] required_samples : {self.required_samples} "
-            f"max_required_samples: {self.max_required_samples} "
-            f"total_train_steps: {self.total_train_steps} "
-            f"total_rollout_steps: {self.total_rollout_steps} "
-            f"max_concurrent_samples: {self.max_concurrent_samples} "
-        )

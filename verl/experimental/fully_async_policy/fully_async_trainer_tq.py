@@ -156,59 +156,11 @@ class TQFullyAsyncTrainer(PPOTrainer, FullyAsyncTrainer):
         self._pre_fit_reset_done = False  # Flag: main.py handles pre-fit RB.reset_staleness
         print("[TQFullyAsyncTrainer] ReplayBuffer handle set")
 
-    # ======== Override: _fit_update_weights — skip rollouter.reset_staleness in pre-fit ========
+    async def init_workers(self):
+        await FullyAsyncTrainer.init_workers(self)
 
-    async def _fit_update_weights(self):
-        """Override to skip rollouter.reset_staleness during pre-fit phase.
+        # ======== Core TQ-specific: data sourcing ========
 
-        In TQ mode, main.py calls RB.reset_staleness directly (synchronously from driver)
-        to avoid a deadlock where trainer → rollouter.reset_staleness competes with
-        rollouter.fit()'s event loop on the same async actor.
-
-        After the first call (pre-fit), subsequent calls in the training loop work normally
-        because rollouter's event loop is idle when reset_staleness arrives.
-        """
-        if self.local_trigger_step != 1:
-            return
-
-        import asyncio
-
-        from verl.utils.debug import marked_timer
-
-        with marked_timer("timing_s/param_sync", self.timing_raw):
-            await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
-        print(
-            f"[TQFullyAsyncTrainer] _fit_update_weights, "
-            f"timing_s/param_sync: {self.timing_raw['timing_s/param_sync']:.4f} seconds "
-            f"self.current_param_version: {self.current_param_version}",
-            flush=True,
-        )
-
-        # Skip rollouter.reset_staleness on first call (pre-fit).
-        # main.py handles it via direct ray.get(rb.reset_staleness.remote()).
-        if not self._pre_fit_reset_done:
-            print(
-                "[TQTrainer] _fit_update_weights: SKIPPING rollouter.reset_staleness (pre-fit)",
-                flush=True,
-            )
-            self._pre_fit_reset_done = True
-            return
-
-        # Normal training-loop path: call rollouter.reset_staleness (async, safe now)
-        timing_raw = await asyncio.wrap_future(self.rollouter.reset_staleness.remote().future())
-        self.logger.log(
-            data=timing_raw,
-            step=self.current_param_version,
-        )
-
-        # Log aggregated training metrics
-        self.logger.log(
-            data=self.metrics_aggregator.get_aggregated_metrics(),
-            step=self.current_param_version,
-        )
-        self.metrics_aggregator.reset()
-
-    # ======== Core TQ-specific: data sourcing ========
     async def _get_kvbatch_from_rb(self) -> KVBatchMeta | None:
         """
         Get a KVBatchMeta from TQ via ReplayBuffer.
@@ -243,28 +195,6 @@ class TQFullyAsyncTrainer(PPOTrainer, FullyAsyncTrainer):
         print(f"[TQFullyAsyncTrainer] KVBatchMeta ready: {len(keys)} keys, wait={consumer_end - consumer_start:.2f}s")
 
         return batch_meta
-
-    # ======== Override: fit() — async RB consumption loop ========
-
-    # Override init_workers: use FullyAsyncTrainer's version (not PPOTrainer's)
-    # because PPOTrainer.init_workers() assumes ActorRollout resource pool exists,
-    # but in TQ fully-async mode the rollouter is a separate Ray actor.
-    async def init_workers(self):
-        """Initialize workers using FullyAsyncTrainer's pipeline (avoids ActorRollout pool dependency)."""
-        self._init_resource_pools()
-        self._create_worker_classes()
-        self._init_worker_groups()
-        self._init_models()
-
-        # Initialize checkpoint_manager (normally done in PPOTrainer.init_workers)
-        if not hasattr(self, "checkpoint_manager"):
-            from verl.checkpoint_engine import CheckpointEngineManager
-
-            self.checkpoint_manager = CheckpointEngineManager(
-                config=self.config.trainer.checkpoint,
-                actor_rollout_wg=getattr(self, "actor_rollout_wg", None),
-                ref_wg=getattr(self, "ref_policy_wg", None),
-            )
 
     async def fit(self):
         """Main training loop: async RB consumption + PPOTrainer step() pipeline."""

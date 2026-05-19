@@ -168,10 +168,9 @@ class FullyAsyncTaskRunner:
         """Create ReplayBuffer Ray Actor (TQ mode)."""
         from verl.experimental.fully_async_policy.replay_buffer import ReplayBuffer
 
-        max_required_samples = ray.get(self.components["rollouter"].get_max_pending_slots.remote())
-        max_pending_slots = max(max_required_samples, 256)
-        print(f"[ASYNC MAIN] Creating ReplayBuffer... max_pending_slots={max_pending_slots}")
-        replay_buffer = ReplayBuffer.remote(max_pending_slots=max_pending_slots)
+        max_required_samples = ray.get(self.components["rollouter"].get_max_queue_size.remote())
+        print(f"[ASYNC MAIN] Creating ReplayBuffer... max_pending_slots={max_required_samples}")
+        replay_buffer = ReplayBuffer.remote(max_pending_slots=max_required_samples)
         self.components["replay_buffer"] = replay_buffer
 
         ray.get(self.components["rollouter"].set_replay_buffer.remote(replay_buffer))
@@ -179,7 +178,6 @@ class FullyAsyncTaskRunner:
 
     def _create_rollouter(self, config) -> None:
         """Create rollouter: FullyAsyncRollouter (default) or TQFullyAsyncRollouter (TQ mode)."""
-        print("[ASYNC MAIN] Starting create rollouter...")
 
         rollouter = self._rollouter_cls.remote(
             config=config,
@@ -202,7 +200,6 @@ class FullyAsyncTaskRunner:
 
     def _create_trainer(self, config) -> None:
         """Create trainer: FullyAsyncTrainer (default) or TQFullyAsyncTrainer (TQ mode)."""
-        print("[ASYNC MAIN] Starting create trainer...")
         trainer_role_mapping = {
             role: worker_cls
             for role, worker_cls in self.components["role_worker_mapping"].items()
