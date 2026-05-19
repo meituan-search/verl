@@ -240,8 +240,15 @@ class FullyAsyncTaskRunner:
         self.running = True
 
         print("[ASYNC MAIN] Starting Rollouter and Trainer...")
+        print(f"[ASYNC MAIN] rollouter handle: {self.components['rollouter']}", flush=True)
+        print(f"[ASYNC MAIN] trainer handle: {self.components['trainer']}", flush=True)
         rollouter_future = self.components["rollouter"].fit.remote()
         trainer_future = self.components["trainer"].fit.remote()
+        print(
+            f"[ASYNC MAIN] fit.remote() submitted, rollouter_future={rollouter_future},"
+            f" trainer_future={trainer_future}",
+            flush=True,
+        )
 
         futures = [rollouter_future, trainer_future]
 

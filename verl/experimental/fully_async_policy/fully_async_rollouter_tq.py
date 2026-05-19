@@ -19,17 +19,13 @@ Key changes from base class (FullyAsyncRollouter):
 2. _process_single_sample_streaming(): write to TQ instead of MessageQueue
 3. _should_pause_generation(): always returns False (slot-based flow control in _feed_samples
    replaces queue-size / staleness backpressure; _processor_worker is reused from base class)
-4. _async_monitor_loop(): remove auto-resume based on _should_pause_generation()
-5. set_message_queue_client() → set_replay_buffer()
 6. reset_staleness() delegates to ReplayBuffer
-7. finish signal via ReplayBuffer.signal_finish() instead of MessageQueue.put_sample(None)
 """
 
 import asyncio
 import logging
 import os
 import time
-from pprint import pformat
 
 import numpy as np
 import ray
@@ -79,9 +75,6 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
         # ==================== TQ-specific overrides ====================
         self.replay_buffer = None  # Ray Actor handle, set via set_replay_buffer()
 
-        # Track current param version for TQ tags
-        self.current_param_version = 0
-
         print("[TQFullyAsyncRollouter] initialized (TQ mode)")
 
     # ======== ReplayBuffer injection (replaces set_message_queue_client) ========
@@ -108,16 +101,14 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
         feed_count = 0
 
         for epoch, batch_dict in continuous_iterator:
-            # ★ CORE CHANGE: acquire slot at dataloader source (blocking)
-            if self.replay_buffer is not None:
-                print(f"[TQFullyAsyncRollouter][Feed] Acquiring slot for sample {feed_count}...", flush=True)
-                acquired = await asyncio.wrap_future(self.replay_buffer.acquire_slot.remote(timeout=None).future())
-                if not acquired:
-                    print(
-                        f"[TQFullyAsyncRollouter][Feed] ReplayBuffer finished or closed, "
-                        f"stop feeding after {feed_count} samples"
-                    )
-                    break
+            print(f"[TQFullyAsyncRollouter][Feed] Acquiring slot for sample {feed_count}...", flush=True)
+            acquired = await asyncio.wrap_future(self.replay_buffer.acquire_slot.remote(timeout=None).future())
+            if not acquired:
+                print(
+                    f"[TQFullyAsyncRollouter][Feed] ReplayBuffer finished or closed, "
+                    f"stop feeding after {feed_count} samples"
+                )
+                break
 
             # Prepare data (same as base class)
             full_batch = prepare_single_generation_data(batch_dict, self.config)
@@ -151,12 +142,6 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
         # End signal
         await self.pending_queue.put(None)
         print(f"[TQFullyAsyncRollouter][Feed] Sample addition is complete, {feed_count} samples have been added")
-
-        # Notify ReplayBuffer that production is done
-        if self.replay_buffer is not None:
-            ray.get(self.replay_buffer.signal_finish.remote())
-
-    # ======== Override: _should_pause_generation — RB slot-based backpressure ========
 
     async def _should_pause_generation(self) -> bool:
         return False
@@ -256,10 +241,12 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
                     elif ntkey in batch:
                         field[ntkey] = batch[ntkey][idx]
 
-                # Per-sample metadata (scalar, same for all samples in this batch)
+                # Per-sample metadata: model version from generate result (ret)
+                # min_global_steps / max_global_steps are set by FullyAsyncLLMServerClient.generate()
+                # into TokenOutput.extra_fields, then collected by AgentLoop into non_tensor_batch.
                 field["global_steps"] = self.global_steps
-                field["start_model_version"] = self.current_param_version
-                field["end_model_version"] = self.current_param_version
+                field["start_model_version"] = non_tensor.get("min_global_steps", idx)[idx]
+                field["end_model_version"] = non_tensor.get("max_global_steps", idx)[idx]
 
                 # Ensure loss_mask exists (required by _update_actor pipeline).
                 # In AgentLoopWorkerTQ._agent_loop_postprocess: field["loss_mask"] = field["response_mask"]
@@ -298,8 +285,8 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
                     {
                         "current_status": "finish",
                         "uid": sample_key,
-                        "start_model_version": self.current_param_version,
-                        "end_model_version": self.current_param_version,
+                        "start_model_version": field["start_model_version"],
+                        "end_model_version": field["end_model_version"],
                         "prompt_len": int(prompt_len),
                         "response_len": int(response_len),
                         "seq_len": int(seq_len),
@@ -335,15 +322,13 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
                 flush=True,
             )
 
-            # Notify RB that all samples are finished (replaces _poll_from_tq for cross-process TQ)
-            if self.replay_buffer is not None:
-                for sample_key, tag in zip(keys, tags, strict=False):
-                    finish_meta = dict(tag)
-                    await asyncio.wrap_future(
-                        self.replay_buffer.mark_finish.remote(
-                            key=sample_key, partition_id="train", meta=finish_meta
-                        ).future()
-                    )
+            for sample_key, tag in zip(keys, tags, strict=False):
+                finish_meta = dict(tag)
+                await asyncio.wrap_future(
+                    self.replay_buffer.mark_finish.remote(
+                        key=sample_key, partition_id="train", meta=finish_meta
+                    ).future()
+                )
         except Exception as e:
             logger.exception(f"[TQFullyAsyncRollouter] Failed to write {base_key} to TQ: {e}")
             # Release slot on error so we don't leak
@@ -360,8 +345,19 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
         Key difference from base class:
         - Finish signal goes through RB.signal_finish() instead of MQ.put_sample(None)
         """
+        print("[TQFullyAsyncRollouter][_streaming_generation_main] ENTER", flush=True)
         if self.async_rollout_manager is None:
+            print(
+                "[TQFullyAsyncRollouter][_streaming_generation_main] Calling _init_async_rollout_manager...", flush=True
+            )
             await self._init_async_rollout_manager()
+            print("[TQFullyAsyncRollouter][_streaming_generation_main] _init_async_rollout_manager DONE", flush=True)
+        else:
+            print(
+                "[TQFullyAsyncRollouter][_streaming_generation_main] "
+                "async_rollout_manager already exists, skipping init",
+                flush=True,
+            )
 
         print(
             f"[TQFullyAsyncRollouter] Start streaming mode, max concurrent: {self.max_concurrent_samples}", flush=True
@@ -406,49 +402,10 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
             self.feed_task = None
             self.processor_task = None
 
-            # ★ CHANGED: Signal finish via RB (already done in _feed_samples, but ensure here too)
-            # Note: _feed_samples already calls signal_finish when it ends.
-            # This is a safety net for error paths.
-            if self.replay_buffer is not None:
-                try:
-                    ray.get(self.replay_buffer.signal_finish.remote())
-                except Exception:
-                    pass
+            await self.replay_buffer.signal_finish.remote()
 
             async with self.lock:
                 self.running = False
-
-    # ======== Override: fit — check replay_buffer instead of message_queue_client ========
-
-    async def fit(self):
-        """Start the async rollouter."""
-        print("[TQFullyAsyncRollouter] Starting TQFullyAsyncRollouter...")
-
-        if self.replay_buffer is None:
-            raise ValueError("ReplayBuffer not set. Call set_replay_buffer() first.")
-
-        # Set running status (same as base class)
-        async with self.lock:
-            self.paused = False
-            self.running = True
-            self._resume_event.set()
-
-        # Create main tasks (same structure as base class)
-        generation_task = safe_create_task(self._streaming_generation_main(), name="generation_task")
-        monitor_task = safe_create_task(self._async_monitor_loop(), name="monitor_task")
-
-        try:
-            await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
-        except Exception as e:
-            print(f"[TQFullyAsyncRollouter] Asynchronous task execution error: {e}")
-        finally:
-            if not generation_task.done():
-                generation_task.cancel()
-            if not monitor_task.done():
-                monitor_task.cancel()
-            await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
-
-        print("[TQFullyAsyncRollouter] Rollouter fit completed")
 
     # ======== Override: reset_staleness — delegate to RB ========
 
@@ -462,12 +419,6 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
         blocking the event loop inside this async actor, which would cause deadlocks
         when the RB actor is also serving other concurrent calls (e.g., acquire_slot).
         """
-        print("[TQFullyAsyncRollouter][reset_staleness] STARTING", flush=True)
-        async with self.lock:
-            self.paused = False
-            self._resume_event.set()
-        print("[TQFullyAsyncRollouter][reset_staleness] lock acquired & released", flush=True)
-
         active_task_count = len(self.active_tasks)
         print(
             f"[RollouterTQ][reset_staleness] calling RB.reset_staleness (tasks={active_task_count})",
@@ -478,33 +429,6 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
         )
         print("[TQFullyAsyncRollouter][reset_staleness] RB.reset_staleness DONE", flush=True)
         return timing_raw
-
-    # ======== Override: _async_monitor_loop — remove _should_pause_generation ========
-
-    async def _async_monitor_loop(self):
-        """Monitor loop for logging and recovery.
-
-        Key difference from base class:
-        - REMOVED: `_should_pause_generation()` check for auto-resume
-          (slot-based flow control doesn't use pause/resume for backpressure)
-        - KEPT: basic statistics logging
-        """
-        last_stats_time = time.time()
-        stats_interval = 60.0
-        check_interval = 10.0
-
-        while True:
-            async with self.lock:
-                if not self.running:
-                    break
-            await asyncio.sleep(check_interval)
-
-            # Print statistics periodically
-            current_time = time.time()
-            if current_time - last_stats_time >= stats_interval:
-                stats = await self.get_statistics()
-                print(f"[TQFullyAsyncRollouter][MonitorLoop][Statistics] {pformat(stats)}")
-                last_stats_time = current_time
 
     # ======== Override: get_statistics — source from RB instead of MQ ========
 
@@ -521,7 +445,6 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
             # Counting stats
             "count/total_generated_samples": self.total_generated_samples,
             "count/processed_sample_count": self.processed_sample_count,
-            "count/current_param_version": self.current_param_version,
             # Static config
             "static/max_required_samples": self.max_required_samples,
             "static/required_samples": self.required_samples,

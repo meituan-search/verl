@@ -271,13 +271,40 @@ class ReplayBuffer:
         partition_id: str,
         batch_size: int,
     ) -> list[tuple[str, dict]] | None:
-        """Block until enough finish samples are ready or finish signal received.
+        """Block until enough finish samples are ready or production is fully complete.
 
         Called by TQFullyAsyncTrainer at the start of each training step.
         Returns keys whose metadata has current_status='finish'.
 
         Uses lock-free reads (safe due to Ray actor serialization + GIL for simple ops).
         mark_finish() is the writer and does not use lock either.
+
+        IMPORTANT — Termination semantics:
+        -----------------------------------
+        signal_finish() is called by Rollouter's _streaming_generation_main()
+        only AFTER both:
+          1. _feed_samples() has finished iterating the dataloader AND
+          2. _processor_worker() has processed ALL samples from pending_queue
+             (every sample has been inferred, written to TQ, and mark_finish()'d)
+
+        In other words, signal_finish() means "production is FULLY done — every
+        sample that entered the pipeline has completed inference and been written
+        to TQ with status=finish". There are NO in-flight samples remaining when
+        this fires.
+
+        Therefore, once _finished=True, it is safe to return remaining samples
+        or None immediately — no need to check _pending_slots because they are
+        guaranteed to be 0 at this point.
+
+        Decision matrix:
+        ┌─────────────┬───────────────┬──────────────────────────────────┐
+        │ _finished   │ ready count   │ Action                           │
+        ├─────────────┼───────────────┼──────────────────────────────────┤
+        │ False       │ ≥ batch_size  │ Return batch (normal path)       │
+        │ False       │ < batch_size  │ Keep waiting                      │
+        │ True        │ > 0           │ Return remaining (< batch_size)   │
+        │ True        │ = 0           │ Return None (truly done)          │
+        └─────────────┴───────────────┴──────────────────────────────────┘
 
         Args:
             partition_id: Partition to sample from, e.g. "train".
@@ -308,12 +335,21 @@ class ReplayBuffer:
                     )
                     return ready[:batch_size]
 
+                # Production is fully complete — safe to drain remaining or return None
                 if self._finished:
-                    print(
-                        f"[ReplayBuffer][wait_and_sample] Finished, returning {len(ready) if ready else 0} remaining",
-                        flush=True,
-                    )
-                    return ready if ready else None
+                    if ready:
+                        print(
+                            "[ReplayBuffer][wait_and_sample] Finished, returning "
+                            f"{len(ready)} remaining samples (partial batch)",
+                            flush=True,
+                        )
+                        return ready
+                    else:
+                        print(
+                            "[ReplayBuffer][wait_and_sample] Finished, no remaining samples, returning None",
+                            flush=True,
+                        )
+                        return None
 
             time.sleep(self.poll_interval)
 
@@ -330,9 +366,17 @@ class ReplayBuffer:
     # ======== Control signals ========
 
     def signal_finish(self):
-        """Signal that production is complete (no more samples will arrive).
+        """Signal that production is fully complete — all samples are done.
 
-        Called by TQFullyAsyncRollouter after _feed_samples finishes.
+        Called by TQFullyAsyncRollouter._streaming_generation_main() in its
+        finally block, which runs ONLY after both:
+          1. _feed_samples() has exhausted the dataloader (put None sentinel), AND
+          2. _processor_worker() has drained pending_queue completely
+             (all samples inferred, written to TQ, mark_finish()'d).
+
+        This is the definitive "no more data ever" signal. When this fires,
+        wait_and_sample() can safely return remaining samples or None.
+        There are guaranteed to be zero in-flight / un-finished samples.
         """
         with self._slot_available:
             self._finished = True
@@ -359,7 +403,18 @@ class ReplayBuffer:
             Dict with timing metrics for logging.
         """
         print(f"[ReplayBuffer][reset_staleness] ENTER (active_tasks={active_task_count})", flush=True)
+        print(
+            f"[ReplayBuffer][reset_staleness] "
+            f"Trying to acquire lock, _poll_started={self._poll_started}, lock_locked={self.lock.locked()}",
+            flush=True,
+        )
+        print(
+            f"[ReplayBuffer][reset_staleness] "
+            f"BEFORE LOCK pid={os.getpid()} thread={threading.current_thread().name} time={time.time():.2f}",
+            flush=True,
+        )
         with self.lock:
+            print(f"[ReplayBuffer][reset_staleness] INSIDE LOCK pid={os.getpid()} time={time.time():.2f}", flush=True)
             # Count ready (finish) samples in RB
             ready_count = self.count_by_status("finish")
             running_count = self.count_by_status("running") + self.count_by_status("partial")
@@ -420,13 +475,18 @@ class ReplayBuffer:
     # ======== Statistics ========
 
     def count_by_status(self, status: StatusType, partition_id: str | None = None) -> int:
-        """Count samples by status."""
-        with self.lock:
-            if partition_id:
-                parts = [self.partitions.get(partition_id, {})]
-            else:
-                parts = list(self.partitions.values())
-            return sum(1 for part in parts for v in part.values() if v.get("current_status") == status)
+        """Count samples by status.
+
+        NOTE: This is called both from inside lock-holding contexts (e.g. reset_staleness)
+        and from outside. Since threading.Lock is NOT reentrant, we must NOT acquire
+        the lock here if we're already holding it. The caller is responsible for
+        acquiring the lock when needed.
+        """
+        if partition_id:
+            parts = [self.partitions.get(partition_id, {})]
+        else:
+            parts = list(self.partitions.values())
+        return sum(1 for part in parts for v in part.values() if v.get("current_status") == status)
 
     def pending_count(self) -> int:
         """Count of samples with current_status='pending'."""
@@ -442,15 +502,17 @@ class ReplayBuffer:
 
     @property
     def total_in_flight(self) -> int:
-        """Total in-flight samples across all non-terminal states."""
-        with self.lock:
-            return (
-                self._pending_slots
-                + self.count_by_status("pending")
-                + self.count_by_status("running")
-                + self.count_by_status("partial")
-                + self.count_by_status("finish")
-            )
+        """Total in-flight samples across all non-terminal states.
+
+        NOTE: Caller must hold self.lock if thread-safety is required.
+        """
+        return (
+            self._pending_slots
+            + self.count_by_status("pending")
+            + self.count_by_status("running")
+            + self.count_by_status("partial")
+            + self.count_by_status("finish")
+        )
 
     def get_staleness_statistics(self, current_version: int, partition_id: str = "train") -> dict[str, Any]:
         """Calculate staleness distribution for monitoring.

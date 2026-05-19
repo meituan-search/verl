@@ -1003,10 +1003,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         Main async fit method that coordinates all coroutines
         """
 
+        print("[FullyAsyncRollouter] fit() ENTER", flush=True)
         print("[FullyAsyncRollouter] Starting FullyAsyncRollouter...")
-
-        if self.message_queue_client is None:
-            raise ValueError("MessageQueue client not set. Call set_message_queue_client() first.")
 
         # Set the running status flag
         async with self.lock:
