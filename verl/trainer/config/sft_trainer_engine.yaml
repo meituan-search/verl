@@ -46,6 +46,18 @@ data:
   # Set to True to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids.
   ignore_input_ids_mismatch: False
 
+  # Shuffle training data each epoch. Set False to preserve sample order (e.g. tree-structured datasets).
+  shuffle: True
+
+  # Enable prefix-tree shared-prefix deduplication.
+  # Only effective with data.pad_mode=no_padding and thd format (use_remove_padding=True).
+  use_prefix_tree: False
+
+  # Attention backend for prefix-tree deduplication.
+  # "flex"  — PyTorch flex_attention (default, no extra deps)
+  # "magi"  — MAGI attention (requires magi_attention installed, set MAGI_ATTENTION_KERNEL_BACKEND)
+  prefix_tree_attention: flex
+
 # Checkpoint configuration
 checkpoint:
   _target_: verl.trainer.config.CheckpointConfig
@@ -86,3 +98,25 @@ trainer:
   n_gpus_per_node: 1
 
   profile_interval: [-1, -1]
+
+# global_profiler: required by sft_trainer_ray.py when profiler.tool=nsys
+# mirrors the structure in ppo_trainer.yaml
+global_profiler:
+
+  global_tool_config:
+
+    nsys:
+
+      discrete: False
+
+      worker_nsight_options:
+
+        trace: "cuda,nvtx,cublas"
+
+        cuda-memory-usage: "true"
+
+        capture-range: "cudaProfilerApi"
+
+        capture-range-end: "stop"
+
+        kill: none
