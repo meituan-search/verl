@@ -5,6 +5,7 @@ excludes:
 
 env_vars:
 #  VLLM_USE_V1: "1"
+  DEBUG_NO_PADDING_2_PADDING: "1"
   HYDRA_FULL_ERROR: "1"
   NCCL_NVLS_ENABLE: "0"
   NCCL_SOCKET_IFNAME: "eth0"

@@ -82,6 +82,7 @@ class ReplayBuffer:
         max_version_slots: int,
         max_pending_slots: int = 256,
         poll_interval: float = 1.0,
+        keys_per_slot: int = 16,
     ):
         # Partition -> {key: tags_dict}
         self._idle_start_time = None
@@ -103,17 +104,22 @@ class ReplayBuffer:
         self._data_available = asyncio.Condition()
 
         # ======== Layer 2: Version window control (staleness guard) ========
-        # Limits total slots issued per model version.
+        # Limits total samples (slots) per model version.
         # When _version_slots >= max_version_slots, acquire_slot() blocks until
         # reset_staleness() is called (after param sync).
+        # _version_slots is in SLOT granularity: 1 slot = 1 sample (prompt).
+        # Each slot produces keys_per_slot TQ keys (trajectories) via
+        # full_batch.repeat(rollout.n) in prepare_single_generation_data.
         # Maps to: max_required_samples (e.g. required_samples * trigger_parameter_sync_step)
         self.max_version_slots = max_version_slots
+        self.keys_per_slot = keys_per_slot
         self._version_slots = 0  # cumulative slots issued in current version
 
         print(
             f"[ReplayBuffer] initialized with "
             f"max_pending_slots={max_pending_slots}, "
             f"max_version_slots={max_version_slots}, "
+            f"keys_per_slot={keys_per_slot}, "
             f"poll_interval={poll_interval}"
         )
 
@@ -150,8 +156,15 @@ class ReplayBuffer:
             while True:
                 data = tq.kv_list()
                 poll_count += 1
-                if poll_count % 10 == 1:  # Log every 10 polls (~10s with 1s interval)
-                    print(f"[ReplayBuffer][_poll] poll #{poll_count}", flush=True)
+                if poll_count % 10 == 0:  # Log every 10 polls (~10s with 1s interval)
+                    total_keys = sum(len(items) for items in data.values()) if data else 0
+                    rb_keys = sum(len(p) for p in self.partitions.values())
+                    print(
+                        f"[ReplayBuffer][_poll] poll #{poll_count} "
+                        f"tq_keys={total_keys} rb_keys={rb_keys} "
+                        f"pending={self._pending_slots} version_slots={self._version_slots}",
+                        flush=True,
+                    )
                 if data is not None:
                     for partition_id, items in data.items():
                         async with self._data_available:
@@ -370,25 +383,40 @@ class ReplayBuffer:
         Called by TQFullyAsyncTrainer (via Rollouter) after
         checkpoint_manager.update_weights(). This:
 
-        1. Resets ``_version_slots = 0`` — unblocks acquire_slot() if it was
-           blocked on the version window being full.
+        Recalibrates ``_version_slots`` to reflect actual current backlog,
+        mirroring FullyAsyncRollouter's original logic::
+
+            staleness_samples = len(active_tasks) + message_queue_client.get_queue_size()
+
+        In TQ terms:
+            _version_slots = pending_slots (in-flight) + tq_keys (unconsumed backlog)
+
+        This ensures the version window limits total samples *in the system*
+        (not just newly issued slots). After reset, new slots can only be
+        acquired up to ``max_version_slots - current_backlog``.
 
         Notifies _slot_available so acquire_slot can wake up.
 
         Returns:
             Dict with timing/metrics for logging.
         """
-        # now = time.time()
         async with self._slot_available:
             prev_version_slots = self._version_slots
 
-            # Core: reset version window to unblock acquire_slot()
-            self._version_slots = 0
+            # Count actual keys currently in TQ (unconsumed backlog)
+            try:
+                data = tq.kv_list()
+                tq_keys = sum(len(items) for items in data.values()) if data else 0
+            except Exception:
+                tq_keys = 0
+
+            tq_backlog_slots = (tq_keys + self.keys_per_slot - 1) // self.keys_per_slot
+            self._version_slots = self._pending_slots + tq_backlog_slots
 
             # Timing metrics
             active_time = time.time()
             version_time = time.time()
-            idle_ratio = 0
+            idle_ratio = 0.0
 
             timing_raw = {
                 "fully_async/rollouter/active_time": active_time,
@@ -398,9 +426,12 @@ class ReplayBuffer:
 
             print(
                 f"[ReplayBuffer][reset_staleness] "
-                f"version_slots: {prev_version_slots} -> 0, "
-                f"pending_slots: {self._pending_slots}, "
+                f"version_slots: {prev_version_slots} -> {self._version_slots} "
+                f"pending_slots={self._pending_slots}, "
+                f"tq_backlog_slots={tq_backlog_slots}, "
+                f"tq_keys={tq_keys}), "
                 f"idle_ratio: {idle_ratio:.4f}",
+                flush=True,
             )
 
             # Wake up acquire_slot waiters blocked on version window

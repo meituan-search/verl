@@ -25,7 +25,6 @@ Data flow:
                                               update_actor(KVBatchMeta)
 """
 
-import asyncio
 import logging
 import time
 from typing import Any
@@ -173,11 +172,9 @@ class TQFullyAsyncTrainer(PPOTrainer, FullyAsyncTrainer):
         print(f"[TQFullyAsyncTrainer] Waiting for {self.required_samples} samples from RB...", flush=True)
         consumer_start = time.time()
 
-        sampled_keys_meta = await asyncio.wrap_future(
-            self.replay_buffer.wait_and_sample.remote(
-                partition_id="train",
-                batch_size=self.required_samples,
-            ).future()
+        sampled_keys_meta = await self.replay_buffer.wait_and_sample.remote(
+            partition_id="train",
+            batch_size=self.required_samples * self.config.actor_rollout_ref.rollout.n,
         )
 
         if sampled_keys_meta is None or len(sampled_keys_meta) == 0:
@@ -267,17 +264,10 @@ class TQFullyAsyncTrainer(PPOTrainer, FullyAsyncTrainer):
             batch_meta = self._balance_batch(batch_meta, metrics=metrics)
 
             # 5. compute old_log_prob
-            # NOTE: When rollout_correction.bypass_mode=True, _compute_old_log_prob returns None
-            # (missing return value in PPOTrainer's bypass path). Guard against this.
             with marked_timer("old_log_prob", timing_raw, color="blue"):
                 old_log_prob_result = self._compute_old_log_prob(batch_meta, metrics=metrics)
                 if old_log_prob_result is not None:
                     batch_meta = old_log_prob_result
-                else:
-                    print(
-                        "[TQTrainer] _compute_old_log_prob returned None (bypass mode)",
-                        flush=True,
-                    )
 
             # 6. [OPTIONAL] compute ref_log_prob
             if self.use_reference_policy:

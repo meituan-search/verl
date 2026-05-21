@@ -28,7 +28,6 @@ import os
 import time
 
 import numpy as np
-import ray
 
 from verl.experimental.fully_async_policy.detach_utils import (
     RolloutSample,
@@ -154,6 +153,11 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
         - Instead of message_queue_client.put_sample(ray.cloudpickle.dumps(...)),
           writes data to TQ with status=finish tag.
         - Caller releases slot via release_slot() after successful TQ write.
+
+        TQ write format follows AgentLoopWorkerTQ._agent_loop_postprocess from main_ppo_sync.py:
+        - Each sample is written as an independent 1-D tensor dict (jagged layout)
+        - response_mask and loss_mask are 1-D padded tensors (from _postprocess output)
+        - Tags include global_steps, status, prompt_len, response_len, seq_len
         """
         print(
             f"[TQFullyAsyncRollouter][_process_single] Starting generate for {rollout_sample.sample_id}...", flush=True
@@ -175,14 +179,16 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
             "count/total_generated_samples": self.total_generated_samples,
         }
 
-        # ★ CORE CHANGE: Write to TQ instead of MessageQueue
-        # Follow AgentLoopWorkerTQ._agent_loop_postprocess pattern:
-        # - Use async_kv_batch_put (not blocking kv_batch_put)
-        # - Split 2D [bsz, seq] batch into per-sample 1D dicts, then list_of_dict_to_tensordict
-        #   This is critical because TQ's jagged layout requires each sample to be a 1-D tensor
-        #   (matching AgentLoopWorkerTQ where output.as_dict() yields 1-D prompts/responses).
+        # ★ CORE: Write to TQ following AgentLoopWorkerTQ._agent_loop_postprocess pattern from main_ppo_sync.py
+        #
+        # Data flow comparison:
+        #   AgentLoopWorkerTQ path:  AgentLoopOutput.as_dict() → 1-D tensors → TQ
+        #   Our path:               AgentLoopWorker._postprocess() → DataProto (2D padded) → unbind per-sample → TQ
+        #
+        # Both paths must produce identical per-sample 1-D tensor format so that
+        # PPOTrainer._compute_advantage() and friends can consume them interchangeably.
         base_key = rollout_sample.sample_id  # e.g. "sample_0_42"
-        full_batch = rollout_sample.full_batch  # DataProto
+        full_batch = rollout_sample.full_batch  # DataProto from AgentLoopWorker._postprocess()
 
         try:
             batch = full_batch.batch if hasattr(full_batch, "batch") else full_batch
@@ -195,116 +201,141 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
             elif "prompts" in batch:
                 bsz = batch["prompts"].shape[0]
 
-            # Tensor keys to extract per-sample (2D → 1D unbind along dim=0)
-            per_sample_tensor_keys = [
-                "input_ids",
-                "attention_mask",
-                "position_ids",
-                "response_mask",
-                "prompts",
-                "responses",
-                "loss_mask",
-            ]
-            # Non-tensor / score keys to index per-sample
-            per_sample_nt_keys = [
-                "uid",
-                "reward_score",
-                "rm_scores",
-                "rollout_log_probs",
-                "old_log_probs",
-                "ref_log_prob",
-                "log_probs",
-                "entropy",
-            ]
-
             keys, fields, tags = [], [], []
             for idx in range(bsz):
                 sample_key = f"{base_key}_{idx}" if bsz > 1 else base_key
                 field = {}
 
-                # Unbind 2D tensors along batch dimension → 1D per sample
-                for tkey in per_sample_tensor_keys:
+                # ---- Extract per-sample tensors (unbind 2D padded → 1D) ----
+                # These match the fields produced by AgentLoopOutput.as_dict():
+                #   prompts, responses, response_mask are all 1-D tensors
+                # In our case they come from _postprocess() as 2D padded, so we unbind.
+                for tkey in [
+                    "prompts",
+                    "responses",
+                    "response_mask",
+                    "input_ids",
+                    "attention_mask",
+                    "position_ids",
+                    "rm_scores",
+                    "rollout_log_probs",
+                ]:
                     if tkey in batch:
                         field[tkey] = batch[tkey][idx]
 
-                # Index non-tensor arrays along batch dimension
-                for ntkey in per_sample_nt_keys:
-                    if ntkey in non_tensor:
-                        val = non_tensor[ntkey]
-                        # Handle numpy arrays: index element-wise
-                        if isinstance(val, np.ndarray):
-                            field[ntkey] = val[idx]
-                        elif isinstance(val, list) and len(val) > idx:
-                            field[ntkey] = val[idx]
-                        else:
-                            field[ntkey] = val
-                    elif ntkey in batch:
-                        field[ntkey] = batch[ntkey][idx]
+                # ---- Strip padding to produce true 1-D variable-length tensors ----
+                #
+                # CRITICAL: AgentLoopWorkerTQ writes 1-D tensors of *actual* length (no padding),
+                # e.g. prompts=[p0,p1,...], responses=[r0,r1,...], response_mask=[1,1,0,1,...].
+                # TQ's list_of_dict_to_tensordict converts these unequal-length 1-D tensors into
+                # a jagged layout, so kv_batch_get() returns **nested tensors**.
+                #
+                # Our _postprocess() produces 2D padded tensors. After unbind we get 1-D tensors
+                # with trailing zeros/padding. If we write these AS-IS, TQ treats them as equal-
+                # length and returns **padded tensors** from kv_batch_get(), causing
+                #   AssertionError in response_to_nested(): assert response_mask.is_nested
+                #
+                # Fix: truncate each per-sample tensor to its effective length using response_mask
+                # (for response-level fields) or attention_mask (for sequence-level fields).
+                if "responses" in field and "response_mask" in field:
+                    rm_1d = field["response_mask"]
+                    # response_mask effective length = last non-zero position + 1
+                    # (rm is int64 where valid positions >= 0, padding positions == 0)
+                    resp_len = (rm_1d != 0).nonzero(as_tuple=True)[0]
+                    eff_resp_len = resp_len[-1].item() + 1 if len(resp_len) > 0 else rm_1d.shape[0]
 
-                # Per-sample metadata: model version from generate result (ret)
-                # min_global_steps / max_global_steps are set by FullyAsyncLLMServerClient.generate()
-                # into TokenOutput.extra_fields, then collected by AgentLoop into non_tensor_batch.
-                field["global_steps"] = self.global_steps
-                field["start_model_version"] = non_tensor.get("min_global_steps", idx)[idx]
-                field["end_model_version"] = non_tensor.get("max_global_steps", idx)[idx]
+                    # Truncate response-level fields to eff_resp_len
+                    for rkey in ("responses", "response_mask", "rm_scores", "rollout_log_probs"):
+                        if rkey in field:
+                            field[rkey] = field[rkey][:eff_resp_len]
 
-                # Fields required by _compute_metrics in main_ppo_sync.py
-                # num_turns: number of conversation turns (default 1 for single-turn)
-                if "num_turns" not in field:
-                    field["num_turns"] = 1
-                # token_level_rewards: defaults to rm_scores if not set by reward model
-                if "token_level_rewards" not in field:
-                    field["token_level_rewards"] = field.get("rm_scores", 0.0)
-                # returns: will be computed by trainer during PPO, provide placeholder
-                if "returns" not in field:
-                    field["returns"] = field.get("rm_scores", 0.0)
+                    if "prompts" in field:
+                        prompt_len = field["prompts"].shape[0]
+                        eff_seq_len = prompt_len + eff_resp_len
+                        # Truncate sequence-level fields to eff_seq_len
+                        for skey in ("input_ids", "attention_mask"):
+                            if skey in field:
+                                field[skey] = field[skey][:eff_seq_len]
+                        if "position_ids" in field:
+                            pos = field["position_ids"]
+                            if pos.dim() == 2:
+                                # position_ids may be [3, seq_len] or [1, seq_len]
+                                field["position_ids"] = pos[:, :eff_seq_len]
+                            else:
+                                field["position_ids"] = pos[:eff_seq_len]
 
-                # Ensure loss_mask exists (required by _update_actor pipeline).
-                # In AgentLoopWorkerTQ._agent_loop_postprocess: field["loss_mask"] = field["response_mask"]
-                # The rollout output batch typically does NOT contain loss_mask, so we derive it from response_mask.
-                # Use .clone() to avoid potential shared-memory issues with jagged/nested tensors.
+                # DEBUG: log per-sample tensor format after stripping padding
+                if idx == 0:
+                    rm = field.get("response_mask")
+                    print(
+                        f"[RollouterTQ][DEBUG] {sample_key} response_mask after strip: "
+                        f"is_nested={getattr(rm, 'is_nested', False)}, shape={rm.shape if rm is not None else None}",
+                        flush=True,
+                    )
+
+                # ---- Match AgentLoopWorkerTQ._agent_loop_postprocess field assignments ----
+                # Line 413: field["loss_mask"] = field["response_mask"]
                 if "response_mask" in field:
-                    if "loss_mask" not in field:
-                        field["loss_mask"] = (
-                            field["response_mask"].clone()
-                            if hasattr(field["response_mask"], "clone")
-                            else field["response_mask"]
-                        )
-                    lm_shape = field["loss_mask"].shape
-                    print(
-                        f"[RollouterTQ] {sample_key}: loss_mask set, shape={lm_shape}",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        f"[TQFullyAsyncRollouter][_process_single] WARNING: {sample_key} no response_mask/loss_mask!",
-                        flush=True,
-                    )
+                    field["loss_mask"] = field["response_mask"]
 
-                # Compute seq_len from 1-D prompts/responses (same as AgentLoopWorkerTQ)
-                prompts_1d = field.get("prompts")
-                responses_1d = field.get("responses")
-                prompt_len = prompts_1d.size(0) if (prompts_1d is not None and hasattr(prompts_1d, "size")) else 1
-                response_len = (
-                    responses_1d.size(0) if (responses_1d is not None and hasattr(responses_1d, "size")) else 0
-                )
+                # ---- Per-sample metadata from kwargs / non_tensor_batch ----
+                # These match what AgentLoopWorkerTQ does via field.update(kwargs)
+                # where kwargs contains uid, session_id, raw_prompt, global_steps etc.
+                field["uid"] = sample_key
+                field["global_steps"] = self.global_steps
+
+                # Model version tracking (set by FullyAsyncLLMServerClient.generate())
+                # Stored in non_tensor_batch by AgentLoopWorker._postprocess() extra_fields
+                if "min_global_steps" in non_tensor:
+                    val = non_tensor["min_global_steps"]
+                    field["start_model_version"] = val[idx] if isinstance(val, np.ndarray) else val
+                if "max_global_steps" in non_tensor:
+                    val = non_tensor["max_global_steps"]
+                    field["end_model_version"] = val[idx] if isinstance(val, np.ndarray) else val
+
+                # num_turns from _postprocess non_tensor_batch (__num_turns__)
+                # AgentLoopOutput carries this; _postprocess stores it as __num_turns__
+                if "__num_turns__" in non_tensor:
+                    val = non_tensor["__num_turns__"]
+                    field["num_turns"] = int(val[idx]) if isinstance(val, np.ndarray) else int(val)
+                else:
+                    field["num_turns"] = 1
+
+                # reward_extra_info from _postprocess non_tensor_batch
+                for rei_key in ["reward_model", "data_source"]:
+                    if rei_key in non_tensor:
+                        val = non_tensor[rei_key]
+                        field[rei_key] = val[idx] if isinstance(val, np.ndarray) else val
+
+                # Do not store raw image/video data (same as AgentLoopWorkerTQ line 411)
+                field.pop("multi_modal_inputs", None)
+                field.pop("multi_modal_data", None)
+
+                # ---- Compute seq_len for tags (same as AgentLoopWorkerTQ line 418-419) ----
+                prompt_len = field["prompts"].size(0) if "prompts" in field else 0
+                response_len = field["responses"].size(0) if "responses" in field else 0
                 seq_len = prompt_len + response_len
 
                 keys.append(sample_key)
                 fields.append(field)
                 tags.append(
                     {
+                        # Match AgentLoopWorkerTQ tag format (line 419-427)
+                        "global_steps": self.global_steps,
+                        "status": "success",  # AgentLoopWorkerTQ uses "success"
+                        "prompt_len": prompt_len,
+                        "response_len": response_len,
+                        "seq_len": seq_len,
+                        # Additional metadata for fully_async pipeline
                         "current_status": "finish",
                         "uid": sample_key,
-                        "start_model_version": field["start_model_version"],
-                        "end_model_version": field["end_model_version"],
-                        "prompt_len": int(prompt_len),
-                        "response_len": int(response_len),
-                        "seq_len": int(seq_len),
+                        "start_model_version": field.get("start_model_version", -1),
+                        "end_model_version": field.get("end_model_version", -1),
                     }
                 )
 
             # Convert list of per-sample dicts → TensorDict (handles jagged correctly)
+            # Same as AgentLoopWorkerTQ line 431-432: list_of_dict_to_tensordict(fields)
             print(
                 f"[TQFullyAsyncRollouter][_process_single] Preparing TQ write for {base_key}, bsz={bsz}",
                 flush=True,
@@ -426,7 +457,7 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
         """Gather statistics from RB and local state."""
         rb_stats = {}
         if self.replay_buffer is not None:
-            rb_stats = ray.get(self.replay_buffer.get_statistics.remote())
+            rb_stats = await self.replay_buffer.get_statistics.remote()
 
         stats = {
             # Monitor stats

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import asyncio
 import logging
 import os
 import time
@@ -510,7 +509,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         )
 
         # Reset staleness in rollouter
-        timing_raw = await asyncio.wrap_future(self.rollouter.reset_staleness.remote().future())
+        timing_raw = await self.rollouter.reset_staleness.remote()
         self.logger.log(
             data=timing_raw,
             step=self.current_param_version,

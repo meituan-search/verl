@@ -1011,7 +1011,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         Main async fit method that coordinates all coroutines
         """
 
-        print("[FullyAsyncRollouter] fit() ENTER", flush=True)
         print("[FullyAsyncRollouter] Starting FullyAsyncRollouter...")
 
         # Set the running status flag
