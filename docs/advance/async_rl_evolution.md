@@ -371,7 +371,21 @@ Rollout Replica 之间的权重同步，并支持多种通信后端。
 
 ### 架构设计
 
-CheckpointEngine 提供三个统一 API：
+> **抽象层：用于同步训练和推理后端之间的权重**
+
+CheckpointEngine 是一个可插拔的权重同步抽象层，提供统一的 API 来协调 Trainer 和多个 Rollout Replica 之间的参数传输，屏蔽底层通信细节。
+
+**核心特性：**
+
+- **统一 API**：
+  - `send_weights` — 从 Trainer 流式发送权重
+  - `receive_weights` — 在 Rollout 侧流式接收权重
+  - `get_weights` — 从本地缓存获取（如共享内存）
+
+- **可扩展的传输后端**：
+  - **集合通信（Collective）**：NCCL、HCCL、UCCL — 适合固定集群的高吞吐广播
+  - **点对点（P2P）**：NIXL、Mooncake — 支持弹性调度和故障容错
+  - **本地缓存（Local Cache）**：共享内存、本地磁盘 — 零网络开销，适合 colocated 场景
 
 ```python
 class CheckpointEngine(ABC):
