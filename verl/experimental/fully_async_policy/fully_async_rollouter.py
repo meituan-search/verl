@@ -478,6 +478,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # When set, its GPUs back hybrid replicas for trainer-side validation.
         self._hybrid_worker_group = None
 
+        self.agent_loop_manager_class = FullyAsyncAgentLoopManager
+
         # Config
         self.staleness_threshold: float = config.async_training.get("staleness_threshold", 1)
         # required_samples use ppo_mini_batch_size*require_batches as the minimum number of samples.
@@ -801,7 +803,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             config=self.config,
             worker_group=self.get_hybrid_worker_group(),
         )
-        self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
+        self.async_rollout_manager = await self.agent_loop_manager_class.create(
             config=self.config,
             llm_client=self.llm_server_manager.get_client(client_cls=FullyAsyncLLMServerClient),
             reward_loop_worker_handles=reward_loop_worker_handles,

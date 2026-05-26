@@ -4,6 +4,7 @@ excludes:
   - ".git/"
 
 env_vars:
+#  VLLM_USE_V1: "1"
   HYDRA_FULL_ERROR: "1"
   NCCL_NVLS_ENABLE: "0"
   NCCL_SOCKET_IFNAME: "eth0"
@@ -24,6 +25,7 @@ env_vars:
   # Do NOT use VLLM_ATTENTION_BACKEND - it is not a valid vLLM v1 env var.
   # To work around fa2 PTX incompatibility on this cluster, use enforce_eager=True
   # in the rollout config and set attention_backend via engine_kwargs.vllm instead.
-#  NCCL_CUMEM_ENABLE: "0"
-#  NCCL_CUMEM_HOST_ENABLE: "0"
-#  ROLLOUT_NAME: "vllm"
+
+  NCCL_CUMEM_ENABLE: "0"
+  NCCL_CUMEM_HOST_ENABLE: "0"
+  ROLLOUT_NAME: "vllm"

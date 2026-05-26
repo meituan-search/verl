@@ -53,7 +53,7 @@ class FullyAsyncTaskRunner:
 
     def run(self, config):
         # Detect backend mode from config and resolve class references
-        self._use_tq = getattr(config.transfer_queue, "enable", False)
+        self._use_tq = config.transfer_queue.enable
         if self._use_tq:
             from verl.experimental.fully_async_policy.fully_async_rollouter_tq import TQFullyAsyncRollouter
             from verl.experimental.fully_async_policy.fully_async_trainer_tq import TQFullyAsyncTrainer
@@ -325,7 +325,6 @@ def main(config):
     config.actor_rollout_ref.rollout.nnodes = config.rollout.nnodes
     config.actor_rollout_ref.rollout.n_gpus_per_node = config.rollout.n_gpus_per_node
     config = migrate_legacy_reward_impl(config)
-
     run_ppo(config, task_runner_class=FullyAsyncTaskRunner)
     print(f"total time: {time() - start_time:.2f} seconds")
 
