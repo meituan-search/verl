@@ -1489,34 +1489,8 @@ class PPOTrainer:
         ]
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
         num_turns = np.array(data.pop("num_turns").tolist())
-        # Handle both nested (from AgentLoopWorkerTQ) and padded (from fully_async rollouter) tensors
-        prompts_td = data["prompts"]
-        responses_td = data["responses"]
-        # DEBUG: log tensor format for diagnosing TQ data format
-        print(
-            f"[DEBUG][_compute_metrics] prompts: is_nested={getattr(prompts_td, 'is_nested', None)}, "
-            f"shape={getattr(prompts_td, 'shape', 'N/A')}, dim={getattr(prompts_td, 'dim', 'N/A')}",
-            flush=True,
-        )
-        if getattr(prompts_td, "is_nested", False):
-            prompt_length = prompts_td.offsets().diff()
-            response_length = responses_td.offsets().diff()
-        else:
-            # Fallback for padded tensors: use shape[dim=1] as length
-            try:
-                if prompts_td.dim() == 1:
-                    prompt_length = torch.tensor([prompts_td.shape[0]])
-                    response_length = torch.tensor([responses_td.shape[0]])
-                else:
-                    bsz = len(prompts_td)
-                    prompt_length = torch.full((bsz,), prompts_td.shape[1], dtype=torch.long)
-                    response_length = torch.full((bsz,), responses_td.shape[1], dtype=torch.long)
-            except (AttributeError, TypeError) as e:
-                # Fallback for unexpected tensor types (e.g. NestedIntNode from TQ)
-                print(f"[DEBUG][_compute_metrics] fallback failed: {e}, using len-based heuristic", flush=True)
-                bsz = len(data) if hasattr(data, "__len__") else 1
-                prompt_length = torch.zeros(bsz, dtype=torch.long)
-                response_length = torch.zeros(bsz, dtype=torch.long)
+        prompt_length = data["prompts"].offsets().diff()
+        response_length = data["responses"].offsets().diff()
         global_token_num = (prompt_length + response_length).tolist()
         data = data.to_padded_tensor()
         data["token_level_scores"] = data["rm_scores"]

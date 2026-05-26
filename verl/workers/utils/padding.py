@@ -121,26 +121,10 @@ def no_padding_2_padding(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor
             max_response_len = response_lens.max().item()
     else:
         attention_mask = data["attention_mask"]
-        # Handle nested attention_mask (e.g. from TQ jagged layout data)
-        # When data comes from TransferQueue with variable-length tensors,
-        # attention_mask may be nested even if prompts was converted to padded.
-        if attention_mask.is_nested:
-            # Use offsets from nested attention_mask to compute lengths
-            attn_offsets = attention_mask.offsets()
-            seq_lens = attn_offsets.diff()
-            # prompts may be padded; use its shape[1] as prompt length if not nested
-            if hasattr(prompt_ids, "shape") and len(prompt_ids.shape) >= 1:
-                prompt_lens = torch.full_like(seq_lens, prompt_ids.shape[1] if prompt_ids.dim() > 1 else 1)
-            else:
-                prompt_lens = torch.ones_like(seq_lens)
-            response_lens = seq_lens - prompt_lens
-            # Compute max_response_len from nested responses or attention_mask
-            if max_response_len < 0:
-                max_response_len = response_lens.max().item()
-        else:
-            prompt_lens = attention_mask[:, : prompt_ids.shape[1]].sum(dim=1)
-            response_lens = attention_mask[:, prompt_ids.shape[1] :].sum(dim=1)
-            max_response_len = response_ids.shape[1]
+        assert not attention_mask.is_nested
+        prompt_lens = attention_mask[:, : prompt_ids.shape[1]].sum(dim=1)
+        response_lens = attention_mask[:, prompt_ids.shape[1] :].sum(dim=1)
+        max_response_len = response_ids.shape[1]
 
     sequence_lens = prompt_lens + response_lens
     sequence_offsets = sequence_lens.cumsum(dim=0)
