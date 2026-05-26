@@ -331,8 +331,17 @@ class SGLangHttpServer:
 
         # enable_weights_cpu_backup is supported in sglang>=0.5.3
         if "enable_weights_cpu_backup" in [f.name for f in dataclasses.fields(ServerArgs)]:
+            # HYBRID mode also needs CPU weight backup so that:
+            #   1. sleep() can release GPU weights to free memory for the training engine.
+            #   2. naive update_weights() can call resume(tags=["weights"]) to reload weights
+            #      from CPU before applying the latest trainer weights via IPC.
+            # Without this, sleep() releases GPU memory but update_weights() cannot restore
+            # the weight buffers, causing OOM when training tries to use the freed memory.
             enable_weights_cpu_backup = (
-                True if self.rollout_mode == RolloutMode.COLOCATED or self.model_config.lora_rank > 0 else False
+                True
+                if self.rollout_mode in (RolloutMode.COLOCATED, RolloutMode.HYBRID)
+                or self.model_config.lora_rank > 0
+                else False
             )
             args["enable_weights_cpu_backup"] = enable_weights_cpu_backup
 
@@ -356,8 +365,8 @@ class SGLangHttpServer:
         # mtp
         if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
             # Enable weights CPU backup for sglang >= 0.5.6
-            if sglang.__version__ < "0.5.6":
-                raise ValueError(f"sglang version {sglang.__version__} is not supported for MTP rollout")
+            # if sglang.__version__ < "0.5.6":
+            #     raise ValueError(f"sglang version {sglang.__version__} is not supported for MTP rollout")
 
             args["speculative_algorithm"] = self.config.mtp.speculative_algorithm
             args["speculative_num_steps"] = self.config.mtp.speculative_num_steps
@@ -367,6 +376,23 @@ class SGLangHttpServer:
             args["enable_weights_cpu_backup"] = True
             args["enable_draft_weights_cpu_backup"] = True
 
+        # HYBRID mode with free_cache_engine requires enable_memory_saver=True.
+        # When free_cache_engine=True, sleep() calls release_memory_occupation() which relies on
+        # TorchMemorySaverAdapter.pause() to actually free GPU memory.  If enable_memory_saver
+        # is False (e.g. overridden via engine_kwargs), the adapter is a no-op and sleep()
+        # silently does nothing, leaving GPU weights+kvcache in place and causing OOM when the
+        # training engine tries to use the same GPU.
+        # Similarly, COLOCATED mode also needs memory saver to release/resume during weight sync.
+        if self.rollout_mode in (RolloutMode.HYBRID, RolloutMode.COLOCATED) and self.config.free_cache_engine:
+            if not args.get("enable_memory_saver", True):
+                print(
+                    f"[SGLangHttpServer] WARNING: enable_memory_saver=False detected for "
+                    f"rollout_mode={self.rollout_mode.name} with free_cache_engine=True. "
+                    f"Forcing enable_memory_saver=True — without it, sleep() cannot release "
+                    f"GPU memory and training will OOM."
+                )
+            args["enable_memory_saver"] = True
+
         # NOTE: We can't directly call SGLang's launch_server since it's not an async function.
         # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/http_server.py
         sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
@@ -374,30 +400,38 @@ class SGLangHttpServer:
         server_args = ServerArgs(**args)
         # For SGLang main branch or version >= 0.5.10
         # The latest main branch of SGLang has wrapped the _launch_subprocesses function inside the Engine class
-        if version.parse(sglang.__version__) >= version.parse("0.5.10"):
-            from sglang.srt.entrypoints.http_server import Engine
+        # if version.parse(sglang.__version__) >= version.parse("0.5.10"):
+        #     from sglang.srt.entrypoints.http_server import Engine
 
-            self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = Engine._launch_subprocesses(
-                server_args=server_args,
-                init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
-                run_scheduler_process_func=sglang.srt.entrypoints.engine.run_scheduler_process,
-                run_detokenizer_process_func=sglang.srt.entrypoints.engine.run_detokenizer_process,
-            )
-        elif version.parse(sglang.__version__) >= version.parse("0.5.7"):
-            from sglang.srt.entrypoints.http_server import _launch_subprocesses
+        #     self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = Engine._launch_subprocesses(
+        #         server_args=server_args,
+        #         init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
+        #         run_scheduler_process_func=sglang.srt.entrypoints.engine.run_scheduler_process,
+        #         run_detokenizer_process_func=sglang.srt.entrypoints.engine.run_detokenizer_process,
+        #     )
+        # elif version.parse(sglang.__version__) >= version.parse("0.5.7"):
+        #     from sglang.srt.entrypoints.http_server import _launch_subprocesses
 
-            self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
-                server_args=server_args,
-                init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
-                run_scheduler_process_func=sglang.srt.entrypoints.engine.run_scheduler_process,
-                run_detokenizer_process_func=sglang.srt.entrypoints.engine.run_detokenizer_process,
-            )
-        else:
-            from sglang.srt.entrypoints.http_server import _launch_subprocesses
+        #     self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
+        #         server_args=server_args,
+        #         init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
+        #         run_scheduler_process_func=sglang.srt.entrypoints.engine.run_scheduler_process,
+        #         run_detokenizer_process_func=sglang.srt.entrypoints.engine.run_detokenizer_process,
+        #     )
+        # else:
+        #     from sglang.srt.entrypoints.http_server import _launch_subprocesses
 
-            self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
-                server_args=server_args
-            )
+        #     self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
+        #         server_args=server_args
+        #     )
+
+        from sglang.srt.entrypoints.http_server import Engine
+        self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = Engine._launch_subprocesses(
+            server_args=server_args,
+            init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
+            run_scheduler_process_func=sglang.srt.entrypoints.engine.run_scheduler_process,
+            run_detokenizer_process_func=sglang.srt.entrypoints.engine.run_detokenizer_process,
+        )
 
         # In multi-node cases, non-zero rank nodes should not launch http server.
         if self.node_rank > 0:

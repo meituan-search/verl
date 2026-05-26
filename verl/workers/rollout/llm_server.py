@@ -58,9 +58,8 @@ class GlobalRequestLoadBalancer:
     """
 
     def __init__(self, servers: dict[str, ray.actor.ActorHandle], max_cache_size: int = DEFAULT_ROUTING_CACHE_SIZE):
-        if not servers:
-            raise ValueError("servers must be non-empty")
-
+        # Allow empty initial servers: in dynamic-resource-scaling mode all
+        # replicas are hybrid and will be registered later via add_servers().
         self._servers: dict[str, ray.actor.ActorHandle] = dict(servers)
         self._inflight_requests: dict[str, int] = {sid: 0 for sid in servers}
         self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
@@ -123,7 +122,7 @@ class GlobalRequestLoadBalancer:
         for sid in server_ids:
             self._inflight_requests.pop(sid, None)
             self._servers.pop(sid, None)
-        logger.info(f"[GlobalLoadBalancer] removed {len(server_ids)} servers")
+        print(f"[GlobalLoadBalancer] removed {len(server_ids)} servers")
 
     def get_inflight_count(self, server_id: str) -> int:
         """Get number of in-flight requests for a server."""
@@ -154,6 +153,7 @@ class LLMServerClient:
         self,
         config: DictConfig,
         load_balancer_handle: ray.actor.ActorHandle,
+        only_hybrid: bool = False,
         **kwargs,
     ):
         """Initialize the LLMServerClient.
@@ -162,13 +162,29 @@ class LLMServerClient:
             config (DictConfig): whole config for main entrypoint.
             load_balancer_handle (ray.actor.ActorHandle): shared global load balancer actor
                 that also holds the server-handle registry.
+            only_hybrid (bool): When ``True``, hybrid replicas are the *only* rollout
+                resource.  If the load balancer is temporarily empty (e.g. during
+                weight synchronisation) :meth:`_acquire_server` will keep retrying
+                every 3 s instead of raising immediately.
         """
         self.config = config
         self._load_balancer = load_balancer_handle
+        self._only_hybrid = only_hybrid
 
     async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
         # Atomic acquire: returns (server_id, handle) in one Ray RPC.
-        return await self._load_balancer.acquire_server.remote(request_id=request_id)
+        # When only_hybrid is True, hybrid replicas are the sole rollout resource and
+        # the LB may be temporarily empty during weight sync / scaling transitions.
+        # In that case keep retrying every 3 s until a server becomes available.
+        # Otherwise raise immediately so callers see the error right away.
+        while True:
+            try:
+                return await self._load_balancer.acquire_server.remote(request_id=request_id)
+            except RuntimeError as e:
+                if "No available servers in load balancer" in str(e) and self._only_hybrid:
+                    await asyncio.sleep(3)
+                else:
+                    raise
 
     def _release_server(self, server_id: str) -> None:
         # Fire-and-forget: release is just a counter decrement, no need to await.

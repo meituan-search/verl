@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import functools
 import logging
 import os
@@ -685,7 +686,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # Resolve mode: "auto" falls back to config, explicit values take precedence
         effective_mode = mode if mode != "auto" else self.config.rollout.checkpoint_engine.backend
 
-        # 0. send_weights only for async training with disaggregated trainer and rollout
         if effective_mode != "naive":
             per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
             await self.checkpoint_engine.send_weights(per_tensor_param)

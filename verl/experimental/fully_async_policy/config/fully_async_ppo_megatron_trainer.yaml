@@ -25,6 +25,35 @@ async_training:
   # whether to use trainer do_validate
   use_trainer_do_validate: False
 
+  # Whether to enable dynamic resource scaling.
+  # When True, hybrid rollout replicas are initialised on Trainer-node GPUs at
+  # startup (sleeping, memory returned to the training engine), and are kept
+  # active so that Trainer GPUs participate in rollout alongside standalone GPUs.
+  use_dynamic_resource_scaling: False
+
+  # Name of the dynamic scaling policy to use.  The policy controls *when* to
+  # deactivate hybrid replicas and how to adapt its parameters at runtime.
+  #
+  # Built-in policies:
+  #   "default" — replicates the original behaviour: deactivate whenever hybrid
+  #               replicas are active, wait for deactivate_ratio × required_samples
+  #               samples, and adapt the ratio based on wait-time / sample backlog.
+  #
+  # Custom policies can be registered with the @register_policy decorator in
+  # verl/experimental/fully_async_policy/dynamic_resource_controller.py and then
+  # referenced here by their registered name.
+  dynamic_scaling_policy: "default"
+
+  # Sample-collection ratio threshold for deactivating hybrid replicas.
+  # Used by the "default" policy (and typically by custom policies too).
+  # At each fit_step, the controller waits until
+  #   deactivate_ratio × required_samples × trigger_parameter_sync_step
+  # samples are buffered before deactivating hybrid replicas and returning
+  # Trainer GPUs to the training engine.
+  # Set lower (e.g. 0.3) to deactivate earlier; set to 1.0 to wait for a
+  # full batch before deactivating.
+  dynamic_scaling_deactivate_ratio: 0.3
+
 # Rollout config
 rollout:
 
@@ -49,6 +78,12 @@ actor_rollout_ref:
   rollout:
     # Must be enabled! Otherwise, log_probs cannot be calculated.
     calculate_log_probs: True
+
+    # When use_dynamic_resource_scaling is enabled, hybrid replicas share the GPU with
+    # the training engine, so gpu_memory_utilization should be kept low (e.g. 0.3-0.5).
+    # standalone_gpu_memory_utilization applies only to standalone replicas (dedicated
+    # rollout GPUs); null means fall back to gpu_memory_utilization.
+    standalone_gpu_memory_utilization: null
 
     checkpoint_engine:
       backend: "nccl"
