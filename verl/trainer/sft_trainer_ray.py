@@ -111,6 +111,9 @@ class SFTTrainer:
 
         self.loss_fn = partial(sft_loss, config=None)
 
+        self.engine_config.use_prefix_tree = self.config.data.get("use_prefix_tree", False)
+        self.engine_config.prefix_tree_attention = self.config.data.get("prefix_tree_attention", "flex")
+
         config = TrainingWorkerConfig(
             model_type="language_model",
             model_config=self.model_config,
@@ -182,7 +185,8 @@ class SFTTrainer:
         dp_size = 1
 
         self.train_sampler = DistributedSampler(
-            self.train_dataset, shuffle=True, num_replicas=dp_size, rank=dp_rank, drop_last=True
+            self.train_dataset, shuffle=self.config.data.get("shuffle", True),
+            num_replicas=dp_size, rank=dp_rank, drop_last=True
         )
 
         self.global_batch_size = config.data.train_batch_size
@@ -284,6 +288,8 @@ class SFTTrainer:
             "global_batch_size": self.global_batch_size,
             "pad_mode": self.config.data.pad_mode,
             "pad_token_id": self.model_config.tokenizer.pad_token_id,
+            "use_prefix_tree": self.config.data.get("use_prefix_tree", False),
+            "prefix_tree_attention": self.config.data.get("prefix_tree_attention", "flex"),
         }
 
         train_time = 0

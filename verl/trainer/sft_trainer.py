@@ -162,6 +162,11 @@ class SFTTrainer:
 
         self.loss_fn = partial(sft_loss, config=None)
 
+        # propagate data-side prefix-tree flags into engine_config so
+        # engine_workers.py can inject them into each micro-batch
+        self.engine_config.use_prefix_tree = self.config.data.get("use_prefix_tree", False)
+        self.engine_config.prefix_tree_attention = self.config.data.get("prefix_tree_attention", "flex")
+
         config = TrainingWorkerConfig(
             model_type="language_model",
             model_config=self.model_config,
@@ -234,7 +239,7 @@ class SFTTrainer:
         dp_size = self.engine.get_data_parallel_size()
 
         self.train_sampler = DistributedSampler(
-            self.train_dataset, shuffle=True, num_replicas=dp_size, rank=dp_rank, drop_last=True
+            self.train_dataset, shuffle=self.config.data.get("shuffle", True), num_replicas=dp_size, rank=dp_rank, drop_last=True
         )
 
         self.global_batch_size = config.data.train_batch_size
@@ -349,6 +354,8 @@ class SFTTrainer:
             "global_batch_size": self.global_batch_size,
             "pad_mode": self.config.data.pad_mode,
             "pad_token_id": self.model_config.tokenizer.pad_token_id,
+            "use_prefix_tree": self.config.data.get("use_prefix_tree", False),
+            "prefix_tree_attention": self.config.data.get("prefix_tree_attention", "flex"),
         }
 
         train_time = 0
@@ -391,7 +398,7 @@ class SFTTrainer:
                     metrics = tu.get(output, "metrics")
 
                     # TODO: we can actual accumulate metrics for N steps and perform aggregate metrics
-                    for k in ["loss", "grad_norm", "lr", "mfu"]:
+                    for k in ["loss", "grad_norm", "lr", "mfu", "tree_flop_ratio"]:
                         if k in metrics.keys():
                             value = metrics.pop(k)
                             metrics[f"train/{k}"] = value
@@ -434,7 +441,7 @@ class SFTTrainer:
                         last_valid_metric = metric
                     torch.distributed.barrier()
 
-                if is_last_step or (self.save_freq > 0 and is_save_step):
+                if (is_last_step and self.save_freq != -1) or (self.save_freq > 0 and is_save_step):
                     aggressive_empty_cache(force_sync=True)
                     self.ckpt_handler.save_checkpoint(step=global_step)
 

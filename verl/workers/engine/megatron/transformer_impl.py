@@ -125,8 +125,10 @@ class MegatronEngine(BaseEngine):
 
         if is_cuda_available:
             from verl.models.mcore.patch import apply_patch_megatron_recomputation_backward
+            from verl.models.mcore.prefix_tree_merge import apply_prefix_tree_patch as apply_magi_patch
 
             apply_patch_megatron_recomputation_backward()
+            apply_magi_patch()
 
     def _init_device_mesh(self):
         # TODO: set different parallelism for actor, critic, ref
@@ -818,6 +820,17 @@ class MegatronEngineWithLMHead(MegatronEngine):
         calculate_entropy = tu.get_non_tensor_data(batch, key="calculate_entropy", default=False)
         calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
         distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
+        use_prefix_tree = tu.get_non_tensor_data(batch, key="use_prefix_tree", default=False)
+        prefix_tree_attention = tu.get_non_tensor_data(batch, key="prefix_tree_attention", default="flex")
+        if use_prefix_tree:
+            assert self.engine_config.use_remove_padding, (
+                "use_prefix_tree=True requires use_remove_padding=True (THD format). "
+                "Set model.use_remove_padding=True in your config."
+            )
+            assert prefix_tree_attention in ("flex", "magi"), (
+                f"prefix_tree_attention must be 'flex' or 'magi', got {prefix_tree_attention!r}"
+            )
+        prefix_segments_batch = tu.get_non_tensor_data(batch, key="prefix_segments", default=None)
 
         if calculate_sum_pi_squared and use_fused_kernels:
             raise NotImplementedError(
@@ -895,7 +908,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
             data_format = "thd" if self.engine_config.use_remove_padding else "bshd"
 
             def logits_processor(logits, label, temperature):
-                assert logits.shape[:2] == label.shape[:2]
+                assert logits.size(0) == label.size(0), f"logits batch {logits.size(0)} != label batch {label.size(0)}"
                 # avoid non-positive temperature such as padding
                 temperature[temperature <= 0] = 1e-8
                 assert torch.all(temperature > 0).item(), f"temperature tensor must be positive. Got {temperature}"
@@ -925,7 +938,14 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 ret["log_probs"] = log_probs
                 return ret
 
-            logits_processor_args = {"label": label, "temperature": temperature, "loss_mask": loss_mask}
+            logits_processor_args = {
+                "label": label,
+                "temperature": temperature,
+                "loss_mask": loss_mask,
+                "use_prefix_tree": use_prefix_tree,
+                "prefix_tree_attention": prefix_tree_attention,
+                "prefix_segments_batch": prefix_segments_batch,
+            }
 
             output = forward_fn(
                 model,

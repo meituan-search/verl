@@ -1396,6 +1396,29 @@ class RayPPOTrainer:
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 rollout_n = self.config.actor_rollout_ref.rollout.n
                 gen_batch_output = gen_batch.repeat(repeat_times=rollout_n, interleave=True)
+                # Inject prefix_segments prior for prefix-tree MAGI attention.
+                # DataProto.repeat() already propagates existing prefix_segments entries
+                # (np.repeat interleaves them correctly).  This fallback handles datasets
+                # that do not yet produce per-sub-turn prefix_segments.
+                if (
+                    self.config.actor_rollout_ref.rollout.get("use_prefix_tree", False)
+                    and "prefix_segments" not in gen_batch_output.non_tensor_batch
+                    and gen_batch_output.batch is not None
+                    and "input_ids" in gen_batch_output.batch.keys()
+                ):
+                    from verl.utils.prefix_tree_magi import build_prefix_segments_single_turn
+                    _ids = gen_batch_output.batch["input_ids"]
+                    _mask = gen_batch_output.batch.get("attention_mask", None)
+                    gen_batch_output.non_tensor_batch["prefix_segments"] = np.array(
+                        [
+                            build_prefix_segments_single_turn(
+                                _ids[i],
+                                _mask[i] if _mask is not None else None,
+                            )
+                            for i in range(_ids.shape[0])
+                        ],
+                        dtype=object,
+                    )
 
                 if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                     # NOTE: REMAX needs one sampled rollout plus one greedy baseline per prompt.
