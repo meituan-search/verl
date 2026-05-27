@@ -1267,7 +1267,7 @@ class PPOTrainer:
             )
             data["old_log_probs"] = data.pop("rollout_log_probs")
             tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data)
-            return None
+            return batch
 
         # 1. compute log probs
         batch.extra_info.update(

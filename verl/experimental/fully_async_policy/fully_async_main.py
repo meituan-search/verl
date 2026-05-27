@@ -55,11 +55,11 @@ class FullyAsyncTaskRunner:
         # Detect backend mode from config and resolve class references
         self._use_tq = config.transfer_queue.enable
         if self._use_tq:
-            from verl.experimental.fully_async_policy.fully_async_rollouter_tq import TQFullyAsyncRollouter
-            from verl.experimental.fully_async_policy.fully_async_trainer_tq import TQFullyAsyncTrainer
+            from verl.experimental.fully_async_policy.fully_async_rollouter_tq import FullyAsyncRollouterTQ
+            from verl.experimental.fully_async_policy.fully_async_trainer_tq import FullyAsyncTrainerTQ
 
-            self._rollouter_cls = ray.remote(TQFullyAsyncRollouter).options(num_cpus=10, max_concurrency=100)
-            self._trainer_cls = ray.remote(TQFullyAsyncTrainer).options(num_cpus=10, max_concurrency=100)
+            self._rollouter_cls = ray.remote(FullyAsyncRollouterTQ).options(num_cpus=10, max_concurrency=100)
+            self._trainer_cls = ray.remote(FullyAsyncTrainerTQ).options(num_cpus=10, max_concurrency=100)
 
             # Initialize TQ in the main process FIRST with config.transfer_queue
             # This ensures all subsequent tq.init() calls (in Rollouter, Trainer, RB actors)

@@ -243,18 +243,6 @@ class ReplayBuffer:
                     self._version_slots += 1
                     return True
 
-                # Diagnostic: log which condition blocked us (only once per block)
-                if not physical_ok:
-                    print(
-                        f"[RB][acquire_slot] BLOCKED: physical full "
-                        f"(pending={self._pending_slots}/{self.max_pending_slots})",
-                    )
-                elif not version_ok:
-                    print(
-                        f"[RB][acquire_slot] BLOCKED: version window full "
-                        f"(version_slots={self._version_slots}/{self.max_version_slots}, ",
-                    )
-
                 # Wait for notification (slot release, reset_staleness, or signal_finish)
                 if not _wait_forever:
                     remaining = _deadline_abs - asyncio.get_event_loop().time()
@@ -282,7 +270,6 @@ class ReplayBuffer:
         async with self._slot_available:
             self._pending_slots = max(0, self._pending_slots - 1)
             self._slot_available.notify_all()
-        print(f"[ReplayBuffer][release_slot] pending={self._pending_slots}", flush=True)
 
     async def wait_and_sample(
         self,

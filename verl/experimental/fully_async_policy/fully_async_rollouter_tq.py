@@ -12,19 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fully Async Policy with TQ support.
-
-Provides three components that implement TQ writing for fully-async path:
-
-1. FullyAsyncAgentLoopWorkerTQ — Ray worker that intercepts _agent_loop_postprocess to
-   capture raw AgentLoopOutput (pre-padding) and writes to TQ in _postprocess (blocking).
-
-2. FullyAsyncAgentLoopManagerTQ — Manager using FullyAsyncAgentLoopWorkerTQ workers.
-
-3. TQFullyAsyncRollouter — Rollouter using FullyAsyncAgentLoopManagerTQ, with
-   simplified _process_single_sample_streaming() that just calls the worker and releases slot.
-"""
-
 import asyncio
 import logging
 import os
@@ -83,7 +70,6 @@ class FullyAsyncAgentLoopWorkerTQ(AgentLoopWorker):
 
     async def _agent_loop_postprocess(self, output: AgentLoopOutput, validate: bool, **kwargs):
         """Compute scores and return raw AgentLoopOutput; skip tokenizer padding."""
-        import pickle
 
         # Compute reward score and teacher logprobs (same as base class)
         await self._compute_score([output], kwargs=kwargs)
@@ -94,20 +80,6 @@ class FullyAsyncAgentLoopWorkerTQ(AgentLoopWorker):
             validate=validate,
             sample_kwargs=kwargs,
         )
-
-        # Debug: check if output is pickle-safe before returning
-        try:
-            pickle.dumps(output)
-            print("[FullyAsyncAgentLoopWorkerTQ][_agent_loop_postprocess] output pickle OK", flush=True)
-        except Exception as e:
-            print(f"[FullyAsyncAgentLoopWorkerTQ][_agent_loop_postprocess] output pickle FAILED: {e}", flush=True)
-            # Dump extra_fields to find the culprit
-            for k, v in output.extra_fields.items():
-                try:
-                    pickle.dumps(v)
-                except Exception as ef:
-                    print(f"  -> extra_fields['{k}'] ({type(v).__name__}) pickle failed: {ef}", flush=True)
-
         return output
 
     async def _postprocess(self, inputs, input_non_tensor_batch=None, validate=False):
@@ -191,20 +163,8 @@ class FullyAsyncAgentLoopWorkerTQ(AgentLoopWorker):
             f"[FullyAsyncAgentLoopWorkerTQ] Wrote {bsz} samples [{keys_str}] to TQ ({partition_id})",
             flush=True,
         )
-
         # Return minimal DataProto — data is already in TQ, caller just needs success signal
-        result = DataProto(batch=TensorDict({}, batch_size=n))
-
-        # Debug: verify return value is pickle-safe
-        import pickle
-
-        try:
-            pickle.dumps(result)
-            print("[FullyAsyncAgentLoopWorkerTQ][_postprocess] DataProto return value pickle OK", flush=True)
-        except Exception as e:
-            print(f"[FullyAsyncAgentLoopWorkerTQ][_postprocess] DataProto return value pickle FAILED: {e}", flush=True)
-
-        return result
+        return DataProto(batch=TensorDict({}, batch_size=n))
 
 
 class FullyAsyncAgentLoopManagerTQ(FullyAsyncAgentLoopManager):
@@ -215,7 +175,7 @@ class FullyAsyncAgentLoopManagerTQ(FullyAsyncAgentLoopManager):
         super().__init__(*args, **kwargs)
 
 
-class TQFullyAsyncRollouter(FullyAsyncRollouter):
+class FullyAsyncRollouterTQ(FullyAsyncRollouter):
     """
     FullyAsyncRollouter variant that uses TransferQueue + ReplayBuffer instead of MessageQueue.
 
@@ -239,7 +199,6 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
         # ==================== TQ-specific overrides ====================
         self.replay_buffer = None  # Ray Actor handle, set via set_replay_buffer()
 
-        # ★ Tell base class _init_async_rollout_manager() to use TQ agent loop manager
         self.agent_loop_manager_class = FullyAsyncAgentLoopManagerTQ
 
         print("[TQFullyAsyncRollouter] initialized (TQ mode)")
@@ -254,8 +213,6 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
             tq.init()
             print("[TQFullyAsyncRollouter] TQ initialized in Rollouter actor process", flush=True)
 
-    # ======== Override: _feed_samples — add acquire_slot() ========
-
     async def _feed_samples(self):
         """Feed samples from dataloader to pending_queue, with source-level flow control.
 
@@ -265,15 +222,13 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
         """
         print("[TQFullyAsyncRollouter][_feed_samples] STARTING", flush=True)
         continuous_iterator = self._create_continuous_iterator()
-        feed_count = 0
 
         for epoch, batch_dict in continuous_iterator:
-            print(f"[TQFullyAsyncRollouter][Feed] Acquiring slot for sample {feed_count}...", flush=True)
             acquired = await self.replay_buffer.acquire_slot.remote(timeout=None)
             if not acquired:
                 print(
                     f"[TQFullyAsyncRollouter][Feed] ReplayBuffer finished or closed, "
-                    f"stop feeding after {feed_count} samples"
+                    f"stop feeding after {self.global_steps} samples"
                 )
                 break
 
@@ -289,11 +244,6 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
             )
 
             await self.pending_queue.put(rollout_sample)
-            feed_count += 1
-            print(
-                f"[TQFullyAsyncRollouter][Feed] Put sample {feed_count - 1} to pending_queue (total={feed_count})",
-                flush=True,
-            )
 
             # Check if have reached the last step
             if self.global_steps >= self.total_rollout_steps:
@@ -308,12 +258,10 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
 
         # End signal
         await self.pending_queue.put(None)
-        print(f"[TQFullyAsyncRollouter][Feed] Sample addition is complete, {feed_count} samples have been added")
+        print(f"[TQFullyAsyncRollouter][Feed] Sample addition is complete, {self.global_steps} samples have been added")
 
     async def _should_pause_generation(self) -> bool:
         return False
-
-    # ======== Override: _process_single_sample_streaming — delegated TQ write ========
 
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample: generate via ALM worker (which writes to TQ blocking), then release slot.
@@ -324,9 +272,8 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
           (via overridden _agent_loop_postprocess + _postprocess)
           → we just call it and release the slot
         """
-        print(
+        logger.debug(
             f"[TQFullyAsyncRollouter][_process_single] Starting generate for {rollout_sample.sample_id}...",
-            flush=True,
         )
         try:
             # Inject sample_id into batch so worker can use it for unique TQ keys
@@ -339,18 +286,11 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
             rollout_sample.full_batch.non_tensor_batch["global_steps"] = np.array(
                 [self.global_steps] * bsz, dtype=np.int64
             )
-
-            # ★ This single call does ALL of:
-            #   1. Run agent loop(s) for the sample (base class generate_sequences)
-            #   2. _agent_loop_postprocess captures raw outputs + computes scores
-            #   3. _postprocess writes data to TQ in unpadded format (blocking!)
-            #   4. Returns minimal DataProto (data already in TQ)
-            ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
-            print(
+            await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
+            logger.debug(
                 f"[TQFullyAsyncRollouter][_process_single] generate + TQ write done for {rollout_sample.sample_id}",
-                flush=True,
             )
-            self.total_generated_samples += len(ret) if ret is not None else 1
+            self.total_generated_samples += 1
         except Exception as e:
             logger.exception(f"[TQFullyAsyncRollouter] Failed to process {rollout_sample.sample_id}: {e}")
         finally:
@@ -359,43 +299,17 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
 
         self.processed_sample_count += 1
 
-    # ======== Override: _streaming_generation_main — finish signal via RB ========
-
     async def _streaming_generation_main(self):
-        """Main entry for stream processing.
-
-        Key difference from base class:
-        - Finish signal goes through RB.signal_finish() instead of MQ.put_sample(None)
-        """
-        print("[TQFullyAsyncRollouter][_streaming_generation_main] ENTER", flush=True)
-        if self.async_rollout_manager is None:
-            print(
-                "[TQFullyAsyncRollouter][_streaming_generation_main] Calling _init_async_rollout_manager...", flush=True
-            )
-            await self._init_async_rollout_manager()
-            print("[TQFullyAsyncRollouter][_streaming_generation_main] _init_async_rollout_manager DONE", flush=True)
-        else:
-            print(
-                "[TQFullyAsyncRollouter][_streaming_generation_main] "
-                "async_rollout_manager already exists, skipping init",
-                flush=True,
-            )
-
-        print(
-            f"[TQFullyAsyncRollouter] Start streaming mode, max concurrent: {self.max_concurrent_samples}", flush=True
-        )
-
+        """Main entry for stream processing."""
         # Start feed and processor tasks (same as base class)
         print("[TQFullyAsyncRollouter] Starting feed_task...", flush=True)
         self.feed_task = safe_create_task(self._feed_samples(), name="feed_task")
         print("[TQFullyAsyncRollouter] Starting processor_task...", flush=True)
         self.processor_task = safe_create_task(self._processor_worker(), name="processor_task")
-
         try:
             done, pending = await asyncio.wait(
                 [self.feed_task, self.processor_task], return_when=asyncio.FIRST_COMPLETED
             )
-
             for task in done:
                 if task.exception():
                     raise task.exception()
@@ -429,16 +343,10 @@ class TQFullyAsyncRollouter(FullyAsyncRollouter):
             async with self.lock:
                 self.running = False
 
-    # ======== Override: reset_staleness — resume + delegate to RB ========
-
     async def reset_staleness(self):
         """Reset version window after parameter update."""
-        print("[RollouterTQ][reset_staleness] calling RB.reset_staleness (version window reset)", flush=True)
         rb_timing = await self.replay_buffer.reset_staleness.remote()
-        print(f"[TQFullyAsyncRollouter][reset_staleness] RB.reset_staleness DONE {rb_timing}", flush=True)
         return rb_timing
-
-    # ======== Override: get_statistics — source from RB instead of MQ ========
 
     async def get_statistics(self) -> dict:
         """Gather statistics from RB and local state."""
