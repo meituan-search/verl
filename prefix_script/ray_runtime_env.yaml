@@ -1,0 +1,12 @@
+# Runtime environment for ray job submit
+# Uses system site-packages — no working_dir upload needed
+# since verl is installed or the PYTHONPATH is set on the cluster.
+
+env_vars:
+  OMP_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  NCCL_DEBUG: "WARN"
+  TOKENIZERS_PARALLELISM: "true"
+  VLLM_LOGGING_LEVEL: "WARN"
+  VLLM_DISABLE_COMPILE_CACHE: "1"
+  CUDA_DEVICE_MAX_CONNECTIONS: "1"
