@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 # Status type
-StatusType = Literal["pending", "running", "partial", "finish"]
+StatusType = Literal["error", "finish"]
 
 
 @ray.remote(max_concurrency=100)
@@ -85,8 +85,8 @@ class ReplayBuffer:
         keys_per_slot: int = 16,
     ):
         # Partition -> {key: tags_dict}
-        self._idle_start_time = None
-        self._last_reset_time = None
+        self.idle_start_time = time.time()
+        self.step_start_time = time.time()
 
         self.partitions: dict[str, dict[str, dict]] = defaultdict(dict)
         self.poll_interval = poll_interval
@@ -146,32 +146,18 @@ class ReplayBuffer:
 
     async def _poll_from_tq(self):
         """Background asyncio task that polls TQ for metadata updates.
-
         Syncs TQ metadata into self.partitions so wait_and_sample() can discover
         finished samples. Slot release is NOT done here — it is handled explicitly
         by the Rollouter calling release_slot() after writing to TQ.
         """
-        poll_count = 0
         try:
             while True:
                 data = tq.kv_list()
-                poll_count += 1
-                if poll_count % 10 == 0:  # Log every 10 polls (~10s with 1s interval)
-                    total_keys = sum(len(items) for items in data.values()) if data else 0
-                    rb_keys = sum(len(p) for p in self.partitions.values())
-                    print(
-                        f"[ReplayBuffer][_poll] poll #{poll_count} "
-                        f"tq_keys={total_keys} rb_keys={rb_keys} "
-                        f"pending={self._pending_slots} version_slots={self._version_slots}",
-                        flush=True,
-                    )
                 if data is not None:
                     for partition_id, items in data.items():
                         async with self._data_available:
                             for key, meta in items.items():
-                                # Update metadata (purely for wait_and_sample discovery)
                                 self.partitions[partition_id][key] = meta
-                            # Notify wait_and_sample that new data may be available
                             self._data_available.notify_all()
                 await asyncio.sleep(self.poll_interval)
         except Exception as e:
@@ -200,9 +186,6 @@ class ReplayBuffer:
     async def acquire_slot(self, timeout: float | None = None) -> bool:
         """Acquire a slot before processing a dataloader sample.
 
-        Called by TQFullyAsyncRollouter in _feed_samples(), BEFORE putting
-        the sample into pending_queue. This implements **dual-layer flow control**:
-
         Layer 1 (Physical): ``_pending_slots < max_pending_slots``
             Limits simultaneous in-flight samples to prevent OOM / GPU overload.
             Slot is released by calling release_slot() after writing to TQ.
@@ -214,14 +197,6 @@ class ReplayBuffer:
             Only enforced if max_version_slots is set (via set_version_config()).
 
         Both conditions must be satisfied for a slot to be issued.
-
-        Uses asyncio.Condition for efficient notification-based waiting instead of polling.
-
-        Args:
-            timeout: Max seconds to wait. None = block indefinitely.
-
-        Returns:
-            True if slot acquired, False if timed out or finished.
         """
         _wait_forever = timeout is None
         _deadline_abs = None if _wait_forever else (asyncio.get_event_loop().time() + timeout)
@@ -261,14 +236,16 @@ class ReplayBuffer:
     async def release_slot(self):
         """Release a slot after processing.
 
-        Called by TQFullyAsyncRollouter in two cases:
-        1. Normal path: after successfully writing sample to TQ (_process_single_sample_streaming)
-        2. Error/drop path: when a sample fails BEFORE being written to TQ
-
-        Notifies _slot_available so acquire_slot can wake up.
+        When all slots are released (_pending_slots == 0), record the idle start time.
+        This means the rollouter has finished all in-flight work but may be blocked
+        from acquiring new slots (e.g., version window full, dataloader exhausted).
+        Mirrors fully_async_rollouter.py:886 idle tracking.
         """
         async with self._slot_available:
             self._pending_slots = max(0, self._pending_slots - 1)
+            # Record idle start when all slots are released (rollouter has no work)
+            if self._pending_slots == 0:
+                self.idle_start_time = time.time()
             self._slot_available.notify_all()
 
     async def wait_and_sample(
@@ -276,49 +253,7 @@ class ReplayBuffer:
         partition_id: str,
         batch_size: int,
     ) -> list[tuple[str, dict]] | None:
-        """Block until enough finish samples are ready or production is fully complete.
-
-        Called by TQFullyAsyncTrainer at the start of each training step.
-        Returns keys whose metadata has current_status='finish'.
-
-        Uses lock-free reads (safe due to Ray actor serialization + GIL for simple ops).
-        Callers update metadata via update_metadata() and use Condition for safe writes.
-
-        IMPORTANT — Termination semantics:
-        -----------------------------------
-        signal_finish() is called by Rollouter's _streaming_generation_main()
-        only AFTER both:
-          1. _feed_samples() has finished iterating the dataloader AND
-          2. _processor_worker() has processed ALL samples from pending_queue
-             (every sample has been inferred, written to TQ, and release_slot()'d)
-
-        In other words, signal_finish() means "production is FULLY done — every
-        sample that entered the pipeline has completed inference and been written
-        to TQ with status=finish". There are NO in-flight samples remaining when
-        this fires.
-
-        Therefore, once _finished=True, it is safe to return remaining samples
-        or None immediately — no need to check _pending_slots because they are
-        guaranteed to be 0 at this point.
-
-        Decision matrix:
-        ┌─────────────┬───────────────┬──────────────────────────────────┐
-        │ _finished   │ ready count   │ Action                           │
-        ├─────────────┼───────────────┼──────────────────────────────────┤
-        │ False       │ ≥ batch_size  │ Return batch (normal path)       │
-        │ False       │ < batch_size  │ Keep waiting                      │
-        │ True        │ > 0           │ Return remaining (< batch_size)   │
-        │ True        │ = 0           │ Return None (truly done)          │
-        └─────────────┴───────────────┴──────────────────────────────────┘
-
-        Args:
-            partition_id: Partition to sample from, e.g. "train".
-            batch_size: Desired number of samples.
-
-        Returns:
-            List of (key, meta) tuples. Length may be < batch_size when finished.
-            Returns None if finished and no samples available.
-        """
+        """Block until enough finish samples are ready or production is fully complete."""
         async with self._data_available:
             while True:
                 # Check termination first
@@ -344,7 +279,8 @@ class ReplayBuffer:
 
                     if len(ready) >= batch_size:
                         print(
-                            f"[RB][wait_and_sample] Returning {len(ready[:batch_size])} samples from {partition_id}",
+                            f"[ReplayBuffer][wait_and_sample] Returning {len(ready[:batch_size])} "
+                            f"samples from {partition_id}",
                         )
                         return ready[:batch_size]
 
@@ -352,11 +288,7 @@ class ReplayBuffer:
                 await self._data_available.wait()
 
     async def remove(self, partition_id: str, keys: list[str]):
-        """Remove consumed samples from the metadata store.
-
-        Called by TQFullyAsyncTrainer after consuming samples via wait_and_sample()
-        and reading data from TQ. Cleans up self.partitions to prevent unbounded growth.
-        """
+        """Remove consumed samples from the metadata store."""
         async with self._data_available:
             part = self.partitions.get(partition_id)
             if part is not None:
@@ -367,47 +299,44 @@ class ReplayBuffer:
     async def reset_staleness(self) -> dict:
         """Reset the version window after parameter synchronization.
 
-        Called by TQFullyAsyncTrainer (via Rollouter) after
-        checkpoint_manager.update_weights(). This:
-
-        Recalibrates ``_version_slots`` to reflect actual current backlog,
-        mirroring FullyAsyncRollouter's original logic::
-
-            staleness_samples = len(active_tasks) + message_queue_client.get_queue_size()
-
-        In TQ terms:
-            _version_slots = pending_slots (in-flight) + tq_keys (unconsumed backlog)
-
-        This ensures the version window limits total samples *in the system*
-        (not just newly issued slots). After reset, new slots can only be
-        acquired up to ``max_version_slots - current_backlog``.
-
-        Notifies _slot_available so acquire_slot can wake up.
-
-        Returns:
-            Dict with timing/metrics for logging.
+        Mirrors FullyAsyncRollouter.reset_staleness() timing logic:
+        - version_time: wall-clock time since last reset (i.e., this param sync cycle duration)
+        - active_time: actual work time within the cycle (version_time minus idle periods)
+        - idle_ratio: fraction of time the rollouter was idle during the cycle
         """
         async with self._slot_available:
             prev_version_slots = self._version_slots
-
-            # Count actual keys currently in TQ (unconsumed backlog)
-            try:
-                data = tq.kv_list()
-                tq_keys = sum(len(items) for items in data.values()) if data else 0
-            except Exception:
-                tq_keys = 0
-
+            data = tq.kv_list()
+            tq_keys = sum(len(items) for items in data.values()) if data else 0
             tq_backlog_slots = (tq_keys + self.keys_per_slot - 1) // self.keys_per_slot
+
+            # _version_slots = pending_slots (in-flight) + tq_keys (unconsumed backlog)
+            # This ensures the version window limits total samples *in the system*
+            # (not just newly issued slots). After reset, new slots can only be
+            # acquired up to ``max_version_slots - current_backlog``.
             self._version_slots = self._pending_slots + tq_backlog_slots
 
             # Timing metrics
-            active_time = time.time()
-            version_time = time.time()
-            idle_ratio = 0.0
+            # |step_start_time          |idle_start_time
+            #
+            # |<----- active_time ----->|<------ idle time ------>|
+            # |<------------- version_time ---------------------->|
+            now = time.time()
+            if self.step_start_time is None:
+                self.step_start_time = now
+                self.idle_start_time = now
+
+            rollout_version_time = max(now - self.step_start_time, 1e-6)
+            if self.idle_start_time is not None and self.idle_start_time > self.step_start_time:
+                rollout_active_time = self.idle_start_time - self.step_start_time
+                idle_ratio = 1.0 - rollout_active_time / rollout_version_time
+            else:
+                rollout_active_time = rollout_version_time
+                idle_ratio = 0.0
 
             timing_raw = {
-                "fully_async/rollouter/active_time": active_time,
-                "fully_async/rollouter/version_time": version_time,
+                "fully_async/rollouter/active_time": rollout_active_time,
+                "fully_async/rollouter/version_time": rollout_version_time,
                 "fully_async/rollouter/idle_ratio": idle_ratio,
             }
 
@@ -421,24 +350,17 @@ class ReplayBuffer:
                 flush=True,
             )
 
+            # Reset timers for next cycle (mirrors fully_async_rollouter.py:600)
+            self.step_start_time = now
+            self.idle_start_time = now
+
             # Wake up acquire_slot waiters blocked on version window
             self._slot_available.notify_all()
 
         return timing_raw
 
     async def signal_finish(self):
-        """Signal that production is fully complete — all samples are done.
-
-        Called by TQFullyAsyncRollouter._streaming_generation_main() in its
-        finally block, which runs ONLY after both:
-          1. _feed_samples() has exhausted the dataloader (put None sentinel), AND
-          2. _processor_worker() has drained pending_queue completely
-             (all samples inferred, written to TQ, and release_slot()'d).
-
-        This is the definitive "no more data ever" signal. When this fires,
-        wait_and_sample() and acquire_slot() can safely return.
-        There are guaranteed to be zero in-flight / un-finished samples.
-        """
+        """Signal that production is fully complete — all samples are done."""
         # Wake up acquire_slot waiters (return False)
         async with self._slot_available:
             self._finished = True
@@ -459,19 +381,13 @@ class ReplayBuffer:
 
     def total_in_flight(self) -> int:
         """Total in-flight samples across all non-terminal states. Lock-free read."""
-        return (
-            self._pending_slots
-            + self.count_by_status("pending")
-            + self.count_by_status("running")
-            + self.count_by_status("partial")
-            + self.count_by_status("finish")
-        )
+        return self._pending_slots + self.count_by_status("finish")
 
     def get_statistics(self) -> dict:
         """Return statistics about the buffer state. Lock-free read."""
         partition_stats = {}
         for pid, part in self.partitions.items():
-            stats = {"pending": 0, "running": 0, "partial": 0, "finish": 0, "total": len(part)}
+            stats = {"finish": 0}
             for v in part.values():
                 status = v.get("current_status", "unknown")
                 if status in stats:
@@ -480,9 +396,6 @@ class ReplayBuffer:
 
         return {
             "partitions": partition_stats,
-            "total_pending": self.count_by_status("pending"),
-            "total_running": self.count_by_status("running") + self.count_by_status("partial"),
-            "total_ready": self.count_by_status("finish"),
             "total_in_flight": self.total_in_flight(),
             # Layer 1: Physical slot control
             "pending_slots": self._pending_slots,

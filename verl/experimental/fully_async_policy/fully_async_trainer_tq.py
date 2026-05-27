@@ -27,9 +27,9 @@ Data flow:
 
 import logging
 import os
-import time
 from typing import Any
 
+import numpy as np
 from omegaconf import OmegaConf
 
 from verl.experimental.fully_async_policy.detach_utils import MetricsAggregator
@@ -166,7 +166,6 @@ class FullyAsyncTrainerTQ(PPOTrainer, FullyAsyncTrainer):
         Returns KVBatchMeta compatible with PPOTrainer's entire step() pipeline.
         """
         print(f"[TQFullyAsyncTrainer] Waiting for {self.required_samples} samples from RB...", flush=True)
-        consumer_start = time.time()
 
         sampled_keys_meta = await self.replay_buffer.wait_and_sample.remote(
             partition_id="train",
@@ -179,14 +178,8 @@ class FullyAsyncTrainerTQ(PPOTrainer, FullyAsyncTrainer):
 
         keys = [k for k, _ in sampled_keys_meta]
         tags = [meta for _, meta in sampled_keys_meta]
-        print(f"[TQFullyAsyncTrainer] Got {len(keys)} samples from RB")
 
-        batch_meta = KVBatchMeta(partition_id="train", keys=keys, tags=tags)
-
-        consumer_end = time.time()
-        print(f"[TQFullyAsyncTrainer] KVBatchMeta ready: {len(keys)} keys, wait={consumer_end - consumer_start:.2f}s")
-
-        return batch_meta
+        return KVBatchMeta(partition_id="train", keys=keys, tags=tags)
 
     async def fit(self):
         """Main training loop: async RB consumption + PPOTrainer step() pipeline."""
@@ -245,6 +238,7 @@ class FullyAsyncTrainerTQ(PPOTrainer, FullyAsyncTrainer):
                 if batch is None:
                     raise TrainingStopException("Training terminated: RB returned None")
                 batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+            print(f"[TQFullyAsyncTrainer] KVBatchMeta ready: {len(batch)} keys, wait={timing_raw['gen']:.2f}s")
 
             # 3. [OPTIONAL] compute reward score with colocated reward model
             # TODO colocate reward not implemented
@@ -286,13 +280,101 @@ class FullyAsyncTrainerTQ(PPOTrainer, FullyAsyncTrainer):
         await self._fit_validate()
         self._fit_save_checkpoint()
         self._stop_profiling()
-        self._fit_collect_metrics(batch)
+        await self._fit_collect_metrics(batch)
         self._fit_postprocess_step()
 
         # Cleanup consumed data from TQ + RB (after _compute_metrics reads TQ via kv_batch_get)
         tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
         await self.replay_buffer.remove.remote(batch.partition_id, batch.keys)
 
-    def _fit_collect_metrics(self, batch: KVBatchMeta):
-        """Collect metrics using PPOTrainer's _compute_metrics (expects KVBatchMeta)."""
+    async def _fit_collect_metrics(self, batch: KVBatchMeta):
+        """Collect metrics using PPOTrainer's _compute_metrics (expects KVBatchMeta).
+
+        Also merges rollouter statistics and TQ timing tags to produce the same set of
+        ``fully_async/*`` and ``timing_s/*`` metrics as the non-TQ path's batch assembly.
+        """
+        # 1. Base PPOTrainer metrics (data, timing, throughput, variance proxy)
         self._compute_metrics(batch, self.metrics, self.timing_raw, global_steps=self.global_steps, epoch=self.epoch)
+
+        # 2. Collect per-sample timing stats from tags for aggregation
+        processing_times = []
+        tool_calls_list = []
+        compute_score_list = []
+        param_versions = []  # max_global_steps per sample (mirrors trajectory_param_versions in detach_utils)
+        param_version_starts = []  # min_global_steps per sample
+        if batch.tags:
+            for tag in batch.tags:
+                if not isinstance(tag, dict):
+                    continue
+                # Collect raw values for aggregation
+                if "timing_s/gen" in tag:
+                    processing_times.append(tag["timing_s/gen"])
+                if "timing_s/agent_loop/tool_calls" in tag:
+                    tool_calls_list.append(tag["timing_s/agent_loop/tool_calls"])
+                if "timing_s/compute_score" in tag:
+                    compute_score_list.append(tag["timing_s/compute_score"])
+                if "max_global_steps" in tag:
+                    param_versions.append(tag["max_global_steps"])
+                if "min_global_steps" in tag:
+                    param_version_starts.append(tag["min_global_steps"])
+                # Merge all fully_async/* and timing_s/* tags directly
+                for key, value in tag.items():
+                    if key.startswith("fully_async") or key.startswith("timing_s"):
+                        self.metrics[key] = value
+
+        # 3. Compute aggregated processing_time stats (mirrors assemble_batch_from_rollout_samples lines 134-149)
+        if processing_times:
+            processing_time_stats = {
+                "fully_async/processing_time/avg": float(np.mean(processing_times)),
+                "fully_async/processing_time/max": float(np.max(processing_times)),
+                "fully_async/processing_time/min": float(np.min(processing_times)),
+                "fully_async/processing_time/tp50": float(np.percentile(processing_times, 50)),
+                "fully_async/processing_time/tp99": float(np.percentile(processing_times, 99)),
+                "fully_async/processing_time/tp95": float(np.percentile(processing_times, 95)),
+            }
+            self.metrics.update(processing_time_stats)
+
+        # 4. Compute tool_calls stats
+        if tool_calls_list:
+            tool_calls_stats = {
+                "timing_s/agent_loop/tool_calls/max": float(np.max(tool_calls_list)),
+                "timing_s/agent_loop/tool_calls/min": float(np.min(tool_calls_list)),
+                "timing_s/agent_loop/tool_calls/mean": float(np.mean(tool_calls_list)),
+            }
+            self.metrics.update(tool_calls_stats)
+
+        # 4b. Compute compute_score stats
+        if compute_score_list:
+            compute_score_stats = {
+                "timing_s/compute_score/max": float(np.max(compute_score_list)),
+                "timing_s/compute_score/min": float(np.min(compute_score_list)),
+                "timing_s/compute_score/mean": float(np.mean(compute_score_list)),
+            }
+            self.metrics.update(compute_score_stats)
+
+        # 5. Compute partial stats from param versions (mirrors assemble_batch_from_rollout_samples lines 151-159)
+        if param_versions and param_version_starts:
+            param_version_diff = [abs(a - b) for a, b in zip(param_versions, param_version_starts, strict=False)]
+            num_diff0 = param_version_diff.count(0)
+            partial_stats = {
+                "fully_async/partial/total_partial_num": len(param_version_diff) - num_diff0,
+                "fully_async/partial/partial_ratio": (len(param_version_diff) - num_diff0) / len(param_version_diff)
+                if param_version_diff
+                else 0.0,
+                "fully_async/partial/max_partial_span": max(param_version_diff) if param_version_diff else 0,
+            }
+            self.metrics.update(partial_stats)
+
+            # 6. stale_trajectory_processed count
+            # Use max_global_steps as trajectory_param_versions
+            stale_traj_count = sum(1 for v in param_versions if self.current_param_version - v >= 1)
+            self.stale_trajectory_processed += stale_traj_count
+            self.metrics["fully_async/count/stale_trajectory_processed"] = self.stale_trajectory_processed
+            self.metrics["fully_async/count/current_param_version"] = self.current_param_version
+
+        # 7. Merge rollouter monitor/count/static stats
+        if self.rollouter is not None:
+            rollouter_stats = await self.rollouter.get_statistics.remote()
+            for k, v in rollouter_stats.items():
+                if isinstance(v, int | float):
+                    self.metrics[f"fully_async/{k}"] = v

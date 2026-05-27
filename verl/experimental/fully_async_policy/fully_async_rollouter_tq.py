@@ -82,18 +82,18 @@ class FullyAsyncAgentLoopWorkerTQ(AgentLoopWorker):
         )
         return output
 
-    async def _postprocess(self, inputs, input_non_tensor_batch=None, validate=False):
+    async def _postprocess(self, outputs: list[AgentLoopOutput], input_non_tensor_batch=None, validate=False):
         """Write all raw outputs to TQ (blocking), return minimal DataProto.
 
         Args:
-            inputs: list of raw AgentLoopOutput returned by _agent_loop_postprocess.
+            outputs: list of raw AgentLoopOutput returned by _agent_loop_postprocess.
             input_non_tensor_batch: non-tensor batch dict from generate_sequences.
             validate: whether this is a validation batch.
         """
-        raw_outputs = inputs
-        n = len(raw_outputs) if raw_outputs else 0
+        outputs = outputs
+        n = len(outputs) if outputs else 0
 
-        if not raw_outputs:
+        if not outputs:
             return DataProto(batch=TensorDict({}, batch_size=n))
 
         # Build first_kwargs from non_tensor_batch (same as AgentLoopWorkerTQ pattern)
@@ -105,14 +105,14 @@ class FullyAsyncAgentLoopWorkerTQ(AgentLoopWorker):
             first_kwargs["uid"] = base_key
 
         # Broadcast final reward score to all outputs in trajectory
-        final_output = raw_outputs[-1]
+        final_output = outputs[-1]
         if final_output.reward_score is not None:
-            for output in raw_outputs[:-1]:
+            for output in outputs[:-1]:
                 output.reward_score = final_output.reward_score
                 output.extra_fields["reward_extra_info"] = final_output.extra_fields.get("reward_extra_info", {})
 
         keys, fields, tags = [], [], []
-        for i, output in enumerate(raw_outputs):
+        for i, output in enumerate(outputs):
             prompts = torch.tensor(output.prompt_ids, dtype=torch.int64)
             responses = torch.tensor(output.response_ids, dtype=torch.int64)
             input_ids = torch.cat([prompts, responses], dim=0)
@@ -138,13 +138,20 @@ class FullyAsyncAgentLoopWorkerTQ(AgentLoopWorker):
             fields.append(field)
 
             prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
+
             tags.append(
                 {
                     "global_steps": global_steps,
+                    "min_global_steps": output.extra_fields.get("min_global_steps", global_steps),
+                    "max_global_steps": output.extra_fields.get("max_global_steps", global_steps),
                     "current_status": "finish",  # Required by ReplayBuffer.wait_and_sample()
                     "prompt_len": prompt_len,
                     "response_len": response_len,
                     "seq_len": prompt_len + response_len,
+                    # Per-sample timing metrics (aggregated into batch-level stats in _fit_collect_metrics)
+                    "timing_s/gen": output.metrics.generate_sequences,
+                    "timing_s/agent_loop/tool_calls": output.metrics.tool_calls,
+                    "timing_s/compute_score": output.metrics.compute_score,
                 }
             )
 
@@ -157,12 +164,9 @@ class FullyAsyncAgentLoopWorkerTQ(AgentLoopWorker):
             partition_id=partition_id,
         )
 
-        bsz = len(raw_outputs)
+        bsz = len(outputs)
         keys_str = ", ".join(keys[:3]) + ("..." if len(keys) > 3 else "")
-        print(
-            f"[FullyAsyncAgentLoopWorkerTQ] Wrote {bsz} samples [{keys_str}] to TQ ({partition_id})",
-            flush=True,
-        )
+        print(f"[FullyAsyncAgentLoopWorkerTQ] Wrote {bsz} trajectories [{keys_str}] to TQ ({partition_id})")
         # Return minimal DataProto — data is already in TQ, caller just needs success signal
         return DataProto(batch=TensorDict({}, batch_size=n))
 
