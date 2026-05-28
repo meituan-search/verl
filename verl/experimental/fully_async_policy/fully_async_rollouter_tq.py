@@ -98,9 +98,8 @@ class FullyAsyncAgentLoopWorkerTQ(AgentLoopWorker):
 
         # Build first_kwargs from non_tensor_batch (same as AgentLoopWorkerTQ pattern)
         first_kwargs = {k: v[0] for k, v in input_non_tensor_batch.items() if k != "__do_sample__"}
-        global_steps = first_kwargs.get("global_steps", -1)
-        base_key = first_kwargs.get("sample_id", f"unknown_{global_steps}")
-        # Ensure uid is present (required by downstream processing)
+        base_key = first_kwargs["sample_id"]
+
         if "uid" not in first_kwargs:
             first_kwargs["uid"] = base_key
 
@@ -141,9 +140,8 @@ class FullyAsyncAgentLoopWorkerTQ(AgentLoopWorker):
 
             tags.append(
                 {
-                    "global_steps": global_steps,
-                    "min_global_steps": output.extra_fields.get("min_global_steps", global_steps),
-                    "max_global_steps": output.extra_fields.get("max_global_steps", global_steps),
+                    "min_global_steps": output.extra_fields["min_global_steps"],
+                    "max_global_steps": output.extra_fields["max_global_steps"],
                     "current_status": "finish",  # Required by ReplayBuffer.wait_and_sample()
                     "prompt_len": prompt_len,
                     "response_len": response_len,
@@ -164,9 +162,13 @@ class FullyAsyncAgentLoopWorkerTQ(AgentLoopWorker):
             partition_id=partition_id,
         )
 
-        bsz = len(outputs)
-        keys_str = ", ".join(keys[:3]) + ("..." if len(keys) > 3 else "")
-        print(f"[FullyAsyncAgentLoopWorkerTQ] Wrote {bsz} trajectories [{keys_str}] to TQ ({partition_id})")
+        # bsz = len(outputs)
+        # keys_str = ", ".join(keys[:3]) + ("..." if len(keys) > 3 else "")
+        # print(
+        #     f"[FullyAsyncAgentLoopWorkerTQ] Wrote {bsz} trajectories [{keys_str}] to TQ ({partition_id})"
+        #     f"tags:{tags}\n"
+        #     f"fields:{fields}\n"
+        # )
         # Return minimal DataProto — data is already in TQ, caller just needs success signal
         return DataProto(batch=TensorDict({}, batch_size=n))
 
@@ -286,9 +288,6 @@ class FullyAsyncRollouterTQ(FullyAsyncRollouter):
             bsz = len(rollout_sample.full_batch)
             rollout_sample.full_batch.non_tensor_batch["sample_id"] = np.array(
                 [rollout_sample.sample_id] * bsz, dtype=object
-            )
-            rollout_sample.full_batch.non_tensor_batch["global_steps"] = np.array(
-                [self.global_steps] * bsz, dtype=np.int64
             )
             await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
             logger.debug(
