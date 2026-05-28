@@ -19,12 +19,13 @@ import os
 import numpy as np
 import ray
 import torch
-from tensordict import TensorDict
+from tensordict import NonTensorData, NonTensorStack, TensorDict
 
 from verl import DataProto
 from verl.experimental.agent_loop import (
     AgentLoopOutput,
     AgentLoopWorker,
+    get_trajectory_info,
 )
 from verl.experimental.fully_async_policy.detach_utils import (
     RolloutSample,
@@ -35,6 +36,7 @@ from verl.experimental.fully_async_policy.fully_async_rollouter import (
     FullyAsyncAgentLoopManager,
     FullyAsyncRollouter,
 )
+from verl.trainer.main_ppo_sync import apply_greedy_sampling_params
 
 try:
     import transfer_queue as tq
@@ -67,49 +69,219 @@ class FullyAsyncAgentLoopWorkerTQ(AgentLoopWorker):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         tq.init()
+        self.background_tasks = set()
 
-    async def _agent_loop_postprocess(self, output: AgentLoopOutput, validate: bool, **kwargs):
-        """Compute scores and return raw AgentLoopOutput; skip tokenizer padding."""
+    # async def _agent_loop_postprocess(self, output: AgentLoopOutput, validate: bool, **kwargs):
+    #     """Compute scores and return raw AgentLoopOutput; skip tokenizer padding."""
+    #
+    #     # Compute reward score and teacher logprobs (same as base class)
+    #     await self._compute_score([output], kwargs=kwargs)
+    #     await self._compute_teacher_logprobs(
+    #         output,
+    #         prompt_ids=output.prompt_ids,
+    #         response_ids=output.response_ids,
+    #         validate=validate,
+    #         sample_kwargs=kwargs,
+    #     )
+    #     return output
 
-        # Compute reward score and teacher logprobs (same as base class)
-        await self._compute_score([output], kwargs=kwargs)
+    # async def _postprocess(self, outputs: list[AgentLoopOutput], input_non_tensor_batch=None, validate=False):
+    #     """Write all raw outputs to TQ (blocking), return minimal DataProto.
+    #
+    #     Args:
+    #         outputs: list of raw AgentLoopOutput returned by _agent_loop_postprocess.
+    #         input_non_tensor_batch: non-tensor batch dict from generate_sequences.
+    #         validate: whether this is a validation batch.
+    #     """
+    #     outputs = outputs
+    #     n = len(outputs) if outputs else 0
+    #
+    #     if not outputs:
+    #         return DataProto(batch=TensorDict({}, batch_size=n))
+    #
+    #     # Build first_kwargs from non_tensor_batch (same as AgentLoopWorkerTQ pattern)
+    #     first_kwargs = {k: v[0] for k, v in input_non_tensor_batch.items() if k != "__do_sample__"}
+    #     base_key = first_kwargs["sample_id"]
+    #
+    #     if "uid" not in first_kwargs:
+    #         first_kwargs["uid"] = base_key
+    #
+    #     # Broadcast final reward score to all outputs in trajectory
+    #     final_output = outputs[-1]
+    #     if final_output.reward_score is not None:
+    #         for output in outputs[:-1]:
+    #             output.reward_score = final_output.reward_score
+    #             output.extra_fields["reward_extra_info"] = final_output.extra_fields.get("reward_extra_info", {})
+    #
+    #     keys, fields, tags = [], [], []
+    #     for i, output in enumerate(outputs):
+    #         prompts = torch.tensor(output.prompt_ids, dtype=torch.int64)
+    #         responses = torch.tensor(output.response_ids, dtype=torch.int64)
+    #         input_ids = torch.cat([prompts, responses], dim=0)
+    #         attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
+    #         multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
+    #         position_ids = self._compute_position_ids(
+    #             input_ids.unsqueeze(0), attention_mask.unsqueeze(0), multi_modal_inputs
+    #         ).squeeze(0)
+    #
+    #         # Key format: {sample_id}_{i} (globally unique)
+    #         keys.append(f"{base_key}_{i}")
+    #
+    #         # Field dict: start from output.as_dict(), then enrich with kwargs
+    #         field = output.as_dict()
+    #         field.update(first_kwargs)
+    #         # Do not store raw image/video
+    #         field.pop("multi_modal_data", None)
+    #         # Uniform response_mask and loss_mask
+    #         field["loss_mask"] = field["response_mask"]
+    #         field["input_ids"] = input_ids
+    #         field["position_ids"] = position_ids
+    #         field["multi_modal_inputs"] = multi_modal_inputs
+    #         fields.append(field)
+    #
+    #         prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
+    #
+    #         tags.append(
+    #             {
+    #                 "min_global_steps": output.extra_fields["min_global_steps"],
+    #                 "max_global_steps": output.extra_fields["max_global_steps"],
+    #                 "current_status": "finish",  # Required by ReplayBuffer.wait_and_sample()
+    #                 "prompt_len": prompt_len,
+    #                 "response_len": response_len,
+    #                 "seq_len": prompt_len + response_len,
+    #                 # Per-sample timing metrics (aggregated into batch-level stats in _fit_collect_metrics)
+    #                 "timing_s/gen": output.metrics.generate_sequences,
+    #                 "timing_s/agent_loop/tool_calls": output.metrics.tool_calls,
+    #                 "timing_s/compute_score": output.metrics.compute_score,
+    #             }
+    #         )
+    #
+    #     # Write to TQ (blocking)
+    #     partition_id = "train" if not validate else "val"
+    #     await tq.async_kv_batch_put(
+    #         keys=keys,
+    #         fields=list_of_dict_to_tensordict(fields),
+    #         tags=tags,
+    #         partition_id=partition_id,
+    #     )
+    #
+    #     # bsz = len(outputs)
+    #     # keys_str = ", ".join(keys[:3]) + ("..." if len(keys) > 3 else "")
+    #     # print(
+    #     #     f"[FullyAsyncAgentLoopWorkerTQ] Wrote {bsz} trajectories [{keys_str}] to TQ ({partition_id})"
+    #     #     f"tags:{tags}\n"
+    #     #     f"fields:{fields}\n"
+    #     # )
+    #     # Return minimal DataProto — data is already in TQ, caller just needs success signal
+    #     return DataProto(batch=TensorDict({}, batch_size=n))
+
+    async def generate_sequences(self, batch: TensorDict):
+        """Spawn agent loop for each sample in the batch without waiting for the results."""
+        validate = batch["validate"] if "validate" in batch else False
+        batch.pop("validate", None)
+        config = self.config.actor_rollout_ref.rollout
+        sampling_params = dict(
+            temperature=config.temperature,
+            top_p=config.top_p,
+            top_k=config.top_k,
+            repetition_penalty=1.0,
+            logprobs=config.calculate_log_probs,
+        )
+
+        # override sampling params for validation
+        if validate:
+            sampling_params["top_p"] = config.val_kwargs.top_p
+            sampling_params["top_k"] = config.val_kwargs.top_k
+            sampling_params["temperature"] = config.val_kwargs.temperature
+
+        # by default, we assume it's a single turn agent
+        if "agent_name" not in batch:
+            default_agent_loop = config.agent.default_agent_loop
+            batch["agent_name"] = NonTensorData(default_agent_loop)
+
+        trajectory_info = await get_trajectory_info(batch["global_steps"], batch["index"], validate)
+
+        # create background tasks for each sample in the batch (fire-and-forget, same as main_ppo_sync.py)
+        for i in range(len(batch)):
+            # TODO(wuxibin): add trace support
+            trace_this_sample = False
+            prompt = {}
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    prompt[k] = v[i]
+                elif isinstance(v, NonTensorStack):
+                    prompt[k] = v[i].data
+                elif isinstance(v, NonTensorData):
+                    prompt[k] = v.data
+                else:
+                    logger.exception(f"Unsupported type {type(v)} for key {k}")
+
+            # fire-and-forget background tasks (same pattern as main_ppo_sync.py AgentLoopWorkerTQ)
+            task = asyncio.create_task(
+                self._run_prompt(prompt, sampling_params, trajectory=trajectory_info[i], trace=trace_this_sample)
+            )
+            self.background_tasks.add(task)
+            task.add_done_callback(self.background_tasks.discard)
+
+    async def _run_prompt(self, prompt: dict, sampling_params: dict, trajectory: dict, trace: bool = False) -> None:
+        """Spawn multiple agent loops in parallel according to rollout.n or rollout.val_kwargs.n."""
+        uid, partition_id = prompt["uid"], "train" if not trajectory["validate"] else "val"
+        try:
+            # NOTE: user can dynamically adjust n for each sample here, e.g according to task difficulty.
+            config = self.config.actor_rollout_ref.rollout
+            n = prompt.pop("__rollout_n__", config.n if not trajectory["validate"] else config.val_kwargs.n)
+            do_sample = prompt.pop("__do_sample__", True)
+
+            run_sampling_params = dict(sampling_params)
+            if not trajectory["validate"] and not do_sample:
+                apply_greedy_sampling_params(run_sampling_params)
+
+            tasks = []
+            for i in range(n):
+                task = asyncio.create_task(
+                    self._run_agent_loop(
+                        run_sampling_params, trajectory=trajectory, trace=trace, session_id=i, **prompt
+                    )
+                )
+                tasks.append(task)
+            await asyncio.gather(*tasks)
+            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "finished"})
+        except Exception as e:
+            logger.exception(f"Error in _run_prompt: {e}")
+            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
+
+    async def _agent_loop_postprocess(
+        self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs
+    ) -> None:
+        """Put agent loop outputs into TransferQueue."""
+        uid, session_id = kwargs["uid"], kwargs["session_id"]
+        outputs = output if isinstance(output, list) else [output]
+        if not outputs:
+            logger.warning(f"Empty output for prompt {uid}_{session_id}")
+            return
+
+        await self._compute_score(outputs, kwargs=kwargs)
+
+        final_output = outputs[-1]
+        # TODO: Support output:list[AgentLoopOutput]
         await self._compute_teacher_logprobs(
-            output,
-            prompt_ids=output.prompt_ids,
-            response_ids=output.response_ids,
+            final_output,
+            prompt_ids=final_output.prompt_ids,
+            response_ids=final_output.response_ids,
             validate=validate,
             sample_kwargs=kwargs,
         )
-        return output
 
-    async def _postprocess(self, outputs: list[AgentLoopOutput], input_non_tensor_batch=None, validate=False):
-        """Write all raw outputs to TQ (blocking), return minimal DataProto.
-
-        Args:
-            outputs: list of raw AgentLoopOutput returned by _agent_loop_postprocess.
-            input_non_tensor_batch: non-tensor batch dict from generate_sequences.
-            validate: whether this is a validation batch.
-        """
-        outputs = outputs
-        n = len(outputs) if outputs else 0
-
-        if not outputs:
-            return DataProto(batch=TensorDict({}, batch_size=n))
-
-        # Build first_kwargs from non_tensor_batch (same as AgentLoopWorkerTQ pattern)
-        first_kwargs = {k: v[0] for k, v in input_non_tensor_batch.items() if k != "__do_sample__"}
-        base_key = first_kwargs["sample_id"]
-
-        if "uid" not in first_kwargs:
-            first_kwargs["uid"] = base_key
-
-        # Broadcast final reward score to all outputs in trajectory
-        final_output = outputs[-1]
         if final_output.reward_score is not None:
             for output in outputs[:-1]:
                 output.reward_score = final_output.reward_score
-                output.extra_fields["reward_extra_info"] = final_output.extra_fields.get("reward_extra_info", {})
+                output.extra_fields["reward_extra_info"] = final_output.extra_fields["reward_extra_info"]
 
+        # NOTE: agent loop may has multiple outputs, put each output into TransferQueue.
+        # key format: {uid}_{session_id}_{index}
+        # - uid: raw prompt uid from dataset
+        # - session_id: session id for rollout.n sampling
+        # - index: index of agent loop output
         keys, fields, tags = [], [], []
         for i, output in enumerate(outputs):
             prompts = torch.tensor(output.prompt_ids, dtype=torch.int64)
@@ -121,64 +293,83 @@ class FullyAsyncAgentLoopWorkerTQ(AgentLoopWorker):
                 input_ids.unsqueeze(0), attention_mask.unsqueeze(0), multi_modal_inputs
             ).squeeze(0)
 
-            # Key format: {sample_id}_{i} (globally unique)
-            keys.append(f"{base_key}_{i}")
-
-            # Field dict: start from output.as_dict(), then enrich with kwargs
+            keys.append(f"{uid}_{session_id}_{i}")
             field = output.as_dict()
-            field.update(first_kwargs)
-            # Do not store raw image/video
+            field.update(kwargs)
+            # do not store raw image/video
             field.pop("multi_modal_data", None)
-            # Uniform response_mask and loss_mask
+            # TODO: uniform response_mask and loss_mask
             field["loss_mask"] = field["response_mask"]
             field["input_ids"] = input_ids
             field["position_ids"] = position_ids
             field["multi_modal_inputs"] = multi_modal_inputs
             fields.append(field)
-
             prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
-
             tags.append(
                 {
+                    "global_steps": kwargs["global_steps"],
                     "min_global_steps": output.extra_fields["min_global_steps"],
                     "max_global_steps": output.extra_fields["max_global_steps"],
-                    "current_status": "finish",  # Required by ReplayBuffer.wait_and_sample()
+                    "status": "success",
                     "prompt_len": prompt_len,
                     "response_len": response_len,
                     "seq_len": prompt_len + response_len,
-                    # Per-sample timing metrics (aggregated into batch-level stats in _fit_collect_metrics)
-                    "timing_s/gen": output.metrics.generate_sequences,
-                    "timing_s/agent_loop/tool_calls": output.metrics.tool_calls,
-                    "timing_s/compute_score": output.metrics.compute_score,
                 }
             )
 
-        # Write to TQ (blocking)
-        partition_id = "train" if not validate else "val"
         await tq.async_kv_batch_put(
             keys=keys,
             fields=list_of_dict_to_tensordict(fields),
             tags=tags,
-            partition_id=partition_id,
+            partition_id="train" if not validate else "val",
         )
-
-        # bsz = len(outputs)
-        # keys_str = ", ".join(keys[:3]) + ("..." if len(keys) > 3 else "")
-        # print(
-        #     f"[FullyAsyncAgentLoopWorkerTQ] Wrote {bsz} trajectories [{keys_str}] to TQ ({partition_id})"
-        #     f"tags:{tags}\n"
-        #     f"fields:{fields}\n"
-        # )
-        # Return minimal DataProto — data is already in TQ, caller just needs success signal
-        return DataProto(batch=TensorDict({}, batch_size=n))
 
 
 class FullyAsyncAgentLoopManagerTQ(FullyAsyncAgentLoopManager):
-    """Agent loop manager that uses FullyAsyncAgentLoopWorkerTQ workers."""
+    """Agent loop manager that uses FullyAsyncAgentLoopWorkerTQ workers.
+
+    Key difference from base FullyAsyncAgentLoopManager:
+    - Overrides ``generate_sequences_single`` to convert DataProto → TensorDict
+      before dispatching to workers, aligning with main_ppo_sync.py's calling convention
+      where AgentLoopWorkerTQ expects TensorDict (not DataProto).
+    """
 
     def __init__(self, *args, **kwargs):
         self.agent_loop_workers_class = ray.remote(FullyAsyncAgentLoopWorkerTQ)
         super().__init__(*args, **kwargs)
+
+    async def generate_sequences_single(self, prompts):
+        """Convert DataProto to TensorDict, then dispatch to agent loop worker.
+
+        Aligns with main_ppo_sync.py PPOTrainer.step() which calls:
+            batch = tu.get_tensordict(batch_dict)
+            self.async_rollout_manager.generate_sequences(batch)
+
+        Args:
+            prompts (DataProto): Input batch (will be converted to TensorDict internally).
+        Returns:
+            TensorDict: Output (empty, since TQ worker writes data directly to TransferQueue).
+        """
+        # Convert DataProto → TensorDict (align with main_ppo_sync.py input side)
+        # Manually merge batch + non_tensor_batch into a TensorDict, and lift meta_info
+        # fields (validate, global_steps) into the TensorDict as NonTensorData — this
+        # avoids the key collision in DataProto.to_tensordict() which also merges meta_info.
+        if isinstance(prompts, DataProto):
+            from verl.utils import tensordict_utils as tu
+
+            tensor_batch = prompts.batch.to_dict() if prompts.batch is not None else {}
+            for key, val in prompts.non_tensor_batch.items():
+                tensor_batch[key] = val
+            # Lift critical meta_info fields that generate_sequences expects as batch keys
+            if "validate" in prompts.meta_info:
+                tensor_batch["validate"] = prompts.meta_info["validate"]
+            if "global_steps" in prompts.meta_info:
+                tensor_batch["global_steps"] = prompts.meta_info["global_steps"]
+            prompts = tu.get_tensordict(tensor_batch)
+
+        worker = self._select_best_worker()
+        output_future = worker.generate_sequences.remote(prompts)
+        return await asyncio.wrap_future(output_future.future())
 
 
 class FullyAsyncRollouterTQ(FullyAsyncRollouter):
@@ -289,6 +480,16 @@ class FullyAsyncRollouterTQ(FullyAsyncRollouter):
             rollout_sample.full_batch.non_tensor_batch["sample_id"] = np.array(
                 [rollout_sample.sample_id] * bsz, dtype=object
             )
+            # Inject global_steps into non_tensor_batch (align with main_ppo_sync.py:1395
+            # tu.assign_non_tensor_data(batch, "global_steps", self.global_steps))
+            # so that AgentLoopWorkerTQ.generate_sequences can access it via batch["global_steps"]
+            rollout_sample.full_batch.non_tensor_batch["global_steps"] = np.array(
+                [self.global_steps] * bsz, dtype=np.int64
+            )
+            # Inject uid into non_tensor_batch (align with main_ppo_sync.py:1393
+            # batch_dict["uid"] = np.array([str(uuid.uuid4()) for _ in range(bsz)], dtype=object)
+            # _run_prompt needs prompt["uid"] to generate unique TQ keys
+            rollout_sample.full_batch.non_tensor_batch["uid"] = np.array([rollout_sample.sample_id] * bsz, dtype=object)
             await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
             logger.debug(
                 f"[TQFullyAsyncRollouter][_process_single] generate + TQ write done for {rollout_sample.sample_id}",

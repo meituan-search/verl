@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 # Status type
-StatusType = Literal["error", "finish"]
+StatusType = Literal["error", "success"]
 
 
 @ray.remote(max_concurrency=100)
@@ -260,7 +260,7 @@ class ReplayBuffer:
                 if self._finished:
                     part = self.partitions.get(partition_id)
                     if part:
-                        ready = [(k, v) for k, v in part.items() if v.get("current_status") == "finish"]
+                        ready = [(k, v) for k, v in part.items() if v.get("status") == "success"]
                         if ready:
                             print(
                                 "[ReplayBuffer][wait_and_sample] Finished, returning "
@@ -275,7 +275,7 @@ class ReplayBuffer:
                 # Check if enough finish samples are ready
                 part = self.partitions.get(partition_id)
                 if part is not None:
-                    ready = [(k, v) for k, v in part.items() if v.get("current_status") == "finish"]
+                    ready = [(k, v) for k, v in part.items() if v.get("status") == "success"]
 
                     if len(ready) >= batch_size:
                         print(
@@ -377,19 +377,19 @@ class ReplayBuffer:
             parts = [self.partitions.get(partition_id, {})]
         else:
             parts = list(self.partitions.values())
-        return sum(1 for part in parts for v in part.values() if v.get("current_status") == status)
+        return sum(1 for part in parts for v in part.values() if v.get("status") == status)
 
     def total_in_flight(self) -> int:
         """Total in-flight samples across all non-terminal states. Lock-free read."""
-        return self._pending_slots + self.count_by_status("finish")
+        return self._pending_slots + self.count_by_status("success")
 
     def get_statistics(self) -> dict:
         """Return statistics about the buffer state. Lock-free read."""
         partition_stats = {}
         for pid, part in self.partitions.items():
-            stats = {"finish": 0}
+            stats = {"success": 0}
             for v in part.values():
-                status = v.get("current_status", "unknown")
+                status = v.get("status", "unknown")  # Align with wait_and_sample() which uses "status" key
                 if status in stats:
                     stats[status] += 1
             partition_stats[pid] = stats
