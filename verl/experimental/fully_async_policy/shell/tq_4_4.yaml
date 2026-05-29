@@ -14,7 +14,7 @@ env_vars:
   # For distributed training, the path must be set on a distributed file system (DFS) to ensure visibility across all nodes.
   HF_HOME: "/tmp/hf_home_mimo"
   PYTHONPATH: "/tmp/hf_home_mimo/modules/"
-  TENSORBOARD_DIR: "/home/hadoop-djst-algoplat/data/tensorboard/qwen2.5-7b-math/4-4-tq-4"
+  TENSORBOARD_DIR: "/home/hadoop-djst-algoplat/data/tensorboard/qwen2.5-7b-math/4-4-tq-6"
   MODEL_PATH: "/home/hadoop-djst-algoplat/model/Qwen2.5-0.5B-Instruct"
 #  MODEL_PATH: "/home/hadoop-djst-algoplat/model/Qwen2.5-Math-7B"
   TRAIN_FILE: "/home/hadoop-djst-algoplat/data/gsm8k/train.parquet"

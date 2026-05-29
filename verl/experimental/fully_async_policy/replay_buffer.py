@@ -216,6 +216,7 @@ class ReplayBuffer:
                 if physical_ok and version_ok:
                     self._pending_slots += 1
                     self._version_slots += 1
+                    print(f"[ReplayBuffer][acquire_slot] Acquiring slot, pending_slots={self._pending_slots}")
                     return True
 
                 # Wait for notification (slot release, reset_staleness, or signal_finish)
@@ -242,10 +243,12 @@ class ReplayBuffer:
         Mirrors fully_async_rollouter.py:886 idle tracking.
         """
         async with self._slot_available:
+            print(f"[ReplayBuffer][release_slot] Releasing slot, pending_slots={self._pending_slots}")
             self._pending_slots = max(0, self._pending_slots - 1)
             # Record idle start when all slots are released (rollouter has no work)
             if self._pending_slots == 0:
                 self.idle_start_time = time.time()
+                print(f"[ReplayBuffer][release_slot] Idle start recorded at {self.idle_start_time}")
             self._slot_available.notify_all()
 
     async def wait_and_sample(

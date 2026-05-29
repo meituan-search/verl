@@ -14,6 +14,7 @@
 
 
 import torch
+import torch.nn.functional as F
 from tensordict import TensorDict
 
 from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
@@ -95,6 +96,28 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     old_log_prob = data["old_log_probs"]
     advantages = data["advantages"]
     rollout_is_weights = data.get("rollout_is_weights", None)
+
+    # [FIX] Ensure all tensors have the same shape as log_prob.
+    # TQ stores each field as an independent nested tensor; to_padded_tensor() pads
+    # each to its own max element size, causing shape mismatches between fields.
+    target_len = log_prob.shape[1]
+    if old_log_prob.shape[1] != target_len:
+        if old_log_prob.shape[1] < target_len:
+            old_log_prob = F.pad(old_log_prob, (0, target_len - old_log_prob.shape[1]))
+        else:
+            old_log_prob = old_log_prob[:, :target_len]
+        print(f"[DEBUG ppo_loss] FIXED old_log_prob shape: {old_log_prob.shape}", flush=True)
+    if response_mask.shape[1] != target_len:
+        if response_mask.shape[1] < target_len:
+            response_mask = F.pad(response_mask, (0, target_len - response_mask.shape[1]), value=False)
+        else:
+            response_mask = response_mask[:, :target_len]
+    if advantages.shape[1] != target_len:
+        if advantages.shape[1] < target_len:
+            advantages = F.pad(advantages, (0, target_len - advantages.shape[1]), value=0.0)
+        else:
+            advantages = advantages[:, :target_len]
+        print(f"[DEBUG ppo_loss] FIXED advantages shape: {advantages.shape}", flush=True)
 
     loss_agg_mode = config.loss_agg_mode
 
