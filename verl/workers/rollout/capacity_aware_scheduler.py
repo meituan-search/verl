@@ -120,7 +120,74 @@ class _CapacityAwareScheduler:
                 healthy=True,
                 last_polled=0.0,
             )
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    task = asyncio.ensure_future(self._poll_loop(server_id))
+                    self._poll_tasks[server_id] = task
+                # else: no running event loop (e.g. sync test context); poll loop
+                # must be started explicitly via _start_poll_loops() once running.
+            except RuntimeError:
+                # No event loop at all; same fallback as above.
+                pass
         logger.info(f"[CapacityAwareScheduler] added {len(servers)} servers")
+
+    async def _start_poll_loops(self) -> None:
+        """Start one background poll Task per replica. Call once after __init__ inside Ray actor."""
+        for server_id in list(self._states):
+            task = asyncio.ensure_future(self._poll_loop(server_id))
+            self._poll_tasks[server_id] = task
+
+    async def _poll_loop(self, server_id: str) -> None:
+        while server_id in self._states:
+            try:
+                usage = await self._load_backend.fetch(server_id)
+                state = self._states[server_id]
+                state.token_usage = usage
+                state.healthy = True
+                state.last_polled = time.time()
+                if usage < self._capacity_threshold:
+                    self._capacity_event.set()
+            except Exception as exc:
+                logger.warning(f"[CapacityAwareScheduler] poll failed for {server_id}: {exc}")
+                if server_id in self._states:
+                    self._states[server_id].healthy = False
+            await asyncio.sleep(self._poll_interval_s)
+
+    async def acquire_server(
+        self,
+        request_id: str,
+        group_id: str | None = None,
+    ) -> tuple[str, ray.actor.ActorHandle]:
+        key = group_id or request_id
+
+        # Path A: established group — unconditional sticky route
+        if key in self._affinity:
+            server_id = self._affinity[key]
+            return server_id, self._states[server_id].handle
+
+        # Path B: new group — capacity-gated dispatch
+        while True:
+            best = self._best_available()
+            if best is not None:
+                self._affinity[key] = best.server_id
+                return best.server_id, best.handle
+            self._capacity_event.clear()
+            await self._capacity_event.wait()
+
+    def _best_available(self) -> ReplicaState | None:
+        available = [
+            s for s in self._states.values()
+            if s.healthy and s.token_usage < self._capacity_threshold
+        ]
+        if not available:
+            return None
+        min_usage = min(s.token_usage for s in available)
+        candidates = [s for s in available if s.token_usage - min_usage < 0.05]
+        return random.choice(candidates)
+
+    def release_server(self, server_id: str) -> None:
+        self._capacity_event.set()
 
     def remove_servers(self, server_ids: list[str]) -> None:
         for sid in server_ids:

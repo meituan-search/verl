@@ -167,3 +167,159 @@ def test_get_status():
     assert status["replicas"]["http://h0:8000"]["token_usage"] == 0.4
     assert "affinity_count" in status
     assert "capacity_threshold" in status
+
+
+# ---------------------------------------------------------------------------
+# Task 4: _poll_loop + _start_poll_loops
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_updates_token_usage():
+    sched, _ = _make_scheduler(("http://h0:8000",))
+    sched._poll_interval_s = 0.01
+    call_count = 0
+
+    async def fake_fetch(address):
+        nonlocal call_count
+        call_count += 1
+        return 0.6
+
+    sched._load_backend.fetch = fake_fetch
+    task = asyncio.ensure_future(sched._poll_loop("http://h0:8000"))
+    await asyncio.sleep(0.08)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert call_count >= 2
+    assert sched._states["http://h0:8000"].token_usage == pytest.approx(0.6)
+    assert sched._states["http://h0:8000"].healthy is True
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_marks_unhealthy_on_error():
+    sched, _ = _make_scheduler(("http://h0:8000",))
+    sched._poll_interval_s = 0.01
+
+    async def fail_fetch(address):
+        raise Exception("connection refused")
+
+    sched._load_backend.fetch = fail_fetch
+    task = asyncio.ensure_future(sched._poll_loop("http://h0:8000"))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert sched._states["http://h0:8000"].healthy is False
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_sets_capacity_event_when_below_threshold():
+    sched, _ = _make_scheduler(("http://h0:8000",))
+    sched._poll_interval_s = 0.01
+    sched._capacity_event.clear()
+
+    async def fetch_low(address):
+        return 0.3
+
+    sched._load_backend.fetch = fetch_low
+    task = asyncio.ensure_future(sched._poll_loop("http://h0:8000"))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert sched._capacity_event.is_set()
+
+
+# ---------------------------------------------------------------------------
+# Task 5: acquire_server, _best_available, release_server
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_acquire_server_new_group_routes_to_least_loaded():
+    sched, handles = _make_scheduler(("http://h0:8000", "http://h1:8000"))
+    sched._states["http://h0:8000"].token_usage = 0.3
+    sched._states["http://h1:8000"].token_usage = 0.6
+    sched._capacity_event.set()
+
+    server_id, handle = await sched.acquire_server("req-1", group_id="group-1")
+    assert server_id == "http://h0:8000"
+    assert sched._affinity["group-1"] == "http://h0:8000"
+
+
+@pytest.mark.asyncio
+async def test_acquire_server_sticky_group_bypasses_capacity():
+    sched, handles = _make_scheduler(("http://h0:8000", "http://h1:8000"))
+    sched._states["http://h0:8000"].token_usage = 0.95  # over threshold
+    sched._states["http://h1:8000"].token_usage = 0.3
+    sched._affinity["group-2"] = "http://h0:8000"
+    sched._capacity_event.set()
+
+    server_id, handle = await sched.acquire_server("req-2", group_id="group-2")
+    assert server_id == "http://h0:8000"  # sticky despite over threshold
+
+
+@pytest.mark.asyncio
+async def test_acquire_server_blocks_when_all_full_then_unblocks():
+    sched, handles = _make_scheduler(("http://h0:8000",))
+    sched._states["http://h0:8000"].token_usage = 0.95
+    sched._capacity_event.clear()
+
+    acquired = []
+
+    async def do_acquire():
+        sid, _ = await sched.acquire_server("req-3", group_id="group-3")
+        acquired.append(sid)
+
+    task = asyncio.ensure_future(do_acquire())
+    await asyncio.sleep(0.02)
+    assert len(acquired) == 0  # still blocked
+
+    sched._states["http://h0:8000"].token_usage = 0.5
+    sched._capacity_event.set()
+    await asyncio.sleep(0.02)
+
+    assert acquired == ["http://h0:8000"]
+    task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_acquire_server_no_group_id_falls_back_to_request_id():
+    sched, handles = _make_scheduler(("http://h0:8000", "http://h1:8000"))
+    sched._states["http://h0:8000"].token_usage = 0.4
+    sched._states["http://h1:8000"].token_usage = 0.7
+    sched._capacity_event.set()
+
+    server_id, _ = await sched.acquire_server("req-4")
+    assert server_id == "http://h0:8000"
+    assert sched._affinity.get("req-4") == "http://h0:8000"
+
+
+def test_release_server_sets_capacity_event():
+    sched, _ = _make_scheduler()
+    sched._capacity_event.clear()
+    sched.release_server("http://h0:8000")
+    assert sched._capacity_event.is_set()
+
+
+def test_best_available_randomizes_within_epsilon():
+    sched, _ = _make_scheduler(("http://h0:8000", "http://h1:8000", "http://h2:8000"))
+    sched._states["http://h0:8000"].token_usage = 0.30
+    sched._states["http://h1:8000"].token_usage = 0.32
+    sched._states["http://h2:8000"].token_usage = 0.80  # over threshold
+
+    seen = set()
+    for _ in range(40):
+        result = sched._best_available()
+        seen.add(result.server_id)
+    assert seen == {"http://h0:8000", "http://h1:8000"}
