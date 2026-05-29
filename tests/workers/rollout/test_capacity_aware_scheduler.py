@@ -323,3 +323,29 @@ def test_best_available_randomizes_within_epsilon():
         result = sched._best_available()
         seen.add(result.server_id)
     assert seen == {"http://h0:8000", "http://h1:8000"}
+
+
+# ---------------------------------------------------------------------------
+# Task 6: LLMServerClient group_id forwarding
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_llm_server_client_passes_group_id_to_acquire():
+    """LLMServerClient.generate() must forward group_id to acquire_server.remote()."""
+    from verl.workers.rollout.llm_server import LLMServerClient
+    from verl.workers.rollout.replica import TokenOutput
+
+    mock_output = TokenOutput(token_ids=[1, 2, 3], log_probs=None, stop_reason="stop", extra_fields={})
+
+    mock_lb = MagicMock()
+    mock_handle = MagicMock()
+    mock_lb.acquire_server.remote = AsyncMock(return_value=("http://h0:8000", mock_handle))
+    mock_lb.release_server.remote = MagicMock()
+    mock_handle.generate.remote = AsyncMock(return_value=mock_output)
+
+    cfg = MagicMock()
+    client = LLMServerClient(config=cfg, load_balancer_handle=mock_lb)
+    await client.generate("req-1", group_id="group-A", prompt_ids=[10, 20], sampling_params={})
+
+    mock_lb.acquire_server.remote.assert_called_once()
+    call_kwargs = mock_lb.acquire_server.remote.call_args.kwargs
+    assert call_kwargs.get("group_id") == "group-A"
