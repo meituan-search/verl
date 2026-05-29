@@ -43,7 +43,11 @@ DEFAULT_ROUTING_CACHE_SIZE = 10000
 
 @ray.remote
 class GlobalRequestLoadBalancer:
-    """Global sticky-session + in-flight load balancer shared by all AgentLoopWorkers.
+    """Deprecated: use CapacityAwareScheduler instead.
+
+    Kept for backward compatibility. Will be removed in a future release.
+
+    Global sticky-session + in-flight load balancer shared by all AgentLoopWorkers.
 
     When a sticky session points to a removed server, the cache entry is
     automatically invalidated and a new server is selected.
