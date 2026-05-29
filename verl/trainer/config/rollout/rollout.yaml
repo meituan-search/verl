@@ -478,3 +478,18 @@ disaggregation:
 
   # InfiniBand device (required for mooncake over RDMA).
   ib_device: null
+
+# Load balancer configuration for CapacityAwareScheduler
+load_balance:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.LoadBalanceConfig
+
+  # KV cache usage ratio above which a replica is considered full (new groups blocked)
+  capacity_threshold: 0.85
+
+  # How often to poll each replica's /v1/loads endpoint (milliseconds)
+  poll_interval_ms: 200
+
+  # Backend adapter: sglang | vllm
+  backend: sglang

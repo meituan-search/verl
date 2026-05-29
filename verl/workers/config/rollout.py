@@ -33,6 +33,7 @@ __all__ = [
     "RolloutConfig",
     "CheckpointEngineConfig",
     "SkipConfig",
+    "LoadBalanceConfig",
 ]
 
 
@@ -158,6 +159,20 @@ class CheckpointEngineConfig(BaseConfig):
 
 
 @dataclass
+class LoadBalanceConfig(BaseConfig):
+    """
+    Configuration for CapacityAwareScheduler load balancing across rollout replicas.
+    """
+
+    # KV cache usage ratio above which a replica is considered full (new groups blocked)
+    capacity_threshold: float = 0.85
+    # How often to poll each replica's /v1/loads endpoint (milliseconds)
+    poll_interval_ms: int = 200
+    # Backend adapter: sglang | vllm
+    backend: str = "sglang"
+
+
+@dataclass
 class RolloutConfig(BaseConfig):
     _mutable_fields = {
         "max_model_len",
@@ -280,6 +295,9 @@ class RolloutConfig(BaseConfig):
     qat: Optional[dict] = None
 
     disaggregation: DisaggregationConfig = field(default_factory=DisaggregationConfig)
+
+    # Load balancer configuration for CapacityAwareScheduler
+    load_balance: LoadBalanceConfig = field(default_factory=LoadBalanceConfig)
 
     def __post_init__(self):
         """Validate the rollout config"""
