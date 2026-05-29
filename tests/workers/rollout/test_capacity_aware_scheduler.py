@@ -109,3 +109,61 @@ async def test_vllm_load_backend_parses_prometheus():
     with patch("verl.workers.rollout.capacity_aware_scheduler.aiohttp.ClientSession", return_value=mock_session):
         usage = await backend.fetch("http://host:9000")
     assert usage == pytest.approx(0.72)
+
+
+# ---------------------------------------------------------------------------
+# Tests for CapacityAwareScheduler skeleton
+# ---------------------------------------------------------------------------
+from verl.workers.rollout.capacity_aware_scheduler import _CapacityAwareScheduler
+
+
+def _make_scheduler(addresses=("http://h0:8000", "http://h1:8000")):
+    handles = {addr: MagicMock() for addr in addresses}
+    # Use the raw (non-Ray-decorated) class so object.__new__ works without a Ray cluster
+    sched = object.__new__(_CapacityAwareScheduler)
+    _CapacityAwareScheduler.__init__(sched, servers=handles, capacity_threshold=0.85, poll_interval_ms=200, load_backend="sglang")
+    return sched, handles
+
+
+def test_scheduler_init_creates_replica_states():
+    sched, handles = _make_scheduler()
+    assert len(sched._states) == 2
+    for addr in handles:
+        assert sched._states[addr].server_id == addr
+        assert sched._states[addr].token_usage == 0.0
+        assert sched._states[addr].healthy is True
+
+
+def test_add_servers():
+    sched, _ = _make_scheduler(("http://h0:8000",))
+    new_handle = MagicMock()
+    sched.add_servers({"http://h2:8000": new_handle})
+    assert "http://h2:8000" in sched._states
+    assert sched._states["http://h2:8000"].handle is new_handle
+
+
+def test_remove_servers_cleans_state():
+    sched, _ = _make_scheduler()
+    mock_task = MagicMock()
+    mock_task.cancel = MagicMock()
+    sched._poll_tasks["http://h0:8000"] = mock_task
+    sched.remove_servers(["http://h0:8000"])
+    assert "http://h0:8000" not in sched._states
+    mock_task.cancel.assert_called_once()
+
+
+def test_clear_affinity():
+    sched, _ = _make_scheduler()
+    sched._affinity["group_1"] = "http://h0:8000"
+    sched.clear_affinity()
+    assert len(sched._affinity) == 0
+
+
+def test_get_status():
+    sched, _ = _make_scheduler()
+    sched._states["http://h0:8000"].token_usage = 0.4
+    status = sched.get_status()
+    assert "replicas" in status
+    assert status["replicas"]["http://h0:8000"]["token_usage"] == 0.4
+    assert "affinity_count" in status
+    assert "capacity_threshold" in status
