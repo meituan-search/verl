@@ -36,4 +36,5 @@ def test_load_balance_config_from_yaml():
     raw = OmegaConf.create(yaml)
     cfg = LoadBalanceConfig(**raw)
     assert cfg.capacity_threshold == 0.90
+    assert cfg.poll_interval_ms == 100
     assert cfg.backend == "vllm"
