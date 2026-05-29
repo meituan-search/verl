@@ -52,7 +52,8 @@ class SGLangLoadBackend:
             async with session.get(f"{address}/v1/loads") as resp:
                 data = await resp.json()
                 d = data[0]
-                return d["num_used_tokens"] / d["num_total_tokens"]
+                total = d["num_total_tokens"]
+                return d["num_used_tokens"] / total if total > 0 else 0.0
 
 
 class VLLMLoadBackend:
