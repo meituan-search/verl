@@ -29,45 +29,55 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class LoadMetrics:
+    token_usage: float       # 0.0–1.0, KV cache utilization
+    num_total_tokens: int    # total KV cache capacity in tokens; 0 = unknown
+
+
+@dataclass
 class ReplicaState:
-    server_id: str          # also the HTTP base URL, e.g. "http://host:8000"
+    server_id: str                 # also the HTTP base URL, e.g. "http://host:8000"
     handle: ray.actor.ActorHandle
-    token_usage: float      # 0.0–1.0, from /v1/loads
+    token_usage: float             # 0.0–1.0, last polled KV cache utilization
     healthy: bool
-    last_polled: float      # Unix timestamp
+    last_polled: float             # Unix timestamp
+    num_total_tokens: int = 1      # KV cache capacity; updated each poll cycle
+    pending_tokens: int = 0        # tokens dispatched since last poll, not yet reflected in token_usage
 
 
 class LoadBackend(Protocol):
-    async def fetch(self, address: str) -> float:
-        """Return token_usage in [0.0, 1.0]."""
+    async def fetch(self, address: str) -> LoadMetrics:
+        """Return current load metrics for the replica at address."""
         ...
 
 
 class SGLangLoadBackend:
-    """Fetches token_usage from sglang /v1/loads endpoint."""
+    """Fetches load metrics from sglang /v1/loads endpoint."""
 
-    async def fetch(self, address: str) -> float:
+    async def fetch(self, address: str) -> LoadMetrics:
         timeout = aiohttp.ClientTimeout(total=0.5)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(f"{address}/v1/loads") as resp:
                 data = await resp.json()
                 d = data[0]
                 total = d["num_total_tokens"]
-                return d["num_used_tokens"] / total if total > 0 else 0.0
+                usage = d["num_used_tokens"] / total if total > 0 else 0.0
+                return LoadMetrics(token_usage=usage, num_total_tokens=total)
 
 
 class VLLMLoadBackend:
-    """Fetches token_usage from vLLM Prometheus /metrics endpoint."""
+    """Fetches load metrics from vLLM Prometheus /metrics endpoint."""
 
-    async def fetch(self, address: str) -> float:
+    async def fetch(self, address: str) -> LoadMetrics:
         timeout = aiohttp.ClientTimeout(total=0.5)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(f"{address}/metrics") as resp:
                 text = await resp.text()
         for line in text.splitlines():
             if line.startswith("vllm:gpu_cache_usage_perc") and not line.startswith("#"):
-                return float(line.split()[-1])
-        return 0.0
+                # vLLM Prometheus does not expose raw token counts; pending estimation disabled
+                return LoadMetrics(token_usage=float(line.split()[-1]), num_total_tokens=0)
+        return LoadMetrics(token_usage=0.0, num_total_tokens=0)
 
 
 def _make_load_backend(backend: str) -> LoadBackend:
@@ -141,12 +151,16 @@ class _CapacityAwareScheduler:
     async def _poll_loop(self, server_id: str) -> None:
         while server_id in self._states:
             try:
-                usage = await self._load_backend.fetch(server_id)
+                metrics = await self._load_backend.fetch(server_id)
                 state = self._states[server_id]
-                state.token_usage = usage
+                state.token_usage = metrics.token_usage
+                if metrics.num_total_tokens > 0:
+                    state.num_total_tokens = metrics.num_total_tokens
+                # Poll reflects actual server state; reset pending estimate
+                state.pending_tokens = 0
                 state.healthy = True
                 state.last_polled = time.time()
-                if usage < self._capacity_threshold:
+                if self._effective_usage(state) < self._capacity_threshold:
                     self._capacity_event.set()
             except Exception as exc:
                 logger.warning(f"[CapacityAwareScheduler] poll failed for {server_id}: {exc}")
@@ -154,22 +168,35 @@ class _CapacityAwareScheduler:
                     self._states[server_id].healthy = False
             await asyncio.sleep(self._poll_interval_s)
 
+    def _effective_usage(self, state: ReplicaState) -> float:
+        """Combine polled token_usage with pending estimate to prevent over-dispatch."""
+        if state.num_total_tokens > 0:
+            pending_fraction = state.pending_tokens / state.num_total_tokens
+        else:
+            # Backend doesn't expose total tokens (e.g. vLLM via Prometheus)
+            pending_fraction = 0.0
+        return min(state.token_usage + pending_fraction, 1.0)
+
     async def acquire_server(
         self,
         request_id: str,
         group_id: str | None = None,
+        estimated_tokens: int = 0,
     ) -> tuple[str, ray.actor.ActorHandle]:
         key = group_id or request_id
 
         # Path A: established group — unconditional sticky route
+        # Preserves prefix-cache warmth; server handles queuing internally
         if key in self._affinity:
             server_id = self._affinity[key]
+            self._states[server_id].pending_tokens += estimated_tokens
             return server_id, self._states[server_id].handle
 
         # Path B: new group — capacity-gated dispatch
         while True:
             best = self._best_available()
             if best is not None:
+                best.pending_tokens += estimated_tokens
                 self._affinity[key] = best.server_id
                 return best.server_id, best.handle
             self._capacity_event.clear()
@@ -178,15 +205,17 @@ class _CapacityAwareScheduler:
     def _best_available(self) -> ReplicaState | None:
         available = [
             s for s in self._states.values()
-            if s.healthy and s.token_usage < self._capacity_threshold
+            if s.healthy and self._effective_usage(s) < self._capacity_threshold
         ]
         if not available:
             return None
-        min_usage = min(s.token_usage for s in available)
-        candidates = [s for s in available if s.token_usage - min_usage < 0.05]
+        min_usage = min(self._effective_usage(s) for s in available)
+        candidates = [s for s in available if self._effective_usage(s) - min_usage < 0.05]
         return random.choice(candidates)
 
-    def release_server(self, server_id: str) -> None:
+    def release_server(self, server_id: str) -> None:  # noqa: ARG002
+        # server_id kept for API compatibility with GlobalRequestLoadBalancer.
+        # pending_tokens resets to 0 on the next poll cycle (which reflects actual state).
         self._capacity_event.set()
 
     def remove_servers(self, server_ids: list[str]) -> None:
@@ -205,6 +234,9 @@ class _CapacityAwareScheduler:
             "replicas": {
                 sid: {
                     "token_usage": s.token_usage,
+                    "effective_usage": self._effective_usage(s),
+                    "pending_tokens": s.pending_tokens,
+                    "num_total_tokens": s.num_total_tokens,
                     "healthy": s.healthy,
                     "last_polled": s.last_polled,
                 }

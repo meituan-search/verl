@@ -50,6 +50,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from verl.workers.rollout.capacity_aware_scheduler import (
+    LoadMetrics,
     ReplicaState,
     SGLangLoadBackend,
     VLLMLoadBackend,
@@ -84,8 +85,9 @@ async def test_sglang_load_backend_parses_response():
     mock_session.get = MagicMock(return_value=mock_resp)
 
     with patch("verl.workers.rollout.capacity_aware_scheduler.aiohttp.ClientSession", return_value=mock_session):
-        usage = await backend.fetch("http://host:8000")
-    assert usage == pytest.approx(0.4)
+        metrics = await backend.fetch("http://host:8000")
+    assert metrics.token_usage == pytest.approx(0.4)
+    assert metrics.num_total_tokens == 1000
 
 
 @pytest.mark.asyncio
@@ -107,8 +109,9 @@ async def test_vllm_load_backend_parses_prometheus():
     mock_session.get = MagicMock(return_value=mock_resp)
 
     with patch("verl.workers.rollout.capacity_aware_scheduler.aiohttp.ClientSession", return_value=mock_session):
-        usage = await backend.fetch("http://host:9000")
-    assert usage == pytest.approx(0.72)
+        metrics = await backend.fetch("http://host:9000")
+    assert metrics.token_usage == pytest.approx(0.72)
+    assert metrics.num_total_tokens == 0  # vLLM Prometheus does not expose raw token count
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +186,7 @@ async def test_poll_loop_updates_token_usage():
     async def fake_fetch(address):
         nonlocal call_count
         call_count += 1
-        return 0.6
+        return LoadMetrics(token_usage=0.6, num_total_tokens=10000)
 
     sched._load_backend.fetch = fake_fetch
     task = asyncio.ensure_future(sched._poll_loop("http://h0:8000"))
@@ -226,7 +229,7 @@ async def test_poll_loop_sets_capacity_event_when_below_threshold():
     sched._capacity_event.clear()
 
     async def fetch_low(address):
-        return 0.3
+        return LoadMetrics(token_usage=0.3, num_total_tokens=10000)
 
     sched._load_backend.fetch = fetch_low
     task = asyncio.ensure_future(sched._poll_loop("http://h0:8000"))

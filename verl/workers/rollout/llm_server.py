@@ -173,11 +173,14 @@ class LLMServerClient:
         self._load_balancer = load_balancer_handle
 
     async def _acquire_server(
-        self, request_id: str, group_id: str | None = None
+        self,
+        request_id: str,
+        group_id: str | None = None,
+        estimated_tokens: int = 0,
     ) -> tuple[str, ray.actor.ActorHandle]:
         # Atomic acquire: returns (server_id, handle) in one Ray RPC.
         return await self._load_balancer.acquire_server.remote(
-            request_id=request_id, group_id=group_id
+            request_id=request_id, group_id=group_id, estimated_tokens=estimated_tokens
         )
 
     def _release_server(self, server_id: str) -> None:
@@ -210,7 +213,10 @@ class LLMServerClient:
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
-        server_id, server = await self._acquire_server(request_id, group_id=group_id)
+        estimated_tokens = len(prompt_ids) + sampling_params.get("max_tokens", 512)
+        server_id, server = await self._acquire_server(
+            request_id, group_id=group_id, estimated_tokens=estimated_tokens
+        )
         try:
             multimodal_kwargs = {}
             if audio_data is not None:
