@@ -115,7 +115,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             )
 
             # Compute log probs immediately after this chunk with current model weights.
-            if engine_server_keys and self._model_engine_manager is not None:
+            if len(engine_server_keys) > 0 and self._model_engine_manager is not None:
                 await self._compute_chunk_log_probs(output, context_prompt_ids, sampling_params)
 
             # 2. merge output into final_output
