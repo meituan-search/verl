@@ -384,7 +384,7 @@ class ReplayBuffer:
                 f"pending_slots={self._pending_slots}, "
                 f"train_finished_slots={train_finished_slots}, "
                 f"tq_keys={tq_keys}), "
-                f"idle_ratio: {idle_ratio:.4f}",
+                f"idle_ratio: {idle_ratio:.4f}, ",
                 f"partition_stats: {partition_stats}",
                 flush=True,
             )
@@ -430,7 +430,6 @@ class ReplayBuffer:
         """Return statistics about the buffer state. Lock-free read."""
         partition_stats = self.compute_partition_stats()
 
-        # Also fetch TQ kv_list for cross-validation / debugging
         return {
             "partitions": partition_stats,
             # Layer 1: Physical slot control
@@ -441,6 +440,4 @@ class ReplayBuffer:
             "version_slots": self._version_slots,
             "max_version_slots": self.max_version_slots,
             "available_version_slots": max(0, (self.max_version_slots or 0) - self._version_slots),
-            # Control
-            "finished": self._finished,
         }

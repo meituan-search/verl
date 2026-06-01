@@ -297,3 +297,6 @@ class FullyAsyncRollouterTQ(FullyAsyncRollouter):
         }
 
         return stats
+
+    async def _async_monitor_loop(self):
+        pass
