@@ -337,21 +337,10 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 else:
                     logger.exception(f"Unsupported type {type(v)} for key {k}")
 
-            uid = prompt.get("uid", f"unknown_{i}")
+            uid = prompt.get("uid")
             print(f"[AgentLoopWorkerTQ] Creating task {i} for uid={uid}, wait={wait}", flush=True)
 
-            async def _run_with_logging(prompt_dict, traj_info, task_idx):
-                print(f"[AgentLoopWorkerTQ] Task {task_idx} (uid={prompt_dict.get('uid')}) STARTED", flush=True)
-                try:
-                    await self._run_prompt(prompt_dict, sampling_params, trajectory=traj_info, trace=False)
-                    print(f"[AgentLoopWorkerTQ] Task {task_idx} (uid={prompt_dict.get('uid')}) COMPLETED", flush=True)
-                except Exception as e:
-                    print(f"[AgentLoopWorkerTQ] Task {task_idx} (uid={prompt_dict.get('uid')}) FAILED: {e}", flush=True)
-                    import traceback
-
-                    traceback.print_exc()
-
-            task = asyncio.create_task(_run_with_logging(prompt, trajectory_info[i], i))
+            task = asyncio.create_task(self._run_prompt(prompt, trajectory_info[i], i))
             tasks.append(task)
 
             if not wait:
@@ -371,9 +360,6 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
     async def _run_prompt(self, prompt: dict, sampling_params: dict, trajectory: dict, trace: bool = False) -> None:
         """Spawn multiple agent loops in parallel according to rollout.n or rollout.val_kwargs.n."""
         uid, partition_id = prompt["uid"], "train" if not trajectory["validate"] else "val"
-        # Timeout for each agent loop task (in seconds). Prevents vLLM server hang from blocking the entire system.
-        task_timeout = 600  # 10 minutes max per agent loop
-        print(f"[AgentLoopWorkerTQ][_run_prompt] START uid={uid}, partition={partition_id}", flush=True)
         try:
             # NOTE: user can dynamically adjust n for each sample here, e.g according to task difficulty.
             config = self.config.actor_rollout_ref.rollout
@@ -384,51 +370,18 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             if not trajectory["validate"] and not do_sample:
                 apply_greedy_sampling_params(run_sampling_params)
 
-            print(f"[AgentLoopWorkerTQ][_run_prompt] uid={uid} creating {n} agent loop tasks...", flush=True)
             tasks = []
             for i in range(n):
-                if i == 0:
-                    print(f"[AgentLoopWorkerTQ][_run_prompt] uid={uid} creating agent_loop task {i}/{n}", flush=True)
                 task = asyncio.create_task(
                     self._run_agent_loop(
                         run_sampling_params, trajectory=trajectory, trace=trace, session_id=i, **prompt
                     )
                 )
                 tasks.append(task)
-            print(
-                f"[AgentLoopWorkerTQ][_run_prompt] uid={uid} awaiting {n} "
-                f"agent loop tasks with timeout={task_timeout}s...",
-                flush=True,
-            )
-
-            # Use asyncio.wait_for with timeout to prevent hanging on vLLM server issues
-            try:
-                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=task_timeout)
-            except asyncio.TimeoutError:
-                print(
-                    f"[AgentLoopWorkerTQ][_run_prompt] uid={uid} TIMEOUT after {task_timeout}s! "
-                    f"Cancelling {len(tasks)} stuck tasks...",
-                    flush=True,
-                )
-                # Cancel all stuck tasks
-                for t in tasks:
-                    if not t.done():
-                        t.cancel()
-                # Wait for cancellation to complete
-                await asyncio.gather(*tasks, return_exceptions=True)
-                print(f"[AgentLoopWorkerTQ][_run_prompt] uid={uid} tasks cancelled after timeout", flush=True)
-
-            print(
-                f"[AgentLoopWorkerTQ][_run_prompt] uid={uid} all agent loops done, writing finished status to TQ...",
-                flush=True,
-            )
+            await asyncio.gather(*tasks)
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "finished"})
-            print(f"[AgentLoopWorkerTQ][_run_prompt] uid={uid} DONE", flush=True)
         except Exception as e:
             logger.exception(f"Error in _run_prompt: {e}")
-            print(
-                f"[AgentLoopWorkerTQ][_run_prompt] uid={uid} FAILED: {e}, writing failure status to TQ...", flush=True
-            )
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
 
     async def _agent_loop_postprocess(
@@ -498,20 +451,11 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 }
             )
 
-        print(
-            f"[AgentLoopWorkerTQ][_agent_loop_postprocess] uid={uid} "
-            f"session={session_id} preparing {len(outputs)} outputs for TQ put...",
-            flush=True,
-        )
         await tq.async_kv_batch_put(
             keys=keys,
             fields=list_of_dict_to_tensordict(fields),
             tags=tags,
             partition_id="train" if not validate else "val",
-        )
-        print(
-            f"[AgentLoopWorkerTQ][_agent_loop_postprocess] uid={uid} session={session_id} TQ put DONE, keys={keys}",
-            flush=True,
         )
 
 
@@ -1320,19 +1264,6 @@ class PPOTrainer:
         batch_multiple = self._get_required_batch_multiple(dp_size)
         batch = upsample_batch_to_divisible_size(batch, batch_multiple, self.tokenizer.eos_token_id)
         global_seqlen_lst = torch.tensor([tag["seq_len"] for tag in batch.tags], dtype=torch.int64)
-
-        # [DEBUG] Print balance batch info
-        seq_lens_from_tags = [tag.get("seq_len", 0) for tag in batch.tags]
-        response_lens_from_tags = [tag.get("response_len", 0) for tag in batch.tags]
-        print(
-            f"[DEBUG _balance_batch] bsz: {len(batch.keys)}, batch_multiple: {batch_multiple}, "
-            f"seq_lens (first 5): {seq_lens_from_tags[:5]}, "
-            f"response_lens (first 5): {response_lens_from_tags[:5]}, "
-            f"max_seq_len: {max(seq_lens_from_tags) if seq_lens_from_tags else 0}, "
-            f"max_response_len: {max(response_lens_from_tags) if response_lens_from_tags else 0}",
-            flush=True,
-        )
-
         workload_lst = calculate_workload(global_seqlen_lst)
 
         # reorder based on index. The data will be automatically equally partitioned by dispatch function
@@ -1374,36 +1305,20 @@ class PPOTrainer:
         fields = ["entropy", "log_probs", "response_mask"]
         if self.config.actor_rollout_ref.rollout.calculate_log_probs:
             fields.extend(["responses", "rollout_log_probs"])
+        t_start = time.time()
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        t_end = time.time()
+        print(f"[DEBUG] _compute_old_log_prob time to get data: {t_end - t_start:.2f}", flush=True)
 
         # 2. write old_log_probs and entropy back to TransferQueue
-        old_log_probs_nested = response_from_nested(data.pop("log_probs"), data["response_mask"])
-        data["old_log_probs"] = old_log_probs_nested
+        data["old_log_probs"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
         data["entropy"] = response_from_nested(data.pop("entropy"), data["response_mask"])
-
-        # [DEBUG] Print shape info for old_log_probs after response_from_nested
-        print(
-            f"[DEBUG _compute_old_log_prob] old_log_probs_nested type: {type(old_log_probs_nested)}, "
-            f"is_nested: {old_log_probs_nested.is_nested if hasattr(old_log_probs_nested, 'is_nested') else 'N/A'}",
-            flush=True,
-        )
-        if hasattr(old_log_probs_nested, "offsets"):
-            response_lens = old_log_probs_nested.offsets().diff()
-            print(
-                f"[DEBUG _compute_old_log_prob] old_log_probs response_lens (first 5): {response_lens[:5].tolist()}, "
-                f"max: {response_lens.max().item()}, min: {response_lens.min().item()}",
-                flush=True,
-            )
-        if hasattr(data["response_mask"], "offsets"):
-            rm_lens = data["response_mask"].offsets().diff()
-            print(
-                f"[DEBUG _compute_old_log_prob] response_mask response_lens (first 5): {rm_lens[:5].tolist()}, "
-                f"max: {rm_lens.max().item()}, min: {rm_lens.min().item()}",
-                flush=True,
-            )
+        t_start = time.time()
         batch = tq.kv_batch_put(
             keys=batch.keys, partition_id=batch.partition_id, fields=data.select("old_log_probs", "entropy")
         )
+        t_end = time.time()
+        print(f"[DEBUG] _compute_old_log_prob time to put data: {t_end - t_start:.2f}", flush=True)
 
         data = DataProto(batch=data.to_padded_tensor())
 
@@ -1445,11 +1360,17 @@ class PPOTrainer:
         assert len(output) == len(batch)
 
         # 2. write ref_log_prob and entropy back to TransferQueue
+        t_start = time.time()
         data = tq.kv_batch_get(
             keys=batch.keys, partition_id=batch.partition_id, select_fields=["log_probs", "response_mask"]
         )
+        t_end = time.time()
+        print(f"[DEBUG] _compute_ref_log_prob time to get data: {t_end - t_start:.2f}", flush=True)
         data["ref_log_prob"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
+        t_start = time.time()
         tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data.select("ref_log_prob"))
+        t_end = time.time()
+        print(f"[DEBUG] _compute_ref_log_prob time to put data: {t_end - t_start:.2f}", flush=True)
 
         return batch
 
@@ -1461,11 +1382,17 @@ class PPOTrainer:
         ray.get(output.futures)
 
         # 2. write value back to TransferQueue
+        t_start = time.time()
         data = tq.kv_batch_get(
             keys=batch.keys, partition_id=batch.partition_id, select_fields=["values", "response_mask"]
         )
+        t_end = time.time()
+        print(f"[DEBUG] _compute_values time to get data: {t_end - t_start:.2f}", flush=True)
         data["values"] = response_from_nested(data.pop("values"), data["response_mask"])
+        t_start = time.time()
         tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data.select("values"))
+        t_end = time.time()
+        print(f"[DEBUG] _compute_values time to put data: {t_end - t_start:.2f}", flush=True)
 
         return batch
 
@@ -1474,9 +1401,11 @@ class PPOTrainer:
         fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
         if self.config.algorithm.adv_estimator == core_algos.AdvantageEstimator.REMAX:
             fields.append("reward_baselines")
+        t_start = time.time()
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
-
         response_mask = data["response_mask"]
+        t_end = time.time()
+        print(f"[DEBUG] _compute_advantage time to get data: {t_end - t_start:.2f}", flush=True)
         data = DataProto(batch=data.to_padded_tensor())
         data.batch["token_level_scores"] = data.batch["rm_scores"]
         data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
@@ -1527,8 +1456,10 @@ class PPOTrainer:
         for field in fields:
             output[field] = response_to_nested(data.batch[field], response_mask)
         output = TensorDict(output, batch_size=len(batch))
-
+        t_start = time.time()
         batch = tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=output)
+        t_end = time.time()
+        print(f"[DEBUG] _compute_advantage time to put data: {t_end - t_start:.2f}", flush=True)
 
         return batch
 
@@ -1606,19 +1537,6 @@ class PPOTrainer:
         response_length = data["responses"].offsets().diff()
         global_token_num = (prompt_length + response_length).tolist()
         data = data.to_padded_tensor()
-
-        # [FIX] Ensure all response-level tensors have the same shape as responses.
-        # TQ stores each field as an independent nested tensor; to_padded_tensor() pads
-        # each to its own max element size, causing shape mismatches.
-        target_response_len = data["responses"].shape[1]
-        for key in ["response_mask", "values", "advantages", "returns", "token_level_rewards"]:
-            if key in data and data[key].shape[1] != target_response_len:
-                if data[key].shape[1] < target_response_len:
-                    import torch.nn.functional as F
-
-                    data[key] = F.pad(data[key], (0, target_response_len - data[key].shape[1]))
-                else:
-                    data[key] = data[key][:, :target_response_len]
         data["token_level_scores"] = data["rm_scores"]
         if "token_level_rewards" not in data:
             data["token_level_rewards"] = data["rm_scores"]
@@ -1875,20 +1793,17 @@ class TaskRunner:
         # initialize transfer queue
         tq.init(config.transfer_queue)
 
-        try:
-            self.add_actor_rollout_worker(config)
-            self.add_critic_worker(config)
-            self.init_resource_pool_mgr(config)
+        self.add_actor_rollout_worker(config)
+        self.add_critic_worker(config)
+        self.init_resource_pool_mgr(config)
 
-            trainer = PPOTrainer(
-                config=config,
-                role_worker_mapping=self.role_worker_mapping,
-                resource_pool_manager=self.resource_pool_manager,
-            )
-            trainer.init_workers()
-            trainer.fit()
-        finally:
-            tq.close()
+        trainer = PPOTrainer(
+            config=config,
+            role_worker_mapping=self.role_worker_mapping,
+            resource_pool_manager=self.resource_pool_manager,
+        )
+        trainer.init_workers()
+        trainer.fit()
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
