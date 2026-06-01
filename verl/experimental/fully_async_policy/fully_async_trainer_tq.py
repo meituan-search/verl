@@ -165,11 +165,10 @@ class FullyAsyncTrainerTQ(PPOTrainer, FullyAsyncTrainer):
 
         Returns KVBatchMeta compatible with PPOTrainer's entire step() pipeline.
         """
-        print(f"[TQFullyAsyncTrainer] Waiting for {self.required_samples} samples from RB...", flush=True)
-
         sampled_keys_meta = await self.replay_buffer.wait_and_sample.remote(
             partition_id="train",
             sample_size=self.required_samples,
+            rollout_n=self.config.actor_rollout_ref.rollout.n,
         )
 
         if sampled_keys_meta is None or len(sampled_keys_meta) == 0:
@@ -238,7 +237,11 @@ class FullyAsyncTrainerTQ(PPOTrainer, FullyAsyncTrainer):
                 if batch is None:
                     raise TrainingStopException("Training terminated: RB returned None")
                 batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
-            print(f"[TQFullyAsyncTrainer] KVBatchMeta ready: {len(batch)} keys, wait={timing_raw['gen']:.2f}s")
+            print(
+                f"[TQFullyAsyncTrainer] Waiting for {self.required_samples} samples, "
+                f"keys={len(batch)}, "
+                f"wait={timing_raw['gen']:.2f}s"
+            )
 
             # 3. [OPTIONAL] compute reward score with colocated reward model
             # TODO colocate reward not implemented
@@ -308,10 +311,30 @@ class FullyAsyncTrainerTQ(PPOTrainer, FullyAsyncTrainer):
         tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
         await self.replay_buffer.remove.remote(batch.partition_id, batch.keys)
 
-        print(
-            f"[TQFullyAsyncTrainer] _cleanup_batch: {len(batch.keys)} total keys, {len(uid_keys)} deduped uids cleared",
-            flush=True,
-        )
+        # Diagnostic: detect abnormal key counts
+        expected_keys = self.required_samples * self.config.actor_rollout_ref.rollout.n
+        if len(batch.keys) != expected_keys:
+            # Print per-uid key breakdown
+            uid_key_map: dict[str, list[str]] = {}
+            for key, tag in zip(batch.keys, batch.tags, strict=False):
+                uid = tag.get("uid", "") if isinstance(tag, dict) else ""
+                if uid:
+                    uid_key_map.setdefault(uid, []).append(key)
+
+            print(
+                f"[TQFullyAsyncTrainer] _cleanup_batch ⚠️ ABNORMAL! "
+                f"{len(batch.keys)} total keys (expected {expected_keys}), "
+                f"{len(uid_keys)} deduped uids (expected {self.required_samples})\n"
+                f"  PER-UID KEY BREAKDOWN: {uid_key_map}\n"
+                f"  ALL KEYS: {batch.keys}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[TQFullyAsyncTrainer] _cleanup_batch: {len(batch.keys)} total keys, "
+                f"{len(uid_keys)} deduped uids cleared",
+                flush=True,
+            )
 
     async def _fit_update_weights(self):
         if self.local_trigger_step != 1:

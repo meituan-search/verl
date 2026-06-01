@@ -251,13 +251,13 @@ class ReplayBuffer:
             # Record idle start when all slots are released (rollouter has no work)
             if self._pending_slots == 0:
                 self.idle_start_time = time.time()
-                print(f"[ReplayBuffer][release_slot] Idle start recorded at {self.idle_start_time}")
             self._slot_available.notify_all()
 
     async def wait_and_sample(
         self,
         partition_id: str,
         sample_size: int,
+        rollout_n: int,
     ) -> list[tuple[str, dict]] | None:
         """Block until enough finish samples (uids) are ready or production is fully complete.
 
@@ -265,13 +265,15 @@ class ReplayBuffer:
             partition_id: Partition to sample from (e.g. 'train').
             sample_size: Number of **samples (uids)** to wait for, not number of response keys.
                         Each sample/uid may have multiple response keys (e.g. n=16 responses per prompt).
+            rollout_n: Number of response keys per uid (e.g. n=16 responses per prompt).
 
         Strategy:
-        1. Find uid-level keys with status 'finished' or 'success' (e.g. 'sample_0_190')
+        1. Find uid-level keys with status 'finished' (written by _run_prompt after all n responses done)
         2. Extract uids from these uid-level keys
         3. For each uid, find ALL matching response keys (e.g. 'sample_0_190_0', ..., 'sample_0_190_15')
-           from the partition
-        4. Return all collected response keys for up to sample_size uids
+           from the partition — integrity check: skip uids whose response keys haven't been
+           fully synced by _poll_from_tq yet (race between uid "finished" and response key arrival)
+        4. Return all collected response keys for up to sample_size *complete* uids
         """
         async with self._data_available:
             while True:
@@ -282,7 +284,7 @@ class ReplayBuffer:
                 # Check if enough finish samples (uids) are ready
                 part = self.partitions.get(partition_id)
                 if part is not None:
-                    # Step 1: Find finished uids from uid-level keys with status 'finished' or 'success'
+                    # Step 1: Find finished uids from uid-level keys with status 'finished'
                     finished_uids: set[str] = set()
                     for key, meta in part.items():
                         status = meta.get("status", "")
@@ -291,20 +293,80 @@ class ReplayBuffer:
 
                     # Step 2: Check if we have enough finished uids
                     if len(finished_uids) >= sample_size:
-                        # Step 3: Collect ALL response keys for the first sample_size uids
-                        selected_uids = list(finished_uids)[:sample_size]
-                        all_response_keys: list[tuple[str, dict]] = []
+                        # Step 3: Count response keys per uid (integrity check)
+                        # Build uid -> [response_keys] mapping from ALL non-uid-level entries
+                        uid_response_keys: dict[str, list[tuple[str, dict]]] = {}
                         for key, meta in part.items():
                             uid = meta.get("uid", "")
-                            if uid in selected_uids:
-                                all_response_keys.append((key, meta))
+                            if uid and uid in finished_uids:
+                                # This is a response key (has uid tag) belonging to a finished uid
+                                uid_response_keys.setdefault(uid, []).append((key, meta))
 
-                        print(
-                            f"[ReplayBuffer][wait_and_sample] Returning {len(all_response_keys)} "
-                            f"response keys from {len(selected_uids)} uids "
-                            f"(sample_size={sample_size}, total_finished={len(finished_uids)})",
-                        )
-                        return all_response_keys
+                        # Filter to only uids that have ALL their response keys synced.
+                        # A uid is "complete" when it has at least 1 response key.
+                        # (We can't know exact n here, but we require at least some responses arrived.)
+                        # The key insight: _run_prompt writes "finished" AFTER all n
+                        # _agent_loop_postprocess calls, but those writes go to TQ first and
+                        # need _poll_from_tq to sync into self.partitions. So we wait until
+                        # we see response keys for this uid.
+                        complete_uids = [uid for uid, keys in uid_response_keys.items() if len(keys) == rollout_n]
+                        major_complete_uids = [uid for uid, keys in uid_response_keys.items() if len(keys) > rollout_n]
+                        incomplete_uids = [uid for uid, keys in uid_response_keys.items() if len(keys) < rollout_n]
+
+                        if len(complete_uids) >= sample_size:
+                            selected_uids = complete_uids[:sample_size]
+                            all_response_keys: list[tuple[str, dict]] = []
+                            for uid in selected_uids:
+                                all_response_keys.extend(uid_response_keys[uid])
+
+                            expected_keys = sample_size * rollout_n
+
+                            # Diagnostic: print full key details when count is abnormal
+                            if len(all_response_keys) != expected_keys:
+                                # Print per-uid key breakdown for the selected uids
+                                per_uid_breakdown = {
+                                    uid: [k for k, _ in uid_response_keys[uid]] for uid in selected_uids
+                                }
+                                print(
+                                    f"[ReplayBuffer][wait_and_sample] ⚠️ ABNORMAL KEY COUNT! "
+                                    f"Returning {len(all_response_keys)} keys (expected {expected_keys}) "
+                                    f"from {len(selected_uids)} uids (expected {sample_size}), "
+                                    f"rollout_n={rollout_n}\n"
+                                    f"  PER-UID BREAKDOWN ({len(per_uid_breakdown)} uids): {per_uid_breakdown}\n"
+                                    f"  major_complete_uids (> {rollout_n} keys): {major_complete_uids}\n"
+                                    f"  incomplete_uids (< {rollout_n} keys): "
+                                    f"{[uid for uid in incomplete_uids]}",
+                                    f"all_response_keys={all_response_keys}",
+                                    flush=True,
+                                )
+                                continue
+                            else:
+                                print(
+                                    f"[ReplayBuffer][wait_and_sample] Returning {len(all_response_keys)} "
+                                    f"response keys from {len(selected_uids)} uids "
+                                    f"(sample_size={sample_size}, "
+                                    f"total_finished={len(finished_uids)}, "
+                                    f"complete_uids={len(complete_uids)}, "
+                                    f"incomplete_uids={len(incomplete_uids)})",
+                                    f"major_complete_uids={len(major_complete_uids)})",
+                                    flush=True,
+                                )
+
+                            return all_response_keys
+                        else:
+                            # Not enough uids have their response keys synced yet — wait for next poll
+                            # Print incomplete uid details for debugging
+                            incomplete_details = {
+                                uid: [k for k, _ in uid_response_keys[uid]] for uid in incomplete_uids
+                            }
+                            incomplete_count = len(finished_uids) - len(complete_uids)
+                            print(
+                                f"[ReplayBuffer][wait_and_sample] "
+                                f"ready: {len(finished_uids)} uids finished, "
+                                f"but only {len(complete_uids)} have response keys synced "
+                                f"({incomplete_count} incomplete), need={sample_size}\n"
+                                f"  INCOMPLETE UID DETAILS (have < {rollout_n} keys): {incomplete_details}",
+                            )
                     else:
                         print(
                             f"[ReplayBuffer][wait_and_sample] ready: {len(finished_uids)} uids, need={sample_size}",
