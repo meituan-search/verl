@@ -387,7 +387,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             print(f"[AgentLoopWorkerTQ][_run_prompt] uid={uid} creating {n} agent loop tasks...", flush=True)
             tasks = []
             for i in range(n):
-                print(f"[AgentLoopWorkerTQ][_run_prompt] uid={uid} creating agent_loop task {i}/{n}", flush=True)
+                if i == 0:
+                    print(f"[AgentLoopWorkerTQ][_run_prompt] uid={uid} creating agent_loop task {i}/{n}", flush=True)
                 task = asyncio.create_task(
                     self._run_agent_loop(
                         run_sampling_params, trajectory=trajectory, trace=trace, session_id=i, **prompt

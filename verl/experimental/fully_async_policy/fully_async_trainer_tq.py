@@ -277,15 +277,45 @@ class FullyAsyncTrainerTQ(PPOTrainer, FullyAsyncTrainer):
             self._fit_update_local_step()
             await self._fit_update_weights()
 
+        await self._fit_collect_metrics(batch)
+
+        # Cleanup consumed data from TQ + RB (after _compute_metrics reads TQ via kv_batch_get)
+        # clear TQ and RB must before reset_staleness
+        tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
+        await self.replay_buffer.remove.remote(batch.partition_id, batch.keys)
+
+        await self._fit_reset_staleness()
+
         await self._fit_validate()
         self._fit_save_checkpoint()
         self._stop_profiling()
-        await self._fit_collect_metrics(batch)
         self._fit_postprocess_step()
 
-        # Cleanup consumed data from TQ + RB (after _compute_metrics reads TQ via kv_batch_get)
-        tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
-        await self.replay_buffer.remove.remote(batch.partition_id, batch.keys)
+    async def _fit_update_weights(self):
+        if self.local_trigger_step != 1:
+            return
+
+        with marked_timer("timing_s/param_sync", self.timing_raw):
+            await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
+        print(
+            f"[FullyAsyncTrainer] _fit_update_weights, "
+            f"timing_s/param_sync: {self.timing_raw['timing_s/param_sync']:.4f} seconds "
+            f"self.current_param_version: {self.current_param_version}"
+        )
+        # Log aggregated training metrics
+        self.logger.log(
+            data=self.metrics_aggregator.get_aggregated_metrics(),
+            step=self.current_param_version,
+        )
+        self.metrics_aggregator.reset()
+
+    async def _fit_reset_staleness(self):
+        # Reset staleness in rollouter
+        timing_raw = await self.rollouter.reset_staleness.remote()
+        self.logger.log(
+            data=timing_raw,
+            step=self.current_param_version,
+        )
 
     async def _fit_collect_metrics(self, batch: KVBatchMeta):
         """Collect metrics using PPOTrainer's _compute_metrics (expects KVBatchMeta).

@@ -22,7 +22,6 @@ import ray
 from verl import DataProto
 from verl.experimental.fully_async_policy.detach_utils import (
     RolloutSample,
-    prepare_single_generation_data,
     safe_create_task,
 )
 from verl.experimental.fully_async_policy.fully_async_rollouter import (
@@ -30,6 +29,7 @@ from verl.experimental.fully_async_policy.fully_async_rollouter import (
     FullyAsyncRollouter,
 )
 from verl.trainer.main_ppo_sync import AgentLoopWorkerTQ
+from verl.utils import tensordict_utils as tu
 
 try:
     import transfer_queue as tq
@@ -136,9 +136,17 @@ class FullyAsyncRollouterTQ(FullyAsyncRollouter):
         Key difference from base class: acquire_slot() is called BEFORE putting
         to pending_queue. This blocks the dataloader when too many samples are
         in-flight, replacing the need for _should_pause_generation().
+
+        Alignment with main_ppo_sync.py PPOTrainer.step():1740-1758:
+            - Do NOT repeat(n) here — let AgentLoopWorkerTQ._run_prompt loop n times
+              via __rollout_n__ field (avoids double-repeat bug).
+            - Set uid/__rollout_n__/sample_id/global_steps in batch_dict (plain dict)
+              BEFORE calling tu.get_tensordict(), so these np.array values become NonTensorStack
+              (supporting per-index access in AgentLoopWorkerTQ.generate_sequences).
         """
         print("[TQFullyAsyncRollouter][_feed_samples] STARTING", flush=True)
         continuous_iterator = self._create_continuous_iterator()
+        rollout_n = self.config.actor_rollout_ref.rollout.n
 
         for epoch, batch_dict in continuous_iterator:
             acquired = await self.replay_buffer.acquire_slot.remote(timeout=None)
@@ -149,9 +157,23 @@ class FullyAsyncRollouterTQ(FullyAsyncRollouter):
                 )
                 break
 
-            # Prepare data (same as base class)
-            full_batch = prepare_single_generation_data(batch_dict, self.config)
             sample_id = f"sample_{epoch}_{self.global_steps}"
+
+            # Inject fields into batch_dict (plain dict) BEFORE tu.get_tensordict().
+            # All np.array values become NonTensorStack via get_tensordict:424,
+            # supporting per-index access in AgentLoopWorkerTQ.generate_sequences().
+            batch_dict["uid"] = np.array([sample_id], dtype=object)
+            batch_dict["__rollout_n__"] = np.full(1, rollout_n, dtype=np.int64)
+            batch_dict["sample_id"] = np.array([sample_id], dtype=object)
+            batch_dict["global_steps"] = np.full(1, self.global_steps, dtype=np.int64)
+
+            # Convert to TensorDict (np.array values → NonTensorStack via get_tensordict:424)
+            full_batch = tu.get_tensordict(batch_dict)
+
+            # Set agent_name for non-multi-turn mode (same as prepare_single_generation_data)
+            if not self.config.actor_rollout_ref.rollout.multi_turn.enable:
+                batch_dict["agent_name"] = np.array(["single_turn_agent"], dtype=object)
+                full_batch = tu.get_tensordict(batch_dict)
 
             rollout_sample = RolloutSample(
                 full_batch=full_batch,
@@ -188,30 +210,17 @@ class FullyAsyncRollouterTQ(FullyAsyncRollouter):
         - TQ path: generate + TQ write both happen INSIDE AgentLoopWorkerTQ
           (via overridden _agent_loop_postprocess)
           → we just call it and release the slot
+
+        Note: full_batch now has bsz=1 (no repeat(n)), and contains __rollout_n__.
+              AgentLoopWorkerTQ._run_prompt will loop n times internally to produce
+              n responses per prompt, each written to TQ with a unique key.
         """
-        logger.debug(
+        print(
             f"[TQFullyAsyncRollouter][_process_single] Starting generate for {rollout_sample.sample_id}...",
         )
         try:
-            # Inject sample_id into batch so worker can use it for unique TQ keys
-            rollout_sample.full_batch.meta_info["sample_id"] = rollout_sample.sample_id
-            # Also inject into non_tensor_batch so _postprocess can access it for TQ key generation
-            bsz = len(rollout_sample.full_batch)
-            rollout_sample.full_batch.non_tensor_batch["sample_id"] = np.array(
-                [rollout_sample.sample_id] * bsz, dtype=object
-            )
-            # Inject global_steps into non_tensor_batch (align with main_ppo_sync.py:1395
-            # tu.assign_non_tensor_data(batch, "global_steps", self.global_steps))
-            # so that AgentLoopWorkerTQ.generate_sequences can access it via batch["global_steps"]
-            rollout_sample.full_batch.non_tensor_batch["global_steps"] = np.array(
-                [self.global_steps] * bsz, dtype=np.int64
-            )
-            # Inject uid into non_tensor_batch (align with main_ppo_sync.py:1393
-            # batch_dict["uid"] = np.array([str(uuid.uuid4()) for _ in range(bsz)], dtype=object)
-            # _run_prompt needs prompt["uid"] to generate unique TQ keys
-            rollout_sample.full_batch.non_tensor_batch["uid"] = np.array([rollout_sample.sample_id] * bsz, dtype=object)
             await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
-            logger.debug(
+            print(
                 f"[TQFullyAsyncRollouter][_process_single] generate + TQ write done for {rollout_sample.sample_id}",
             )
             self.total_generated_samples += 1
