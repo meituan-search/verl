@@ -326,6 +326,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         # create background tasks for each sample in the batch
         for i in range(len(batch)):
             # TODO(wuxibin): add trace support
+            trace_this_sample = False
             prompt = {}
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
@@ -340,7 +341,9 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             uid = prompt.get("uid")
             print(f"[AgentLoopWorkerTQ] Creating task {i} for uid={uid}, wait={wait}", flush=True)
 
-            task = asyncio.create_task(self._run_prompt(prompt, trajectory_info[i], i))
+            task = asyncio.create_task(
+                self._run_prompt(prompt, sampling_params, trajectory=trajectory_info[i], trace=trace_this_sample)
+            )
             tasks.append(task)
 
             if not wait:
@@ -1384,6 +1387,7 @@ class PPOTrainer:
         if self.config.algorithm.adv_estimator == core_algos.AdvantageEstimator.REMAX:
             fields.append("reward_baselines")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+
         response_mask = data["response_mask"]
         data = DataProto(batch=data.to_padded_tensor())
         data.batch["token_level_scores"] = data.batch["rm_scores"]
@@ -1435,6 +1439,7 @@ class PPOTrainer:
         for field in fields:
             output[field] = response_to_nested(data.batch[field], response_mask)
         output = TensorDict(output, batch_size=len(batch))
+
         batch = tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=output)
 
         return batch
