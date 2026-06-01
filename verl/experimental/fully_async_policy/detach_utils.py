@@ -69,12 +69,15 @@ def prepare_single_generation_data(batch_dict, config) -> DataProto:
     # Add global step count to generated data
     full_batch = full_batch.repeat(repeat_times=config.actor_rollout_ref.rollout.n, interleave=True)
 
-    # Determine whether engine server logprobs should be computed.
+    # Determine which engine server logprob keys to compute based on enabled modes.
     mes_cfg = config.get("model_engine_server", {})
-    use_engine_server = mes_cfg.get("enable", False) and (
-        mes_cfg.get("enable_old_mode", False) or mes_cfg.get("enable_ref_mode", False)
-    )
-    full_batch.non_tensor_batch["use_engine_server"] = np.array([use_engine_server] * len(full_batch))
+    _engine_server_keys = ()
+    if mes_cfg.get("enable", False):
+        if mes_cfg.get("enable_old_mode", False):
+            _engine_server_keys += ("old_logprobs", "old_entropys")
+        if mes_cfg.get("enable_ref_mode", False):
+            _engine_server_keys += ("ref_logprobs", "ref_entropys")
+    full_batch.non_tensor_batch["engine_server_keys"] = np.array([_engine_server_keys] * len(full_batch), dtype=object)
 
     return full_batch
 

@@ -42,7 +42,6 @@ from verl.utils.ray_utils import auto_await
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.llm_server import LLMServerClient, LLMServerManager
-from verl.workers.rollout.model_engine_server import ENGINE_SERVER_LOGPROB_KEYS
 from verl.workers.rollout.replica import RolloutReplica, TokenOutput
 from verl.workers.rollout.utils import update_prometheus_config
 
@@ -86,7 +85,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         Returns:
             TokenOutput: token output
         """
-        use_engine_server = kwargs.pop("use_engine_server", False)
+        engine_server_keys = kwargs.pop("engine_server_keys", ())
         prompt_ids = normalize_token_ids(prompt_ids)
 
         limit_key = None
@@ -116,7 +115,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             )
 
             # Compute log probs immediately after this chunk with current model weights.
-            if use_engine_server and self._model_engine_manager is not None:
+            if engine_server_keys and self._model_engine_manager is not None:
                 await self._compute_chunk_log_probs(output, context_prompt_ids, sampling_params)
 
             # 2. merge output into final_output
@@ -137,11 +136,10 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 final_output.num_preempted += output.num_preempted
             final_output.stop_reason = output.stop_reason
 
-            if use_engine_server:
-                for key in ENGINE_SERVER_LOGPROB_KEYS:
-                    if output.extra_fields.get(key) is not None:
-                        final_output.extra_fields.setdefault(key, [])
-                        final_output.extra_fields[key].extend(output.extra_fields[key])
+            for key in engine_server_keys:
+                if output.extra_fields.get(key) is not None:
+                    final_output.extra_fields.setdefault(key, [])
+                    final_output.extra_fields[key].extend(output.extra_fields[key])
 
             global_steps = output.extra_fields.get("global_steps", None)
             if min_global_steps is None:
@@ -173,9 +171,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             return
         temperature = sampling_params.get("temperature", 1.0)
         results = await self._model_engine_manager.compute_log_probs(context_prompt_ids, output.token_ids, temperature)
-        for key in ENGINE_SERVER_LOGPROB_KEYS:
-            if key in results:
-                output.extra_fields[key] = results[key]
+        output.extra_fields.update(results)
 
 
 class FullyAsyncLLMServerManager(LLMServerManager):

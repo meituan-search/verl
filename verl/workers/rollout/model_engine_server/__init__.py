@@ -13,7 +13,6 @@
 # limitations under the License.
 
 from .model_engine_server import (
-    ENGINE_SERVER_LOGPROB_KEYS,
     ModelEngineReplica,
     ModelEngineServer,
     ModelEngineServerAdapter,
@@ -22,7 +21,6 @@ from .model_engine_server import (
 )
 
 __all__ = [
-    "ENGINE_SERVER_LOGPROB_KEYS",
     "ModelEngineServerAdapter",
     "ModelEngineWorker",
     "ModelEngineServer",

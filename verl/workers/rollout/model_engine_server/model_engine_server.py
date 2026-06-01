@@ -43,9 +43,6 @@ from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_pad
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
-# Keys written into TokenOutput.extra_fields by ModelEngineServer.
-ENGINE_SERVER_LOGPROB_KEYS = ("old_logprobs", "old_entropys", "ref_logprobs", "ref_entropys")
-
 
 class ModelEngineServerAdapter(BaseRollout):
     """BaseRollout adapter that wraps a TrainingWorker for old log probability computation."""
