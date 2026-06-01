@@ -39,6 +39,12 @@ from verl.workers.rollout.replica import TokenOutput
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+SPEC_DECODE_EXTRA_KEYS = (
+    "spec_num_draft_tokens",
+    "spec_num_accepted_tokens",
+    "spec_num_verify_steps",
+)
+
 
 class AgentState(Enum):
     PENDING = "pending"
@@ -224,6 +230,11 @@ class ToolAgentLoop(AgentLoopBase):
         **kwargs,
     ) -> AgentState:
         """Handle the generating state: generate model response and check for tool calls."""
+        # Inject tool parser stop tokens so generation halts after each tool call
+        if self.tool_parser.stop_token_ids:
+            stop_token_ids = list(set((sampling_params.get("stop_token_ids") or []) + self.tool_parser.stop_token_ids))
+            sampling_params = {**sampling_params, "stop_token_ids": stop_token_ids}
+
         with simple_timer("generate_sequences", agent_data.metrics):
             output: TokenOutput = await self.server_manager.generate(
                 request_id=agent_data.request_id,
@@ -250,6 +261,9 @@ class ToolAgentLoop(AgentLoopBase):
             max_global_steps = output.extra_fields.get("max_global_steps", None)
             if max_global_steps:
                 agent_data.extra_fields["max_global_steps"] = max_global_steps
+            for key in SPEC_DECODE_EXTRA_KEYS:
+                if key in output.extra_fields and key in agent_data.extra_fields:
+                    agent_data.extra_fields[key] = int(agent_data.extra_fields[key]) + int(output.extra_fields[key])
 
         agent_data.assistant_turns += 1
         agent_data.response_ids = output.token_ids
@@ -354,6 +368,22 @@ class ToolAgentLoop(AgentLoopBase):
             response_ids = await self.loop.run_in_executor(
                 None, lambda: self.tokenizer.encode(tool_response_text, add_special_tokens=False)
             )
+        elif self.tool_parser_name == "gemma4":
+            # Gemma4's chat template drops tool responses when passed without the preceding
+            # assistant tool_call message. Manually format the response tokens.
+            # Format: <|tool_response>response:func_name{value:<|"|>content<|"|>}<tool_response|>
+            parts = []
+            for msg, name in zip(add_messages, tool_call_names, strict=True):
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    content = "".join([item.get("text", "") for item in content if item.get("type") == "text"])
+                if isinstance(content, list):
+                    content = "".join([item.get("text", "") for item in content if item.get("type") == "text"])
+                parts.append(f'<|tool_response>response:{name}{{value:<|"|>{content}<|"|>}}<tool_response|>')
+            tool_response_text = "".join(parts)
+            response_ids = await self.loop.run_in_executor(
+                None, lambda: self.tokenizer.encode(tool_response_text, add_special_tokens=False)
+            )
         else:
             # Note that we have to pass None to the images and videos if there are no new images / videos
             # to stay compatible with downstream image processing logic!
@@ -446,9 +476,9 @@ class ToolAgentLoop(AgentLoopBase):
         tool_response_text = tool_execution_response.text
         if tool_response_text and len(tool_response_text) > self.max_tool_response_length:
             if self.tool_response_truncate_side == "left":
-                tool_response_text = tool_response_text[: self.max_tool_response_length] + "...(truncated)"
-            elif self.tool_response_truncate_side == "right":
                 tool_response_text = "(truncated)..." + tool_response_text[-self.max_tool_response_length :]
+            elif self.tool_response_truncate_side == "right":
+                tool_response_text = tool_response_text[: self.max_tool_response_length] + "...(truncated)"
             else:
                 length = self.max_tool_response_length // 2
                 tool_response_text = tool_response_text[:length] + "...(truncated)..." + tool_response_text[-length:]

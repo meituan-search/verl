@@ -33,7 +33,7 @@ from verl.single_controller.base.decorator import Dispatch, make_nd_compute_data
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_device_name, get_torch_device, is_npu_available, set_expandable_segments
+from verl.utils.device import get_device_name, get_torch_device, set_expandable_segments
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.import_utils import import_external_libs
@@ -84,11 +84,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
         Worker.__init__(self)
 
         from verl.workers.engine import BaseEngine, EngineRegistry
-
-        # TODO(jhz): Switch to `set_expandable_segments` when the torch_npu library
-        # supports `torch.npu.memory._set_allocator_settings`
-        if is_npu_available:
-            os.environ["PYTORCH_NPU_ALLOC_CONF"] = "expandable_segments:True"
 
         initialize_global_process_group_ray(timeout_second=None)
 
@@ -476,9 +471,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         else:
             tool_config = None
 
-        self.enable_routing_replay = (
-            self.config.actor.strategy == "megatron" and self.config.actor.megatron.router_replay.mode != "disabled"
-        )
+        # Router replay is supported on the megatron engine and on the veomni
+        # engine. Both expose `router_replay` on their per-strategy engine
+        # config (the field lives on the shared `EngineConfig` base).
+        actor_strategy = self.config.actor.strategy
+        if actor_strategy == "megatron":
+            rr_mode = self.config.actor.megatron.router_replay.mode
+        elif actor_strategy == "veomni":
+            rr_mode = self.config.actor.veomni.router_replay.mode
+        else:
+            rr_mode = "disabled"
+        self.enable_routing_replay = rr_mode != "disabled"
 
         DistProfilerExtension.__init__(
             self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
@@ -693,7 +696,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if effective_mode != "naive":
             per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
-            await self.checkpoint_engine.send_weights(per_tensor_param)
+            await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
             return
 
         set_expandable_segments(False)
