@@ -82,7 +82,6 @@ class ReplayBuffer:
         max_version_slots: int,
         max_pending_slots: int = 256,
         poll_interval: float = 1.0,
-        keys_per_slot: int = 16,
     ):
         # Partition -> {key: tags_dict}
         self.idle_start_time = time.time()
@@ -108,18 +107,13 @@ class ReplayBuffer:
         # When _version_slots >= max_version_slots, acquire_slot() blocks until
         # reset_staleness() is called (after param sync).
         # _version_slots is in SLOT granularity: 1 slot = 1 sample (prompt).
-        # Each slot produces keys_per_slot TQ keys (trajectories) via
-        # full_batch.repeat(rollout.n) in prepare_single_generation_data.
-        # Maps to: max_required_samples (e.g. required_samples * trigger_parameter_sync_step)
         self.max_version_slots = max_version_slots
-        self.keys_per_slot = keys_per_slot
         self._version_slots = 0  # cumulative slots issued in current version
 
         print(
             f"[ReplayBuffer] initialized with "
             f"max_pending_slots={max_pending_slots}, "
             f"max_version_slots={max_version_slots}, "
-            f"keys_per_slot={keys_per_slot}, "
             f"poll_interval={poll_interval}"
         )
 
@@ -183,7 +177,7 @@ class ReplayBuffer:
 
     # ======== Public API ========
 
-    async def acquire_slot(self, timeout: float | None = None) -> bool:
+    async def acquire_slot(self, timeout: float | None = None, uid="") -> bool:
         """Acquire a slot before processing a dataloader sample.
 
         Layer 1 (Physical): ``_pending_slots < max_pending_slots``
@@ -216,7 +210,12 @@ class ReplayBuffer:
                 if physical_ok and version_ok:
                     self._pending_slots += 1
                     self._version_slots += 1
-                    print(f"[ReplayBuffer][acquire_slot] Acquiring slot, pending_slots={self._pending_slots}")
+                    logger.debug(
+                        f"[ReplayBuffer][acquire_slot] Acquiring slot, "
+                        f"pending_slots={self._pending_slots}, "
+                        f"version_slots={self._version_slots}, "
+                        f"uid={uid}"
+                    )
                     return True
 
                 # Wait for notification (slot release, reset_staleness, or signal_finish)
@@ -243,8 +242,12 @@ class ReplayBuffer:
         Mirrors fully_async_rollouter.py:886 idle tracking.
         """
         async with self._slot_available:
-            print(f"[ReplayBuffer][release_slot] Releasing slot, pending_slots={self._pending_slots}")
             self._pending_slots = max(0, self._pending_slots - 1)
+            logger.debug(
+                f"[ReplayBuffer][release_slot] Releasing slot, "
+                f"pending_slots={self._pending_slots}, "
+                f"version_slots={self._version_slots}"
+            )
             # Record idle start when all slots are released (rollouter has no work)
             if self._pending_slots == 0:
                 self.idle_start_time = time.time()
@@ -254,38 +257,58 @@ class ReplayBuffer:
     async def wait_and_sample(
         self,
         partition_id: str,
-        batch_size: int,
+        sample_size: int,
     ) -> list[tuple[str, dict]] | None:
-        """Block until enough finish samples are ready or production is fully complete."""
+        """Block until enough finish samples (uids) are ready or production is fully complete.
+
+        Args:
+            partition_id: Partition to sample from (e.g. 'train').
+            sample_size: Number of **samples (uids)** to wait for, not number of response keys.
+                        Each sample/uid may have multiple response keys (e.g. n=16 responses per prompt).
+
+        Strategy:
+        1. Find uid-level keys with status 'finished' or 'success' (e.g. 'sample_0_190')
+        2. Extract uids from these uid-level keys
+        3. For each uid, find ALL matching response keys (e.g. 'sample_0_190_0', ..., 'sample_0_190_15')
+           from the partition
+        4. Return all collected response keys for up to sample_size uids
+        """
         async with self._data_available:
             while True:
                 # Check termination first
                 if self._finished:
-                    part = self.partitions.get(partition_id)
-                    if part:
-                        ready = [(k, v) for k, v in part.items() if v.get("status") == "success"]
-                        if ready:
-                            print(
-                                "[ReplayBuffer][wait_and_sample] Finished, returning "
-                                f"{len(ready)} remaining samples (partial batch)",
-                            )
-                            return ready
-                    print(
-                        "[ReplayBuffer][wait_and_sample] Finished, no remaining samples, returning None",
-                    )
                     return None
 
-                # Check if enough finish samples are ready
+                # Check if enough finish samples (uids) are ready
                 part = self.partitions.get(partition_id)
                 if part is not None:
-                    ready = [(k, v) for k, v in part.items() if v.get("status") == "success"]
+                    # Step 1: Find finished uids from uid-level keys with status 'finished' or 'success'
+                    finished_uids: set[str] = set()
+                    for key, meta in part.items():
+                        status = meta.get("status", "")
+                        if status == "finished":
+                            finished_uids.add(key)
 
-                    if len(ready) >= batch_size:
+                    # Step 2: Check if we have enough finished uids
+                    if len(finished_uids) >= sample_size:
+                        # Step 3: Collect ALL response keys for the first sample_size uids
+                        selected_uids = list(finished_uids)[:sample_size]
+                        all_response_keys: list[tuple[str, dict]] = []
+                        for key, meta in part.items():
+                            uid = meta.get("uid", "")
+                            if uid in selected_uids:
+                                all_response_keys.append((key, meta))
+
                         print(
-                            f"[ReplayBuffer][wait_and_sample] Returning {len(ready[:batch_size])} "
-                            f"samples from {partition_id}",
+                            f"[ReplayBuffer][wait_and_sample] Returning {len(all_response_keys)} "
+                            f"response keys from {len(selected_uids)} uids "
+                            f"(sample_size={sample_size}, total_finished={len(finished_uids)})",
                         )
-                        return ready[:batch_size]
+                        return all_response_keys
+                    else:
+                        print(
+                            f"[ReplayBuffer][wait_and_sample] ready: {len(finished_uids)} uids, need={sample_size}",
+                        )
 
                 # Wait for _poll_from_tq to write new metadata or signal_finish
                 await self._data_available.wait()
@@ -294,10 +317,17 @@ class ReplayBuffer:
         """Remove consumed samples from the metadata store."""
         async with self._data_available:
             part = self.partitions.get(partition_id)
+            size_before = len(part) if part is not None else 0
             if part is not None:
                 for key in keys:
                     part.pop(key, None)
-        print(f"[ReplayBuffer][remove] Removed {len(keys)} keys from {partition_id}", flush=True)
+            size_after = len(part) if part is not None else 0
+        print(
+            f"[ReplayBuffer][remove] partition={partition_id}: "
+            f"size {size_before} -> {size_after} "
+            f"(removed {len(keys)} keys, actually_deleted={size_before - size_after})",
+            flush=True,
+        )
 
     async def reset_staleness(self) -> dict:
         """Reset the version window after parameter synchronization.
@@ -308,18 +338,21 @@ class ReplayBuffer:
         - idle_ratio: fraction of time the rollouter was idle during the cycle
         """
         async with self._slot_available:
+            # Compute current partition status counts for state reset
+            partition_stats = self.compute_partition_stats()
             prev_version_slots = self._version_slots
+
             data = tq.kv_list()
             tq_keys = sum(len(items) for items in data.values()) if data else 0
-            tq_backlog_slots = tq_keys // self.keys_per_slot
 
-            # _version_slots = pending_slots (in-flight) + tq_keys (unconsumed backlog)
-            # This ensures the version window limits total samples *in the system*
-            # (not just newly issued slots). After reset, new slots can only be
-            # acquired up to ``max_version_slots - current_backlog``.
+            # Use partition_stats["train"]["success"] as the unconsumed backlog count
+            # This reflects samples written to TQ (status=success) but not yet consumed by trainer
+            train_stats = partition_stats.get("train", {})
+            train_finished_slots = train_stats.get("finished", 0)
 
-            # 这里如果 slots 没有释放，但是rollout 正在写 TQ 那么这里可能会多统计一些 in-flight 的样本
-            self._version_slots = self._pending_slots + tq_backlog_slots
+            # _version_slots = pending_slots (in-flight) + success_backlog (unconsumed in partitions)
+            # Uses partition_stats which is the source of truth for what trainer has not yet consumed
+            self._version_slots = self._pending_slots + train_finished_slots
 
             # Timing metrics
             # |step_start_time          |idle_start_time
@@ -349,9 +382,10 @@ class ReplayBuffer:
                 f"[ReplayBuffer][reset_staleness] "
                 f"version_slots: {prev_version_slots} -> {self._version_slots} "
                 f"pending_slots={self._pending_slots}, "
-                f"tq_backlog_slots={tq_backlog_slots}, "
+                f"train_finished_slots={train_finished_slots}, "
                 f"tq_keys={tq_keys}), "
                 f"idle_ratio: {idle_ratio:.4f}",
+                f"partition_stats: {partition_stats}",
                 flush=True,
             )
 
@@ -375,33 +409,30 @@ class ReplayBuffer:
             self._data_available.notify_all()
 
     # ======== Statistics ========
+    def compute_partition_stats(self) -> dict[str, dict[str, int]]:
+        """Compute per-partition status counts. Lock-free read.
 
-    def count_by_status(self, status: StatusType, partition_id: str | None = None) -> int:
-        """Count samples by status. Lock-free read."""
-        if partition_id:
-            parts = [self.partitions.get(partition_id, {})]
-        else:
-            parts = list(self.partitions.values())
-        return sum(1 for part in parts for v in part.values() if v.get("status") == status)
-
-    def total_in_flight(self) -> int:
-        """Total in-flight samples across all non-terminal states. Lock-free read."""
-        return self._pending_slots + self.count_by_status("success")
-
-    def get_statistics(self) -> dict:
-        """Return statistics about the buffer state. Lock-free read."""
-        partition_stats = {}
+        Returns:
+            dict mapping partition_id -> {status_type: count, ...}
+            e.g. {"train": {"success": 64, "finished": 2}}
+        """
+        partition_stats: dict[str, dict[str, int]] = {}
         for pid, part in self.partitions.items():
-            stats = {"success": 0}
+            stats: dict[str, int] = {"success": 0, "finished": 0, "failure": 0}
             for v in part.values():
-                status = v.get("status", "unknown")  # Align with wait_and_sample() which uses "status" key
+                status = v.get("status", "unknown")
                 if status in stats:
                     stats[status] += 1
             partition_stats[pid] = stats
+        return partition_stats
 
+    def get_statistics(self) -> dict:
+        """Return statistics about the buffer state. Lock-free read."""
+        partition_stats = self.compute_partition_stats()
+
+        # Also fetch TQ kv_list for cross-validation / debugging
         return {
             "partitions": partition_stats,
-            "total_in_flight": self.total_in_flight(),
             # Layer 1: Physical slot control
             "pending_slots": self._pending_slots,
             "max_pending_slots": self.max_pending_slots,

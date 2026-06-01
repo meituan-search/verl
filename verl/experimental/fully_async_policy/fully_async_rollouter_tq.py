@@ -149,15 +149,14 @@ class FullyAsyncRollouterTQ(FullyAsyncRollouter):
         rollout_n = self.config.actor_rollout_ref.rollout.n
 
         for epoch, batch_dict in continuous_iterator:
-            acquired = await self.replay_buffer.acquire_slot.remote(timeout=None)
+            sample_id = f"sample_{epoch}_{self.global_steps}"
+            acquired = await self.replay_buffer.acquire_slot.remote(timeout=None, uid=sample_id)
             if not acquired:
                 print(
                     f"[TQFullyAsyncRollouter][Feed] ReplayBuffer finished or closed, "
                     f"stop feeding after {self.global_steps} samples"
                 )
                 break
-
-            sample_id = f"sample_{epoch}_{self.global_steps}"
 
             # Inject fields into batch_dict (plain dict) BEFORE tu.get_tensordict().
             # All np.array values become NonTensorStack via get_tensordict:424,
@@ -215,14 +214,8 @@ class FullyAsyncRollouterTQ(FullyAsyncRollouter):
               AgentLoopWorkerTQ._run_prompt will loop n times internally to produce
               n responses per prompt, each written to TQ with a unique key.
         """
-        print(
-            f"[TQFullyAsyncRollouter][_process_single] Starting generate for {rollout_sample.sample_id}...",
-        )
         try:
             await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
-            print(
-                f"[TQFullyAsyncRollouter][_process_single] generate + TQ write done for {rollout_sample.sample_id}",
-            )
             self.total_generated_samples += 1
         except Exception as e:
             logger.exception(f"[TQFullyAsyncRollouter] Failed to process {rollout_sample.sample_id}: {e}")

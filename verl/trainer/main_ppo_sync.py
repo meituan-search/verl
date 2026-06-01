@@ -338,9 +338,6 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 else:
                     logger.exception(f"Unsupported type {type(v)} for key {k}")
 
-            uid = prompt.get("uid")
-            print(f"[AgentLoopWorkerTQ] Creating task {i} for uid={uid}, wait={wait}", flush=True)
-
             task = asyncio.create_task(
                 self._run_prompt(prompt, sampling_params, trajectory=trajectory_info[i], trace=trace_this_sample)
             )
@@ -353,7 +350,6 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
 
         # Optional: wait for all tasks to complete
         if wait:
-            print(f"[AgentLoopWorkerTQ] Waiting for {len(tasks)} tasks to complete...", flush=True)
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for i, result in enumerate(results):
                 if isinstance(result, Exception):
@@ -448,6 +444,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     "prompt_len": prompt_len,
                     "response_len": response_len,
                     "seq_len": prompt_len + response_len,
+                    "uid": uid,
                     "min_global_steps": output.extra_fields.get("min_global_steps"),
                     "max_global_steps": output.extra_fields.get("max_global_steps"),
                 }
@@ -1625,6 +1622,18 @@ class PPOTrainer:
                     self._log_rollout_data(batch, timing_raw, rollout_data_dir)
 
                 # 7. cleanup transfer queue and replay buffer
+
+                # Clear uid status : 'uid': {'status': 'finished'} or  {'status': 'failure'}
+                uid_keys: set[str] = set()
+                for key, tag in zip(batch.keys, batch.tags, strict=False):
+                    uid = tag.get("uid", "") if isinstance(tag, dict) else ""
+                    if uid and uid not in uid_keys:
+                        uid_keys.add(uid)
+
+                # Clear uid-deduped keys from TQ and RB
+                tq.kv_clear(keys=list(uid_keys), partition_id=batch.partition_id)
+                self.replay_buffer.remove(batch.partition_id, list(uid_keys))
+
                 tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
                 self.replay_buffer.remove(batch.partition_id, batch.keys)
 

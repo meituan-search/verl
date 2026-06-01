@@ -155,7 +155,7 @@ class FullyAsyncTrainerTQ(PPOTrainer, FullyAsyncTrainer):
         await FullyAsyncTrainer.init_workers(self)
         tq.init()
 
-    async def _get_kvbatch_from_rb(self) -> KVBatchMeta | None:
+    async def _get_keys_from_rb(self) -> KVBatchMeta | None:
         """
         Get a KVBatchMeta from TQ via ReplayBuffer.
 
@@ -169,7 +169,7 @@ class FullyAsyncTrainerTQ(PPOTrainer, FullyAsyncTrainer):
 
         sampled_keys_meta = await self.replay_buffer.wait_and_sample.remote(
             partition_id="train",
-            batch_size=self.required_samples * self.config.actor_rollout_ref.rollout.n,
+            sample_size=self.required_samples,
         )
 
         if sampled_keys_meta is None or len(sampled_keys_meta) == 0:
@@ -234,7 +234,7 @@ class FullyAsyncTrainerTQ(PPOTrainer, FullyAsyncTrainer):
 
             # 2. sample batch from replay buffer
             with marked_timer("gen", timing_raw, color="red"):
-                batch = await self._get_kvbatch_from_rb()
+                batch = await self._get_keys_from_rb()
                 if batch is None:
                     raise TrainingStopException("Training terminated: RB returned None")
                 batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
@@ -278,18 +278,40 @@ class FullyAsyncTrainerTQ(PPOTrainer, FullyAsyncTrainer):
             await self._fit_update_weights()
 
         await self._fit_collect_metrics(batch)
-
-        # Cleanup consumed data from TQ + RB (after _compute_metrics reads TQ via kv_batch_get)
-        # clear TQ and RB must before reset_staleness
-        tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
-        await self.replay_buffer.remove.remote(batch.partition_id, batch.keys)
-
+        await self._cleanup_batch(batch)
         await self._fit_reset_staleness()
 
         await self._fit_validate()
         self._fit_save_checkpoint()
         self._stop_profiling()
         self._fit_postprocess_step()
+
+    async def _cleanup_batch(self, batch):
+        """Cleanup consumed batch from TQ and RB.
+
+        Two-phase cleanup:
+        1. Clear uid-level keys (deduplicated by uid from tags): removes uid status entries
+           like {'uid': {'status': 'finished'}} from both TQ and RB partitions.
+        2. Clear all sampled response keys: full cleanup of {uid}_{resp_idx} keys from TQ and RB.
+        """
+        # Phase 1: Deduplicate by uid from tags to get uid-level keys
+        uid_keys: set[str] = set()
+        for key, tag in zip(batch.keys, batch.tags, strict=False):
+            uid = tag.get("uid", "") if isinstance(tag, dict) else ""
+            if uid and uid not in uid_keys:
+                uid_keys.add(uid)
+
+        tq.kv_clear(keys=list(uid_keys), partition_id=batch.partition_id)
+        await self.replay_buffer.remove.remote(batch.partition_id, list(uid_keys))
+
+        # Phase 2: Clear all sampled response keys (full cleanup)
+        tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
+        await self.replay_buffer.remove.remote(batch.partition_id, batch.keys)
+
+        print(
+            f"[TQFullyAsyncTrainer] _cleanup_batch: {len(batch.keys)} total keys, {len(uid_keys)} deduped uids cleared",
+            flush=True,
+        )
 
     async def _fit_update_weights(self):
         if self.local_trigger_step != 1:
