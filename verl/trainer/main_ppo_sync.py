@@ -358,7 +358,6 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             for i, result in enumerate(results):
                 if isinstance(result, Exception):
                     print(f"[AgentLoopWorkerTQ] Task {i} raised exception: {result}", flush=True)
-            print(f"[AgentLoopWorkerTQ] All {len(tasks)} tasks completed", flush=True)
 
     async def _run_prompt(self, prompt: dict, sampling_params: dict, trajectory: dict, trace: bool = False) -> None:
         """Spawn multiple agent loops in parallel according to rollout.n or rollout.val_kwargs.n."""

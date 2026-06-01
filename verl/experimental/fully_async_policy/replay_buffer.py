@@ -311,12 +311,14 @@ class ReplayBuffer:
             prev_version_slots = self._version_slots
             data = tq.kv_list()
             tq_keys = sum(len(items) for items in data.values()) if data else 0
-            tq_backlog_slots = (tq_keys + self.keys_per_slot - 1) // self.keys_per_slot
+            tq_backlog_slots = tq_keys // self.keys_per_slot
 
             # _version_slots = pending_slots (in-flight) + tq_keys (unconsumed backlog)
             # This ensures the version window limits total samples *in the system*
             # (not just newly issued slots). After reset, new slots can only be
             # acquired up to ``max_version_slots - current_backlog``.
+
+            # 这里如果 slots 没有释放，但是rollout 正在写 TQ 那么这里可能会多统计一些 in-flight 的样本
             self._version_slots = self._pending_slots + tq_backlog_slots
 
             # Timing metrics

@@ -311,6 +311,8 @@ class FullyAsyncTrainerTQ(PPOTrainer, FullyAsyncTrainer):
 
     async def _fit_reset_staleness(self):
         # Reset staleness in rollouter
+        if self.local_trigger_step != 1:
+            return
         timing_raw = await self.rollouter.reset_staleness.remote()
         self.logger.log(
             data=timing_raw,
