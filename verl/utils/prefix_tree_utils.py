@@ -28,6 +28,7 @@ __all__ = [
     "build_prefix_tree_dense_mask",
     "build_prefix_tree_flex_spec",
     "build_multilevel_flex_spec",
+    "build_layout_from_tree_node",
     "build_prefix_tree_params",
     "extract_sample_tensor",
     "extract_sample_tensors",
@@ -171,6 +172,145 @@ def build_multilevel_flex_spec(
     _emit_node(root)
 
     return q_ranges, k_ranges, mask_types
+
+
+def build_layout_from_tree_node(
+    samples: Sequence[Tensor],
+    tree_root: TreeNode,
+    leaf_to_sample: Sequence[int],
+    loss_masks_by_sample: Optional[Sequence[Tensor]] = None,
+    position_ids_by_sample: Optional[Sequence[Tensor]] = None,
+) -> PrefixTreeParams:
+    """Build flat layout (PrefixTreeParams) from a TreeNode spec.
+
+    Consumed by the dynamic-trie detection path: ``build_tree_dynamic`` produces
+    a ``(TreeNode, leaf_to_sample)`` pair describing the LOGICAL shared-prefix
+    structure, and this function realises it as a PHYSICAL flat token layout
+    plus q/k attention rectangles.
+
+    For each node we track an "owner" sample (the first leaf descendant) and an
+    "owner offset" (the cumulative segment_len of all ancestors). The owner's
+    token slice at ``[offset, offset+segment_len)`` is what gets emitted into
+    the flat tensor for that node.
+
+    Args:
+        samples: Per-sample 1-D token tensors. ``samples[i]`` is the original
+            sequence for sample ``i``.
+        tree_root: Root of the prefix tree. Its ``segment_len`` is the length
+            of the shared root prefix.
+        leaf_to_sample: For each leaf in DFS pre-order, the original sample
+            index this leaf corresponds to. Length must equal the number of
+            leaves in ``tree_root``.
+        loss_masks_by_sample / position_ids_by_sample: optional per-sample
+            auxiliary tensors. When None, position ids default to
+            ``arange(owner_offset, owner_offset + segment_len)`` so each
+            sample's RoPE positions match the original layout.
+
+    Returns:
+        PrefixTreeParams with ``multilevel=True``. Also stashes
+        ``_leaf_ancestor_ranges`` on the params instance for downstream
+        ``restore_flat_to_nested``.
+    """
+    # build_multilevel_flex_spec assigns _flat_start / _flat_end to every node
+    # as a side effect — we rely on that for leaf_ranges + ancestor ranges below.
+    q_ranges, k_ranges, mask_types = build_multilevel_flex_spec(tree_root)
+
+    # Walk top-down: assign each node its owner sample (first leaf descendant)
+    # and owner offset (= sum of ancestor segment_lens). Also collect leaves in
+    # DFS order and a parent_of map for restoring ancestor chains.
+    leaves_in_dfs: list[TreeNode] = []
+    parent_of: dict[int, TreeNode] = {}
+    leaf_cursor = [0]  # mutable closure cell
+
+    def _annotate(node: TreeNode, owner_offset: int) -> int:
+        node._owner_offset = owner_offset  # type: ignore[attr-defined]
+        if node.is_leaf:
+            sample_idx = int(leaf_to_sample[leaf_cursor[0]])
+            leaf_cursor[0] += 1
+            node._owner_sample = sample_idx  # type: ignore[attr-defined]
+            leaves_in_dfs.append(node)
+            return sample_idx
+        child_offset = owner_offset + node.segment_len
+        first_owner: Optional[int] = None
+        for i, child in enumerate(node.children):
+            parent_of[id(child)] = node
+            owner = _annotate(child, child_offset)
+            if i == 0:
+                first_owner = owner
+        node._owner_sample = first_owner  # type: ignore[attr-defined]
+        return first_owner  # type: ignore[return-value]
+
+    _annotate(tree_root, 0)
+
+    # Emit flat tokens via DFS pre-order using each node's (owner_sample, owner_offset).
+    device = samples[0].device
+    flat_pieces: list[Tensor] = []
+    flat_lm_pieces: Optional[list[Tensor]] = [] if loss_masks_by_sample is not None else None
+    flat_pid_pieces: Optional[list[Tensor]] = [] if position_ids_by_sample is not None else None
+    default_pid_pieces: list[Tensor] = []
+
+    def _emit(node: TreeNode) -> None:
+        if node.segment_len > 0:
+            owner = node._owner_sample  # type: ignore[attr-defined]
+            s = node._owner_offset  # type: ignore[attr-defined]
+            e = s + node.segment_len
+            flat_pieces.append(samples[owner][s:e])
+            if flat_lm_pieces is not None:
+                flat_lm_pieces.append(loss_masks_by_sample[owner][s:e])
+            if flat_pid_pieces is not None:
+                flat_pid_pieces.append(position_ids_by_sample[owner][s:e])
+            else:
+                default_pid_pieces.append(torch.arange(s, e, device=device, dtype=torch.long))
+        for child in node.children:
+            _emit(child)
+
+    _emit(tree_root)
+
+    flat_tokens = torch.cat(flat_pieces) if flat_pieces else torch.empty(0, dtype=samples[0].dtype, device=device)
+    flat_loss_mask = torch.cat(flat_lm_pieces) if flat_lm_pieces is not None else None
+    if flat_pid_pieces is not None:
+        flat_position_ids = torch.cat(flat_pid_pieces)
+    else:
+        flat_position_ids = (
+            torch.cat(default_pid_pieces) if default_pid_pieces else torch.empty(0, dtype=torch.long, device=device)
+        )
+
+    leaf_ranges = [(leaf._flat_start, leaf._flat_end) for leaf in leaves_in_dfs]  # type: ignore[attr-defined]
+    leaf_to_sample_list = [int(s) for s in leaf_to_sample]
+    sample_to_leaf_range = {s: r for s, r in zip(leaf_to_sample_list, leaf_ranges, strict=False)}
+
+    leaf_ancestor_ranges: list[list[RangeSpec]] = []
+    for leaf in leaves_in_dfs:
+        chain: list[RangeSpec] = []
+        cur = parent_of.get(id(leaf))
+        while cur is not None:
+            chain.append((cur._flat_start, cur._flat_end))  # type: ignore[attr-defined]
+            cur = parent_of.get(id(cur))
+        chain.reverse()  # root first
+        leaf_ancestor_ranges.append(chain)
+
+    prefix_range = (tree_root._flat_start, tree_root._flat_end)  # type: ignore[attr-defined]
+
+    params = PrefixTreeParams(
+        prefix_range=prefix_range,
+        prefix_segments=[prefix_range],
+        leaf_ranges=leaf_ranges,
+        leaf_segments=list(leaf_ranges),
+        leaf_to_sample=leaf_to_sample_list,
+        sample_to_leaf_range=sample_to_leaf_range,
+        q_ranges=q_ranges,
+        k_ranges=k_ranges,
+        mask_types=mask_types,
+        total_seqlen_q=flat_tokens.numel(),
+        total_seqlen_k=flat_tokens.numel(),
+        flat_tokens=flat_tokens,
+        flat_labels=None,
+        flat_loss_mask=flat_loss_mask,
+        flat_position_ids=flat_position_ids,
+        multilevel=True,
+    )
+    params._leaf_ancestor_ranges = leaf_ancestor_ranges  # type: ignore[attr-defined]
+    return params
 
 
 def build_prefix_tree_dense_mask(

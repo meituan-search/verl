@@ -254,6 +254,7 @@ def gptmodel_forward_model_engine(
         # ------------------------------------------------------------------
         use_prefix_tree = (logits_processor_args or {}).get("use_prefix_tree", False)
         prefix_tree_attention = (logits_processor_args or {}).get("prefix_tree_attention", "flex")
+        prefix_tree_dynamic = (logits_processor_args or {}).get("prefix_tree_dynamic", False)
         pt_batch = None
         if use_prefix_tree and not vision_model and not mtp_enable_train:
             from verl.utils.prefix_tree_magi import (
@@ -283,6 +284,7 @@ def gptmodel_forward_model_engine(
                 attention_type=prefix_tree_attention,
                 tp_size=_mpu.get_tensor_model_parallel_world_size(),
                 cp_size=_mpu.get_context_parallel_world_size(),
+                dynamic_trie=prefix_tree_dynamic,
             )
             _t1 = _time.perf_counter()
             if pt_batch is not None:
