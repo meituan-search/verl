@@ -51,6 +51,9 @@ actor_rollout_ref:
       force_use_huggingface: false
       activation_gpu_limit: 0.0
       moe_load_balance_monitor_interval: 0
+      router_replay:
+        _target_: verl.workers.config.EngineRouterReplayConfig
+        mode: disabled
     _target_: verl.workers.config.VeOmniActorConfig
     rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
     strategy: veomni
@@ -144,6 +147,7 @@ actor_rollout_ref:
       - re:.*mlp.gate$
       activation_observer: static_minmax
       quantization_config_path: null
+    use_remove_padding: ${oc.select:actor_rollout_ref.model.use_remove_padding,false}
   ref:
     rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
     strategy: veomni
@@ -217,6 +221,9 @@ actor_rollout_ref:
       force_use_huggingface: false
       activation_gpu_limit: 0.0
       moe_load_balance_monitor_interval: 0
+      router_replay:
+        _target_: verl.workers.config.EngineRouterReplayConfig
+        mode: disabled
     _target_: verl.workers.config.VeOmniActorConfig
   rollout:
     _target_: verl.workers.config.RolloutConfig
@@ -501,6 +508,9 @@ critic:
     force_use_huggingface: false
     activation_gpu_limit: 0.0
     moe_load_balance_monitor_interval: 0
+    router_replay:
+      _target_: verl.workers.config.EngineRouterReplayConfig
+      mode: disabled
   _target_: verl.workers.config.VeOmniCriticConfig
   rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
   strategy: veomni
