@@ -1,4 +1,16 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from __future__ import annotations
 
@@ -52,7 +64,7 @@ class PrefixTreeParams:
         if prefix_end < prefix_start:
             raise ValueError("prefix_range must be non-decreasing")
 
-        for leaf_range, leaf_segment in zip(self.leaf_ranges, self.leaf_segments):
+        for leaf_range, leaf_segment in zip(self.leaf_ranges, self.leaf_segments, strict=False):
             leaf_start, leaf_end = leaf_range
             if leaf_end < leaf_start:
                 raise ValueError("leaf ranges must be non-decreasing")
@@ -75,11 +87,11 @@ class PrefixTreeParams:
                     raise ValueError("leaf ranges must start at or after the shared prefix")
             expected_ranges = [self.prefix_range]
             expected_k_ranges = [self.prefix_range]
-            expected_mask_types = ['causal']
+            expected_mask_types = ["causal"]
             for leaf_range in self.leaf_ranges:
                 expected_ranges.extend([leaf_range, leaf_range])
                 expected_k_ranges.extend([self.prefix_range, leaf_range])
-                expected_mask_types.extend(['full', 'causal'])
+                expected_mask_types.extend(["full", "causal"])
             if self.q_ranges != expected_ranges:
                 raise ValueError("q_ranges do not match root-shared PrefixTree layout")
             if self.k_ranges != expected_k_ranges:
@@ -87,15 +99,15 @@ class PrefixTreeParams:
             if self.mask_types != expected_mask_types:
                 raise ValueError("mask_types do not match root-shared PrefixTree layout")
 
-        for sample_idx, leaf_range in zip(self.leaf_to_sample, self.leaf_ranges):
+        for sample_idx, leaf_range in zip(self.leaf_to_sample, self.leaf_ranges, strict=False):
             if self.sample_to_leaf_range[sample_idx] != leaf_range:
                 raise ValueError("sample_to_leaf_range does not match leaf_to_sample ordering")
 
         for name, tensor in {
-            'flat_tokens': self.flat_tokens,
-            'flat_labels': self.flat_labels,
-            'flat_loss_mask': self.flat_loss_mask,
-            'flat_position_ids': self.flat_position_ids,
+            "flat_tokens": self.flat_tokens,
+            "flat_labels": self.flat_labels,
+            "flat_loss_mask": self.flat_loss_mask,
+            "flat_position_ids": self.flat_position_ids,
         }.items():
             if tensor is not None and tensor.numel() != self.total_seqlen_q:
                 raise ValueError(f"{name} must have total_seqlen_q elements")
