@@ -450,8 +450,7 @@ class FullyAsyncTrainerTQ(PPOTrainer, FullyAsyncTrainer):
             self.metrics["fully_async/count/current_param_version"] = self.current_param_version
 
         # 7. Merge rollouter monitor/count/static stats
-        if self.rollouter is not None:
-            rollouter_stats = await self.rollouter.get_statistics.remote()
-            for k, v in rollouter_stats.items():
-                if isinstance(v, int | float):
-                    self.metrics[f"fully_async/{k}"] = v
+        rollouter_stats = await self.replay_buffer.get_statistics.remote()
+        for k, v in rollouter_stats.items():
+            if isinstance(v, int | float):
+                self.metrics[f"fully_async/{k}"] = v

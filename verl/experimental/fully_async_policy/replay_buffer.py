@@ -302,71 +302,62 @@ class ReplayBuffer:
                                 # This is a response key (has uid tag) belonging to a finished uid
                                 uid_response_keys.setdefault(uid, []).append((key, meta))
 
-                        # Filter to only uids that have ALL their response keys synced.
-                        # A uid is "complete" when it has at least 1 response key.
-                        # (We can't know exact n here, but we require at least some responses arrived.)
-                        # The key insight: _run_prompt writes "finished" AFTER all n
-                        # _agent_loop_postprocess calls, but those writes go to TQ first and
-                        # need _poll_from_tq to sync into self.partitions. So we wait until
-                        # we see response keys for this uid.
-                        complete_uids = [uid for uid, keys in uid_response_keys.items() if len(keys) == rollout_n]
-                        major_complete_uids = [uid for uid, keys in uid_response_keys.items() if len(keys) > rollout_n]
-                        incomplete_uids = [uid for uid, keys in uid_response_keys.items() if len(keys) < rollout_n]
+                        normal_eq_uids = [uid for uid, keys in uid_response_keys.items() if len(keys) == rollout_n]
+                        abnormal_gt_uids = [uid for uid, keys in uid_response_keys.items() if len(keys) > rollout_n]
+                        abnormal_lt_uids = [uid for uid, keys in uid_response_keys.items() if len(keys) < rollout_n]
 
-                        if len(complete_uids) >= sample_size:
-                            selected_uids = complete_uids[:sample_size]
+                        if len(normal_eq_uids) >= sample_size:
+                            selected_uids = normal_eq_uids[:sample_size]
                             all_response_keys: list[tuple[str, dict]] = []
                             for uid in selected_uids:
                                 all_response_keys.extend(uid_response_keys[uid])
 
                             expected_keys = sample_size * rollout_n
 
-                            # Diagnostic: print full key details when count is abnormal
                             if len(all_response_keys) != expected_keys:
+                                print(
+                                    f"len(all_response_keys)={len(all_response_keys)} != expected_keys={expected_keys}"
+                                )
+                                continue
+
+                            print(
+                                f"[ReplayBuffer][wait_and_sample] Returning {len(all_response_keys)} "
+                                f"response keys from {len(selected_uids)} uids "
+                                f"(sample_size={sample_size}, "
+                                f"total_finished={len(finished_uids)}, "
+                                f"normal_eq_uids={len(normal_eq_uids)}, "
+                                f"abnormal_gt_uids={len(abnormal_gt_uids)}, "
+                                f"abnormal_lt_uids={len(abnormal_lt_uids)})",
+                                flush=True,
+                            )
+
+                            if abnormal_gt_uids or abnormal_lt_uids:
                                 # Print per-uid key breakdown for the selected uids
                                 per_uid_breakdown = {
                                     uid: [k for k, _ in uid_response_keys[uid]] for uid in selected_uids
+                                }
+                                # Also show abnormal uid details for context
+                                abnormal_gt_details = {
+                                    uid: [k for k, _ in uid_response_keys[uid]] for uid in abnormal_gt_uids
+                                }
+                                abnormal_lt_details = {
+                                    uid: [k for k, _ in uid_response_keys[uid]] for uid in abnormal_lt_uids
                                 }
                                 print(
                                     f"[ReplayBuffer][wait_and_sample] ⚠️ ABNORMAL KEY COUNT! "
                                     f"Returning {len(all_response_keys)} keys (expected {expected_keys}) "
                                     f"from {len(selected_uids)} uids (expected {sample_size}), "
                                     f"rollout_n={rollout_n}\n"
-                                    f"  PER-UID BREAKDOWN ({len(per_uid_breakdown)} uids): {per_uid_breakdown}\n"
-                                    f"  major_complete_uids (> {rollout_n} keys): {major_complete_uids}\n"
-                                    f"  incomplete_uids (< {rollout_n} keys): "
-                                    f"{[uid for uid in incomplete_uids]}",
-                                    f"all_response_keys={all_response_keys}",
-                                    flush=True,
-                                )
-                                continue
-                            else:
-                                print(
-                                    f"[ReplayBuffer][wait_and_sample] Returning {len(all_response_keys)} "
-                                    f"response keys from {len(selected_uids)} uids "
-                                    f"(sample_size={sample_size}, "
-                                    f"total_finished={len(finished_uids)}, "
-                                    f"complete_uids={len(complete_uids)}, "
-                                    f"incomplete_uids={len(incomplete_uids)})",
-                                    f"major_complete_uids={len(major_complete_uids)})",
+                                    f"  SELECTED PER-UID BREAKDOWN ({len(per_uid_breakdown)} uids): "
+                                    f"{per_uid_breakdown}\n"
+                                    f"  ABNORMAL_GT UIDS (> {rollout_n} keys, {len(abnormal_gt_uids)} total): "
+                                    f"{abnormal_gt_details}\n"
+                                    f"  ABNORMAL_LT UIDS (< {rollout_n} keys, {len(abnormal_lt_uids)} total): "
+                                    f"{abnormal_lt_details}",
                                     flush=True,
                                 )
 
                             return all_response_keys
-                        else:
-                            # Not enough uids have their response keys synced yet — wait for next poll
-                            # Print incomplete uid details for debugging
-                            incomplete_details = {
-                                uid: [k for k, _ in uid_response_keys[uid]] for uid in incomplete_uids
-                            }
-                            incomplete_count = len(finished_uids) - len(complete_uids)
-                            print(
-                                f"[ReplayBuffer][wait_and_sample] "
-                                f"ready: {len(finished_uids)} uids finished, "
-                                f"but only {len(complete_uids)} have response keys synced "
-                                f"({incomplete_count} incomplete), need={sample_size}\n"
-                                f"  INCOMPLETE UID DETAILS (have < {rollout_n} keys): {incomplete_details}",
-                            )
                     else:
                         print(
                             f"[ReplayBuffer][wait_and_sample] ready: {len(finished_uids)} uids, need={sample_size}",

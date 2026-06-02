@@ -110,17 +110,12 @@ class FullyAsyncRollouterTQ(FullyAsyncRollouter):
         processor=None,
         device_name=None,
     ):
-        # Call parent __init__ (sets up datasets, dataloader, basic config)
         super().__init__(config=config, tokenizer=tokenizer, processor=processor, device_name=device_name)
 
         # ==================== TQ-specific overrides ====================
         self.replay_buffer = None  # Ray Actor handle, set via set_replay_buffer()
-
         self.agent_loop_manager_class = FullyAsyncAgentLoopManagerTQ
-
         print("[TQFullyAsyncRollouter] initialized (TQ mode)")
-
-    # ======== ReplayBuffer injection (replaces set_message_queue_client) ========
 
     async def set_replay_buffer(self, replay_buffer):
         """Set ReplayBuffer Ray Actor handle."""
@@ -144,7 +139,6 @@ class FullyAsyncRollouterTQ(FullyAsyncRollouter):
               BEFORE calling tu.get_tensordict(), so these np.array values become NonTensorStack
               (supporting per-index access in AgentLoopWorkerTQ.generate_sequences).
         """
-        print("[TQFullyAsyncRollouter][_feed_samples] STARTING", flush=True)
         continuous_iterator = self._create_continuous_iterator()
         rollout_n = self.config.actor_rollout_ref.rollout.n
 
@@ -197,9 +191,6 @@ class FullyAsyncRollouterTQ(FullyAsyncRollouter):
         # End signal
         await self.pending_queue.put(None)
         print(f"[TQFullyAsyncRollouter][Feed] Sample addition is complete, {self.global_steps} samples have been added")
-
-    async def _should_pause_generation(self) -> bool:
-        return False
 
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample: generate via ALM worker (which writes to TQ blocking), then release slot.
@@ -274,29 +265,8 @@ class FullyAsyncRollouterTQ(FullyAsyncRollouter):
         rb_timing = await self.replay_buffer.reset_staleness.remote()
         return rb_timing
 
-    async def get_statistics(self) -> dict:
-        """Gather statistics from RB and local state."""
-        rb_stats = {}
-        if self.replay_buffer is not None:
-            rb_stats = await self.replay_buffer.get_statistics.remote()
-
-        stats = {
-            # Monitor stats
-            "monitor/active_tasks_size": len(self.active_tasks),
-            "monitor/queue/pending_queue_size": self.pending_queue.qsize(),
-            # Counting stats
-            "count/total_generated_samples": self.total_generated_samples,
-            "count/processed_sample_count": self.processed_sample_count,
-            # Static config
-            "static/max_required_samples": self.max_required_samples,
-            "static/required_samples": self.required_samples,
-            "static/staleness_threshold": self.staleness_threshold,
-            "static/max_concurrent_samples": self.max_concurrent_samples,
-            # RB stats (if available)
-            **rb_stats,
-        }
-
-        return stats
+    async def _should_pause_generation(self) -> bool:
+        return False
 
     async def _async_monitor_loop(self):
         pass
