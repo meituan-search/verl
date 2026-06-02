@@ -239,7 +239,11 @@ class SFTTrainer:
         dp_size = self.engine.get_data_parallel_size()
 
         self.train_sampler = DistributedSampler(
-            self.train_dataset, shuffle=self.config.data.get("shuffle", True), num_replicas=dp_size, rank=dp_rank, drop_last=True
+            self.train_dataset,
+            shuffle=self.config.data.get("shuffle", True),
+            num_replicas=dp_size,
+            rank=dp_rank,
+            drop_last=True,
         )
 
         self.global_batch_size = config.data.train_batch_size

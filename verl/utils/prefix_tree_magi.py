@@ -30,9 +30,9 @@ Usage (inside gptmodel_forward_model_engine):
         )
         output = restore_flat_to_nested(output, pt_batch)
 """
+
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass
 from typing import Optional
 
@@ -46,8 +46,8 @@ class PrefixTreeMagiBatch:
     """Holds the flat layout and MAGI key for one prefix-tree micro-batch."""
 
     # flat input tensors ready to pass to model(...)
-    flat_input_ids: Tensor       # (total_tokens,)
-    flat_position_ids: Tensor    # (total_tokens,)
+    flat_input_ids: Tensor  # (total_tokens,)
+    flat_position_ids: Tensor  # (total_tokens,)
     flat_loss_mask: Optional[Tensor]  # (total_tokens,) or None
 
     # Attention keys — one will be None depending on prefix_tree_attention setting
@@ -124,11 +124,9 @@ def build_prefix_tree_micro_batch(
     Returns:
         PrefixTreeMagiBatch or None.
     """
-    import torch.distributed as dist
 
     from verl.utils.prefix_tree_utils import (
         build_prefix_tree_params,
-        extract_sample_tensors,
         longest_common_prefix_length,
     )
 
@@ -145,13 +143,17 @@ def build_prefix_tree_micro_batch(
 
     # Fast path: use injected prior knowledge when available.
     import os as _os
+
     if prefix_segments_batch is not None and len(prefix_segments_batch) == len(tokens_by_sample):
         prefix_len = _resolve_prefix_len_from_segments(prefix_segments_batch)
-        if _os.environ.get('DEBUG_PREFIX_LEN') == '1':
+        if _os.environ.get("DEBUG_PREFIX_LEN") == "1":
             scan_len = longest_common_prefix_length(tokens_by_sample)
             T = tokens_by_sample[0].shape[0] if tokens_by_sample else 0
-            print(f'[PREFIX_LEN] seg_len={prefix_len} scan_len={scan_len} T={T} '
-                  f'n_segs={[len(s) for s in prefix_segments_batch]}', flush=True)
+            print(
+                f"[PREFIX_LEN] seg_len={prefix_len} scan_len={scan_len} T={T} "
+                f"n_segs={[len(s) for s in prefix_segments_batch]}",
+                flush=True,
+            )
     else:
         prefix_len = longest_common_prefix_length(tokens_by_sample)
 
@@ -187,14 +189,14 @@ def build_prefix_tree_micro_batch(
     if prefix_segments_batch is not None:
         actual_root_len = longest_common_prefix_length(tokens_by_sample)
         if actual_root_len > 0:
-            multilevel_result = _resolve_multilevel_tree(
-                tokens_by_sample, prefix_segments_batch, actual_root_len
-            )
+            multilevel_result = _resolve_multilevel_tree(tokens_by_sample, prefix_segments_batch, actual_root_len)
 
     if multilevel_result is not None:
         root_len, children_info = multilevel_result
         params = _build_multilevel_prefix_tree_params(
-            tokens_by_sample, root_len, children_info,
+            tokens_by_sample,
+            root_len,
+            children_info,
             loss_masks_by_sample=loss_masks_by_sample,
             position_ids_by_sample=position_ids_by_sample,
         )
@@ -216,13 +218,13 @@ def build_prefix_tree_micro_batch(
         pad_len = (align_size - total % align_size) % align_size
         if pad_len > 0:
             import torch as _torch
-            params.flat_tokens = _torch.cat(
-                [params.flat_tokens, params.flat_tokens.new_zeros(pad_len)])
+
+            params.flat_tokens = _torch.cat([params.flat_tokens, params.flat_tokens.new_zeros(pad_len)])
             params.flat_position_ids = _torch.cat(
-                [params.flat_position_ids, params.flat_position_ids.new_zeros(pad_len)])
+                [params.flat_position_ids, params.flat_position_ids.new_zeros(pad_len)]
+            )
             if params.flat_loss_mask is not None:
-                params.flat_loss_mask = _torch.cat(
-                    [params.flat_loss_mask, params.flat_loss_mask.new_zeros(pad_len)])
+                params.flat_loss_mask = _torch.cat([params.flat_loss_mask, params.flat_loss_mask.new_zeros(pad_len)])
             params.total_seqlen_q += pad_len
             params.total_seqlen_k += pad_len
             # Do NOT add rectangles for padding tokens — they are stripped before loss.
@@ -256,7 +258,7 @@ def build_prefix_tree_micro_batch(
         prefix_range=params.prefix_range,
         original_batch_size=params.num_samples,
         real_tokens=real_tokens,
-        leaf_ancestor_ranges=getattr(params, '_leaf_ancestor_ranges', None),
+        leaf_ancestor_ranges=getattr(params, "_leaf_ancestor_ranges", None),
         local_flat_input_ids=local_flat_tokens,
         local_flat_position_ids=local_flat_position_ids,
         local_flat_loss_mask=local_flat_loss_mask,
@@ -320,9 +322,11 @@ def _hash_prefix(token_ids_flat: Tensor) -> int:
     raw = token_ids_flat.numpy().tobytes()
     try:
         import xxhash  # type: ignore[import]
+
         return xxhash.xxh128_intdigest(raw)
     except ImportError:
         import hashlib
+
         return int.from_bytes(hashlib.md5(raw).digest(), "little")
 
 
@@ -374,6 +378,7 @@ def _resolve_multilevel_tree(
     have ≥2 samples, a 2-level tree exists and we return a TreeNode root.
     """
     from collections import defaultdict
+
     from verl.utils.prefix_tree_utils import TreeNode
 
     n = len(tokens_by_sample)
@@ -400,6 +405,7 @@ def _resolve_multilevel_tree(
     # Use token scan (not segment hashes) to get exact turn2 shared prefix length per group.
     # Segment hashes can mis-align due to chat-template boundary effects.
     from verl.utils.prefix_tree_utils import longest_common_prefix_length
+
     children = []
     for _h, idxs in useful:
         group_tokens = [tokens_by_sample[i] for i in idxs]
@@ -409,8 +415,7 @@ def _resolve_multilevel_tree(
         if shared_suffix_len <= 0:
             return None
         group_turn2_len = shared_suffix_len
-        leaves = [TreeNode(int(tokens_by_sample[i].shape[0]) - root_prefix_len - group_turn2_len, [])
-                  for i in idxs]
+        leaves = [TreeNode(int(tokens_by_sample[i].shape[0]) - root_prefix_len - group_turn2_len, []) for i in idxs]
         if any(leaf.segment_len <= 0 for leaf in leaves):
             return None
         children.append((idxs, TreeNode(group_turn2_len, leaves)))
@@ -427,8 +432,9 @@ def _build_multilevel_prefix_tree_params(
 ):
     """Build PrefixTreeParams for a 2-level tree using build_multilevel_flex_spec."""
     import torch
-    from verl.utils.prefix_tree_utils import TreeNode, build_multilevel_flex_spec
+
     from verl.utils.prefix_tree_params import PrefixTreeParams
+    from verl.utils.prefix_tree_utils import TreeNode, build_multilevel_flex_spec
 
     # Build TreeNode for flex_spec
     tree_children = [child_node for _, child_node in children_info]
@@ -442,6 +448,7 @@ def _build_multilevel_prefix_tree_params(
         for child in node.children:
             cur = _assign_offsets(child, cur)
         return cur
+
     total_tokens = _assign_offsets(root_node, 0)
 
     # Build flat token tensor: root + each child group + each leaf in DFS order
@@ -470,21 +477,20 @@ def _build_multilevel_prefix_tree_params(
         # internal node: add this node's own tokens (shared by its group)
         sample_idx = sample_idxs_list[0]
         tok = tokens_by_sample[sample_idx]
-        node_start_in_sample = node._flat_start  # offset in flat layout
         # Compute where this node's tokens start in the original sample
         # For root: sample[0:root_len]
         # For depth-1 child: sample[root_len : root_len + child.segment_len]
         if depth == 0:
-            content = tok[:node._flat_end]  # root tokens
+            content = tok[: node._flat_end]  # root tokens
         else:
-            content = tok[root_len: root_len + node.segment_len]  # turn2 tokens
+            content = tok[root_len : root_len + node.segment_len]  # turn2 tokens
         flat_parts.append(content)
 
         # Recurse into children, distributing sample indices
         leaf_idx = 0
         for child in node.children:
             n_leaves = _count_leaves(child)
-            _flatten_node(child, sample_idxs_list[leaf_idx:leaf_idx + n_leaves], depth + 1)
+            _flatten_node(child, sample_idxs_list[leaf_idx : leaf_idx + n_leaves], depth + 1)
             leaf_idx += n_leaves
 
     def _count_leaves(node):
@@ -502,19 +508,18 @@ def _build_multilevel_prefix_tree_params(
     for child_idxs, child_node in children_info:
         # Add turn2 tokens (from first sample of this group)
         sample0 = child_idxs[0]
-        turn2_tokens = tokens_by_sample[sample0][root_len: root_len + child_node.segment_len]
+        turn2_tokens = tokens_by_sample[sample0][root_len : root_len + child_node.segment_len]
         flat_parts.append(turn2_tokens)
         turn2_flat_start = cur_offset
         cur_offset += child_node.segment_len
         turn2_flat_range = (turn2_flat_start, cur_offset)
 
         # Add each leaf
-        for leaf_node, sample_idx in zip(child_node.children, child_idxs):
+        for leaf_node, sample_idx in zip(child_node.children, child_idxs, strict=False):
             leaf_start = cur_offset
             leaf_len = leaf_node.segment_len
-            leaf_tokens = tokens_by_sample[sample_idx][root_len + child_node.segment_len:]
-            assert leaf_tokens.shape[0] == leaf_len, \
-                f"leaf token mismatch: {leaf_tokens.shape[0]} != {leaf_len}"
+            leaf_tokens = tokens_by_sample[sample_idx][root_len + child_node.segment_len :]
+            assert leaf_tokens.shape[0] == leaf_len, f"leaf token mismatch: {leaf_tokens.shape[0]} != {leaf_len}"
             flat_parts.append(leaf_tokens)
             leaf_ranges.append((leaf_start, leaf_start + leaf_len))
             leaf_to_sample.append(sample_idx)
@@ -522,8 +527,7 @@ def _build_multilevel_prefix_tree_params(
             cur_offset += leaf_len
 
     flat_tokens = torch.cat(flat_parts)
-    assert flat_tokens.shape[0] == total_tokens, \
-        f"flat token count mismatch: {flat_tokens.shape[0]} != {total_tokens}"
+    assert flat_tokens.shape[0] == total_tokens, f"flat token count mismatch: {flat_tokens.shape[0]} != {total_tokens}"
 
     # Build loss mask
     flat_loss_mask = None
@@ -531,9 +535,9 @@ def _build_multilevel_prefix_tree_params(
         lm_parts = [loss_masks_by_sample[0][:root_len]]
         for child_idxs, child_node in children_info:
             sample0 = child_idxs[0]
-            lm_parts.append(loss_masks_by_sample[sample0][root_len: root_len + child_node.segment_len])
-            for leaf_node, sample_idx in zip(child_node.children, child_idxs):
-                lm_parts.append(loss_masks_by_sample[sample_idx][root_len + child_node.segment_len:])
+            lm_parts.append(loss_masks_by_sample[sample0][root_len : root_len + child_node.segment_len])
+            for leaf_node, sample_idx in zip(child_node.children, child_idxs, strict=False):
+                lm_parts.append(loss_masks_by_sample[sample_idx][root_len + child_node.segment_len :])
         flat_loss_mask = torch.cat(lm_parts)
 
     # Build position ids: root is 0..root_len-1, each turn2 starts at root_len,
@@ -544,7 +548,7 @@ def _build_multilevel_prefix_tree_params(
     for child_idxs, child_node in children_info:
         # turn2 positions: root_len .. root_len + turn2_len - 1
         pid_parts.append(torch.arange(root_len, root_len + child_node.segment_len, device=device))
-        for leaf_node, _sample_idx in zip(child_node.children, child_idxs):
+        for leaf_node, _sample_idx in zip(child_node.children, child_idxs, strict=False):
             # leaf positions: root_len + turn2_len .. root_len + turn2_len + leaf_len - 1
             leaf_start_pos = root_len + child_node.segment_len
             pid_parts.append(torch.arange(leaf_start_pos, leaf_start_pos + leaf_node.segment_len, device=device))
@@ -559,7 +563,7 @@ def _build_multilevel_prefix_tree_params(
         leaf_ranges=leaf_ranges,
         leaf_segments=leaf_ranges,
         leaf_to_sample=leaf_to_sample,
-        sample_to_leaf_range=dict(zip(leaf_to_sample, leaf_ranges)),
+        sample_to_leaf_range=dict(zip(leaf_to_sample, leaf_ranges, strict=False)),
         q_ranges=q_ranges,
         k_ranges=k_ranges,
         mask_types=mask_types,
@@ -617,6 +621,7 @@ def _build_flex_key(params, device):
 
     # leaf_id[t] = which leaf token t belongs to (-1 = prefix)
     import torch as _torch
+
     leaf_id = _torch.full((total,), -1, dtype=_torch.int32)
     for i, (s, e) in enumerate(params.leaf_ranges):
         leaf_id[s:e] = i
@@ -636,9 +641,9 @@ def _build_flex_key(params, device):
 
     # _compile=False: avoid Triton JIT which takes minutes for new shapes.
     # Memory is handled at the call site via torch.utils.checkpoint.
-    block_mask = create_block_mask(prefix_tree_mask, B=None, H=None,
-                                   Q_LEN=total, KV_LEN=total, device=device,
-                                   _compile=False)
+    block_mask = create_block_mask(
+        prefix_tree_mask, B=None, H=None, Q_LEN=total, KV_LEN=total, device=device, _compile=False
+    )
     block_mask._leaf_id = leaf_id  # keep closure alive
     return block_mask
 
@@ -656,7 +661,7 @@ def _build_magi_key(model, params):
     cfg = unwrap_model(model).config
     num_heads_q = cfg.num_attention_heads
     # GQA: num_query_groups may be set; fall back to num_heads_q if not
-    num_heads_kv = getattr(cfg, 'num_query_groups', num_heads_q) or num_heads_q
+    num_heads_kv = getattr(cfg, "num_query_groups", num_heads_q) or num_heads_q
     head_dim = cfg.kv_channels  # hidden_size // num_attention_heads
 
     # Use the CP group so MAGI dispatch operates across CP ranks only.
@@ -667,6 +672,7 @@ def _build_magi_key(model, params):
     # operate on SP-scattered T/TP tokens which is incorrect for CP>1.
     try:
         from megatron.core import parallel_state as mpu
+
         cp_group = mpu.get_context_parallel_group()
     except Exception:
         cp_group = dist.group.WORLD
@@ -682,9 +688,7 @@ def _build_magi_key(model, params):
         head_dim=head_dim,
         pad_size=0,
         cp_group_or_mesh=cp_group,
-        dist_attn_config=DistAttnConfig(
-            dispatch_config=DispatchConfig(uneven_shard=True)
-        ),
+        dist_attn_config=DistAttnConfig(dispatch_config=DispatchConfig(uneven_shard=True)),
     )
     return magi_key
 
@@ -701,19 +705,17 @@ def _build_magi_key_sp_scaled(original_key, model, tp_size: int):
     import torch.distributed as dist
     from magi_attention.api import DistAttnConfig, magi_attn_flex_key
     from magi_attention.common import AttnRanges
-    from magi_attention.common.enum import AttnMaskType
     from magi_attention.meta.solver.dispatch_solver import DispatchConfig
 
     try:
         from megatron.core import parallel_state as mpu
+
         cp_group = mpu.get_context_parallel_group()
     except Exception:
         cp_group = dist.group.WORLD
 
-    q_ranges_sp = [(r.start // tp_size, r.end // tp_size)
-                   for r in original_key.q_ranges]
-    k_ranges_sp = [(r.start // tp_size, r.end // tp_size)
-                   for r in original_key.k_ranges]
+    q_ranges_sp = [(r.start // tp_size, r.end // tp_size) for r in original_key.q_ranges]
+    k_ranges_sp = [(r.start // tp_size, r.end // tp_size) for r in original_key.k_ranges]
     total_q_sp = original_key.total_seqlen_q // tp_size
     total_k_sp = original_key.total_seqlen_k // tp_size
 
@@ -728,7 +730,5 @@ def _build_magi_key_sp_scaled(original_key, model, tp_size: int):
         head_dim=original_key.head_dim,
         pad_size=0,
         cp_group_or_mesh=cp_group,
-        dist_attn_config=DistAttnConfig(
-            dispatch_config=DispatchConfig(uneven_shard=True)
-        ),
+        dist_attn_config=DistAttnConfig(dispatch_config=DispatchConfig(uneven_shard=True)),
     )

@@ -30,20 +30,22 @@ Patch chain (each wrapper accepts ``magi_attention_key``/``flex_attention_key`` 
 The ``_magi_attn_forward`` helper (dispatch → calc_attn → undispatch) is copied
 verbatim from the fork and lives here so no Megatron source modification is needed.
 """
+
 from __future__ import annotations
 
 import functools
 import threading
-from typing import Optional
 
 import torch
 from torch import Tensor
 
+from verl.utils.device import get_torch_device
+
 # Module-level capture state for COMPARE_LAYERS=1 debugging
 _layer_capture: dict = {}
-_layer_counter: dict = {'magi': 0, 'flex': 0, 'fa': 0}  # per-attn-type layer counters
-_current_layer_idx: list = [-1]   # set by _sa_forward, read by _magi_attn_forward
-_current_attn_type: list = ['fa']  # set by _sa_forward, read by _magi_attn_forward
+_layer_counter: dict = {"magi": 0, "flex": 0, "fa": 0}  # per-attn-type layer counters
+_current_layer_idx: list = [-1]  # set by _sa_forward, read by _magi_attn_forward
+_current_attn_type: list = ["fa"]  # set by _sa_forward, read by _magi_attn_forward
 # When COMPARE_LAYERS=2, save full hidden state tensors (not just stats)
 _layer_tensors: dict = {}  # key -> Tensor on CPU
 
@@ -58,6 +60,7 @@ _magi_rope_bypass: threading.local = threading.local()
 # ---------------------------------------------------------------------------
 # flex_attention helper for prefix-tree
 # ---------------------------------------------------------------------------
+
 
 def _flex_attn_forward(
     query: Tensor,
@@ -76,26 +79,29 @@ def _flex_attn_forward(
     from torch.nn.attention.flex_attention import flex_attention
 
     T, _, H, D = query.shape
-    q = query.squeeze(1).permute(1, 0, 2).unsqueeze(0)   # (1, H, T, D)
+    q = query.squeeze(1).permute(1, 0, 2).unsqueeze(0)  # (1, H, T, D)
     k = key.squeeze(1).permute(1, 0, 2).unsqueeze(0)
     v = value.squeeze(1).permute(1, 0, 2).unsqueeze(0)
-    enable_gqa = (q.shape[1] != k.shape[1])
+    enable_gqa = q.shape[1] != k.shape[1]
 
-    import time as _t; import torch.distributed as _dist
-    torch.cuda.synchronize()
+    import time as _t
+
+    import torch.distributed as _dist
+
+    get_torch_device().synchronize()
     _t0 = _t.perf_counter()
-    out = flex_attention(q, k, v, block_mask=flex_attention_key,
-                         enable_gqa=enable_gqa)  # (1, Hq, T, D)
-    torch.cuda.synchronize()
+    out = flex_attention(q, k, v, block_mask=flex_attention_key, enable_gqa=enable_gqa)  # (1, Hq, T, D)
+    get_torch_device().synchronize()
     if not _dist.is_initialized() or _dist.get_rank() == 0:
-        print(f"[FLEX-ATTN] T={T} {(_t.perf_counter()-_t0)*1000:.2f}ms", flush=True)
+        print(f"[FLEX-ATTN] T={T} {(_t.perf_counter() - _t0) * 1000:.2f}ms", flush=True)
     out = out.squeeze(0).permute(1, 0, 2)  # (T, Hq, D)
-    return out.reshape(T, 1, -1)           # (T, 1, Hq*D)
+    return out.reshape(T, 1, -1)  # (T, 1, Hq*D)
 
 
 # ---------------------------------------------------------------------------
 # MAGI attention kernel helper (verbatim from Megatron-LM-prefix-tree fork)
 # ---------------------------------------------------------------------------
+
 
 def _magi_attn_forward(
     query: Tensor,
@@ -113,39 +119,46 @@ def _magi_attn_forward(
     across TP to get full T tokens, then dispatch/calc_attn/undispatch across
     CP ranks, then scatter back to T/TP for SP-consistent output.
     """
-    from magi_attention.api import calc_attn, dispatch, undispatch
-    import os as _os, torch as _torch, torch.distributed as _dist
+    import os as _os
 
-    q = query.squeeze(1)   # (T, np, hn) — already full T (Megatron gathers SP before calling here)
+    import torch as _torch
+    import torch.distributed as _dist
+    from magi_attention.api import calc_attn, dispatch, undispatch
+
+    q = query.squeeze(1)  # (T, np, hn) — already full T (Megatron gathers SP before calling here)
     k = key.squeeze(1)
     v = value.squeeze(1)
     _gathered = False
 
-    _save_cp = _os.environ.get('SAVE_CP_TENSORS') == '1'
+    _save_cp = _os.environ.get("SAVE_CP_TENSORS") == "1"
     _cp_rank = _dist.get_rank() if _dist.is_initialized() else 0
-    _save_dir = _os.environ.get('CP_TENSOR_DIR', '/tmp/claude/cp_tensors')
+    _save_dir = _os.environ.get("CP_TENSOR_DIR", "/tmp/claude/cp_tensors")
     # Layer index and attn type set by _sa_forward (which owns the counter increment)
     _layer_idx = _current_layer_idx[0]
     _atype = _current_attn_type[0]
 
     def _save(name, tensor):
-        if not _save_cp: return
+        if not _save_cp:
+            return
         _os.makedirs(_save_dir, exist_ok=True)
-        path = f'{_save_dir}/{_atype}_{name}_rank{_cp_rank}_layer{_layer_idx}.pt'
+        path = f"{_save_dir}/{_atype}_{name}_rank{_cp_rank}_layer{_layer_idx}.pt"
         _torch.save(tensor.detach().cpu(), path)
-        print(f'[CP_SAVE] {_atype}_{name} shape={tuple(tensor.shape)} rank={_cp_rank} layer={_layer_idx} → {path}', flush=True)
+        print(
+            f"[CP_SAVE] {_atype}_{name} shape={tuple(tensor.shape)} rank={_cp_rank} layer={_layer_idx} → {path}",
+            flush=True,
+        )
 
     # before_dispatch_Q/K/V saved by _sa_forward wrapper (covers both FA3 and MAGI)
     dq = dispatch(q, magi_attention_key)
     dk = dispatch(k, magi_attention_key)
     dv = dispatch(v, magi_attention_key)
 
-    _save('after_dispatch_Q', dq)
-    _save('after_dispatch_K', dk)
-    _save('after_dispatch_V', dv)
+    _save("after_dispatch_Q", dq)
+    _save("after_dispatch_K", dk)
+    _save("after_dispatch_V", dv)
 
     out, _ = calc_attn(dq, dk, dv, magi_attention_key)
-    _save('after_calc_attn_out', out)
+    _save("after_calc_attn_out", out)
 
     out = undispatch(out, magi_attention_key)
     # after_undispatch_out saved by _sa_forward wrapper
@@ -157,6 +170,7 @@ def _magi_attn_forward(
 # Patch application
 # ---------------------------------------------------------------------------
 
+
 def apply_prefix_tree_patch() -> None:
     """Monkey-patch upstream Megatron-LM classes to support prefix-tree attention (flex and MAGI).
 
@@ -164,10 +178,10 @@ def apply_prefix_tree_patch() -> None:
     ``_magi_patched`` sentinel attribute).
     """
     from megatron.core.extensions.transformer_engine import TEDotProductAttention
-    from megatron.core.transformer.attention import SelfAttention
-    from megatron.core.transformer.transformer_layer import TransformerLayer
-    from megatron.core.transformer.transformer_block import TransformerBlock
     from megatron.core.models.gpt.gpt_model import GPTModel
+    from megatron.core.transformer.attention import SelfAttention
+    from megatron.core.transformer.transformer_block import TransformerBlock
+    from megatron.core.transformer.transformer_layer import TransformerLayer
 
     if getattr(TEDotProductAttention, "_prefix_tree_patched", False):
         return  # already patched
@@ -178,25 +192,47 @@ def apply_prefix_tree_patch() -> None:
     _orig_te_forward = TEDotProductAttention.forward
 
     @functools.wraps(_orig_te_forward)
-    def _te_forward(self, query, key, value, attention_mask, attn_mask_type,
-                    attention_bias=None, packed_seq_params=None, num_splits=None,
-                    magi_attention_key=None, flex_attention_key=None, **kwargs):
+    def _te_forward(
+        self,
+        query,
+        key,
+        value,
+        attention_mask,
+        attn_mask_type,
+        attention_bias=None,
+        packed_seq_params=None,
+        num_splits=None,
+        magi_attention_key=None,
+        flex_attention_key=None,
+        **kwargs,
+    ):
         if magi_attention_key is not None:
             return _magi_attn_forward(query, key, value, magi_attention_key)
         if flex_attention_key is not None:
             return _flex_attn_forward(query, key, value, flex_attention_key)
         # FA3 path — Q/K/V and output are saved in _sa_forward via core_attention wrapper
-        import time as _t, torch as _torch, torch.distributed as _dist
-        _torch.cuda.synchronize()
+        import time as _t
+
+        import torch.distributed as _dist
+
+        get_torch_device().synchronize()
         _t0 = _t.perf_counter()
-        out = _orig_te_forward(self, query, key, value, attention_mask, attn_mask_type,
-                               attention_bias=attention_bias,
-                               packed_seq_params=packed_seq_params,
-                               num_splits=num_splits, **kwargs)
-        _torch.cuda.synchronize()
+        out = _orig_te_forward(
+            self,
+            query,
+            key,
+            value,
+            attention_mask,
+            attn_mask_type,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+            num_splits=num_splits,
+            **kwargs,
+        )
+        get_torch_device().synchronize()
         if not _dist.is_initialized() or _dist.get_rank() == 0:
             T = query.shape[0]
-            print(f"[FA3-ATTN] T={T} {(_t.perf_counter()-_t0)*1000:.2f}ms", flush=True)
+            print(f"[FA3-ATTN] T={T} {(_t.perf_counter() - _t0) * 1000:.2f}ms", flush=True)
         return out
 
     TEDotProductAttention.forward = _te_forward
@@ -207,12 +243,22 @@ def apply_prefix_tree_patch() -> None:
     _orig_sa_ckpt = SelfAttention._checkpointed_attention_forward
 
     @functools.wraps(_orig_sa_ckpt)
-    def _sa_ckpt_forward(self, query, key, value, attention_mask,
-                         rotary_pos_emb=None, attn_mask_type=None,
-                         attention_bias=None, packed_seq_params=None,
-                         magi_attention_key=None, flex_attention_key=None, **kwargs):
-        from megatron.core.transformer.attention import AttnMaskType
+    def _sa_ckpt_forward(
+        self,
+        query,
+        key,
+        value,
+        attention_mask,
+        rotary_pos_emb=None,
+        attn_mask_type=None,
+        attention_bias=None,
+        packed_seq_params=None,
+        magi_attention_key=None,
+        flex_attention_key=None,
+        **kwargs,
+    ):
         from megatron.core.tensor_parallel.random import checkpoint as tensor_parallel_checkpoint
+        from megatron.core.transformer.attention import AttnMaskType
 
         try:
             from megatron.core.transformer.utils import apply_module
@@ -225,7 +271,10 @@ def apply_prefix_tree_patch() -> None:
             # Keys are already injected via _ca_forward_with_key wrapper on self.core_attention
             # (set by _sa_forward before calling _orig_sa_forward). Don't pass them again.
             return apply_module(self.core_attention)(
-                q, k, v, amask,
+                q,
+                k,
+                v,
+                amask,
                 attn_mask_type=_attn_mask_type,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
@@ -235,8 +284,14 @@ def apply_prefix_tree_patch() -> None:
             attn_mask_type = self.attn_mask_type
         attn_mask_type_tensor = torch.tensor([attn_mask_type.value], dtype=torch.int)
         return tensor_parallel_checkpoint(
-            custom_forward, False,
-            query, key, value, attention_mask, rotary_pos_emb, attn_mask_type_tensor,
+            custom_forward,
+            False,
+            query,
+            key,
+            value,
+            attention_mask,
+            rotary_pos_emb,
+            attn_mask_type_tensor,
         )
 
     SelfAttention._checkpointed_attention_forward = _sa_ckpt_forward
@@ -247,38 +302,50 @@ def apply_prefix_tree_patch() -> None:
     _orig_sa_forward = SelfAttention.forward
 
     @functools.wraps(_orig_sa_forward)
-    def _sa_forward(self, hidden_states, attention_mask,
-                    magi_attention_key=None, flex_attention_key=None, **kwargs):
+    def _sa_forward(self, hidden_states, attention_mask, magi_attention_key=None, flex_attention_key=None, **kwargs):
         attn_key = magi_attention_key or flex_attention_key
         _real_ca_forward = self.core_attention.forward
 
-        import os as _os, torch as _torch, torch.distributed as _dist
-        _save_cp = _os.environ.get('SAVE_CP_TENSORS') == '1'
+        import os as _os
+
+        import torch as _torch
+        import torch.distributed as _dist
+
+        _save_cp = _os.environ.get("SAVE_CP_TENSORS") == "1"
         _cp_rank = _dist.get_rank() if _dist.is_initialized() else 0
-        _save_dir = _os.environ.get('CP_TENSOR_DIR', '/tmp/claude/cp_tensors')
-        _atype = 'magi' if magi_attention_key else ('flex' if flex_attention_key else 'fa')
+        _save_dir = _os.environ.get("CP_TENSOR_DIR", "/tmp/claude/cp_tensors")
+        _atype = "magi" if magi_attention_key else ("flex" if flex_attention_key else "fa")
         _layer_idx = _layer_counter[_atype]
         _layer_counter[_atype] += 1
-        _current_layer_idx[0] = _layer_idx   # share with _magi_attn_forward
-        _current_attn_type[0] = _atype        # share with _magi_attn_forward
+        _current_layer_idx[0] = _layer_idx  # share with _magi_attn_forward
+        _current_attn_type[0] = _atype  # share with _magi_attn_forward
 
         def _save_sa(name, tensor):
-            if not _save_cp: return
+            if not _save_cp:
+                return
             _os.makedirs(_save_dir, exist_ok=True)
-            path = f'{_save_dir}/{_atype}_{name}_rank{_cp_rank}_layer{_layer_idx}.pt'
+            path = f"{_save_dir}/{_atype}_{name}_rank{_cp_rank}_layer{_layer_idx}.pt"
             _torch.save(tensor.detach().cpu(), path)
-            print(f'[CP_SAVE] {_atype}_{name} shape={tuple(tensor.shape)} rank={_cp_rank} layer={_layer_idx} → {path}', flush=True)
+            print(
+                f"[CP_SAVE] {_atype}_{name} shape={tuple(tensor.shape)} rank={_cp_rank} layer={_layer_idx} → {path}",
+                flush=True,
+            )
 
         @functools.wraps(_real_ca_forward)
         def _ca_forward_with_key(q, k, v, *args, **kw):
-            _save_sa('before_dispatch_Q', q.squeeze(1) if q.dim() == 4 else q)
-            _save_sa('before_dispatch_K', k.squeeze(1) if k.dim() == 4 else k)
-            _save_sa('before_dispatch_V', v.squeeze(1) if v.dim() == 4 else v)
-            out = _real_ca_forward(q, k, v, *args,
-                                   magi_attention_key=magi_attention_key if attn_key else None,
-                                   flex_attention_key=flex_attention_key if attn_key else None,
-                                   **kw)
-            _save_sa('after_undispatch_out', out.squeeze(1) if out.dim() == 3 else out)
+            _save_sa("before_dispatch_Q", q.squeeze(1) if q.dim() == 4 else q)
+            _save_sa("before_dispatch_K", k.squeeze(1) if k.dim() == 4 else k)
+            _save_sa("before_dispatch_V", v.squeeze(1) if v.dim() == 4 else v)
+            out = _real_ca_forward(
+                q,
+                k,
+                v,
+                *args,
+                magi_attention_key=magi_attention_key if attn_key else None,
+                flex_attention_key=flex_attention_key if attn_key else None,
+                **kw,
+            )
+            _save_sa("after_undispatch_out", out.squeeze(1) if out.dim() == 3 else out)
             return out
 
         self.core_attention.forward = _ca_forward_with_key
@@ -296,8 +363,7 @@ def apply_prefix_tree_patch() -> None:
     _orig_tl_forward = TransformerLayer.forward
 
     @functools.wraps(_orig_tl_forward)
-    def _tl_forward(self, hidden_states, attention_mask,
-                    magi_attention_key=None, flex_attention_key=None, **kwargs):
+    def _tl_forward(self, hidden_states, attention_mask, magi_attention_key=None, flex_attention_key=None, **kwargs):
         attn_key = magi_attention_key or flex_attention_key
         if attn_key is None:
             out = _orig_tl_forward(self, hidden_states, attention_mask, **kwargs)
@@ -306,9 +372,9 @@ def apply_prefix_tree_patch() -> None:
 
             @functools.wraps(_real_sa_forward)
             def _sa_forward_with_key(*args, **kw):
-                return _real_sa_forward(*args,
-                                        magi_attention_key=magi_attention_key,
-                                        flex_attention_key=flex_attention_key, **kw)
+                return _real_sa_forward(
+                    *args, magi_attention_key=magi_attention_key, flex_attention_key=flex_attention_key, **kw
+                )
 
             self.self_attention.forward = _sa_forward_with_key
             try:
@@ -318,14 +384,15 @@ def apply_prefix_tree_patch() -> None:
 
         # COMPARE_LAYERS: capture forward hidden state + backward gradient per layer
         import os as _os
-        _cl = _os.environ.get('COMPARE_LAYERS', '0')
-        if _cl in ('1', '2'):
+
+        _cl = _os.environ.get("COMPARE_LAYERS", "0")
+        if _cl in ("1", "2"):
             import torch.distributed as _dist
+
             hs_out = out[0] if isinstance(out, tuple) else out
             idx = _layer_counter[0]
-            tag = 'flex' if flex_attention_key is not None else \
-                  'magi' if magi_attention_key is not None else 'fa3'
-            key = f'{tag}_{idx}'
+            tag = "flex" if flex_attention_key is not None else "magi" if magi_attention_key is not None else "fa3"
+            key = f"{tag}_{idx}"
             # Only capture every 5 layers (0, 5, 10, ...) to see trend without huge files
             _layer_counter[0] += 1
             if idx % 5 != 0 or key in _layer_capture:
@@ -337,11 +404,12 @@ def apply_prefix_tree_patch() -> None:
                 if _dist.is_initialized():
                     try:
                         from megatron.core import mpu
+
                         tp_group = mpu.get_tensor_model_parallel_group()
-                        tp_size  = mpu.get_tensor_model_parallel_world_size()
+                        tp_size = mpu.get_tensor_model_parallel_world_size()
                     except Exception:
                         tp_group = None
-                        tp_size  = _dist.get_world_size()
+                        tp_size = _dist.get_world_size()
                     gathered = [torch.zeros_like(h_local) for _ in range(tp_size)]
                     _dist.all_gather(gathered, h_local, group=tp_group)
                     h = torch.cat(gathered, dim=0)  # (T_full, 1, H)
@@ -349,26 +417,29 @@ def apply_prefix_tree_patch() -> None:
                     h = h_local
                 if not _dist.is_initialized() or _dist.get_rank() == 0:
                     _layer_capture[key] = {
-                        'fwd_mean': h.mean().item(),
-                        'fwd_std':  h.std().item(),
-                        'fwd_norm': h.norm().item(),
-                        'shape': list(h.shape),
+                        "fwd_mean": h.mean().item(),
+                        "fwd_std": h.std().item(),
+                        "fwd_norm": h.norm().item(),
+                        "shape": list(h.shape),
                     }
                     # COMPARE_LAYERS=2: also save full tensor to disk for per-token diff
-                    if _cl == '2':
+                    if _cl == "2":
                         _layer_tensors[key] = h.cpu()
                     # Capture gradient via retain_grad + hook
                     _bwd_key = key
-                    def _make_bwd_hook(bk, save_full=(_cl == '2')):
+
+                    def _make_bwd_hook(bk, save_full=(_cl == "2")):
                         def _bwd(grad):
-                            if bk in _layer_capture and 'bwd_norm' not in _layer_capture[bk]:
+                            if bk in _layer_capture and "bwd_norm" not in _layer_capture[bk]:
                                 g = grad.detach().float()
-                                _layer_capture[bk]['bwd_mean'] = g.mean().item()
-                                _layer_capture[bk]['bwd_std']  = g.std().item()
-                                _layer_capture[bk]['bwd_norm'] = g.norm().item()
+                                _layer_capture[bk]["bwd_mean"] = g.mean().item()
+                                _layer_capture[bk]["bwd_std"] = g.std().item()
+                                _layer_capture[bk]["bwd_norm"] = g.norm().item()
                                 if save_full:
-                                    _layer_tensors[bk + '_bwd'] = g.cpu()
+                                    _layer_tensors[bk + "_bwd"] = g.cpu()
+
                         return _bwd
+
                     if hs_out.requires_grad:
                         hs_out.retain_grad()
                         hs_out.register_hook(_make_bwd_hook(_bwd_key))
@@ -382,8 +453,7 @@ def apply_prefix_tree_patch() -> None:
     _orig_tb_forward = TransformerBlock.forward
 
     @functools.wraps(_orig_tb_forward)
-    def _tb_forward(self, hidden_states, attention_mask,
-                    magi_attention_key=None, flex_attention_key=None, **kwargs):
+    def _tb_forward(self, hidden_states, attention_mask, magi_attention_key=None, flex_attention_key=None, **kwargs):
         attn_key = magi_attention_key or flex_attention_key
         if attn_key is None:
             return _orig_tb_forward(self, hidden_states, attention_mask, **kwargs)
@@ -395,16 +465,17 @@ def apply_prefix_tree_patch() -> None:
             def _make_wrapper(orig):
                 @functools.wraps(orig)
                 def _w(*args, **kw):
-                    return orig(*args,
-                                magi_attention_key=magi_attention_key,
-                                flex_attention_key=flex_attention_key, **kw)
+                    return orig(
+                        *args, magi_attention_key=magi_attention_key, flex_attention_key=flex_attention_key, **kw
+                    )
+
                 return _w
 
             layer.forward = _make_wrapper(_orig)
         try:
             out = _orig_tb_forward(self, hidden_states, attention_mask, **kwargs)
         finally:
-            for layer, orig_fwd in zip(self.layers, originals):
+            for layer, orig_fwd in zip(self.layers, originals, strict=False):
                 layer.forward = orig_fwd
         return out
 
@@ -418,8 +489,9 @@ def apply_prefix_tree_patch() -> None:
     _orig_gpt_forward = GPTModel.forward
 
     @functools.wraps(_orig_gpt_forward)
-    def _gpt_forward(self, input_ids, position_ids, attention_mask,
-                     magi_attention_key=None, flex_attention_key=None, **kwargs):
+    def _gpt_forward(
+        self, input_ids, position_ids, attention_mask, magi_attention_key=None, flex_attention_key=None, **kwargs
+    ):
         attn_key = magi_attention_key or flex_attention_key
         if attn_key is None:
             return _orig_gpt_forward(self, input_ids, position_ids, attention_mask, **kwargs)
@@ -427,12 +499,12 @@ def apply_prefix_tree_patch() -> None:
 
         @functools.wraps(_real_decoder_forward)
         def _decoder_forward_with_key(*args, **kw):
-            return _real_decoder_forward(*args,
-                                         magi_attention_key=magi_attention_key,
-                                         flex_attention_key=flex_attention_key, **kw)
+            return _real_decoder_forward(
+                *args, magi_attention_key=magi_attention_key, flex_attention_key=flex_attention_key, **kw
+            )
 
         self.decoder.forward = _decoder_forward_with_key
-        _prev_rope_bypass = getattr(_magi_rope_bypass, 'active', False)
+        _prev_rope_bypass = getattr(_magi_rope_bypass, "active", False)
         _magi_rope_bypass.active = True  # all prefix-tree paths bypass CP RoPE slicing
         try:
             out = _orig_gpt_forward(self, input_ids, position_ids, attention_mask, **kwargs)
@@ -456,20 +528,20 @@ def apply_prefix_tree_patch() -> None:
     # in BSHD attention, so correctness is maintained regardless of CP rank.
     # ------------------------------------------------------------------
     from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
-    _orig_rope_cached = RotaryEmbedding.forward           # lru_cache wrapper
-    _orig_rope_fn = RotaryEmbedding.forward.__wrapped__   # actual function body
+
+    _orig_rope_cached = RotaryEmbedding.forward  # lru_cache wrapper
+    _orig_rope_fn = RotaryEmbedding.forward.__wrapped__  # actual function body
 
     def _rope_forward_pt(self, max_seq_len, offset=0, packed_seq=False, cp_group=None):
-        if getattr(_magi_rope_bypass, 'active', False):
+        if getattr(_magi_rope_bypass, "active", False):
             # Bypass CP slice: return full-sequence freqs identical on all CP ranks.
             # get_rotary_seq_len multiplies by cp_size (yielding 2T for CP=2), so we
             # divide it back out here to get the true flat-sequence length T.
-            _cp = cp_group or getattr(self, 'cp_group', None)
+            _cp = cp_group or getattr(self, "cp_group", None)
             _cp_size = _cp.size() if _cp is not None else 1
             actual_seq_len = max_seq_len // _cp_size
             return _orig_rope_fn(self, actual_seq_len, offset=offset, packed_seq=True, cp_group=None)
-        return _orig_rope_cached(self, max_seq_len, offset=offset,
-                                 packed_seq=packed_seq, cp_group=cp_group)
+        return _orig_rope_cached(self, max_seq_len, offset=offset, packed_seq=packed_seq, cp_group=cp_group)
 
     RotaryEmbedding.forward = _rope_forward_pt
 

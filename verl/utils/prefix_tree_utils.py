@@ -1,4 +1,16 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from __future__ import annotations
 
@@ -12,14 +24,14 @@ from torch import Tensor
 from verl.utils.prefix_tree_params import PrefixTreeParams, RangeSpec
 
 __all__ = [
-    'TreeNode',
-    'build_prefix_tree_dense_mask',
-    'build_prefix_tree_flex_spec',
-    'build_multilevel_flex_spec',
-    'build_prefix_tree_params',
-    'extract_sample_tensor',
-    'extract_sample_tensors',
-    'longest_common_prefix_length',
+    "TreeNode",
+    "build_prefix_tree_dense_mask",
+    "build_prefix_tree_flex_spec",
+    "build_multilevel_flex_spec",
+    "build_prefix_tree_params",
+    "extract_sample_tensor",
+    "extract_sample_tensors",
+    "longest_common_prefix_length",
 ]
 
 
@@ -44,7 +56,7 @@ class TreeNode:
     """
 
     segment_len: int
-    children: list['TreeNode'] = field(default_factory=list)
+    children: list[TreeNode] = field(default_factory=list)
 
     @property
     def is_leaf(self) -> bool:
@@ -61,7 +73,7 @@ def build_prefix_tree_flex_spec(
 
     q_ranges: list[RangeSpec] = [(0, prefix_len)]
     k_ranges: list[RangeSpec] = [(0, prefix_len)]
-    mask_types = ['causal']
+    mask_types = ["causal"]
 
     current = prefix_len
     for branch_len in branch_lengths:
@@ -71,18 +83,18 @@ def build_prefix_tree_flex_spec(
         branch_range = (current, current + branch_len)
         q_ranges.append(branch_range)
         k_ranges.append((0, prefix_len))
-        mask_types.append('full')
+        mask_types.append("full")
 
         q_ranges.append(branch_range)
         k_ranges.append(branch_range)
-        mask_types.append('causal')
+        mask_types.append("causal")
         current += branch_len
 
     return q_ranges, k_ranges, mask_types
 
 
 def build_multilevel_flex_spec(
-    root: 'TreeNode',
+    root: TreeNode,
 ) -> tuple[list[RangeSpec], list[RangeSpec], list[str]]:
     """Encode a multi-level prefix tree as MAGI flex rectangles.
 
@@ -139,7 +151,7 @@ def build_multilevel_flex_spec(
         # Self-attention: causal over this node's own tokens.
         q_ranges.append(node_range)
         k_ranges.append(node_range)
-        mask_types.append('causal')
+        mask_types.append("causal")
 
         if node.is_leaf:
             return
@@ -151,7 +163,7 @@ def build_multilevel_flex_spec(
             desc_range: RangeSpec = (desc._flat_start, desc._flat_end)  # type: ignore[attr-defined]
             q_ranges.append(desc_range)
             k_ranges.append(node_range)
-            mask_types.append('full')
+            mask_types.append("full")
 
         for child in node.children:
             _emit_node(child)
@@ -176,7 +188,7 @@ def build_prefix_tree_dense_mask(
         raise ValueError("total_tokens must be non-negative")
 
     mask = torch.zeros(total_tokens, total_tokens, dtype=torch.bool, device=device)
-    for (q_start, q_end), (k_start, k_end), mask_type in zip(q_ranges, k_ranges, mask_types):
+    for (q_start, q_end), (k_start, k_end), mask_type in zip(q_ranges, k_ranges, mask_types, strict=False):
         if q_start < 0 or k_start < 0 or q_end < q_start or k_end < k_start:
             raise ValueError("range specs must be non-decreasing and non-negative")
         if q_end > total_tokens or k_end > total_tokens:
@@ -184,10 +196,10 @@ def build_prefix_tree_dense_mask(
         if q_end == q_start or k_end == k_start:
             continue
 
-        if mask_type == 'full':
+        if mask_type == "full":
             mask[q_start:q_end, k_start:k_end] = True
             continue
-        if mask_type != 'causal':
+        if mask_type != "causal":
             raise ValueError(f"Unsupported mask type: {mask_type}")
 
         q_pos = torch.arange(q_start, q_end, device=mask.device).unsqueeze(1)
@@ -199,7 +211,7 @@ def build_prefix_tree_dense_mask(
 
 def longest_common_prefix_length(sequences: Sequence[Tensor]) -> int:
     """Return the longest common token prefix across 1D tensors."""
-    reference = _validate_sequence_field('sequences', sequences)
+    reference = _validate_sequence_field("sequences", sequences)
     prefix_len = reference.numel()
 
     for sequence in sequences[1:]:
@@ -231,7 +243,7 @@ def build_prefix_tree_params(
     samples. Autoregressive next-token labels often diverge at the prefix/leaf boundary, so callers
     should omit labels unless they have already accounted for that ambiguity.
     """
-    tokens_reference = _validate_sequence_field('tokens_by_sample', tokens_by_sample)
+    tokens_reference = _validate_sequence_field("tokens_by_sample", tokens_by_sample)
     normalized_sample_indices = _normalize_sample_indices(len(tokens_by_sample), sample_indices)
 
     if prefix_len is None:
@@ -241,23 +253,21 @@ def build_prefix_tree_params(
             raise ValueError("prefix_len must be non-negative")
         if prefix_len > min(sequence.numel() for sequence in tokens_by_sample):
             raise ValueError("prefix_len cannot exceed the shortest sequence")
-        _validate_shared_prefix('tokens_by_sample', tokens_by_sample, prefix_len)
+        _validate_shared_prefix("tokens_by_sample", tokens_by_sample, prefix_len)
 
     branch_lengths = [sequence.numel() - prefix_len for sequence in tokens_by_sample]
     prefix_range = (0, prefix_len)
     leaf_ranges = _build_leaf_ranges(prefix_len, branch_lengths)
     q_ranges, k_ranges, mask_types = build_prefix_tree_flex_spec(prefix_len, branch_lengths)
 
-    flat_tokens = _flatten_root_shared_field('tokens_by_sample', tokens_by_sample, prefix_len)
-    flat_labels = _flatten_optional_field('labels_by_sample', labels_by_sample, tokens_by_sample, prefix_len)
-    flat_loss_mask = _flatten_optional_field(
-        'loss_masks_by_sample', loss_masks_by_sample, tokens_by_sample, prefix_len
-    )
+    flat_tokens = _flatten_root_shared_field("tokens_by_sample", tokens_by_sample, prefix_len)
+    flat_labels = _flatten_optional_field("labels_by_sample", labels_by_sample, tokens_by_sample, prefix_len)
+    flat_loss_mask = _flatten_optional_field("loss_masks_by_sample", loss_masks_by_sample, tokens_by_sample, prefix_len)
     if position_ids_by_sample is None:
         flat_position_ids = _build_default_position_ids(prefix_len, branch_lengths, tokens_reference.device)
     else:
         flat_position_ids = _flatten_optional_field(
-            'position_ids_by_sample', position_ids_by_sample, tokens_by_sample, prefix_len
+            "position_ids_by_sample", position_ids_by_sample, tokens_by_sample, prefix_len
         )
 
     return PrefixTreeParams(
@@ -266,7 +276,7 @@ def build_prefix_tree_params(
         leaf_ranges=leaf_ranges,
         leaf_segments=list(leaf_ranges),
         leaf_to_sample=list(normalized_sample_indices),
-        sample_to_leaf_range=dict(zip(normalized_sample_indices, leaf_ranges)),
+        sample_to_leaf_range=dict(zip(normalized_sample_indices, leaf_ranges, strict=False)),
         q_ranges=q_ranges,
         k_ranges=k_ranges,
         mask_types=mask_types,
@@ -372,11 +382,9 @@ def _validate_auxiliary_field(
     _validate_sequence_field(name, field_by_sample)
     if len(field_by_sample) != len(tokens_by_sample):
         raise ValueError(f"{name} must have the same length as tokens_by_sample")
-    for index, (field_tensor, token_tensor) in enumerate(zip(field_by_sample, tokens_by_sample)):
+    for index, (field_tensor, token_tensor) in enumerate(zip(field_by_sample, tokens_by_sample, strict=False)):
         if field_tensor.numel() != token_tensor.numel():
-            raise ValueError(
-                f"{name}[{index}] must have the same number of elements as tokens_by_sample[{index}]"
-            )
+            raise ValueError(f"{name}[{index}] must have the same number of elements as tokens_by_sample[{index}]")
 
 
 def _validate_sequence_field(name: str, sequences: Sequence[Tensor]) -> Tensor:
