@@ -31,6 +31,7 @@ from omegaconf import DictConfig
 from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
 from verl.utils.ray_utils import auto_await
 from verl.utils.rollout_trace import rollout_trace_op
+from verl.workers.rollout.capacity_aware_scheduler import CapacityAwareScheduler
 from verl.workers.rollout.replica import RolloutReplica, TokenOutput, get_rollout_replica_class
 from verl.workers.rollout.utils import update_prometheus_config
 
@@ -42,7 +43,11 @@ DEFAULT_ROUTING_CACHE_SIZE = 10000
 
 @ray.remote
 class GlobalRequestLoadBalancer:
-    """Global sticky-session + in-flight load balancer shared by all AgentLoopWorkers.
+    """Deprecated: use CapacityAwareScheduler instead.
+
+    Kept for backward compatibility. Will be removed in a future release.
+
+    Global sticky-session + in-flight load balancer shared by all AgentLoopWorkers.
 
     When a sticky session points to a removed server, the cache entry is
     automatically invalidated and a new server is selected.
@@ -65,7 +70,7 @@ class GlobalRequestLoadBalancer:
         self._inflight_requests: dict[str, int] = {sid: 0 for sid in servers}
         self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
 
-    def acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
+    def acquire_server(self, request_id: str, **_) -> tuple[str, ray.actor.ActorHandle]:
         """Acquire a server for the given request (sticky + least-loaded).
 
         Returns:
@@ -167,9 +172,16 @@ class LLMServerClient:
         self.config = config
         self._load_balancer = load_balancer_handle
 
-    async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
+    async def _acquire_server(
+        self,
+        request_id: str,
+        group_id: str | None = None,
+        estimated_tokens: int = 0,
+    ) -> tuple[str, ray.actor.ActorHandle]:
         # Atomic acquire: returns (server_id, handle) in one Ray RPC.
-        return await self._load_balancer.acquire_server.remote(request_id=request_id)
+        return await self._load_balancer.acquire_server.remote(
+            request_id=request_id, group_id=group_id, estimated_tokens=estimated_tokens
+        )
 
     def _release_server(self, server_id: str) -> None:
         # Fire-and-forget: release is just a counter decrement, no need to await.
@@ -181,6 +193,7 @@ class LLMServerClient:
         self,
         request_id,
         *,
+        group_id: str | None = None,
         prompt_ids: list[int],
         sampling_params: dict[str, Any],
         image_data: Optional[list[Any]] = None,
@@ -193,13 +206,15 @@ class LLMServerClient:
 
         Args:
             request_id (str): request id for sticky session.
+            group_id (str | None): optional group id for affinity routing.
             prompt_ids (List[int]): List of prompt token ids.
             sampling_params (Dict[str, Any]): Sampling parameters for the chat completion.
 
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
-        server_id, server = await self._acquire_server(request_id)
+        estimated_tokens = len(prompt_ids) + sampling_params.get("max_tokens", 512)
+        server_id, server = await self._acquire_server(request_id, group_id=group_id, estimated_tokens=estimated_tokens)
         try:
             multimodal_kwargs = {}
             if audio_data is not None:
@@ -335,10 +350,22 @@ class LLMServerManager:
             update_prometheus_config(self.rollout_config.prometheus, self.server_addresses, self.rollout_config.name)
 
     async def _init_global_load_balancer(self) -> None:
-        self.global_load_balancer = GlobalRequestLoadBalancer.remote(
-            servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
-            max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
-        )
+        lb_cfg = getattr(self.rollout_config, "load_balance", None)
+        scheduler = lb_cfg.scheduler if lb_cfg else "capacity_aware"
+        servers = dict(zip(self.server_addresses, self.server_handles, strict=True))
+
+        if scheduler == "capacity_aware":
+            self.global_load_balancer = CapacityAwareScheduler.remote(
+                servers=servers,
+                capacity_threshold=lb_cfg.capacity_threshold if lb_cfg else 0.85,
+                poll_interval_ms=lb_cfg.poll_interval_ms if lb_cfg else 200,
+                load_backend=lb_cfg.backend if lb_cfg else "sglang",
+            )
+            await self.global_load_balancer._start_poll_loops.remote()
+        elif scheduler == "inflight":
+            self.global_load_balancer = GlobalRequestLoadBalancer.remote(servers=servers)
+        else:
+            raise ValueError(f"Unknown load_balance.scheduler={scheduler!r}. Choose 'capacity_aware' or 'inflight'.")
 
     def get_client(self, client_cls=LLMServerClient, **kwargs) -> LLMServerClient:
         """Get the LLMServerClient to request LLM server replicas.
@@ -361,6 +388,11 @@ class LLMServerManager:
     def get_replicas(self) -> list[RolloutReplica]:
         """Get the LLM server replicas."""
         return self.rollout_replicas
+
+    @auto_await
+    async def reset_scheduler(self) -> None:
+        """Clear group affinity at the start of each rollout batch."""
+        await self.global_load_balancer.clear_affinity.remote()
 
     @auto_await
     async def start_profile(self, **kwargs):

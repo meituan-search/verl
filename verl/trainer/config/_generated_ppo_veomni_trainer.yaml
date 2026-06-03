@@ -362,6 +362,12 @@ actor_rollout_ref:
       transfer_backend: nixl
       bootstrap_port: null
       ib_device: null
+    load_balance:
+      _target_: verl.workers.config.LoadBalanceConfig
+      scheduler: capacity_aware
+      capacity_threshold: 0.85
+      poll_interval_ms: 200
+      backend: sglang
   model:
     _target_: verl.workers.config.HFModelConfig
     path: ~/models/deepseek-llm-7b-chat
