@@ -70,7 +70,7 @@ class GlobalRequestLoadBalancer:
         self._inflight_requests: dict[str, int] = {sid: 0 for sid in servers}
         self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
 
-    def acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
+    def acquire_server(self, request_id: str, **_) -> tuple[str, ray.actor.ActorHandle]:
         """Acquire a server for the given request (sticky + least-loaded).
 
         Returns:
@@ -214,9 +214,7 @@ class LLMServerClient:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
         estimated_tokens = len(prompt_ids) + sampling_params.get("max_tokens", 512)
-        server_id, server = await self._acquire_server(
-            request_id, group_id=group_id, estimated_tokens=estimated_tokens
-        )
+        server_id, server = await self._acquire_server(request_id, group_id=group_id, estimated_tokens=estimated_tokens)
         try:
             multimodal_kwargs = {}
             if audio_data is not None:
@@ -353,16 +351,21 @@ class LLMServerManager:
 
     async def _init_global_load_balancer(self) -> None:
         lb_cfg = getattr(self.rollout_config, "load_balance", None)
-        capacity_threshold = lb_cfg.capacity_threshold if lb_cfg else 0.85
-        poll_interval_ms = lb_cfg.poll_interval_ms if lb_cfg else 200
-        load_backend = lb_cfg.backend if lb_cfg else "sglang"
-        self.global_load_balancer = CapacityAwareScheduler.remote(
-            servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
-            capacity_threshold=capacity_threshold,
-            poll_interval_ms=poll_interval_ms,
-            load_backend=load_backend,
-        )
-        await self.global_load_balancer._start_poll_loops.remote()
+        scheduler = lb_cfg.scheduler if lb_cfg else "capacity_aware"
+        servers = dict(zip(self.server_addresses, self.server_handles, strict=True))
+
+        if scheduler == "capacity_aware":
+            self.global_load_balancer = CapacityAwareScheduler.remote(
+                servers=servers,
+                capacity_threshold=lb_cfg.capacity_threshold if lb_cfg else 0.85,
+                poll_interval_ms=lb_cfg.poll_interval_ms if lb_cfg else 200,
+                load_backend=lb_cfg.backend if lb_cfg else "sglang",
+            )
+            await self.global_load_balancer._start_poll_loops.remote()
+        elif scheduler == "inflight":
+            self.global_load_balancer = GlobalRequestLoadBalancer.remote(servers=servers)
+        else:
+            raise ValueError(f"Unknown load_balance.scheduler={scheduler!r}. Choose 'capacity_aware' or 'inflight'.")
 
     def get_client(self, client_cls=LLMServerClient, **kwargs) -> LLMServerClient:
         """Get the LLMServerClient to request LLM server replicas.

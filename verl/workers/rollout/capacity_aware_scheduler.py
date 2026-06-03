@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
+import re
 import time
 from dataclasses import dataclass
 from typing import Protocol
@@ -26,23 +28,28 @@ import aiohttp
 import ray
 
 logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 @dataclass
 class LoadMetrics:
-    token_usage: float       # 0.0–1.0, KV cache utilization
-    num_total_tokens: int    # total KV cache capacity in tokens; 0 = unknown
+    token_usage: float  # 0.0–1.0, KV cache utilization
+    num_total_tokens: int  # total KV cache capacity in tokens; 0 = unknown
+    num_requests_running: int = 0  # vLLM: requests currently being decoded
+    num_requests_waiting: int = 0  # vLLM: requests queued, not yet scheduled
 
 
 @dataclass
 class ReplicaState:
-    server_id: str                 # also the HTTP base URL, e.g. "http://host:8000"
+    server_id: str  # also the HTTP base URL, e.g. "http://host:8000"
     handle: ray.actor.ActorHandle
-    token_usage: float             # 0.0–1.0, last polled KV cache utilization
+    token_usage: float  # 0.0–1.0, last polled KV cache utilization
     healthy: bool
-    last_polled: float             # Unix timestamp
-    num_total_tokens: int = 1      # KV cache capacity; updated each poll cycle
-    pending_tokens: int = 0        # tokens dispatched since last poll, not yet reflected in token_usage
+    last_polled: float  # Unix timestamp
+    num_total_tokens: int = 0  # KV cache capacity; updated each poll cycle; 0 = unknown
+    pending_tokens: int = 0  # tokens dispatched since last poll, not yet reflected in token_usage
+    num_requests_running: int = 0  # vLLM: requests currently being decoded
+    num_requests_waiting: int = 0  # vLLM: requests queued, not yet scheduled
 
 
 class LoadBackend(Protocol):
@@ -52,32 +59,94 @@ class LoadBackend(Protocol):
 
 
 class SGLangLoadBackend:
-    """Fetches load metrics from sglang /v1/loads endpoint."""
+    """Fetches load metrics from sglang.
+
+    Tries /v1/loads first (sglang >= 0.4); falls back to /get_load for older versions.
+    /get_load returns: [{"num_reqs", "num_waiting_reqs", "num_tokens", ...}]
+    /v1/loads returns: {"loads": [...], "aggregate": {"total_tokens", "total_used_tokens", ...}}
+    """
 
     async def fetch(self, address: str) -> LoadMetrics:
         timeout = aiohttp.ClientTimeout(total=0.5)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(f"{address}/v1/loads") as resp:
+                if resp.status != 404:
+                    resp.raise_for_status()
+                    data = await resp.json()
+                    agg = data.get("aggregate", {})
+                    total = agg.get("total_tokens", 0)
+                    used = agg.get("total_used_tokens", 0)
+                    usage = used / total if total > 0 else agg.get("avg_token_usage", 0.0)
+                    return LoadMetrics(token_usage=usage, num_total_tokens=total)
+
+            # Fallback: /get_load (deprecated shim in new sglang; native in old sglang)
+            # Fields: num_reqs, num_waiting_reqs, num_tokens (used+pending),
+            #         num_pending_tokens (remaining capacity)
+            async with session.get(f"{address}/get_load") as resp:
+                resp.raise_for_status()
                 data = await resp.json()
-                d = data[0]
-                total = d["num_total_tokens"]
-                usage = d["num_used_tokens"] / total if total > 0 else 0.0
-                return LoadMetrics(token_usage=usage, num_total_tokens=total)
+                total_reqs = sum(d.get("num_reqs", 0) for d in data)
+                total_waiting = sum(d.get("num_waiting_reqs", 0) for d in data)
+                used = sum(d.get("num_tokens", 0) for d in data)
+                pending = sum(d.get("num_pending_tokens", 0) for d in data)
+                total = used + pending
+                usage = used / total if total > 0 else 0.0
+                return LoadMetrics(
+                    token_usage=usage,
+                    num_total_tokens=total,
+                    num_requests_running=total_reqs,
+                    num_requests_waiting=total_waiting,
+                )
 
 
 class VLLMLoadBackend:
-    """Fetches load metrics from vLLM Prometheus /metrics endpoint."""
+    """Fetches load metrics from vLLM Prometheus /metrics endpoint.
+
+    num_total_tokens is derived once from vllm:cache_config_info labels:
+        num_total_tokens = num_gpu_blocks * block_size
+    This enables pending_tokens estimation between poll cycles.
+    """
+
+    _CACHE_METRICS = ("vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc")
+    _RE_NUM_GPU_BLOCKS = re.compile(r'num_gpu_blocks="(\d+)"')
+    _RE_BLOCK_SIZE = re.compile(r'block_size="(\d+)"')
+
+    def __init__(self) -> None:
+        self._num_total_tokens: int = 0  # 0 = not yet parsed from cache_config_info
 
     async def fetch(self, address: str) -> LoadMetrics:
         timeout = aiohttp.ClientTimeout(total=0.5)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(f"{address}/metrics") as resp:
                 text = await resp.text()
+
+        token_usage = 0.0
+        num_requests_running = 0
+        num_requests_waiting = 0
         for line in text.splitlines():
-            if line.startswith("vllm:gpu_cache_usage_perc") and not line.startswith("#"):
-                # vLLM Prometheus does not expose raw token counts; pending estimation disabled
-                return LoadMetrics(token_usage=float(line.split()[-1]), num_total_tokens=0)
-        return LoadMetrics(token_usage=0.0, num_total_tokens=0)
+            if line.startswith("#"):
+                continue
+            if any(line.startswith(m) for m in self._CACHE_METRICS):
+                token_usage = float(line.split()[-1])
+            elif line.startswith("vllm:num_requests_running"):
+                num_requests_running = int(float(line.split()[-1]))
+            elif line.startswith("vllm:num_requests_waiting"):
+                num_requests_waiting = int(float(line.split()[-1]))
+            elif self._num_total_tokens == 0 and line.startswith("vllm:cache_config_info"):
+                m_blocks = self._RE_NUM_GPU_BLOCKS.search(line)
+                m_bsize = self._RE_BLOCK_SIZE.search(line)
+                if m_blocks and m_bsize:
+                    self._num_total_tokens = int(m_blocks.group(1)) * int(m_bsize.group(1))
+                    logger.info(
+                        f"[VLLMLoadBackend] parsed num_total_tokens={self._num_total_tokens} "
+                        f"(num_gpu_blocks={m_blocks.group(1)}, block_size={m_bsize.group(1)})"
+                    )
+        return LoadMetrics(
+            token_usage=token_usage,
+            num_total_tokens=self._num_total_tokens,
+            num_requests_running=num_requests_running,
+            num_requests_waiting=num_requests_waiting,
+        )
 
 
 def _make_load_backend(backend: str) -> LoadBackend:
@@ -148,22 +217,39 @@ class _CapacityAwareScheduler:
             task = asyncio.ensure_future(self._poll_loop(server_id))
             self._poll_tasks[server_id] = task
 
+    @staticmethod
+    def _normalize_address(address: str) -> str:
+        """Ensure address has an http:// scheme for aiohttp."""
+        if address.startswith("http://") or address.startswith("https://"):
+            return address
+        return f"http://{address}"
+
     async def _poll_loop(self, server_id: str) -> None:
+        address = self._normalize_address(server_id)
         while server_id in self._states:
             try:
-                metrics = await self._load_backend.fetch(server_id)
+                metrics = await self._load_backend.fetch(address)
                 state = self._states[server_id]
                 state.token_usage = metrics.token_usage
                 if metrics.num_total_tokens > 0:
                     state.num_total_tokens = metrics.num_total_tokens
+                state.num_requests_running = metrics.num_requests_running
+                state.num_requests_waiting = metrics.num_requests_waiting
                 # Poll reflects actual server state; reset pending estimate
                 state.pending_tokens = 0
                 state.healthy = True
                 state.last_polled = time.time()
-                if self._effective_usage(state) < self._capacity_threshold:
+                logger.info(
+                    f"[CapacityAwareScheduler] poll ok {server_id} "
+                    f"usage={metrics.token_usage:.3f} "
+                    f"effective={self._effective_usage(state):.3f} "
+                    f"running={metrics.num_requests_running} "
+                    f"waiting={metrics.num_requests_waiting}"
+                )
+                if self._is_available(state):
                     self._capacity_event.set()
             except Exception as exc:
-                logger.warning(f"[CapacityAwareScheduler] poll failed for {server_id}: {exc}")
+                logger.warning(f"[CapacityAwareScheduler] poll failed for {server_id}: {type(exc).__name__}: {exc}")
                 if server_id in self._states:
                     self._states[server_id].healthy = False
             await asyncio.sleep(self._poll_interval_s)
@@ -176,6 +262,19 @@ class _CapacityAwareScheduler:
             # Backend doesn't expose total tokens (e.g. vLLM via Prometheus)
             pending_fraction = 0.0
         return min(state.token_usage + pending_fraction, 1.0)
+
+    def _is_available(self, state: ReplicaState) -> bool:
+        """A replica is available for new groups when its queue is empty.
+
+        Uses num_requests_waiting as the gate (accurate, polled directly from vLLM).
+        Falls back to capacity_threshold when waiting count is unavailable (e.g. SGLang).
+        """
+        if state.num_requests_waiting > 0:
+            return False
+        if state.num_requests_running == 0 and state.num_requests_waiting == 0:
+            # Both zero could mean metrics not yet populated; fall back to KV-cache check
+            return self._effective_usage(state) < self._capacity_threshold
+        return True
 
     async def acquire_server(
         self,
@@ -203,14 +302,11 @@ class _CapacityAwareScheduler:
             await self._capacity_event.wait()
 
     def _best_available(self) -> ReplicaState | None:
-        available = [
-            s for s in self._states.values()
-            if s.healthy and self._effective_usage(s) < self._capacity_threshold
-        ]
+        available = [s for s in self._states.values() if s.healthy and self._is_available(s)]
         if not available:
             return None
-        min_usage = min(self._effective_usage(s) for s in available)
-        candidates = [s for s in available if self._effective_usage(s) - min_usage < 0.05]
+        min_running = min(s.num_requests_running for s in available)
+        candidates = [s for s in available if s.num_requests_running - min_running <= 1]
         return random.choice(candidates)
 
     def release_server(self, server_id: str) -> None:  # noqa: ARG002
@@ -237,6 +333,8 @@ class _CapacityAwareScheduler:
                     "effective_usage": self._effective_usage(s),
                     "pending_tokens": s.pending_tokens,
                     "num_total_tokens": s.num_total_tokens,
+                    "num_requests_running": s.num_requests_running,
+                    "num_requests_waiting": s.num_requests_waiting,
                     "healthy": s.healthy,
                     "last_polled": s.last_polled,
                 }

@@ -15,9 +15,21 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 from omegaconf import OmegaConf
+
 from verl.workers.config.rollout import LoadBalanceConfig
+from verl.workers.rollout.capacity_aware_scheduler import (
+    LoadMetrics,
+    ReplicaState,
+    SGLangLoadBackend,
+    VLLMLoadBackend,
+    _CapacityAwareScheduler,
+)
 
 
 def test_load_balance_config_defaults():
@@ -43,18 +55,6 @@ def test_load_balance_config_from_yaml():
 # ---------------------------------------------------------------------------
 # Tests for ReplicaState and LoadBackend implementations
 # ---------------------------------------------------------------------------
-import asyncio
-import time
-from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
-
-from verl.workers.rollout.capacity_aware_scheduler import (
-    LoadMetrics,
-    ReplicaState,
-    SGLangLoadBackend,
-    VLLMLoadBackend,
-)
 
 
 def test_replica_state_fields():
@@ -117,14 +117,15 @@ async def test_vllm_load_backend_parses_prometheus():
 # ---------------------------------------------------------------------------
 # Tests for CapacityAwareScheduler skeleton
 # ---------------------------------------------------------------------------
-from verl.workers.rollout.capacity_aware_scheduler import _CapacityAwareScheduler
 
 
 def _make_scheduler(addresses=("http://h0:8000", "http://h1:8000")):
     handles = {addr: MagicMock() for addr in addresses}
     # Use the raw (non-Ray-decorated) class so object.__new__ works without a Ray cluster
     sched = object.__new__(_CapacityAwareScheduler)
-    _CapacityAwareScheduler.__init__(sched, servers=handles, capacity_threshold=0.85, poll_interval_ms=200, load_backend="sglang")
+    _CapacityAwareScheduler.__init__(
+        sched, servers=handles, capacity_threshold=0.85, poll_interval_ms=200, load_backend="sglang"
+    )
     return sched, handles
 
 

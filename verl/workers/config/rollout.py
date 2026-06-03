@@ -161,14 +161,20 @@ class CheckpointEngineConfig(BaseConfig):
 @dataclass
 class LoadBalanceConfig(BaseConfig):
     """
-    Configuration for CapacityAwareScheduler load balancing across rollout replicas.
+    Configuration for load balancing across rollout replicas.
     """
 
-    # KV cache usage ratio above which a replica is considered full (new groups blocked)
+    # Scheduler implementation: capacity_aware | inflight
+    #   capacity_aware : CapacityAwareScheduler — gates new-group dispatch on KV-cache
+    #                    utilization; blocks until a replica drops below capacity_threshold.
+    #   inflight       : GlobalRequestLoadBalancer — sticky-session + least-in-flight count;
+    #                    no KV-cache polling, legacy behaviour.
+    scheduler: str = "capacity_aware"
+    # KV cache usage ratio above which a replica is considered full (capacity_aware only)
     capacity_threshold: float = 0.85
-    # How often to poll each replica's /v1/loads endpoint (milliseconds)
+    # How often to poll each replica's load endpoint in ms (capacity_aware only)
     poll_interval_ms: int = 200
-    # Backend adapter: sglang | vllm
+    # Load backend adapter: sglang | vllm (capacity_aware only)
     backend: str = "sglang"
 
 
