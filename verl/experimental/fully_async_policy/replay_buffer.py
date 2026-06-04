@@ -106,13 +106,6 @@ class ReplayBuffer:
         self.max_version_slots = max_version_slots
         self._version_slots = 0  # cumulative slots issued in current version
 
-        print(
-            f"[ReplayBuffer] initialized with "
-            f"max_pending_slots={max_pending_slots}, "
-            f"max_version_slots={max_version_slots}, "
-            f"poll_interval={poll_interval}"
-        )
-
         # Initialize TQ in this actor process so _poll_from_tq can call tq.kv_list()
         try:
             import transfer_queue as tq

@@ -69,7 +69,7 @@ mtp_params=(
 fully_async=(
   data.train_batch_size=0
   data.gen_batch_size=1
-  trainer.test_freq=-1
+  trainer.test_freq=1
   actor_rollout_ref.hybrid_engine=False
   actor_rollout_ref.rollout.calculate_log_probs=True
   actor_rollout_ref.actor.optim.lr_decay_steps=51200
@@ -154,7 +154,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     trainer.logger=['console','tensorboard'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     trainer.save_freq=-1 \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.resume_mode=auto \
