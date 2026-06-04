@@ -493,7 +493,7 @@ class ReplayBuffer:
         async with self._data_available:
             partition_stats: dict[str, dict[str, int]] = {}
             for pid, part in self.partitions.items():
-                stats: dict[str, int] = {"success": 0, "finished": 0, "failure": 0}
+                stats: dict[str, int] = {"success": 0, "finished": 0, "failure": 0, "unknown": 0}
                 for v in part.values():
                     status = v.get("status", "unknown")
                     if status in stats:
