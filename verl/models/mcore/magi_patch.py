@@ -15,8 +15,6 @@
 
 from verl.models.mcore.prefix_tree_merge import (  # noqa: F401
     _flex_attn_forward,
-    _layer_capture,
-    _layer_counter,
     _magi_attn_forward,
     apply_magi_patch,
     apply_prefix_tree_patch,

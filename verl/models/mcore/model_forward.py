@@ -244,14 +244,8 @@ def gptmodel_forward_model_engine(
         model_kwargs["video_grid_thw"] = multi_modal_inputs["video_grid_thw"].to(input_ids.device)
 
     batch_size = input_ids.shape[0]
-    import time as _time
-
-    import torch.distributed as _dist
 
     if data_format == "thd":
-        # ------------------------------------------------------------------
-        # Prefix-tree path: flatten [prefix][leaf_0][leaf_1]... and use flex/MAGI attention
-        # ------------------------------------------------------------------
         use_prefix_tree = (logits_processor_args or {}).get("use_prefix_tree", False)
         prefix_tree_attention = (logits_processor_args or {}).get("prefix_tree_attention", "flex")
         prefix_tree_dynamic = (logits_processor_args or {}).get("prefix_tree_dynamic", False)
@@ -264,18 +258,15 @@ def gptmodel_forward_model_engine(
 
             loss_mask_nested = (logits_processor_args or {}).get("loss_mask", None)
             prefix_segments_batch = (logits_processor_args or {}).get("prefix_segments_batch", None)
-            # prefix_segments_batch may be a numpy object array or NonTensorStack; convert to list of lists.
             if prefix_segments_batch is not None:
                 import numpy as _np
 
                 if isinstance(prefix_segments_batch, _np.ndarray):
                     prefix_segments_batch = prefix_segments_batch.tolist()
                 elif hasattr(prefix_segments_batch, "__iter__") and not isinstance(prefix_segments_batch, list):
-                    # NonTensorStack from SFTTensorCollator: each element is NonTensorData with .data
                     prefix_segments_batch = [el.data if hasattr(el, "data") else el for el in prefix_segments_batch]
             from megatron.core import parallel_state as _mpu
 
-            _t0 = _time.perf_counter()
             pt_batch = build_prefix_tree_micro_batch(
                 model,
                 input_ids,
@@ -286,62 +277,17 @@ def gptmodel_forward_model_engine(
                 cp_size=_mpu.get_context_parallel_world_size(),
                 dynamic_trie=prefix_tree_dynamic,
             )
-            _t1 = _time.perf_counter()
-            if pt_batch is not None:
-                _full_tokens = int(input_ids.values().shape[0])
-                _flat_tokens = pt_batch.real_tokens
-                _share_ratio = (_full_tokens - _flat_tokens) / _full_tokens if _full_tokens > 0 else 0.0
-                if not _dist.is_initialized() or _dist.get_rank() == 0:
-                    print(
-                        f"[PT-TIME] build_micro_batch={(_t1 - _t0) * 1000:.2f}ms "
-                        f"total_tokens={pt_batch.flat_input_ids.shape[0]} "
-                        f"real_tokens={_flat_tokens} "
-                        f"full_tokens={_full_tokens} "
-                        f"prefix_sharing={_share_ratio:.1%} "
-                        f"attn={prefix_tree_attention}",
-                        flush=True,
-                    )
             if pt_batch is None:
-                if not _dist.is_initialized() or _dist.get_rank() == 0:
-                    # Diagnose why prefix-tree returned None
-                    _bs = input_ids.shape[0] if hasattr(input_ids, "shape") else len(input_ids)
-                    _segs = prefix_segments_batch[:2] if prefix_segments_batch is not None else None
-                use_prefix_tree = False  # no shared prefix — fall through
-
-        # MEM_DUMP: start recording before forward if requested
-        import os as _os
-
-        _mem_tag = _os.environ.get("MEM_DUMP_TAG", "")
-        _mem_dir = _os.environ.get("MEM_DUMP_DIR", "/tmp/claude")
-        _mem_rank0 = True  # only rank 0
-        try:
-            import torch.distributed as _dist
-
-            _mem_rank0 = not _dist.is_initialized() or _dist.get_rank() == 0
-        except Exception:
-            pass
-        if _mem_tag and _mem_rank0:
-            get_torch_device().memory._record_memory_history(max_entries=50_000)
+                use_prefix_tree = False
 
         if use_prefix_tree and pt_batch is not None:
-            # Flat token layout — pass full flat tokens to model.
-            # For magi+CP>1: we need to scatter flat tokens across TP ranks (SP)
-            # and rebuild the MAGI key for T/TP domain, then dispatch/undispatch
-            # inside _magi_attn_forward handles the CP ring-attention correctly.
             flat_input_ids = pt_batch.local_flat_input_ids.unsqueeze(0)
             flat_position_ids = pt_batch.local_flat_position_ids.unsqueeze(0)
-
-            _magi_key_to_use = pt_batch.magi_key
-            _sp_scattered = False
 
             for _k in ("loss_mask", "use_prefix_tree", "prefix_tree_attention", "prefix_segments_batch"):
                 if logits_processor_args and _k in logits_processor_args:
                     logits_processor_args.pop(_k)
 
-            _tf0 = _time.perf_counter()
-            get_torch_device().synchronize()
-            get_torch_device().reset_peak_memory_stats()
-            _mem_before = get_torch_device().memory_allocated() / 1024**2
             if prefix_tree_attention == "magi":
                 output_orig = model(
                     input_ids=flat_input_ids,
@@ -361,51 +307,16 @@ def gptmodel_forward_model_engine(
                     **model_kwargs,
                 )
             get_torch_device().synchronize()
-            _tf1 = _time.perf_counter()
-            if not _dist.is_initialized() or _dist.get_rank() == 0:
-                _peak_mb = get_torch_device().max_memory_allocated() / 1024**2
-                _alloc_mb = get_torch_device().memory_allocated() / 1024**2
-                print(
-                    f"[PT-TIME] model_fwd={(_tf1 - _tf0) * 1000:.2f}ms "
-                    f"peak_mem={_peak_mb:.0f}MB prefix_sharing={_share_ratio:.1%} "
-                    f"attn={prefix_tree_attention}",
-                    flush=True,
-                )
-
             if post_process and logits_processor is not None:
-                # Strip TP padding (added for sequence-parallel divisibility).
                 real_tokens = pt_batch.real_tokens
                 if output_orig.shape[0] == 1:
-                    output_orig = output_orig[:, :real_tokens]  # (1, real_tokens, vocab)
+                    output_orig = output_orig[:, :real_tokens]
                 else:
-                    output_orig = output_orig[:real_tokens].permute(1, 0, 2)  # (1, real_tokens, vocab)
+                    output_orig = output_orig[:real_tokens].permute(1, 0, 2)
 
-                # Transpose to THD: vocab_parallel_cross_entropy expects (total_tokens, batch, vocab)
-                output_orig_thd = output_orig.squeeze(0).unsqueeze(1)  # (real_tokens, 1, vocab)
+                output_orig_thd = output_orig.squeeze(0).unsqueeze(1)
 
-                import os as _os2
-
-                import torch.distributed as _dist2
-
-                _save_cp2 = _os2.environ.get("SAVE_CP_TENSORS") == "1"
-                _cp_rank2 = _dist2.get_rank() if _dist2.is_initialized() else 0
-                _save_dir2 = _os2.environ.get("CP_TENSOR_DIR", "/tmp/claude/cp_tensors")
-
-                def _save2(name, tensor):
-                    if not _save_cp2:
-                        return
-                    _os2.makedirs(_save_dir2, exist_ok=True)
-                    path = f"{_save_dir2}/{name}_rank{_cp_rank2}.pt"
-                    torch.save(tensor.detach().cpu(), path)
-                    print(f"[CP_SAVE] {name} shape={tuple(tensor.shape)} rank={_cp_rank2} → {path}", flush=True)
-
-                _save2("model_forward_output_logits", output_orig_thd)
-
-                # Shift labels by -1 for next-token prediction (same as preprocess_thd_engine)
-                flat_label = torch.roll(pt_batch.flat_input_ids[:real_tokens], shifts=-1, dims=0).unsqueeze(
-                    1
-                )  # (real_tokens, 1)
-                _save2("model_forward_flat_label", flat_label.squeeze(1))
+                flat_label = torch.roll(pt_batch.flat_input_ids[:real_tokens], shifts=-1, dims=0).unsqueeze(1)
                 orig_args = logits_processor_args or {}
                 total_tokens = flat_label.shape[0]
                 # temperature in THD: (total_tokens, 1)
@@ -432,13 +343,8 @@ def gptmodel_forward_model_engine(
                 # restore_flat_to_nested gives per-sample NestedTensor in original token order.
                 if isinstance(output_dict, dict) and "log_probs" in output_dict:
                     # log_probs shape: (1, T) — batch-first from vocab_parallel_log_probs_from_logits
-                    lp_flat = output_dict["log_probs"].reshape(-1)[:real_tokens]  # (real_tokens,)
-                    _save2("before_restore_log_probs_flat", lp_flat)
+                    lp_flat = output_dict["log_probs"].reshape(-1)[:real_tokens]
                     output_dict["log_probs"] = restore_flat_to_nested(lp_flat, pt_batch)
-                    # save per-sample log_probs after restore
-                    _nested = output_dict["log_probs"]
-                    if hasattr(_nested, "values"):
-                        _save2("after_restore_log_probs_flat", _nested.values())
                 output = output_dict
             else:
                 # Strip TP padding before restoring
@@ -492,8 +398,6 @@ def gptmodel_forward_model_engine(
             if vision_model:
                 input_ids_rmpad, attention_mask = build_vlm_attn_mask_thd(input_ids, pad_token_id)
 
-            _tfa0 = _time.perf_counter()
-            get_torch_device().synchronize()
             output_orig = model(
                 input_ids=input_ids_rmpad,
                 attention_mask=attention_mask,
@@ -503,11 +407,6 @@ def gptmodel_forward_model_engine(
                 packed_seq_params=packed_seq_params,
                 **model_kwargs,
             )
-            get_torch_device().synchronize()
-            _tfa1 = _time.perf_counter()
-            if not _dist.is_initialized() or _dist.get_rank() == 0:
-                _peak_mb = get_torch_device().max_memory_allocated() / 1024**2
-                print(f"[FA3-TIME] model_fwd={(_tfa1 - _tfa0) * 1000:.2f}ms peak_mem={_peak_mb:.0f}MB", flush=True)
 
             if post_process and logits_processor is not None:
                 args = {
@@ -520,36 +419,7 @@ def gptmodel_forward_model_engine(
                     )[0]
                     for k, v in logits_processor_args.items()
                 }
-                import os as _os3
-
-                import torch.distributed as _dist3
-
-                _save_cp3 = _os3.environ.get("SAVE_CP_TENSORS") == "1"
-                _cp_rank3 = _dist3.get_rank() if _dist3.is_initialized() else 0
-                _save_dir3 = _os3.environ.get("CP_TENSOR_DIR", "/tmp/claude/cp_tensors")
-
-                def _save3(name, tensor):
-                    if not _save_cp3:
-                        return
-                    _os3.makedirs(_save_dir3, exist_ok=True)
-                    path = f"{_save_dir3}/{name}_rank{_cp_rank3}.pt"
-                    if _os3.path.exists(path):
-                        return  # only save first forward pass
-                    torch.save(tensor.detach().cpu(), path)
-                    print(f"[CP_SAVE] {name} shape={tuple(tensor.shape)} rank={_cp_rank3} → {path}", flush=True)
-
-                # output_orig shape: (T, 1, vocab) in THD
-                _save3("model_forward_output_logits", output_orig)
-                if "label" in args:
-                    _save3(
-                        "model_forward_flat_label",
-                        args["label"].squeeze(1) if args["label"].dim() == 2 else args["label"],
-                    )
                 output_dict = logits_processor(output_orig, **args)
-                if isinstance(output_dict, dict) and "log_probs" in output_dict:
-                    _lp = output_dict["log_probs"]
-                    if isinstance(_lp, torch.Tensor) and not _lp.is_nested:
-                        _save3("before_restore_log_probs_flat", _lp.reshape(-1))
                 output = {
                     k: postprocess_thd_engine(
                         v,
@@ -561,10 +431,6 @@ def gptmodel_forward_model_engine(
                     )
                     for k, v in output_dict.items()
                 }
-                if isinstance(output, dict) and "log_probs" in output:
-                    _lp_post = output["log_probs"]
-                    if isinstance(_lp_post, torch.Tensor) and not _lp_post.is_nested:
-                        _save3("after_restore_log_probs_flat", _lp_post.flatten())
             else:
                 output = postprocess_thd_engine(
                     output_orig,
@@ -635,27 +501,6 @@ def gptmodel_forward_model_engine(
             output = postprocess_bshd_engine(output_orig, attention_mask_bshd, post_process=post_process)
 
     if value_model and post_process:
-        # output = output[..., 0]
-        # while using nested tensor, the advanced indexing operation above will result in an error at backward, i.e.
-        # ValueError: NestedTensor _nested_select_backward_default(grad_output: t, self: jt_all, dim: any, index: any)
-        # so we use `squeeze` to remove the last dimension
         output = output.squeeze(-1)
-
-    # MEM_DUMP: save snapshot after first forward pass
-    if _mem_tag and _mem_rank0:
-        import os as _os
-
-        _dev = get_torch_device()
-        snap_path = _os.path.join(_mem_dir, f"{_mem_tag}_snapshot.pickle")
-        if not _os.path.exists(snap_path):  # only first call
-            _dev.memory._dump_snapshot(snap_path)
-            peak_mb = _dev.max_memory_allocated() / 1e6
-            summ_path = _os.path.join(_mem_dir, f"{_mem_tag}_mem_summary.txt")
-            with open(summ_path, "w") as _f:
-                _f.write(f"tag={_mem_tag}\n")
-                _f.write(f"peak_allocated_MB={peak_mb:.1f}\n")
-                _f.write(_dev.memory_summary())
-            print(f"[MEM_DUMP] {_mem_tag}: peak={peak_mb:.1f}MB → {snap_path}", flush=True)
-        _dev.memory._record_memory_history(enabled=None)
 
     return output
