@@ -165,7 +165,7 @@ class FullyAsyncTrainerTQ(PPOTrainer, FullyAsyncTrainer):
 
         Returns KVBatchMeta compatible with PPOTrainer's entire step() pipeline.
         """
-        sampled_keys_meta = await self.replay_buffer.wait_and_sample.remote(
+        sampled_keys_meta = await self.replay_buffer.sample.remote(
             partition_id="train",
             sample_size=self.required_samples,
             rollout_n=self.config.actor_rollout_ref.rollout.n,

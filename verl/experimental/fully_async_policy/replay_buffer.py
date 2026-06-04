@@ -159,41 +159,9 @@ class ReplayBuffer:
                 if data is not None:
                     # Build a fresh snapshot from TQ, then atomically replace self.partitions
                     new_partitions: dict[str, dict[str, dict]] = defaultdict(dict)
-                    orphaned_keys: dict[str, dict[str, dict]] = defaultdict(dict)
                     for partition_id, items in data.items():
                         for key, meta in items.items():
-                            # UID integrity check: detect orphaned entries where meta.uid
-                            # exists but does not match the key's prefix.
-                            # This can happen after TQ deletion errors leave behind
-                            # stale keys whose metadata references a different uid.
-                            uid_in_meta = meta.get("uid", "") if isinstance(meta, dict) else ""
-                            if uid_in_meta and not key.startswith(uid_in_meta):
-                                orphaned_keys[partition_id][key] = meta
-                                continue
                             new_partitions[partition_id][key] = meta
-
-                    # Delete orphaned keys from TQ in batch (grouped by partition) to prevent accumulation
-                    if orphaned_keys:
-                        skipped_count = sum(len(keys) for keys in orphaned_keys.values())
-                        for partition_id, keys in orphaned_keys.items():
-                            try:
-                                tq.kv_clear(keys=list(keys.keys()), partition_id=partition_id)
-                            except Exception as e:
-                                print(
-                                    f"[ReplayBuffer][_poll_from_tq] ⚠️ Failed to delete {len(keys)} "
-                                    f"orphaned keys from TQ (partition={partition_id}): {e}",
-                                    flush=True,
-                                )
-                        print(
-                            f"[ReplayBuffer][_poll_from_tq] ⚠️ ABNORMAL KEY COUNT! "
-                            f"Detected and deleted {skipped_count} orphaned entries from TQ:\n"
-                            + "\n".join(
-                                f"  partition={pid}, key='{k}', meta.uid='{m.get('uid', '')}'"
-                                for pid, part_orphans in orphaned_keys.items()
-                                for k, m in part_orphans.items()
-                            ),
-                            flush=True,
-                        )
                     # Update self.partitions atomically
                     async with self._data_available:
                         self.partitions = new_partitions
@@ -215,7 +183,7 @@ class ReplayBuffer:
             if self._finished:
                 break
             try:
-                stats = self.get_statistics()
+                stats = await self.get_statistics()
                 print(f"[ReplayBuffer][Monitor] {pformat(stats)}")
             except Exception as e:
                 logger.error(f"[ReplayBuffer] _monitor_loop error: {e}")
@@ -298,7 +266,7 @@ class ReplayBuffer:
                 self.idle_start_time = time.time()
             self._slot_available.notify_all()
 
-    async def wait_and_sample(
+    async def sample(
         self,
         partition_id: str,
         sample_size: int,
@@ -416,8 +384,18 @@ class ReplayBuffer:
                                     if uid in finished_uids:
                                         keys_to_remove.append(uid)
 
-                                # Remove from partition
+                                # Remove from TQ and in-memory partition
                                 if keys_to_remove:
+                                    # Delete from TQ first
+                                    try:
+                                        tq.kv_clear(keys=keys_to_remove, partition_id=partition_id)
+                                    except Exception as e:
+                                        print(
+                                            f"[ReplayBuffer][wait_and_sample] ⚠️ Failed to delete {len(keys_to_remove)} "
+                                            f"abnormal keys from TQ (partition={partition_id}): {e}",
+                                            flush=True,
+                                        )
+                                    # Then remove from in-memory partition
                                     part = self.partitions.get(partition_id)
                                     if part is not None:
                                         size_before = len(part)
@@ -449,11 +427,11 @@ class ReplayBuffer:
                 for key in keys:
                     part.pop(key, None)
             size_after = len(part) if part is not None else 0
-        print(
+
+        logger.debug(
             f"[ReplayBuffer][remove] partition={partition_id}: "
             f"size {size_before} -> {size_after} "
             f"(removed {len(keys)} keys, actually_deleted={size_before - size_after})",
-            flush=True,
         )
 
     async def reset_staleness(self) -> dict:

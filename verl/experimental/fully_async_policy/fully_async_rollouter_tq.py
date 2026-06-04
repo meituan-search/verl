@@ -300,7 +300,7 @@ class FullyAsyncRollouterTQ(FullyAsyncRollouter):
             self.async_rollout_manager.generate_sequences(batch)
 
             # 2. sample batch from replay buffer
-            batch = await self.replay_buffer.wait_and_sample(
+            batch = await self.replay_buffer.sample(
                 partition_id="val", sample_size=len(batch), rollout_n=self.config.actor_rollout_ref.rollout.val_kwargs.n
             ).remote()
 

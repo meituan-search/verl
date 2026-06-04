@@ -214,7 +214,7 @@ stateDiagram-v2
 acquired = await asyncio.wrap_future(self.replay_buffer.acquire_slot.remote(timeout=None, uid=sample_id).future())
 
 # Trainer 侧 (在 Ray Actor 内部，async)
-sampled_keys_meta = await self.replay_buffer.wait_and_sample.remote(
+sampled_keys_meta = await self.replay_buffer.sample.remote(
     partition_id="train", sample_size=N, rollout_n=n
 )
 ```
@@ -339,7 +339,7 @@ async def _validate(self) -> dict[str, float]:
         self.async_rollout_manager.generate_sequences(batch)
 
         # 2. sample batch from replay buffer (blocks until enough finish samples)
-        batch = await self.replay_buffer.wait_and_sample(
+        batch = await self.replay_buffer.sample(
             partition_id="val", sample_size=len(batch),
             rollout_n=self.config.actor_rollout_ref.rollout.val_kwargs.n
         ).remote()
