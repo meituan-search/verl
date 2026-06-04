@@ -311,31 +311,6 @@ class FullyAsyncTrainerTQ(PPOTrainer, FullyAsyncTrainer):
         tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
         await self.replay_buffer.remove.remote(batch.partition_id, batch.keys)
 
-        # Diagnostic: detect abnormal key counts
-        expected_keys = self.required_samples * self.config.actor_rollout_ref.rollout.n
-        if len(batch.keys) != expected_keys:
-            # Print per-uid key breakdown
-            uid_key_map: dict[str, list[str]] = {}
-            for key, tag in zip(batch.keys, batch.tags, strict=False):
-                uid = tag.get("uid", "") if isinstance(tag, dict) else ""
-                if uid:
-                    uid_key_map.setdefault(uid, []).append(key)
-
-            print(
-                f"[TQFullyAsyncTrainer] _cleanup_batch ⚠️ ABNORMAL! "
-                f"{len(batch.keys)} total keys (expected {expected_keys}), "
-                f"{len(uid_keys)} deduped uids (expected {self.required_samples})\n"
-                f"  PER-UID KEY BREAKDOWN: {uid_key_map}\n"
-                f"  ALL KEYS: {batch.keys}",
-                flush=True,
-            )
-        else:
-            print(
-                f"[TQFullyAsyncTrainer] _cleanup_batch: {len(batch.keys)} total keys, "
-                f"{len(uid_keys)} deduped uids cleared",
-                flush=True,
-            )
-
     async def _fit_update_weights(self):
         if self.local_trigger_step != 1:
             return

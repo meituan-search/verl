@@ -46,7 +46,6 @@ import os
 import time
 from collections import defaultdict
 from pprint import pformat
-from typing import Literal
 
 import ray
 
@@ -60,9 +59,6 @@ from verl.experimental.fully_async_policy.detach_utils import safe_create_task
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-
-# Status type
-StatusType = Literal["error", "success"]
 
 
 @ray.remote(max_concurrency=100)
@@ -319,6 +315,44 @@ class ReplayBuffer:
                         abnormal_gt_uids = [uid for uid, keys in uid_response_keys.items() if len(keys) > rollout_n]
                         abnormal_lt_uids = [uid for uid, keys in uid_response_keys.items() if len(keys) < rollout_n]
 
+                        # For abnormal_gt_uids: check key vs meta.uid consistency,
+                        # remove mismatched keys from in-memory partition (not TQ),
+                        # then promote to normal_eq_uids if remaining count == rollout_n
+                        if abnormal_gt_uids:
+                            promoted_uids: list[str] = []
+                            detail_lines: list[str] = []
+                            for uid in abnormal_gt_uids:
+                                keys_and_metas = uid_response_keys[uid]
+                                matched_keys: list[tuple[str, dict]] = []
+                                removed_keys: list[str] = []
+                                for key, meta in keys_and_metas:
+                                    meta_uid = meta.get("uid", "") if isinstance(meta, dict) else ""
+                                    if meta_uid and key.startswith(meta.uid):
+                                        matched_keys.append((key, meta))
+                                    else:
+                                        part.pop(key, None)
+                                        removed_keys.append(key)
+
+                                if matched_keys and len(matched_keys) == rollout_n:
+                                    promoted_uids.append(uid)
+                                    uid_response_keys[uid] = matched_keys
+                                    detail_lines.append(
+                                        f"  uid='{uid}': {len(keys_and_metas)}->{len(matched_keys)} keys, "
+                                        f"removed={removed_keys}"
+                                    )
+
+                            if detail_lines:
+                                print(
+                                    f"[ReplayBuffer][sample] ✂️ Cleaned {len(abnormal_gt_uids)} abnormal_gt uids "
+                                    f"(promoted {len(promoted_uids)} to normal_eq, "
+                                    f"remaining abnormal={len(abnormal_gt_uids) - len(promoted_uids)})\n"
+                                    + "\n".join(detail_lines),
+                                    flush=True,
+                                )
+
+                            normal_eq_uids.extend(promoted_uids)
+                            abnormal_gt_uids = [u for u in abnormal_gt_uids if u not in set(promoted_uids)]
+
                         if len(normal_eq_uids) >= sample_size:
                             selected_uids = normal_eq_uids[:sample_size]
                             all_response_keys: list[tuple[str, dict]] = []
@@ -344,71 +378,6 @@ class ReplayBuffer:
                                 flush=True,
                             )
 
-                            if abnormal_gt_uids or abnormal_lt_uids:
-                                # Print per-uid key breakdown for the selected uids
-                                per_uid_breakdown = {
-                                    uid: [k for k, _ in uid_response_keys[uid]] for uid in selected_uids
-                                }
-                                # Also show abnormal uid details for context
-                                abnormal_gt_details = {
-                                    uid: [k for k, _ in uid_response_keys[uid]] for uid in abnormal_gt_uids
-                                }
-                                abnormal_lt_details = {
-                                    uid: [k for k, _ in uid_response_keys[uid]] for uid in abnormal_lt_uids
-                                }
-                                print(
-                                    f"[ReplayBuffer][wait_and_sample] ⚠️ ABNORMAL KEY COUNT! "
-                                    f"Returning {len(all_response_keys)} keys (expected {expected_keys}) "
-                                    f"from {len(selected_uids)} uids (expected {sample_size}), "
-                                    f"rollout_n={rollout_n}\n"
-                                    f"  SELECTED PER-UID BREAKDOWN ({len(per_uid_breakdown)} uids): "
-                                    f"{per_uid_breakdown}\n"
-                                    f"  ABNORMAL_GT UIDS (> {rollout_n} keys, {len(abnormal_gt_uids)} total): "
-                                    f"{abnormal_gt_details}\n"
-                                    f"  ABNORMAL_LT UIDS (< {rollout_n} keys, {len(abnormal_lt_uids)} total): "
-                                    f"{abnormal_lt_details}",
-                                    flush=True,
-                                )
-
-                                # Remove abnormal data from partitions to prevent accumulation
-                                abnormal_uids = set(abnormal_gt_uids) | set(abnormal_lt_uids)
-                                keys_to_remove: list[str] = []
-
-                                # Collect response keys for abnormal uids
-                                for uid in abnormal_uids:
-                                    if uid in uid_response_keys:
-                                        keys_to_remove.extend([k for k, _ in uid_response_keys[uid]])
-
-                                # Also remove the uid-level key (status=finished) for abnormal uids
-                                for uid in abnormal_uids:
-                                    if uid in finished_uids:
-                                        keys_to_remove.append(uid)
-
-                                # Remove from TQ and in-memory partition
-                                if keys_to_remove:
-                                    # Delete from TQ first
-                                    try:
-                                        tq.kv_clear(keys=keys_to_remove, partition_id=partition_id)
-                                    except Exception as e:
-                                        print(
-                                            f"[ReplayBuffer][wait_and_sample] ⚠️ Failed to delete {len(keys_to_remove)} "
-                                            f"abnormal keys from TQ (partition={partition_id}): {e}",
-                                            flush=True,
-                                        )
-                                    # Then remove from in-memory partition
-                                    part = self.partitions.get(partition_id)
-                                    if part is not None:
-                                        size_before = len(part)
-                                        for key in keys_to_remove:
-                                            part.pop(key, None)
-                                        size_after = len(part)
-                                        print(
-                                            f"[ReplayBuffer][wait_and_sample] 🧹 Cleaned up {len(keys_to_remove)} "
-                                            f"abnormal keys from partition '{partition_id}': "
-                                            f"size {size_before} -> {size_after} "
-                                            f"(gt_uids={len(abnormal_gt_uids)}, lt_uids={len(abnormal_lt_uids)})",
-                                            flush=True,
-                                        )
                             return all_response_keys
                     else:
                         print(
