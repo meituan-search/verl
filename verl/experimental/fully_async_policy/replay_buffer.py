@@ -144,6 +144,14 @@ class ReplayBuffer:
         Each poll replaces self.partitions with a fresh TQ snapshot (not in-place mutation).
         This ensures self.partitions is always consistent with TQ's current state,
         avoiding stale/corrupted data from incremental merge + concurrent remove().
+
+        UID integrity check:
+            When TQ deletion errors occur, orphaned keys may remain whose meta.uid
+            does not match the key's prefix. For example:
+            - Normal:   key='sample_1_13247_10_0', meta.uid='sample_1_13247'  → key starts with uid ✓
+            - Orphaned: key='sample_1_10885_13_0', meta.uid='sample_1_11114' → key does NOT start with uid ✗
+            Such entries are detected, logged as ABNORMAL, and deleted from TQ to prevent
+            corrupting the uid→response_keys mapping used by wait_and_sample().
         """
         try:
             while True:
@@ -151,9 +159,42 @@ class ReplayBuffer:
                 if data is not None:
                     # Build a fresh snapshot from TQ, then atomically replace self.partitions
                     new_partitions: dict[str, dict[str, dict]] = defaultdict(dict)
+                    orphaned_keys: dict[str, dict[str, dict]] = defaultdict(dict)
                     for partition_id, items in data.items():
                         for key, meta in items.items():
+                            # UID integrity check: detect orphaned entries where meta.uid
+                            # exists but does not match the key's prefix.
+                            # This can happen after TQ deletion errors leave behind
+                            # stale keys whose metadata references a different uid.
+                            uid_in_meta = meta.get("uid", "") if isinstance(meta, dict) else ""
+                            if uid_in_meta and not key.startswith(uid_in_meta):
+                                orphaned_keys[partition_id][key] = meta
+                                continue
                             new_partitions[partition_id][key] = meta
+
+                    # Delete orphaned keys from TQ in batch (grouped by partition) to prevent accumulation
+                    if orphaned_keys:
+                        skipped_count = sum(len(keys) for keys in orphaned_keys.values())
+                        for partition_id, keys in orphaned_keys.items():
+                            try:
+                                tq.kv_clear(keys=list(keys.keys()), partition_id=partition_id)
+                            except Exception as e:
+                                print(
+                                    f"[ReplayBuffer][_poll_from_tq] ⚠️ Failed to delete {len(keys)} "
+                                    f"orphaned keys from TQ (partition={partition_id}): {e}",
+                                    flush=True,
+                                )
+                        print(
+                            f"[ReplayBuffer][_poll_from_tq] ⚠️ ABNORMAL KEY COUNT! "
+                            f"Detected and deleted {skipped_count} orphaned entries from TQ:\n"
+                            + "\n".join(
+                                f"  partition={pid}, key='{k}', meta.uid='{m.get('uid', '')}'"
+                                for pid, part_orphans in orphaned_keys.items()
+                                for k, m in part_orphans.items()
+                            ),
+                            flush=True,
+                        )
+                    # Update self.partitions atomically
                     async with self._data_available:
                         self.partitions = new_partitions
                         self._data_available.notify_all()

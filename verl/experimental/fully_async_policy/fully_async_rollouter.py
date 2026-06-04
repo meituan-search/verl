@@ -601,7 +601,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         return timing_raw
 
-    def do_validate(self):
+    async def do_validate(self):
         """Run validation and return metrics"""
         timing_raw = {}
         with marked_timer("rollouter/validate_time", timing_raw, color="green"):

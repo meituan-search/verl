@@ -15,11 +15,12 @@
 import asyncio
 import logging
 import os
+import uuid
+from collections import defaultdict
 
 import numpy as np
 import ray
 
-from verl import DataProto
 from verl.experimental.fully_async_policy.detach_utils import (
     RolloutSample,
     safe_create_task,
@@ -30,6 +31,7 @@ from verl.experimental.fully_async_policy.fully_async_rollouter import (
 )
 from verl.trainer.main_ppo_sync import AgentLoopWorkerTQ
 from verl.utils import tensordict_utils as tu
+from verl.utils.profiler import marked_timer
 
 try:
     import transfer_queue as tq
@@ -70,26 +72,26 @@ class FullyAsyncAgentLoopManagerTQ(FullyAsyncAgentLoopManager):
         Returns:
             None — data is written directly to TransferQueue by the worker.
         """
-        # Convert DataProto → TensorDict (align with main_ppo_sync.py input side)
-        # Manually merge batch + non_tensor_batch into a TensorDict, and lift meta_info
-        # fields (validate, global_steps) into the TensorDict as NonTensorData — this
-        # avoids the key collision in DataProto.to_tensordict() which also merges meta_info.
-        if isinstance(prompts, DataProto):
-            from verl.utils import tensordict_utils as tu
-
-            tensor_batch = prompts.batch.to_dict() if prompts.batch is not None else {}
-            for key, val in prompts.non_tensor_batch.items():
-                tensor_batch[key] = val
-            # Lift critical meta_info fields that generate_sequences expects as batch keys
-            if "validate" in prompts.meta_info:
-                tensor_batch["validate"] = prompts.meta_info["validate"]
-            if "global_steps" in prompts.meta_info:
-                tensor_batch["global_steps"] = prompts.meta_info["global_steps"]
-            prompts = tu.get_tensordict(tensor_batch)
-
         worker = self._select_best_worker()
         output_future = worker.generate_sequences.remote(prompts, wait=True)
         return await asyncio.wrap_future(output_future.future())
+
+    def generate_sequences(self, prompts):
+        """
+        Dispatch input batch to agent loop workers without blocking. Workers should put agent loop outputs
+        into TransferQueue once an agent loop finished.
+
+        Args:
+            prompts (TensorDict): Input batch from train or validation dataset.
+        """
+        # mark prompts as pending in replay buffer
+        chunkes = prompts.chunk(len(self.agent_loop_workers))
+        return ray.get(
+            [
+                worker.generate_sequences.remote(chunk)
+                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=False)
+            ]
+        )
 
 
 class FullyAsyncRollouterTQ(FullyAsyncRollouter):
@@ -259,6 +261,168 @@ class FullyAsyncRollouterTQ(FullyAsyncRollouter):
 
             async with self.lock:
                 self.running = False
+
+    async def do_validate(self):
+        """Run validation and return metrics.
+
+        Overrides FullyAsyncRollouter.do_validate() to use PPOTrainer's
+        _validate() which operates on TransferQueue + ReplayBuffer (TQ path)
+        instead of SeparateRayPPOTrainer's _validate() which uses MessageQueue.
+        """
+        timing_raw = {}
+        with marked_timer("rollouter/validate_time", timing_raw, color="green"):
+            val_metrics: dict = await self._validate()
+        return timing_raw | val_metrics
+
+    async def _validate(self) -> dict[str, float]:
+        # Lists to collect samples for the table
+        sample_uids = []
+        sample_inputs = []
+        sample_outputs = []
+        sample_gts = []
+        sample_scores = []
+        sample_turns = []
+        data_sources = []
+        reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+        dump_all_inputs: list[str] = []
+        dump_all_outputs: list[str] = []
+        dump_all_keys: list[str] = []
+        session_to_sample_idx: dict[str, int] = {}
+
+        for batch_dict in self.val_dataloader:
+            # 1. put batch to agent loop manager
+            batch_dict["uid"] = np.array(
+                [str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object
+            )
+            batch = tu.get_tensordict(batch_dict)
+            tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
+            tu.assign_non_tensor_data(batch, "validate", True)
+            self.async_rollout_manager.generate_sequences(batch)
+
+            # 2. sample batch from replay buffer
+            batch = await self.replay_buffer.wait_and_sample(
+                partition_id="val", sample_size=len(batch), rollout_n=self.config.actor_rollout_ref.rollout.val_kwargs.n
+            ).remote()
+
+            # 3. [OPTIONAL] compute reward score with colocated reward model
+            if self.reward_loop_manager.reward_loop_worker_handles is None:
+                self.checkpoint_manager.sleep_replicas()
+                batch = self._compute_reward_colocate(batch)
+                self.checkpoint_manager.update_weights()
+
+            # 4. collect necessary data for logging
+            # For multi-output agent loops, only use the final output per session for metrics.
+            # Keys have format {uid}_{session_id}_{index}; keep only the highest index per session.
+            session_max: dict[str, tuple[int, int]] = {}  # session_key -> (max_index, position)
+            for pos, key in enumerate(batch.keys):
+                parts = key.rsplit("_", 2)
+                if len(parts) == 3:
+                    session_key = f"{parts[0]}_{parts[1]}"
+                    index = int(parts[2])
+                    if session_key not in session_max or index > session_max[session_key][0]:
+                        session_max[session_key] = (index, pos)
+                else:
+                    session_max[key] = (0, pos)
+            sorted_sessions = sorted(session_max.items(), key=lambda x: x[1][1])
+            final_indices = [pos for _, (_, pos) in sorted_sessions]
+            final_keys = [batch.keys[i] for i in final_indices]
+            base_offset = len(sample_scores)
+            session_to_sample_idx.update(
+                {session_key: base_offset + j for j, (session_key, _) in enumerate(sorted_sessions)}
+            )
+
+            text_data = tq.kv_batch_get(
+                keys=batch.keys, partition_id=batch.partition_id, select_fields=["prompts", "responses"]
+            )
+            text_data["prompts"] = text_data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
+            text_data["responses"] = text_data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
+            all_inputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in text_data["prompts"]]
+            all_outputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in text_data["responses"]]
+
+            fields = ["uid", "rm_scores", "num_turns", "reward_model", "data_source", "extra_fields"]
+            data = tq.kv_batch_get(keys=final_keys, partition_id=batch.partition_id, select_fields=fields)
+
+            sample_uids.extend(data.pop("uid").tolist())
+            sample_outputs.extend(all_outputs[i] for i in final_indices)
+            sample_inputs.extend(all_inputs[i] for i in final_indices)
+            scores = data["rm_scores"].sum(dim=1).tolist()
+            sample_scores.extend(scores)
+            sample_turns.extend(data.pop("num_turns").tolist())
+            reward_extra_infos_dict["reward"].extend(scores)
+
+            extra_fields_list = data.pop("extra_fields", None)
+            if extra_fields_list is not None:
+                n_prior = len(reward_extra_infos_dict["reward"]) - len(extra_fields_list.tolist())
+                for extra_field in extra_fields_list.tolist():
+                    reward_extra_info = (
+                        extra_field.get("reward_extra_info", {}) if isinstance(extra_field, dict) else {}
+                    )
+                    for key in reward_extra_infos_dict:
+                        if key != "reward" and key not in reward_extra_info:
+                            reward_extra_infos_dict[key].append(None)
+                    for key, value in reward_extra_info.items():
+                        if key not in reward_extra_infos_dict:
+                            reward_extra_infos_dict[key] = [None] * n_prior
+                        reward_extra_infos_dict[key].append(value)
+                    n_prior += 1
+
+            reward_model = data.pop("reward_model", None)
+            if reward_model is not None:
+                sample_gts.extend([item.get("ground_truth", None) for item in reward_model.tolist()])
+            else:
+                sample_gts.extend([None] * len(final_indices))
+
+            data_source = data.pop("data_source", None)
+            if data_source is not None:
+                data_sources.extend(data_source.tolist())
+            else:
+                data_sources.extend(["unknown"] * len(final_indices))
+
+            dump_all_inputs.extend(all_inputs)
+            dump_all_outputs.extend(all_outputs)
+            dump_all_keys.extend(batch.keys)
+
+            # 5. cleanup transfer queue and replay buffer
+            tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
+            self.replay_buffer.remove(batch.partition_id, batch.keys)
+
+        # logger to wandb
+        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+
+        # dump to local dir
+        val_data_dir = self.config.trainer.get("validation_data_dir", None)
+        if val_data_dir:
+            # Sort according to uid (so that generations in the same rollout are together)
+            sort_keys = []
+            for key in dump_all_keys:
+                parts = key.rsplit("_", 2)
+                sort_keys.append((parts[0], int(parts[1]), int(parts[2])) if len(parts) == 3 else (key, 0, 0))
+            sorted_indices = sorted(range(len(dump_all_keys)), key=lambda i: sort_keys[i])
+            dump_all_inputs = [dump_all_inputs[i] for i in sorted_indices]
+            dump_all_outputs = [dump_all_outputs[i] for i in sorted_indices]
+            dump_all_keys = [dump_all_keys[i] for i in sorted_indices]
+
+            # For ground truths, scores and reward extra infos, find the values in the
+            # lists for the final samples of each session
+            dump_all_sessions = [
+                f"{parts[0]}_{parts[1]}" if len(parts) == 3 else key
+                for key in dump_all_keys
+                for parts in [key.rsplit("_", 2)]
+            ]
+            session_final_indices = [session_to_sample_idx[session] for session in dump_all_sessions]
+            self._dump_generations(
+                inputs=dump_all_inputs,
+                outputs=dump_all_outputs,
+                gts=[sample_gts[i] for i in session_final_indices],
+                scores=[sample_scores[i] for i in session_final_indices],
+                reward_extra_infos_dict={
+                    k: [v[i] for i in session_final_indices] for k, v in reward_extra_infos_dict.items()
+                }
+                | {"uid": dump_all_keys},
+                dump_path=val_data_dir,
+            )
+
+        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
     async def reset_staleness(self):
         """Reset version window after parameter update."""

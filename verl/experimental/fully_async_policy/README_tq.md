@@ -1,23 +1,24 @@
-# Fully Async Policy with TransferQueue
+# Fully Async Policy with TransferQueue (TQ)
 
 ## 概述
 
-本方案在 `fully_async_policy` 基础上，将数据传输通道从 Ray MessageQueue 迁移到 TransferQueue (TQ)，
-同时训练侧继承 `main_ppo_sync.py` 的 `PPOTrainer` 以复用 TQ 训练流程。
+本方案在 `fully_async_policy` 基础上，将数据传输通道从 Ray **MessageQueue** 迁移到 **TransferQueue (TQ)**，
+同时训练侧通过**多继承**复用 `main_ppo_sync.py` 的 `PPOTrainer` 以直接使用 TQ 原生的 `KVBatchMeta` 训练流程。
 
 ### 核心设计原则
 
-1. **最小改动**: `FullyAsyncAgentLoopManager` 整体不动，保持现有推理生成逻辑
-2. **ReplayBuffer 控制流速**: 用 ReplayBuffer (Ray Actor) 的 slot 机制替代原 `_should_pause_generation`
+1. **最小改动**: `FullyAsyncAgentLoopManager` 整体不动，保持现有推理生成逻辑；仅通过 `FullyAsyncAgentLoopManagerTQ` 轻量适配
+2. **ReplayBuffer 控制流速**: 用 ReplayBuffer (Ray Actor) 的 Dual-Layer Slot 机制替代原 `_should_pause_generation`
 3. **TQ 替换 MessageQueue**: 数据走 TQ 零拷贝通道，元数据走 ReplayBuffer
-4. **Trainer 继承 PPOTrainer**: 复用 `main_ppo_sync.py` 中成熟的 TQ 训练流程（_compute_old_log_prob, _compute_advantage 等）
+4. **Trainer 多继承 PPOTrainer**: 通过 `class FullyAsyncTrainerTQ(PPOTrainer, FullyAsyncTrainer)` 复用 TQ 训练流程
 
 ### 核心目标
 
 1. **零拷贝传输**: 使用 TQ 替代 MessageQueue，避免 `ray.cloudpickle` 序列化开销
-2. **源头限流**: 在 dataloader 数据获取处 (`_feed_samples`) 通过 `acquire_slot` 控制生产速度
-3. **背压控制**: slot 机制限制 in-flight 请求数，无需额外的暂停/恢复逻辑
-4. **复用成熟代码**: Trainer 侧继承 PPOTrainer，直接使用 TQ 原生的 batch 训练流程
+2. **源头限流**: 在 dataloader 数据获取处 (`_feed_samples`) 通过 `acquire_slot()` 控制生产速度
+3. **背压控制**: Dual-Layer Slot 机制限制 in-flight 请求数，无需额外的暂停/恢复逻辑
+4. **复用成熟代码**: Trainer 侧多继承 PPOTrainer，直接使用 TQ 原生的 batch 训练流程（_compute_old_log_prob, _
+   compute_advantage 等）
 
 ## 架构对比
 
@@ -44,526 +45,393 @@ graph TB
     RM -->|put_sample<br/>cloudpickle| MQ_Q
     MQ_Q -->|get_sample<br/>cloudpickle| TM
     TM -->|fit_step| TM
-
     RM -.->|_should_pause_generation<br/>检查queue_size| MQ_Q
     RM -.->|staleness_samples<br/>手动计数| RM
 ```
 
 **问题**:
+
 - 数据完整 `ray.cloudpickle` 序列化/反序列化开销大
 - Ray Actor 单点瓶颈 (MessageQueue)
 - `_should_pause_generation` 暂停逻辑复杂 (drain → resume)
 - Trainer (`SeparateRayPPOTrainer`) 与 colocate 训练流程差异大，维护两套代码
 
-### 新架构 (TQ + ReplayBuffer + PPOTrainer)
+### 新架构 (TQ + ReplayBuffer + PPOTrainer 多继承)
 
 ```mermaid
 graph TB
-    subgraph Rollouter[Rollouter - 继承 FullyAsyncRollouter]
+    subgraph Rollouter["Rollouter (TQFullyAsyncRollouter)"]
         RM[TQFullyAsyncRollouter]
-        ALM[FullyAsyncAgentLoopManager<br/>不动!]
+        ALM["FullyAsyncAgentLoopManager<br/>(+TQ 适配, wait=True)"]
     end
 
-    subgraph RB[ReplayBuffer - Ray Actor]
-        RB_SLOT[Slot 控制<br/>acquire_slot / release_slot]
-        RB_META[元数据存储<br/>kv_list poll]
-        RB_SAMPLE[采样接口<br/>wait_and_sample]
+    subgraph RB["ReplayBuffer (Ray Actor)"]
+        RB_SLOT["Layer1: Physical Slot<br/>acquire / release"]
+        RB_VER["Layer2: Version Window<br/>reset_staleness 归零"]
+        RB_META["元数据 + wait_and_sample"]
     end
 
     subgraph TQ[TransferQueue]
-        TQ_DATA[TQ Data Plane<br/>Zero-Copy Tensor]
-        TQ_META[TQ kv_list<br/>Metadata Channel]
+        TQ_DATA["Zero-Copy Tensor"]
     end
 
-    subgraph Trainer[Trainer - 继承 PPOTrainer]
-        TM[TQFullyAsyncTrainer]
+    subgraph Worker["AgentLoopWorkerTQ (main_ppo_sync.py)"]
+        W_POST["_agent_loop_postprocess → tq.put"]
     end
 
-    RM -->|"1. _feed_samples:<br/>acquire_slot() 🔒"| RB_SLOT
-    RM -->|"2. kv_batch_put<br/>(prompt + tags)"| TQ_DATA
-    PQ[pending_queue] -->|_processor_worker| ALM
-    ALM -->|generate_sequences_single| RM
-    RM -->|"3. kv_batch_put<br/>(response, status=finish)"| TQ_DATA
-    TQ_META -->|kv_list poll| RB_META
-    RB_META -->|检测到finish→release_slot| RB_SLOT
-    TM -->|"4. wait_and_sample()"| RB_SAMPLE
-    TM -->|"5. kv_batch_get<br/>(完整数据)"| TQ_DATA
-    TM -->|step: PPO训练流程<br/>继承自PPOTrainer| TM
-    TM -->|"6. kv_clear"| TQ_DATA
-    TM -->|"7. remove"| RB_META
+    subgraph Trainer["Trainer (TQFullyAsyncTrainer)"]
+        TM["多继承: PPOTrainer + FullyAsyncTrainer"]
+    end
+
+    RM -->|" 1. acquire_slot 🔒 "| RB_SLOT
+    RM -->|" 2. processor "| ALM
+    ALM -->|generate_sequences| Worker
+    Worker -->|" 3. tq.put (status=success/finished) "| TQ_DATA
+    TQ_DATA -->|kv_list poll| RB_META
+    RM -->|" 4. release_slot ✅ "| RB_SLOT
+    TM -->|" 5. wait_and_sample → KVBatchMeta "| RB_META
+    TM -->|" 6. kv_batch_get → PPO pipeline "| TQ_DATA
+    TM -->|" 7. kv_clear + remove "| TQ_DATA
+    TM -->|" 8. reset_staleness "| RB_VER
 ```
 
 **核心变化**:
 
-| 维度 | 现有架构 | 新架构 |
-|------|---------|--------|
-| **数据通道** | MessageQueue (pickle) | TransferQueue (zero-copy) |
-| **元数据通道** | 无 (混在数据里) | ReplayBuffer (Ray Actor) |
-| **流速控制** | `_should_pause_generation` + staleness_samples | `acquire_slot` 在 `_feed_samples` 源头控制 |
-| **Trainer 基类** | `SeparateRayPPOTrainer` | `PPOTrainer` (from main_ppo_sync.py) |
-| **AgentLoopManager** | `FullyAsyncAgentLoopManager` | **不变** |
-| **暂停/恢复逻辑** | paused + drain + resume | **不需要** (slot 阻塞即限流) |
+| 维度                   | 现有架构                                           | 新架构                                         |
+|----------------------|------------------------------------------------|---------------------------------------------|
+| **数据通道**             | MessageQueue (pickle)                          | TransferQueue (zero-copy)                   |
+| **元数据通道**            | 无 (混在数据里)                                      | ReplayBuffer (Ray Actor)                    |
+| **流速控制**             | `_should_pause_generation` + staleness_samples | `acquire_slot()` 在 `_feed_samples` 源头控制     |
+| **Trainer 基类**       | `SeparateRayPPOTrainer`                        | `PPOTrainer` × `FullyAsyncTrainer` 多继承      |
+| **数据写入者**            | Rollouter._process_single_sample_streaming     | `AgentLoopWorkerTQ._agent_loop_postprocess` |
+| **AgentLoopManager** | `FullyAsyncAgentLoopManager`                   | `FullyAsyncAgentLoopManagerTQ` (轻量子类)       |
+| **暂停/恢复逻辑**          | paused + drain + resume                        | **不需要** (slot 阻塞即限流)                        |
 
 ## 核心组件
 
-### 1. ReplayBuffer (Ray Actor)
+### 1. ReplayBuffer (Ray Actor) — 元数据通道 + Dual-Layer Slot 流控
 
-轻量级元数据通道 + **Dual-Layer Slot 流速控制**。作为 Ray Actor 跨进程共享。
+文件: [`replay_buffer.py`](replay_buffer.py)
+
+轻量级 Ray Actor，同时承担**元数据存储**和 **Dual-Layer Slot 流速控制**两大职责。
 
 ```python
-@ray.remote
+@ray.remote(max_concurrency=100)
 class ReplayBuffer:
-    """Ray Actor: 元数据通道 + Dual-Layer Slot 流速控制"""
+    """Ray Actor: metadata channel + slot-based flow control for TQ fully async training.
+
+    Replaces MessageQueue (data channel) in the original fully_async_policy.
+    Key responsibilities:
+    1. Dual-Layer slot backpressure: acquire_slot() blocks rollouter at dataloader source
+    2. Metadata storage: tracks status of each sample via TQ kv_list polling
+    3. Consumer interface: wait_and_sample() for trainer to get finished samples
+    4. Version tracking: reset_staleness() for parameter sync coordination
+    """
 
     def __init__(
-        self,
-        max_pending_slots: int = 256,       # Layer 1: 物理限流
-        max_version_slots: int | None = None, # Layer 2: 陈旧度控制
-        poll_interval: float = 1.0,
+            self,
+            max_version_slots: int,  # Layer 2: 陈旧度控制
+            max_pending_slots: int = 256,  # Layer 1: 物理限流
+            poll_interval: float = 1.0,
     ):
-        self.partitions: dict[str, dict[str, dict]] = defaultdict(dict)
-        self.lock = threading.Lock()
-        self.poll_interval = poll_interval
-        self._finished = False
-
-        # Layer 1: Physical slot control (物理限流)
-        self.max_pending_slots = max_pending_slots
-        self._pending_slots = 0
-
-        # Layer 2: Version window control (陈旧度控制)
-        self.max_version_slots = max_version_slots
-        self._version_slots = 0
-        self._current_model_version = 0
-
-        # 后台线程: 轮询 TQ kv_list 同步状态 (lazy start via acquire_slot)
-        self._poll_thread = None
-        self._monitor_thread = None
-
-    # ===== Rollouter 接口 =====
-
-    def acquire_slot(self, timeout: float | None = None) -> bool:
-        """获取写入 slot (阻塞) — Dual-Layer 双条件检查。
-
-        Layer 1: _pending_slots < max_pending_slots  (物理限流)
-        Layer 2: _version_slots < max_version_slots   (陈旧度控制)
-
-        两个条件都满足才发放 slot，任一不满足则阻塞等待。
-        """
-
-    def release_slot(self):
-        """手动释放 slot (异常场景)。正常情况下由 mark_finish/poll 自动释放。"""
-
-    # ===== Trainer 接口 =====
-
-    def wait_and_sample(
-        self, partition_id: str, batch_size: int
-    ) -> list[tuple[str, dict]] | None:
-        """阻塞等待足够数量的 finish 样本。
-
-        由 Trainer 在每个 training step 开始时调用。
-        """
-        ...
-
-    def remove(self, partition_id: str, keys: list[str]):
-        """移除已消费的样本元数据。"""
-        ...
-
-    def reset_staleness(self, active_task_count: int = 0) -> dict:
-        """参数同步后重置 staleness 计数。
-
-        由 Trainer 在 _fit_update_weights 后调用。
-        """
-        ...
-
-    # ===== 控制信号 =====
-
-    def signal_finish(self):
-        """通知生产结束 (所有样本已喂入)。"""
-        ...
 ```
 
-#### Slot 控制机制 (Dual-Layer)
+#### Dual-Layer Slot 控制机制
+
+`acquire_slot()` 是 Rollouter 和 RB 之间的**唯一卡控接口**，同时承担两个职责：
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                    acquire_slot() 双条件检查                          │
+│                                                                      │
+│  Layer 1: Physical (物理限流 / OOM 防护)                             │
+│    条件: _pending_slots < max_pending_slots                           │
+│    来源: max_concurrent_samples (如 TP×PP×16)                        │
+│    作用: 防 OOM / GPU 过载                                           │
+│    释放: release_slot() (Rollouter 写入 TQ 后调用)                    │
+│                                                                      │
+│  Layer 2: Version Window (陈旧度控制 / stale sample 防护)            │
+│    条件: _version_slots < max_version_slots                           │
+│    来源: required_samples × trigger_parameter_sync_step              │
+│    作用: 防止样本参数版本过旧                                         │
+│    释放: reset_staleness() 归零（Trainer 参数同步后调用）             │
+│                                                                      │
+│  ✅ 两个条件都满足 → 发放 slot (_pending_slots++, _version_slots++)  │
+│  ❌ 任一不满足   → 阻塞等待                                           │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+状态流转:
 
 ```mermaid
 stateDiagram-v2
     [*] --> Idle: 初始化
     Idle --> Acquired: acquire_slot() 双条件通过
-    Acquired --> InFlight: 写入 TQ status=pending
-    InFlight --> Done: poll 检测到 status=finish
-    Done --> Idle: Layer1: release_slot()<br/>Layer2: 版本窗口不变
-
+    Acquired --> InFlight: 写入 pending_queue
+    InFlight --> Done: AgentLoopWorkerTQ 写入 TQ status=success/finished
+    Done --> Idle: release_slot()
     note right of Idle
         L1: pending_slots < max_pending_slots
         L2: _version_slots < max_version_slots
     end note
-
     note right of Acquired
         pending_slots++
         version_slots++
         Rollouter 可以继续处理数据
     end note
-
     note right of InFlight
-        正在生成中 (pending/running/partial)
+        正在生成中
         Layer1 占用 1 个物理 slot
         Layer2 占用 1 个版本槽位 (累计)
     end note
-
     note right of Done
-        Layer1: pending_slots-- (释放物理 slot)
-        Layer2: version_slots 不变 (只有 reset_staleness 归零)
+        Layer1: release_slot() → pending_slots--
+        Layer2: 不变 (只有 reset_staleness 归零)
     end note
 ```
 
+#### 核心接口
+
+| 接口                                                      | 调用方                                        | 说明                            |
+|---------------------------------------------------------|--------------------------------------------|-------------------------------|
+| `acquire_slot(timeout, uid)`                            | Rollouter._feed_samples                    | 获取写入 slot（阻塞，双条件检查）           |
+| `release_slot()`                                        | Rollouter._process_single_sample_streaming | 释放物理 slot                     |
+| `wait_and_sample(partition_id, sample_size, rollout_n)` | Trainer._get_keys_from_rb                  | 阻塞等待足够数量的 finish 样本           |
+| `remove(partition_id, keys)`                            | Trainer._cleanup_batch                     | 移除已消费样本的元数据                   |
+| `reset_staleness()`                                     | Trainer._fit_reset_staleness               | 参数同步后重置版本窗口，归零 _version_slots |
+| `signal_finish()`                                       | Rollouter._streaming_generation_main       | 通知生产结束                        |
+
+#### 后台任务
+
+- **`_poll_from_tq()`**: 定期轮询 `tq.kv_list()` 获取 TQ 全局快照，原子替换 `self.partitions`。包含 UID 完整性检查：检测孤儿
+  key（meta.uid 与 key 前缀不匹配）并自动清理。
+- **`_monitor_loop()`**: 每 60 秒打印 buffer 统计信息。
+
 #### 调用方式
 
-直接使用 Ray Actor handle 调用（无需 Client 封装）：
-
 ```python
-# Rollouter 侧 (在 Ray Actor 内部)
-acquired = await asyncio.wrap_future(self.replay_buffer.acquire_slot.remote(timeout=None).future())
+# Rollouter 侧 (在 Ray Actor 内部，async)
+acquired = await asyncio.wrap_future(self.replay_buffer.acquire_slot.remote(timeout=None, uid=sample_id).future())
 
-# Trainer 侧 (在 Ray Actor 内部)
-sampled = await asyncio.wrap_future(
-    self.replay_buffer.wait_and_sample.remote(partition_id="train", batch_size=N).future()
+# Trainer 侧 (在 Ray Actor 内部，async)
+sampled_keys_meta = await self.replay_buffer.wait_and_sample.remote(
+    partition_id="train", sample_size=N, rollout_n=n
 )
 ```
 
-或者使用 `ray.get()` 同步调用：
+---
 
-```python
-# fully_async_main.py 中 (Driver 过程)
-ray.get(rollouter.set_replay_buffer.remote(replay_buffer))
-staleness_stats = ray.get(replay_buffer.reset_staleness.remote())
-```
+### 2. FullyAsyncAgentLoopManagerTQ — AgentLoop 轻量适配层
 
-### 2. TQFullyAsyncRollouter
+文件: [`fully_async_rollouter_tq.py`](fully_async_rollouter_tq.py)
 
-基于现有 `FullyAsyncRollouter` 修改，核心变化：
+**关键点**:
 
-**不改动的部分**:
-- ✅ `FullyAsyncAgentLoopManager` — 完全不动
-- ✅ `FullyAsyncLLMServerClient` (partial rollout) — 不动
-- ✅ `FullyAsyncLLMServerManager` (hybrid replica) — 不动
-- ✅ `pending_queue` + `_processor_worker` 核心循环结构 — 基本不动
-- ✅ `fit()` 主循环 — 不动
-- ✅ `checkpoint_manager` 参数同步 — 不动
-- ✅ 验证逻辑 — 不动
+- Worker 类从默认改为 `AgentLoopWorkerTQ`（定义在 `main_ppo_sync.py` 中）
+- `generate_sequences_single` 增加 `wait=True`：确保 Rollouter 知道生成何时完成，避免死锁
+- `AgentLoopWorkerTQ._agent_loop_postprocess` 直接将结果写入 TQ（`tq.async_kv_batch_put`），不返回数据给 Rollouter
 
-**改动的部分**:
+**数据写入 TQ 后的生命周期**:
 
-#### 2.1 `_feed_samples` — 加 `acquire_slot` (源头限流)
+1. `AgentLoopWorkerTQ` 写入 `{uid}_{session_id}_{index}` 个 response key (status=success)
+2. `AgentLoopWorkerTQ` 写入 `{uid}` uid-level key (status=finished)
+3. ReplayBuffer `_poll_from_tq` 通过 `tq.kv_list()` 发现新 key，更新 `self.partitions`
+4. ReplayBuffer `wait_and_sample` 检测到足够多的 finished uid，返回给 Trainer
+5. Trainer 通过 `tq.kv_batch_get` 读取完整数据，执行 PPO 训练
+6. Trainer 训练完成后 `tq.kv_clear` + `rb.remove` 清理
+
+---
+
+### 3. TQFullyAsyncRollouter — Rollouter 适配层
+
+文件: [`fully_async_rollouter_tq.py`](fully_async_rollouter_tq.py)
+
+基于 `FullyAsyncRollouter` 的增量修改子类。核心变化集中在数据馈送、样本处理和验证三个环节。
+
+#### 3.1 `_feed_samples` — 源头限流
 
 ```python
 async def _feed_samples(self):
+    """Feed samples from dataloader to pending_queue, with source-level flow control.
+
+    Key difference from base class: acquire_slot() is called BEFORE putting
+    to pending_queue. This blocks the dataloader when too many samples are
+    in-flight, replacing the need for _should_pause_generation().
+    """
     continuous_iterator = self._create_continuous_iterator()
+    rollout_n = self.config.actor_rollout_ref.rollout.n
 
     for epoch, batch_dict in continuous_iterator:
-        # ★ 核心改动: 在 dataloader 获取数据后、放入 pending_queue 前
-        #   阻塞获取 slot (源头限流，替代原来的 _should_pause_generation)
-        acquired = await asyncio.wrap_future(self.replay_buffer.acquire_slot.remote(timeout=None).future())
+        sample_id = f"sample_{epoch}_{self.global_steps}"
+        # ★ 核心: 在获取数据后立即申请 slot（可能阻塞）
+        acquired = await self.replay_buffer.acquire_slot.remote(timeout=None, uid=sample_id)
         if not acquired:
-            print("[Feed] ReplayBuffer finished or timed out, stop feeding")
             break
 
-        full_batch = prepare_single_generation_data(batch_dict, self.config)
-        sample_id = f"sample_{epoch}_{self.global_steps}"
+        # 注入元数据字段到 batch_dict (plain dict)，在 tu.get_tensordict() 之前
+        # np.array 值会通过 get_tensordict 转为 NonTensorStack，支持按索引访问
+        batch_dict["uid"] = np.array([sample_id], dtype=object)
+        batch_dict["__rollout_n__"] = np.full(1, rollout_n, dtype=np.int64)
+        batch_dict["sample_id"] = np.array([sample_id], dtype=object)
+        batch_dict["global_steps"] = np.full(1, self.global_steps, dtype=np.int64)
 
-        rollout_sample = RolloutSample(
-            full_batch=full_batch,
-            sample_id=sample_id,
-            epoch=epoch,
-            rollout_status={},
-        )
-
+        full_batch = tu.get_tensordict(batch_dict)
+        # ... 构建 RolloutSample 并放入 pending_queue ...
         await self.pending_queue.put(rollout_sample)
 
-        if self.global_steps >= self.total_rollout_steps:
-            break
-        self.global_steps += 1
-
-    # End signal
+    # 结束信号
     await self.pending_queue.put(None)
 ```
 
-#### 2.2 `_process_single_sample_streaming` — MQ → TQ
+**与基类的关键区别**:
+
+- 不再调用 `prepare_single_generation_data()` (不做 repeat(n))，改为注入 `__rollout_n__` 字段让
+  `AgentLoopWorkerTQ._run_prompt` 内部循环 n 次
+- `batch_size=1` (bsz=1)，每个 prompt 单独处理
+- `uid`/`__rollout_n__`/`sample_id`/`global_steps` 作为 `np.array` 注入到 plain dict 中，在 `tu.get_tensordict()` 后变为
+  `NonTensorStack`
+
+#### 3.2 `_process_single_sample_streaming` — 简化为 generate + release
 
 ```python
 async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
-    # AgentLoop 生成 (不变)
-    ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
-    rollout_sample.full_batch = ret
-    rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
-        [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
-    )
+    """Process a single sample: generate via ALM worker (which writes to TQ blocking),
+    then release slot.
 
-    # ★ 改动: 不再 put 到 MessageQueue，改为写入 TQ
-    key = rollout_sample.sample_id  # e.g. "sample_0_42"
+    Simplified from base class:
+    - Base class: generate → put to MessageQueue
+    - TQ path: generate + TQ write both happen INSIDE AgentLoopWorkerTQ
+      (via overridden _agent_loop_postprocess)
+      → we just call it and release the slot
+    """
+    try:
+        # 调用 ALM (内部走 AgentLoopWorkerTQ → 写入 TQ)
+        await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
+        self.total_generated_samples += 1
+    except Exception as e:
+        logger.exception(f"Failed to process {rollout_sample.sample_id}: {e}")
+    finally:
+        # ★ 无论成功失败都释放 slot
+        await self.replay_buffer.release_slot.remote()
 
-    tq.kv_batch_put(
-        keys=[key],
-        partition_id="train",
-        fields=[rollout_sample],           # 完整数据 (或按字段拆分)
-        tags=[{
-            "current_status": "finish",    # 生成完成
-            "uid": key,
-            "start_model_version": self.current_param_version,
-            "end_model_version": self.current_param_version,
-            "prompt_len": ...,              # 从 ret 中提取
-            "response_len": ...,
-        }],
-    )
-    # RB 的后台 poll 线程会检测到 status=finish，自动 release_slot()
-
-    self.total_generated_samples += 1
     self.processed_sample_count += 1
 ```
 
-#### 2.3 `_processor_worker` — 删除 `_should_pause_generation`
+**与基类的核心区别**: 基类需要手动将生成结果 put 到 MessageQueue；TQ 路径下数据写入由
+`AgentLoopWorkerTQ._agent_loop_postprocess` 完成，Rollouter 只需调用 generate 然后 release_slot。
+
+#### 3.3 删除/禁用的方法
+
+| 方法                           | 处理方式       | 原因                                |
+|------------------------------|------------|-----------------------------------|
+| `_should_pause_generation()` | 返回 `False` | 由 `acquire_slot` 替代               |
+| `_async_monitor_loop()`      | 空实现        | 监控由 ReplayBuffer._monitor_loop 承担 |
+
+#### 3.4 验证流程 `_validate`
+
+覆盖基类的验证方法，使用 TQ + ReplayBuffer 路径：
 
 ```python
-async def _processor_worker(self):
+async def _validate(self) -> dict[str, float]:
+    for batch_dict in self.val_dataloader:
+        # 1. dispatch to agent loop manager (writes to TQ via AgentLoopWorkerTQ)
+        batch = tu.get_tensordict(batch_dict)
+        self.async_rollout_manager.generate_sequences(batch)
+
+        # 2. sample batch from replay buffer (blocks until enough finish samples)
+        batch = await self.replay_buffer.wait_and_sample(
+            partition_id="val", sample_size=len(batch),
+            rollout_n=self.config.actor_rollout_ref.rollout.val_kwargs.n
+        ).remote()
+
+        # 3. [OPTIONAL] compute reward score with colocated reward model
+        if self.reward_loop_manager.reward_loop_worker_handles is None:
+            batch = self._compute_reward_colocate(batch)
+
+        # 4. read text data from TQ
+        text_data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id,
+                                    select_fields=["prompts", "responses"])
+
+        # 5. cleanup
+        tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
+        self.replay_buffer.remove(batch.partition_id, batch.keys)
+
+    return self._val_metrics_update(...)
+```
+
+---
+
+### 4. TQFullyAsyncTrainer — 多继承 Trainer
+
+文件: [`fully_async_trainer_tq.py`](fully_async_trainer_tq.py)
+
+**最核心的设计决策**: 通过 Python 多继承 `class FullyAsyncTrainerTQ(PPOTrainer, FullyAsyncTrainer)` 同时获得两边能力：
+
+```python
+"""
+MRO: TQFullyAsyncTrainer → PPOTrainer → FullyAsyncTrainer → SeparateRayPPOTrainer → ...
+
+Data flow:
+    TQFullyAsyncRollouter --(tq.kv_batch_put)--> TransferQueue (status=finish)
+        |
+    TQFullyAsyncTrainer <-(RB.wait_and_sample)--+--(KVBatchMeta)--> [PPOTrainer pipeline]
+                                                    |
+                                              update_actor(KVBatchMeta)
+"""
+```
+
+#### 4.1 `__init__` — 双路径初始化
+
+```python
+class FullyAsyncTrainerTQ(PPOTrainer, FullyAsyncTrainer):
+    def __init__(self, config, tokenizer, role_worker_mapping,
+                 resource_pool_manager, device_name=None, ...):
+        # ======== 1. PPOTrainer.__init__: config, dataloader, local replay_buffer, worker groups ========
+        PPOTrainer.__init__(self, config=config, role_worker_mapping=role_worker_mapping,
+                            resource_pool_manager=resource_pool_manager)
+        # 手动设置 PPOTrainer 不初始化但 FullyAsyncTrainer 需要的字段
+        self.device_name = device_name
+        self.ray_worker_group_cls = ray_worker_group_cls or RayWorkerGroup
+        self.tokenizer = tokenizer
+
+        # ======== 2. FullyAsyncTrainer state fields ========
+        self.global_steps = 0
+        self.current_param_version = 0
+        self.trigger_parameter_sync_step = config.async_training.trigger_parameter_sync_step
+        # ... (mirrors FullyAsyncTrainer.__init__ lines 108-163)
+
+        # ======== 3. TQ-specific ========
+        self.replay_buffer = None  # Set via set_replay_buffer()
+```
+
+#### 4.2 `fit()` — 异步训练主循环
+
+```python
+async def fit(self):
+    """Main training loop: async RB consumption + PPOTrainer step() pipeline."""
+    self.global_steps += 1
+
     while True:
-        # ★ 删除: `await self._should_pause_generation()` 检查
-        # 只保留 paused (用于参数同步时的 drain)
-        if self.paused:
-            print("[Processor] Paused for param sync, draining...")
-            # drain 逻辑保留 (等 active_tasks 完成，用于参数同步)
-            async with self.lock:
-                self.paused = True
-                self._resume_event.clear()
-            # ... drain 代码不变 (等 active_tasks 或 resume 信号) ...
-            continue
-
-        # 取 sample
-        rollout_sample = await self.pending_queue.get()
-        self.pending_queue.task_done()
-
-        # ★ 删除: self.staleness_samples += 1 (由 RB slot 管理)
-
-        if rollout_sample is None:
-            # 结束信号处理不变
-            ...
+        try:
+            await self.fit_step()
+        except TrainingStopException:
             break
 
-        # GPU 并发度限制保留 (max_concurrent_samples)
-        while len(self.active_tasks) >= self.max_concurrent_samples:
-            ...
-
-        # 提交任务
-        task = safe_create_task(
-            self._process_single_sample_streaming(rollout_sample),
-            name=rollout_sample.sample_id,
-            task_set=self.active_tasks,
-        )
+    # 收尾: 最终 validate + checkpoint
+    if self.current_param_version % self.config.trainer.test_freq != 0 or self.local_trigger_step > 1:
+        await self._fit_update_weights()
+        await self._fit_validate()
+    self._fit_save_checkpoint(force=True)
 ```
 
-#### 2.4 删除的方法
+#### 4.3 `fit_step()` — 单步训练
 
-- ❌ `_should_pause_generation()` — **整个删除**，由 `acquire_slot` 替代
+这是整个 TQ 路径的核心：**完全复用 PPOTrainer 的 _compute_* / _update_* 方法**，仅替换数据来源：`
 
-#### 2.5 修改的方法
+#### 4.4 `_get_keys_from_rb()` — 从 RB 获取 KVBatchMeta
 
-| 方法 | 变化 |
-|------|------|
-| `__init__` | `message_queue_client` → `replay_buffer` (Ray Actor handle); 删除 `max_queue_size`, `staleness_samples` 相关字段 |
-| `set_message_queue_client()` | → `set_replay_buffer(rb_handle)` |
-| `reset_staleness()` | 内部改为调用 `self.replay_buffer.reset_staleness.remote()` |
-| `get_statistics()` | 统计来源从 MQ 改为 RB |
-
-### 3. TQFullyAsyncTrainer (继承 PPOTrainer)
-
-**关键决策**: 继承 `main_ppo_sync.py` 的 `PPOTrainer`，而非现有的 `FullyAsyncTrainer`(SeparateRayPPOTrainer)。
-
-这样做的好处：
-- 直接复用 `PPOTrainer` 中成熟的 TQ 训练流程：
-  - `_compute_old_log_prob()` — 从 TQ 读写 log_prob
-  - `_compute_advantage()` — GRPO/GAE advantage 计算
-  - `_update_actor()` / `_update_critic()` — mini-batch 更新
-  - `_balance_batch()` — 序列长度均衡
-- 数据格式统一为 `KVBatchMeta` (TQ 原生格式)，无需 `assemble_batch_from_rollout_samples` 转换
-- 与 colocate 训练共享核心训练逻辑，减少维护成本
-
-```python
-class TQFullyAsyncTrainer(PPOTrainer):
-    """Fully Async Trainer based on PPOTrainer + TQ + ReplayBuffer.
-
-    继承 PPOTrainer (main_ppo_sync.py)，复用其 TQ 训练流程。
-    通过 ReplayBuffer 获取样本，通过 TQ 读写数据。
-    """
-
-    def __init__(
-        self,
-        config: DictConfig,
-        role_worker_mapping: dict[Role, WorkerType],
-        resource_pool_manager: ResourcePoolManager,
-        replay_buffer_handle: ray.actor.ActorHandle,
-        rollouter_handle: ray.actor.ActorHandle | None = None,
-        **kwargs,
-    ):
-        # 先调用 PPOTrainer.__init__ 完成基础初始化
-        # (tokenizer, dataloader, worker groups, agent loop manager, etc.)
-        super().__init__(config, role_worker_mapping, resource_pool_manager, **kwargs)
-
-        # Fully Async 特有配置
-        self.replay_buffer = replay_buffer_handle  # Ray Actor handle，直接调用
-        self.rollouter = rollouter_handle
-
-        # 参数版本追踪
-        self.current_param_version = 0
-        self.local_trigger_step = 1
-        self.trigger_parameter_sync_step = config.async_training.trigger_parameter_sync_step
-
-        # 训练配置
-        self.require_batches = config.async_training.require_batches
-        self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
-
-        # 替换默认的 ReplayBuffer 为共享的 Ray Actor
-        # (PPOTrainer.__init__ 会创建本地 ReplayBuffer，这里替换为远程引用)
-        # 注意: PPOTrainer 的 step() 方法中使用 self.replay_buffer.sample()
-        # 我们需要覆盖 fit() 和 step() 来适配 fully_async 模式
-
-    # ======== 核心改动: fit() 和 step() ========
-
-    def fit(self):
-        """覆盖 PPOTrainer.fit()，适配 fully异步模式。
-
-        关键区别:
-        - PPOTrainer.fit(): 同步 for-loop over dataloader，每步 dispatch+sample+train
-        - TQFullyAsyncTrainer.fit(): 异步循环，从 ReplayBuffer 获取样本，不依赖本地 dataloader
-        """
-        # 加载 checkpoint
-        self._load_checkpoint()
-        self.checkpoint_manager.update_weights()
-
-        # 验证
-        if self.config.trainer.get("val_before_train", True):
-            val_metrics = self._validate()
-            self.logger.log(data=val_metrics, step=self.current_param_version)
-
-        progress_bar = tqdm(total=self.total_training_steps, initial=0, desc="Training Progress")
-        self.global_steps += 1
-
-        while True:
-            try:
-                self.step_fully_async()
-            except TrainingStopException:
-                break
-
-            progress_bar.update(1)
-            self.global_steps += 1
-
-        progress_bar.close()
-
-    def step_fully_async(self):
-        """单个训练步骤: 从 ReplayBuffer 获取样本 → PPO 训练流程。
-
-        复用 PPOTrainer 的 _compute_* / _update_* 方法，
-        但数据获取方式从 replay_buffer.sample(global_steps) 改为
-        replay_buffer.wait_and_sample(batch_size).
-        """
-        metrics, timing_raw = {}, {}
-
-        # 1. 从 ReplayBuffer 获取样本 (替代 dataloader iteration)
-        with marked_timer("gen", timing_raw, color="red"):
-            batch = self._get_samples_from_rb()
-            if batch is None:
-                raise TrainingStopException("No more samples")
-
-        self.checkpoint_manager.sleep_replicas()
-
-        # 2-10. 复用 PPOTrainer 的标准训练流程
-        # (这些方法操作 TQ + KVBatchMeta，与 main_ppo_sync.py 完全一致)
-
-        # 3. balance batch
-        batch = self._balance_batch(batch, metrics)
-
-        # 4. compute old_log_prob (从 TQ 读/写)
-        with marked_timer("old_log_prob", timing_raw, color="blue"):
-            batch = self._compute_old_log_prob(batch, metrics)
-
-        # 5. compute ref_log_prob
-        if self.use_reference_policy:
-            with marked_timer("ref", timing_raw, color="olive"):
-                batch = self._compute_ref_log_prob(batch, metrics)
-
-        # 6. compute critic values
-        if self.use_critic:
-            with marked_timer("values", timing_raw, color="cyan"):
-                batch = self._compute_values(batch, metrics)
-
-        # 7. compute advantage
-        with marked_timer("adv", timing_raw, color="brown"):
-            batch = self._compute_advantage(batch, metrics)
-
-        # 8. update critic
-        if self.use_critic:
-            with marked_timer("update_critic", timing_raw, color="pink"):
-                batch = self._update_critic(batch, metrics)
-
-        # 9. update actor
-        if self.config.trainer.critic_warmup <= self.global_steps:
-            with marked_timer("update_actor", timing_raw, color="red"):
-                batch = self._update_actor(batch, metrics)
-
-        # 10. update weights to rollouter
-        self._fit_update_local_step()
-        with marked_timer("update_weights", timing_raw, color="red"):
-            self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
-            # 通过 RB 重置 staleness
-            timing_rb = ray.get(self.rollouter.reset_staleness.remote())
-            timing_raw.update(timing_rb)
-
-        # 11. cleanup
-        tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
-        ray.get(self.replay_buffer.remove.remote(batch.partition_id, batch.keys))
-
-        # 12. validate & checkpoint
-        self._maybe_validate()
-        self._maybe_save_checkpoint()
-
-        # 13. metrics
-        self._compute_metrics(batch, metrics, timing_raw)
-        self.logger.log(data=metrics, step=self.global_steps)
-
-    def _get_samples_from_rb(self) -> KVBatchMeta | None:
-        """从 ReplayBuffer + TQ 获取训练样本。
-
-        Returns:
-            KVBatchMeta: 可直接传给 _compute_* 方法的 batch
-            None: 没有更多样本 (结束信号)
-        """
-        # 1. 阻塞等待足够数量的 finish 样本
-        sampled = await asyncio.wrap_future(
-            self.replay_buffer.wait_and_sample.remote(
-                partition_id="train",
-                batch_size=self.required_samples,
-            ).future()
-        )
-        if not sampled:
-            return None
-
-        keys = [k for k, _ in sampled]
-
-        # 2. 从 TQ 获取完整数据 (返回 KVBatchMeta)
-        batch = tq.kv_batch_get(keys=keys, partition_id="train")
-
-        return batch
-```
-
-### 4. 不改动的组件
-
-以下组件 **完全不动**，直接复用:
-
-| 组件 | 文件 | 说明 |
-|------|------|------|
-| `FullyAsyncAgentLoopManager` | `fully_async_policy/fully_async_rollouter.py` | AgentLoop Worker 管理，round-robin 调度 |
-| `FullyAsyncLLMServerClient` | `fully_async_policy/fully_async_rollouter.py` | 支持 partial rollout 的 generate |
-| `FullyAsyncLLMServerManager` | `fully_async_policy/fully_async_rollouter.py` | hybrid + standalone replica 管理 |
-| `GlobalRequestLoadBalancer` | `workers/rollout/` | Server 负载均衡 |
-| `CheckpointEngineManager` | `checkpoint_engine/` | NCCL 参数同步 |
-| PPOTrainer 的 `_compute_*` 方法 | `trainer/main_ppo_sync.py` | old_log_prob, ref_log_prob, values, advantage, update |
-| PPOTrainer 的 `_balance_batch` | `trainer/main_ppo_sync.py` | 序列长度均衡 |
+返回的 `KVBatchMeta` 可直接传入所有 PPOTrainer 的 `_compute_*` 方法——这些方法内部通过 `tq.kv_batch_get` 从 TQ 读取实际张量数据。
+---
 
 ## 数据流详解
 
@@ -575,80 +443,64 @@ sequenceDiagram
     participant RB as ReplayBuffer<br/>(Ray Actor)
     participant PQ as pending_queue
     participant P as processor<br/>(_processor_worker)
-    participant ALM as AgentLoopManager<br/>(不动!)
+    participant ALM_TQ as ALM_TQ<br/>(DataProto→TensorDict)
+    participant ALW as AgentLoopWorkerTQ<br/>(main_ppo_sync.py)
     participant TQ as TransferQueue
     participant T as Trainer<br/>(TQFullyAsyncTrainer)
-
-    Note over R, T: Phase 1: Rollouter 生产 (源头限流)
+    Note over R, T: === Phase 1: Rollouter 生产 (源头限流) ===
     loop dataloader iteration
-        R->>RB: acquire_slot() [可能阻塞🔒]
-        RB-->>R: slot acquired
-        R->>PQ: put(RolloutSample)
+        R ->> RB: acquire_slot(uid=sample_id) [可能阻塞🔒]
+        RB -->> R: slot acquired (L1++, L2++)
+        R ->> R: 注入 uid/__rollout_n__/sample_id/global_steps
+        R ->> R: tu.get_tensordict(batch_dict) → bsz=1 TensorDict
+        R ->> PQ: put(RolloutSample{full_batch, sample_id})
     end
-    R->>PQ: put(None) [结束信号]
-
-    Note over R, T: Phase 2: 生成 (现有逻辑不变)
+    R ->> PQ: put(None) [结束信号]
+    Note over R, T: === Phase 2: 生成 (ALM_TQ 适配 + Worker 写 TQ) ===
     loop processor worker
-        P->>PQ: get()
-        P->>ALM: generate_sequences_single(batch)
-        ALM-->>P: DataProto (生成结果)
-        P->>TQ: kv_batch_put(response, tags={status:finish})
-        TQ->>RB: kv_list poll 检测到 finish
-        RB->>RB: auto release_slot() ✅
-        RB-->>R: (如果有等待的 acquire_slot 被唤醒)
+        P ->> PQ: get()
+        P ->> ALM_TQ: generate_sequences_single(batch, wait=True)
+        ALM_TQ ->> ALM_TQ: 选择 worker (round-robin)
+        ALM_TQ ->> ALW: generate_sequences.remote(batch, wait=True)
+        ALW ->> ALW: _run_prompt 循环 __rollout_n__ 次
+        ALW ->> ALW: _compute_score (reward model)
+        ALW ->> TQ: tq.async_kv_batch_put(response keys, status=success)
+        ALW ->> TQ: tq.async_kv_batch_put(uid key, status=finished)
+        ALW -->> ALM_TQ: 返回 (wait=True 确保完成)
+        ALM_TQ -->> P: 返回
+        P ->> RB: release_slot() ✅ (L1--)
+        RB -->> R: (唤醒等待的 acquire_slot)
     end
 
-    Note over R, T: Phase 3: Trainer 消费 + 训练
-    loop training steps
-        T->>RB: wait_and_sample(batch_size=N)
-        RB-->>T: [(key1, meta1), ... (keyN, metaN)]
-        T->>TQ: kv_batch_get(keys)
-        TQ-->>T: KVBatchMeta (完整数据)
-        T->>T: _balance_batch → _compute_old_log_prob<br/>→ _compute_advantage → _update_actor
-        T->>TQ: kv_batch_put(advantages, returns, ...)
-        T->>TQ: kv_clear(keys)
-        T->>RB: remove(keys)
+    Note over R, T: === Phase 3: Trainer 消费 + PPO 训练 ===
+    loop fit_step (每步)
+        T ->> RB: wait_and_sample(sample_size=N, rollout_n=n) [阻塞⏳]
+        RB -->> T: [(key1,tag1), ..., (keyN,tagN)] (KVBatchMeta)
+        T ->> TQ: kv_batch_get(keys) [内部各 _compute_* 方法调用]
+        TQ -->> T: 完整张量数据 (prompts, responses, log_probs, ...)
+        T ->> T: _balance_batch → _compute_old_log_prob
+        T ->> TQ: kv_batch_put(old_log_prob, ...) [写回 TQ]
+        T ->> T: _compute_advantage → _update_actor
+        T ->> TQ: kv_batch_put(advantages, returns, ...)
+        T ->> TQ: kv_clear(response keys + uid keys)
+        T ->> RB: remove(keys)
     end
 
-    Note over R, T: Phase 4: 参数同步 (每 trigger_parameter_sync_step 步)
-    T->>R: checkpoint_manager.update_weights()
-    T->>RB: reset_staleness()
-    RB->>RB: 更新 _current_model_version += 1
+    Note over R, T: === Phase 4: 参数同步 (每 trigger_parameter_sync_step 步) ===
+    T ->> T: _fit_update_weights(): checkpoint_manager.update_weights()
+    T ->> RB: reset_staleness(): _version_slots 归零, 通知 L2 解除阻塞
 ```
 
-### Dual-Layer Slot Control (流速 + 陈旧度)
+### Dual-Layer Slot Control 详细语义
 
-`acquire_slot()` 是 Rollouter 和 RB 之间的**唯一卡控接口**，同时承担两个职责：
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                    acquire_slot() 双条件检查                          │
-│                                                                      │
-│  Layer 1: Physical (物理限流)                                        │
-│    条件: _pending_slots < max_pending_slots                           │
-│    来源: max_concurrent_samples (如 TP×PP×16)                        │
-│    作用: 防 OOM / GPU 过载                                           │
-│    释放: mark_finish() 或 _poll_from_tq 检测到 status=finish          │
-│                                                                      │
-│  Layer 2: Version Window (陈旧度控制)                                │
-│    条件: _version_slots < max_version_slots                           │
-│    来源: max_required_samples (= required_samples × trigger_step)     │
-│    作用: 防止样本参数版本过旧                                         │
-│    释放: reset_staleness() 归零（Trainer 参数同步后调用）              │
-│                                                                      │
-│  ✅ 两个条件都满足 → 发放 slot (_pending_slots++, _version_slots++)  │
-│  ❌ 任一不满足   → 阻塞等待                                           │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
-| 原概念 (fully_async_policy) | 新实现 (fully_async_policy_tq) |
-|---------------------------|-------------------------------|
-| `MessageQueue.queue_size` | `RB._pending_slots` (Layer 1) |
-| `max_queue_size` | `max_pending_slots` (Layer 1) |
-| `_should_pause_generation()` | **删除** — `acquire_slot()` 双条件即限流 |
-| `staleness_samples` (手动计数) | `RB._version_slots` (Layer 2, 累计计数) |
-| `max_required_samples` | `max_version_slots` (Layer 2) |
-| `paused` + `drain` + `resume` | **保留但不再触发卡控** — 仅用于参数同步时的安全 drain |
+| 原概念 (MessageQueue 路径)         | 新实现 (TQ 路径)                         |
+|-------------------------------|-------------------------------------|
+| `MessageQueue.queue_size`     | `RB._pending_slots` (Layer 1: 物理限流) |
+| `max_queue_size`              | `max_pending_slots` (Layer 1)       |
+| `_should_pause_generation()`  | **删除** — `acquire_slot()` 双条件即限流    |
+| `staleness_samples` (手动计数)    | `RB._version_slots` (Layer 2: 累计计数) |
+| `max_required_samples`        | `max_version_slots` (Layer 2)       |
+| `paused` + `drain` + `resume` | **保留但不再触发卡控** — 仅用于参数同步时的安全 drain   |
 
 **改动前后的对比**:
 
@@ -669,101 +521,51 @@ sequenceDiagram
 **参数同步流程**:
 
 ```
-Trainer fit_step:
+Trainer.fit_step:
   1. wait_and_sample(batch_size) → 从 RB 获取 finish 样本
-  2. ... PPO 训练流程 ...
+  2. ... PPO 训练流程 (_compute_* / _update_*) ...
   3. update_weights() → NCCL 同步权重到 Rollouter GPUs
-  4. rollouter.reset_staleness():
-       a. 基类: resume processor (un-pause + wake _resume_event)
-       b. RB:   _version_slots = 0, version++  → 解除 acquire_slot 的 Layer 2 阻塞
+  4. reset_staleness():
+       a. _version_slots = _pending_slots + train_finished_slots (重新计算)
+       b. 重置计时器 (step_start_time, idle_start_time)
+       c. 通知 _slot_available → 解除 acquire_slot 的 Layer 2 阻塞
 ```
 
-**参数同步时的 drain 仍然保留**:
-- `reset_staleness()` 时需要等当前 active_tasks 完成（安全 drain）
-- 这部分 `paused` + drain 逻辑保留在 `_processor_worker` 中
-- 但它不再是"卡控"机制（卡控已由 RB acquire_slot 完成），而是参数同步的安全保障
+## 使用方法
 
-## 文件结构
+### 启动脚本示例
 
+核心配置要点:
+
+```bash
+# ====== 必要的 fully_async 配置 ======
+fully_async=(
+  data.train_batch_size=0                 # TQ 模式下无效，默认 0
+  data.gen_batch_size=1                   # streaming 逐条生成
+  trainer.test_freq=-1                     # 由 rollouter 负责 validate
+  actor_rollout_ref.hybrid_engine=False    # 分离式架构
+  actor_rollout_ref.rollout.calculate_log_probs=True  # 使用 rollout log_prob
+  rollout.total_rollout_steps=$(((512*100)))          # 总生成样本数
+  trainer.nnodes=1                         # Trainer 节点数
+  trainer.n_gpus_per_node=4                # Trainer 每 GPU 数
+  rollout.nnodes=1                         # Rollouter 节点数
+  rollout.n_gpus_per_node=4                # Rollouter 每 GPU 数
+  async_training.staleness_threshold=0.5   # 陈旧度阈值
+  async_training.trigger_parameter_sync_step=4  # 参数同步频率
+  async_training.require_batches=1         # 每次 fetch 的 batch 数
+  async_training.partial_rollout=True       # 支持 partial rollout
+)
+
+# ====== TQ 特有配置 ======
+transfer_queue=(
+  transfer_queue.enable=True               # ★ 启用 TQ 模式
+)
 ```
-verl/experimental/fully_async_policy_tq/
-├── README.md                          # 本文档
-├── replay_buffer.py                   # ReplayBuffer (Ray Actor)
-├── fully_async_rollouter.py           # TQFullyAsyncRollouter (基于现有版修改)
-├── fully_async_trainer.py             # TQFullyAsyncTrainer (继承 PPOTrainer)
-├── fully_async_main.py                # 主入口 (创建组件 + 启动)
-└── config/
-    └── fully_async_ppo_trainer.yaml   # 配置文件
+
+### 依赖安装
+
+```bash
+pip install TransferQueue==0.1.6
 ```
 
-**与现有代码的关系**:
-
-```
-继承/修改                              不动 (直接 import 使用)
-─────────                             ─────────────────────
-fully_async_policy/FullyAsyncRollouter  →  fully_async_policy_tq/TQFullyAsyncRollouter
-fully_async_policy/FullyAsyncTrainer    →  ❌ 不再使用 (改用 PPOTrainer)
-fully_async_policy/MessageQueue         →  ❌ 不再使用 (改用 TQ + ReplayBuffer)
-fully_async_policy/FullyAsyncAgentLoopManager → ✅ 完全不动
-trainer/main_ppo_sync.py/PPOTrainer    →  fully_async_policy_tq/TQFullyAsyncTrainer
-trainer/main_ppo_sync.py/ReplayBuffer   →  ✅ 作为参考 (RB API 不同)
-```
-
-## 改动清单汇总
-
-### 新建文件
-
-| 文件 | 说明 |
-|------|------|
-| `replay_buffer.py` | `@ray.remote class ReplayBuffer` |
-| `fully_async_trainer.py` | `class TQFullyAsyncTrainer(PPOTrainer)` |
-| `fully_async_main.py` | `class TQFullyAsyncTaskRunner` 入口 |
-| `fully_async_rollouter.py` | `class TQFullyAsyncRollouter(FullyAsyncRollouter)` (增量修改) |
-
-### 修改清单 (fully_async_rollouter.py)
-
-| 行为 | 方法/字段 | 说明 |
-|------|----------|------|
-| **新增** | `_feed_samples`: `acquire_slot()` 调用 | 源头限流 |
-| **修改** | `_process_single_sample_streaming`: MQ.put → TQ.kv_batch_put | 数据走 TQ |
-| **简化** | `_processor_worker`: 删除 `_should_pause_generation` 检查 | slot 已限流 |
-| **删除** | `_should_pause_generation()` 整个方法 | 不再需要 |
-| **修改** | `__init__`: client 字段替换 | MQ → RB |
-| **新增** | `set_replay_buffer()` | 替代 set_message_queue_client |
-| **修改** | `reset_staleness()`: 委托给 RB | 统一版本管理 |
-| **删除** | `staleness_samples` 手动计数 | 由 RB 统计 |
-
-### 修改清单 (fully_async_trainer.py — 新文件)
-
-| 行为 | 说明 |
-|------|------|
-| **继承** | `class TQFullyAsyncTrainer(PPOTrainer)` | 复用 TQ 训练流程 |
-| **覆盖** | `fit()`: 异步循环 + RB 采样 | 替代 dataloader for-loop |
-| **新增** | `step_fully_async()`: 单步训练 | 组合 PPOTrainer 的 _compute_* 方法 |
-| **新增** | `_get_samples_from_rb()`: RB + TQ 获取数据 | 替代 _get_samples_from_queue |
-| **修改** | `_fit_update_weights()`: 加 RB.reset_staleness | 参数同步后重置 |
-
-### 修改清单 (fully_async_main.py — 新文件)
-
-| 行为 | 说明 |
-|------|------|
-| **创建** | `ReplayBuffer.remote(max_pending_slots=N)` | 替代 MessageQueue.remote |
-| **注入** | `set_replay_buffer()` 到 Rollouter + Trainer | 替代 set_message_queue_client |
-| **删除** | MessageQueue / MessageQueueClient 创建代码 | 不再需要 |
-
-## 性能预期
-
-| 指标 | MessageQueue | TransferQueue | 提升 |
-|------|-------------|---------------|------|
-| 数据传输延迟 | ~10ms (cloudpickle) | ~1ms (zero-copy) | ~10x |
-| 内存占用 | 2x (序列化副本) | 1x (zero-copy) | 2x |
-| CPU 开销 | 高 (序列化/反序列化) | 低 (无序列化) | ~5x |
-| 限流延迟 | ~100ms (pause→drain→resume) | ~1ms (slot 阻塞/唤醒) | ~100x |
-| 代码复杂度 | 高 (暂停状态机) | 低 (令牌桶) | 显著降低 |
-
-## 参考
-
-- [TransferQueue 文档](docs/data/transfer_queue.md)
-- [main_ppo_sync.py](verl/trainer/main_ppo_sync.py) — PPOTrainer 基类
-- [fully_async_policy 原始实现](verl/experimental/fully_async_policy/) — Rollouter / ALM 基础
-- [fully_async_policy/replay_buffer.py](verl/experimental/fully_async_policy_tq/replay_buffer.py) — ReplayBuffer 参考
+所有 TQ 相关代码都有 fallback：当 `import transfer_queue` 失败时，自动使用 `verl.utils.transferqueue_utils` 中的 mock 实现。
