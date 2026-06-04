@@ -140,19 +140,23 @@ class ReplayBuffer:
 
     async def _poll_from_tq(self):
         """Background asyncio task that polls TQ for metadata updates.
-        Syncs TQ metadata into self.partitions so wait_and_sample() can discover
-        finished samples. Slot release is NOT done here — it is handled explicitly
-        by the Rollouter calling release_slot() after writing to TQ.
+
+        Each poll replaces self.partitions with a fresh TQ snapshot (not in-place mutation).
+        This ensures self.partitions is always consistent with TQ's current state,
+        avoiding stale/corrupted data from incremental merge + concurrent remove().
         """
         try:
             while True:
                 data = tq.kv_list()
                 if data is not None:
+                    # Build a fresh snapshot from TQ, then atomically replace self.partitions
+                    new_partitions: dict[str, dict[str, dict]] = defaultdict(dict)
                     for partition_id, items in data.items():
-                        async with self._data_available:
-                            for key, meta in items.items():
-                                self.partitions[partition_id][key] = meta
-                            self._data_available.notify_all()
+                        for key, meta in items.items():
+                            new_partitions[partition_id][key] = meta
+                    async with self._data_available:
+                        self.partitions = new_partitions
+                        self._data_available.notify_all()
                 await asyncio.sleep(self.poll_interval)
         except Exception as e:
             print(f"[ReplayBuffer] _poll_from_tq error: {e}", flush=True)
@@ -357,6 +361,35 @@ class ReplayBuffer:
                                     flush=True,
                                 )
 
+                                # Remove abnormal data from partitions to prevent accumulation
+                                abnormal_uids = set(abnormal_gt_uids) | set(abnormal_lt_uids)
+                                keys_to_remove: list[str] = []
+
+                                # Collect response keys for abnormal uids
+                                for uid in abnormal_uids:
+                                    if uid in uid_response_keys:
+                                        keys_to_remove.extend([k for k, _ in uid_response_keys[uid]])
+
+                                # Also remove the uid-level key (status=finished) for abnormal uids
+                                for uid in abnormal_uids:
+                                    if uid in finished_uids:
+                                        keys_to_remove.append(uid)
+
+                                # Remove from partition
+                                if keys_to_remove:
+                                    part = self.partitions.get(partition_id)
+                                    if part is not None:
+                                        size_before = len(part)
+                                        for key in keys_to_remove:
+                                            part.pop(key, None)
+                                        size_after = len(part)
+                                        print(
+                                            f"[ReplayBuffer][wait_and_sample] 🧹 Cleaned up {len(keys_to_remove)} "
+                                            f"abnormal keys from partition '{partition_id}': "
+                                            f"size {size_before} -> {size_after} "
+                                            f"(gt_uids={len(abnormal_gt_uids)}, lt_uids={len(abnormal_lt_uids)})",
+                                            flush=True,
+                                        )
                             return all_response_keys
                     else:
                         print(
@@ -392,7 +425,7 @@ class ReplayBuffer:
         """
         async with self._slot_available:
             # Compute current partition status counts for state reset
-            partition_stats = self.compute_partition_stats()
+            partition_stats = await self.compute_partition_stats()
             prev_version_slots = self._version_slots
 
             data = tq.kv_list()
@@ -462,26 +495,27 @@ class ReplayBuffer:
             self._data_available.notify_all()
 
     # ======== Statistics ========
-    def compute_partition_stats(self) -> dict[str, dict[str, int]]:
+    async def compute_partition_stats(self) -> dict[str, dict[str, int]]:
         """Compute per-partition status counts. Lock-free read.
 
         Returns:
             dict mapping partition_id -> {status_type: count, ...}
             e.g. {"train": {"success": 64, "finished": 2}}
         """
-        partition_stats: dict[str, dict[str, int]] = {}
-        for pid, part in self.partitions.items():
-            stats: dict[str, int] = {"success": 0, "finished": 0, "failure": 0}
-            for v in part.values():
-                status = v.get("status", "unknown")
-                if status in stats:
-                    stats[status] += 1
-            partition_stats[pid] = stats
-        return partition_stats
+        async with self._data_available:
+            partition_stats: dict[str, dict[str, int]] = {}
+            for pid, part in self.partitions.items():
+                stats: dict[str, int] = {"success": 0, "finished": 0, "failure": 0}
+                for v in part.values():
+                    status = v.get("status", "unknown")
+                    if status in stats:
+                        stats[status] += 1
+                partition_stats[pid] = stats
+            return partition_stats
 
-    def get_statistics(self) -> dict:
+    async def get_statistics(self) -> dict:
         """Return statistics about the buffer state. Lock-free read."""
-        partition_stats = self.compute_partition_stats()
+        partition_stats = await self.compute_partition_stats()
 
         return {
             "partitions": partition_stats,
