@@ -327,7 +327,7 @@ class ReplayBuffer:
                                 removed_keys: list[str] = []
                                 for key, meta in keys_and_metas:
                                     meta_uid = meta.get("uid", "") if isinstance(meta, dict) else ""
-                                    if meta_uid and key.startswith(meta.uid):
+                                    if meta_uid and key.startswith(meta_uid):
                                         matched_keys.append((key, meta))
                                     else:
                                         part.pop(key, None)
