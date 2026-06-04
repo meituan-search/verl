@@ -27,7 +27,7 @@ Patch chain (each wrapper accepts ``magi_attention_key``/``flex_attention_key`` 
     → SelfAttention.forward     (both checkpointed and normal core-attention calls)
     → TEDotProductAttention.forward  (early-return MAGI branch)
 
-The ``_magi_attn_forward`` helper (dispatch → calc_attn → undispatch) is copied
+The ``magi_attn_forward`` helper (dispatch → calc_attn → undispatch) is copied
 verbatim from the fork and lives here so no Megatron source modification is needed.
 """
 
@@ -39,10 +39,6 @@ import threading
 import torch
 from torch import Tensor
 
-# Thread-local storage for active MAGI key during prefix-tree forward.
-# Set in model_forward.py before calling model(), cleared after.
-_active_magi_key: threading.local = threading.local()
-
 # Set to True during prefix-tree forward to bypass CP-rank-specific RoPE slicing.
 _magi_rope_bypass: threading.local = threading.local()
 
@@ -52,7 +48,7 @@ _magi_rope_bypass: threading.local = threading.local()
 # ---------------------------------------------------------------------------
 
 
-def _flex_attn_forward(
+def flex_attn_forward(
     query: Tensor,
     key: Tensor,
     value: Tensor,
@@ -84,7 +80,7 @@ def _flex_attn_forward(
 # ---------------------------------------------------------------------------
 
 
-def _magi_attn_forward(
+def magi_attn_forward(
     query: Tensor,
     key: Tensor,
     value: Tensor,
@@ -100,10 +96,6 @@ def _magi_attn_forward(
     across TP to get full T tokens, then dispatch/calc_attn/undispatch across
     CP ranks, then scatter back to T/TP for SP-consistent output.
     """
-    import os as _os
-
-    import torch as _torch
-    import torch.distributed as _dist
     from magi_attention.api import calc_attn, dispatch, undispatch
 
     q = query.squeeze(1)   # (T, np, hn) — already full T (Megatron gathers SP before calling here)
@@ -162,9 +154,9 @@ def apply_prefix_tree_patch() -> None:
         **kwargs,
     ):
         if magi_attention_key is not None:
-            return _magi_attn_forward(query, key, value, magi_attention_key)
+            return magi_attn_forward(query, key, value, magi_attention_key)
         if flex_attention_key is not None:
-            return _flex_attn_forward(query, key, value, flex_attention_key)
+            return flex_attn_forward(query, key, value, flex_attention_key)
         # FA3 path
         return _orig_te_forward(self, query, key, value, attention_mask, attn_mask_type,
                                 attention_bias=attention_bias,

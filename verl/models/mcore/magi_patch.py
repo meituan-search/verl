@@ -14,8 +14,8 @@
 """Backward-compatibility shim — use prefix_tree_merge instead."""
 
 from verl.models.mcore.prefix_tree_merge import (  # noqa: F401
-    _flex_attn_forward,
-    _magi_attn_forward,
     apply_magi_patch,
     apply_prefix_tree_patch,
+    flex_attn_forward,
+    magi_attn_forward,
 )
