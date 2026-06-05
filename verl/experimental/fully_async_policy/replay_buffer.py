@@ -143,7 +143,7 @@ class ReplayBuffer:
             corrupting the uid→response_keys mapping used by wait_and_sample().
         """
         try:
-            while True:
+            while not self._finished:
                 data = tq.kv_list()
                 if data is not None:
                     # Build a fresh snapshot from TQ, then atomically replace self.partitions
