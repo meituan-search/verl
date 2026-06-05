@@ -361,7 +361,7 @@ class ReplayBuffer:
                                 continue
 
                             print(
-                                f"[ReplayBuffer][wait_and_sample] Returning {len(all_response_keys)} "
+                                f"[ReplayBuffer][wait_and_sample][{partition_id}] Returning {len(all_response_keys)} "
                                 f"response keys from {len(selected_uids)} uids "
                                 f"(sample_size={sample_size}, "
                                 f"total_finished={len(finished_uids)}, "
@@ -374,7 +374,8 @@ class ReplayBuffer:
                             return all_response_keys
                     else:
                         print(
-                            f"[ReplayBuffer][wait_and_sample] ready: {len(finished_uids)} uids, need={sample_size}",
+                            f"[ReplayBuffer][wait_and_sample][{partition_id}] ready: "
+                            f"{len(finished_uids)} uids, need={sample_size}",
                         )
 
                 # Wait for _poll_from_tq to write new metadata or signal_finish

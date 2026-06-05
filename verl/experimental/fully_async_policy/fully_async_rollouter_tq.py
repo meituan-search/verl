@@ -20,6 +20,7 @@ from collections import defaultdict
 
 import numpy as np
 import ray
+import torch
 
 from verl.experimental.fully_async_policy.detach_utils import (
     RolloutSample,
@@ -300,9 +301,15 @@ class FullyAsyncRollouterTQ(FullyAsyncRollouter):
             self.async_rollout_manager.generate_sequences(batch)
 
             # 2. sample batch from replay buffer
-            batch = await self.replay_buffer.sample(
+            sampled = await self.replay_buffer.sample.remote(
                 partition_id="val", sample_size=len(batch), rollout_n=self.config.actor_rollout_ref.rollout.val_kwargs.n
-            ).remote()
+            )
+            # Unpack list[tuple[str, dict]] into KVBatchMeta format
+            from verl.utils.transferqueue_utils import KVBatchMeta
+
+            keys = [k for k, _ in sampled]
+            tags = [meta for _, meta in sampled]
+            batch = KVBatchMeta(partition_id="val", keys=keys, tags=tags)
 
             # 3. [OPTIONAL] compute reward score with colocated reward model
             if self.reward_loop_manager.reward_loop_worker_handles is None:
@@ -340,14 +347,35 @@ class FullyAsyncRollouterTQ(FullyAsyncRollouter):
             all_outputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in text_data["responses"]]
 
             fields = ["uid", "rm_scores", "num_turns", "reward_model", "data_source", "extra_fields"]
+
             data = tq.kv_batch_get(keys=final_keys, partition_id=batch.partition_id, select_fields=fields)
 
-            sample_uids.extend(data.pop("uid").tolist())
+            from tensordict import NonTensorData, NonTensorStack
+
+            # Extract values handling NonTensorStack/NonTensorData (aligned with main_ppo_sync.py:334-337)
+            def _extract(v):
+                if isinstance(v, torch.Tensor):
+                    return v
+                elif isinstance(v, NonTensorStack):
+                    # NonTensorStack may contain non-unique values; use .tolist()
+                    return v.tolist()
+                elif isinstance(v, NonTensorData):
+                    return v.data
+                return v
+
+            _uid = _extract(data.pop("uid"))
+            _rm_scores = _extract(data["rm_scores"])
+            _num_turns = _extract(data.pop("num_turns"))
+
+            # Ensure plain Python types for lists (aligned with main_ppo_sync.py:932-937)
+            sample_uids.extend(_uid.tolist() if hasattr(_uid, "tolist") else list(_uid))
             sample_outputs.extend(all_outputs[i] for i in final_indices)
             sample_inputs.extend(all_inputs[i] for i in final_indices)
-            scores = data["rm_scores"].sum(dim=1).tolist()
+            scores = _rm_scores.sum(dim=1).tolist()
             sample_scores.extend(scores)
-            sample_turns.extend(data.pop("num_turns").tolist())
+            # np.concatenate requires array-like elements, not scalars (compatible with ray_trainer.py:660)
+            _turns = _num_turns.tolist() if hasattr(_num_turns, "tolist") else list(_num_turns)
+            sample_turns.extend([np.array([t]) for t in _turns])
             reward_extra_infos_dict["reward"].extend(scores)
 
             extra_fields_list = data.pop("extra_fields", None)
@@ -384,7 +412,7 @@ class FullyAsyncRollouterTQ(FullyAsyncRollouter):
 
             # 5. cleanup transfer queue and replay buffer
             tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
-            self.replay_buffer.remove(batch.partition_id, batch.keys)
+            await self.replay_buffer.remove.remote(batch.partition_id, batch.keys)
 
         # logger to wandb
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
