@@ -69,7 +69,7 @@ mtp_params=(
 fully_async=(
   data.train_batch_size=0
   data.gen_batch_size=1
-  trainer.test_freq=1
+  trainer.test_freq=10
   actor_rollout_ref.hybrid_engine=False
   actor_rollout_ref.rollout.calculate_log_probs=True
   actor_rollout_ref.actor.optim.lr_decay_steps=51200
@@ -106,7 +106,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     actor_rollout_ref.actor.clip_ratio_c=10.0 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=64 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
