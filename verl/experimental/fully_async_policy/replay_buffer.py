@@ -378,6 +378,10 @@ class ReplayBuffer:
                             f"{len(finished_uids)} uids, need={sample_size}",
                         )
 
+                # Check termination after trying to satisfy the request
+                if self._finished:
+                    return None
+
                 # Wait for _poll_from_tq to write new metadata or signal_finish
                 await self._data_available.wait()
 
