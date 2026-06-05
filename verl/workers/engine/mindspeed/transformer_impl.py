@@ -35,6 +35,7 @@ from ..megatron import MegatronEngineWithLMHead, MegatronEngineWithValueHead
 from .utils import (
     apply_patch,
     gpt_model_provider,
+    reset_fp8_reuse_quantized_weight,
 )
 
 logger = logging.getLogger(__file__)
@@ -70,6 +71,19 @@ class MindspeedEngineWithLMHead(MegatronEngineWithLMHead):
         _mindspeed_repatch(self.engine_config)
         super()._init_device_mesh()
 
+    def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
+        """
+        Move model parameters, optimizer states, or both to the specified device.
+        Note that this function executes irrespective of offload config. It serves as manual control
+
+        Args:
+            device: Target device identifier.
+            model: If True, move the model.
+            optimizer: If True, move the optimizer states.
+        """
+        reset_fp8_reuse_quantized_weight(self, device, model, optimizer, grad)
+        super().to(device=device, model=model, optimizer=optimizer, grad=grad)
+
 
 @EngineRegistry.register(model_type="value_model", backend="megatron", device="npu")
 class MindspeedEngineWithValueHead(MegatronEngineWithValueHead):
@@ -92,8 +106,8 @@ class MindspeedEngineWithValueHead(MegatronEngineWithValueHead):
         super()._init_device_mesh()
 
 
-@EngineRegistry.register(model_type="language_model", backend="mindspeed_llm", device="npu")
-class MindSpeedLLMEngineWithLMHead(MegatronEngineWithLMHead):
+@EngineRegistry.register(model_type="language_model", backend="mindspeed_megatron", device="npu")
+class MindSpeedMegatronEngineWithLMHead(MegatronEngineWithLMHead):
     def __init__(
         self,
         model_config: HFModelConfig,
@@ -122,9 +136,9 @@ class MindSpeedLLMEngineWithLMHead(MegatronEngineWithLMHead):
         # For forward_only, we don't need optimizer, lr_scheduler, checkpoint_mananager
         if self.engine_config.forward_only:
             module = get_model(gpt_model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=False)
-            return module
+        else:
+            module = get_model(gpt_model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=True)
 
-        module = get_model(gpt_model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=True)
         if self.vanilla_bridge:
             self.bridge.load_weights(module, self.model_config.local_path)
         else:
@@ -137,3 +151,16 @@ class MindSpeedLLMEngineWithLMHead(MegatronEngineWithLMHead):
             print(f"routing replay layers: {len(RouterReplay.router_instances)}")
 
         return module
+
+    def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
+        """
+        Move model parameters, optimizer states, or both to the specified device.
+        Note that this function executes irrespective of offload config. It serves as manual control
+
+        Args:
+            device: Target device identifier.
+            model: If True, move the model.
+            optimizer: If True, move the optimizer states.
+        """
+        reset_fp8_reuse_quantized_weight(self, device, model, optimizer, grad)
+        super().to(device=device, model=model, optimizer=optimizer, grad=grad)

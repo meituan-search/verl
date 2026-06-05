@@ -39,6 +39,7 @@ from verl.utils import normalize_token_ids
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.profiler import marked_timer
 from verl.utils.rollout_trace import rollout_trace_op
+from verl.utils.skip import SkipManager
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.llm_server import LLMServerClient, LLMServerManager
 from verl.workers.rollout.replica import RolloutReplica, TokenOutput
@@ -367,6 +368,7 @@ class FullyAsyncLLMServerManager(LLMServerManager):
 
 
 class FullyAsyncAgentLoopManager(AgentLoopManager):
+    @SkipManager.annotate(role="async_rollout")
     async def generate_sequences_single(self, prompts: DataProto) -> DataProto:
         """Split input batch and dispatch to agent loop workers.
 
@@ -437,6 +439,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.kl_ctrl_in_reward = False
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
+
+        self._init_dump_executor()
 
         # ==================== fully async config ====================
 
@@ -601,6 +605,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         return timing_raw
 
+    async def _start_profiling(self):
+        """Start rollout profiling on all replicas via LLMServerManager after weight sync."""
+        await self.llm_server_manager.start_profile()
+
+    async def _stop_profiling(self):
+        """Stop rollout profiling on all replicas before the next weight sync."""
+        await self.llm_server_manager.stop_profile()
+
     async def do_validate(self):
         """Run validation and return metrics"""
         timing_raw = {}
@@ -700,6 +712,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         await self._create_reward_loop_manager()
         await self._create_teacher_model_manager()
         await self._init_async_rollout_manager()
+        SkipManager.init(self.config)
 
     async def _create_reward_loop_manager(self):
         """Create RewardLoopManager for the rollouter.
@@ -932,8 +945,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
         # Calling asynchronous generation methods
+        # Embed sample_id into prompts for skip management
+        rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
+            [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
+        )
         ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
         rollout_sample.full_batch = ret
+        # Re-set uid on output — agent loop worker returns a new DataProto without the input's non_tensor_batch
         rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
         )

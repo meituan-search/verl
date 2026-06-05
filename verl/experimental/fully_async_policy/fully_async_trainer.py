@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import logging
 import os
 import time
@@ -106,6 +107,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # ==================== SeparateRayPPOTrainer config ====================
         self.global_steps = 0
         self.epoch = 0
+        self._init_dump_executor()
+        self.validation_generations_logger = None
         self.max_steps_duration = 0
         self.progress_bar = None
         self.is_last_step = False
@@ -387,11 +390,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.global_steps += 1
 
         self.prev_step_profile = False
-        self.curr_step_profile = (
-            self.global_steps in self.config.global_profiler.steps
-            if self.config.global_profiler.steps is not None
-            else False
-        )
+        self.curr_step_profile = False
         self.next_step_profile = False
 
         # Use queue mode, no need for traditional dataloader iterator
@@ -428,7 +427,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.reward_tensor = None
         self.reward_extra_infos_dict = {}
 
-        self._fit_start_profile()
+        steps = self.config.global_profiler.steps
+        should_profile = steps is not None and (self.current_param_version + 1) in steps
+        self._fit_start_profile(should_profiler=should_profile)
 
         with marked_timer("step", self.timing_raw):
             batch = await self._fit_generate(None)
@@ -445,7 +446,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         await self._fit_validate()
         self._fit_save_checkpoint()
-        self._fit_stop_profile()
+        self._fit_stop_profile(should_profiler=should_profile)
         self._fit_collect_metrics(batch)
         self._fit_postprocess_step()
 
@@ -500,6 +501,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         if self.local_trigger_step != 1:
             return
 
+        steps = self.config.global_profiler.steps
+        last_profiler_step = self.current_param_version
+        if steps is not None and last_profiler_step in steps:
+            await asyncio.wrap_future(self.rollouter._stop_profiling.remote().future())
+
         with marked_timer("timing_s/param_sync", self.timing_raw):
             await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
         print(
@@ -507,6 +513,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             f"timing_s/param_sync: {self.timing_raw['timing_s/param_sync']:.4f} seconds "
             f"self.current_param_version: {self.current_param_version}"
         )
+
+        profiler_step = last_profiler_step + 1
+
+        if steps is not None and profiler_step in steps:
+            await asyncio.wrap_future(self.rollouter._start_profiling.remote().future())
 
         # Reset staleness in rollouter
         timing_raw = await self.rollouter.reset_staleness.remote()

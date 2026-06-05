@@ -63,6 +63,8 @@ Use parameters in each role's ``profiler.tool_config.npu`` to control npu profil
 
 -  analysis: Enables automatic data parsing.
 -  discrete: Whether to enable discrete mode.
+-  profile_token_start: Effective only for the rollout role; defines the start response-token index for rollout decoding collection. It is applied only when valid (0-based, ``profile_token_end > profile_token_start``, and the window is within response length).
+-  profile_token_end: Effective only for the rollout role; defines the stop response-token index (exclusive) for rollout decoding collection. It is applied only when valid (0-based, ``profile_token_end > profile_token_start``, and the window is within response length).
 
 
 Examples
@@ -122,6 +124,9 @@ Discrete Mode Collection
                tool_config:
                   npu:
                      discrete: True  # Must be enabled in Agent Loop mode
+                     # Optional response-token window for engine-side collection; if not set, the entire rollout stage is collected
+                     profile_token_start: 12
+                     profile_token_end: 46
          # ref follow actor settings
 
 **Agent Loop Mode Description**:
@@ -135,6 +140,12 @@ When Rollout runs in `Agent Loop <../advance/agent_loop.rst>`_ mode, performance
    - vLLM Engine: Automatically collects AsyncLLM scheduling stacks and inference process performance data. Does not support setting analysis (defaults to no analysis, requires offline analysis) and profiler_level (defaults to level1).
    - SGLang Engine: Automatically collects inference process performance data. Does not support the memory option in contents. Does not support setting analysis (defaults to enabled) and profiler_level (defaults to level0).
 
+**Fully Async Policy Mode Description**:
+
+1. In `Fully Async Policy <https://verl.readthedocs.io/en/latest/advance/fully_async.html>`_ mode, ``global_profiler.steps`` refers to the step **after each** ``update_weights`` round. This is consistent with synchronous mode, not a per mini-batch step within a single training round.
+
+2. Because it reuses Agent Loop collection capabilities, the notes for `Fully Async Policy <https://verl.readthedocs.io/en/latest/advance/fully_async.html>`_ mode are the same as for Agent Loop.
+
 
 Visualization
 -------------
@@ -142,7 +153,7 @@ Visualization
 Collected data is stored in the user-defined save_path and can be
 visualized by using the `MindStudio Insight <https://www.hiascend.com/document/detail/zh/mindstudio/80RC1/GUI_baseddevelopmenttool/msascendinsightug/Insight_userguide_0002.html>`_ tool.
 
-Additionally, in a Linux environment, the MindStudio Insight tool is provided in the form of a `JupyterLab Plugin <https://www.hiascend.com/document/detail/zh/mindstudio/82RC1/GUI_baseddevelopmenttool/msascendinsightug/Insight_userguide_0130.html>`_ ，offering a more intuitive and highly interactive user interface. The advantages of the JupyterLab plugin are as follows:
+Additionally, in a Linux environment, the MindStudio Insight tool is provided in the form of a [JupyterLab Plugin](https://www.hiascend.com/document/detail/zh/mindstudio/82RC1/GUI_baseddevelopmenttool/msascendinsightug/Insight_userguide_0130.html), offering a more intuitive and highly interactive user interface. The advantages of the JupyterLab plugin are as follows:
 
 - Seamless integration: Supports running the MindStudio Insight tool directly within the Jupyter environment, eliminating the need to switch platforms or copy data from the server, enabling data to be collected and used immediately.
 - Fast startup: Allows MindStudio Insight to be launched quickly via the JupyterLab command line or graphical interface.
