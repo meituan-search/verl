@@ -74,8 +74,7 @@ class FullyAsyncAgentLoopManagerTQ(FullyAsyncAgentLoopManager):
             None — data is written directly to TransferQueue by the worker.
         """
         worker = self._select_best_worker()
-        output_future = worker.generate_sequences.remote(prompts, wait=True)
-        return await asyncio.wrap_future(output_future.future())
+        return await worker.generate_sequences.remote(prompts, wait=True)
 
     def generate_sequences(self, prompts):
         """
