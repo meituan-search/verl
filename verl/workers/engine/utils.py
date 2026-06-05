@@ -89,8 +89,7 @@ def prepare_micro_batches(
         total_data_size = len(data)
         micro_batch_size_per_gpu = data["micro_batch_size_per_gpu"]
         assert total_data_size % (force_group_size * micro_batch_size_per_gpu) == 0, (
-            f"data={total_data_size} size must be divisible by "
-            f"force_group_size={force_group_size} * micro_batch_size_per_gpu={micro_batch_size_per_gpu}"
+            "data size must be divisible by force_group_size * micro_batch_size_per_gpu"
         )
         micro_batches = tu.chunk_tensordict(data, total_data_size // (micro_batch_size_per_gpu * force_group_size))
         batch_idx_list = None
