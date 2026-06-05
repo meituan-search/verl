@@ -84,16 +84,8 @@ def _flex_attn_forward(
     v = value.squeeze(1).permute(1, 0, 2).unsqueeze(0)
     enable_gqa = q.shape[1] != k.shape[1]
 
-    import time as _t
-
-    import torch.distributed as _dist
-
-    get_torch_device().synchronize()
-    _t0 = _t.perf_counter()
-    out = flex_attention(q, k, v, block_mask=flex_attention_key, enable_gqa=enable_gqa)  # (1, Hq, T, D)
-    get_torch_device().synchronize()
-    if not _dist.is_initialized() or _dist.get_rank() == 0:
-        print(f"[FLEX-ATTN] T={T} {(_t.perf_counter() - _t0) * 1000:.2f}ms", flush=True)
+    with torch.cuda.nvtx.range("prefix_attn/flex"):
+        out = flex_attention(q, k, v, block_mask=flex_attention_key, enable_gqa=enable_gqa)  # (1, Hq, T, D)
     out = out.squeeze(0).permute(1, 0, 2)  # (T, Hq, D)
     return out.reshape(T, 1, -1)  # (T, 1, Hq*D)
 
@@ -148,19 +140,42 @@ def _magi_attn_forward(
             flush=True,
         )
 
+    # MAGI_TIMING=1 → print dispatch/calc_attn/undispatch breakdown for layer 0
+    _timing = _os.environ.get("MAGI_TIMING") == "1" and _layer_idx == 0 and _cp_rank == 0
+
+    def _evt():
+        e = _torch.cuda.Event(enable_timing=True); e.record(); return e
+
     # before_dispatch_Q/K/V saved by _sa_forward wrapper (covers both FA3 and MAGI)
-    dq = dispatch(q, magi_attention_key)
-    dk = dispatch(k, magi_attention_key)
-    dv = dispatch(v, magi_attention_key)
+    with _torch.cuda.nvtx.range("prefix_attn/magi"):
+        t0 = _evt() if _timing else None
+        dq = dispatch(q, magi_attention_key)
+        dk = dispatch(k, magi_attention_key)
+        dv = dispatch(v, magi_attention_key)
+        t1 = _evt() if _timing else None
 
-    _save("after_dispatch_Q", dq)
-    _save("after_dispatch_K", dk)
-    _save("after_dispatch_V", dv)
+        _save("after_dispatch_Q", dq)
+        _save("after_dispatch_K", dk)
+        _save("after_dispatch_V", dv)
 
-    out, _ = calc_attn(dq, dk, dv, magi_attention_key)
-    _save("after_calc_attn_out", out)
+        out, _ = calc_attn(dq, dk, dv, magi_attention_key)
+        t2 = _evt() if _timing else None
+        _save("after_calc_attn_out", out)
 
-    out = undispatch(out, magi_attention_key)
+        out = undispatch(out, magi_attention_key)
+        t3 = _evt() if _timing else None
+
+    if _timing:
+        _torch.cuda.synchronize()
+        T = q.shape[0]
+        print(
+            f"[MAGI-TIMING] layer={_layer_idx} tokens={T}"
+            f" dispatch={t0.elapsed_time(t1):.2f}ms"
+            f" calc_attn={t1.elapsed_time(t2):.2f}ms"
+            f" undispatch={t2.elapsed_time(t3):.2f}ms"
+            f" total={t0.elapsed_time(t3):.2f}ms",
+            flush=True,
+        )
     # after_undispatch_out saved by _sa_forward wrapper
 
     return out.reshape(out.shape[0], 1, -1)
@@ -210,30 +225,20 @@ def apply_prefix_tree_patch() -> None:
             return _magi_attn_forward(query, key, value, magi_attention_key)
         if flex_attention_key is not None:
             return _flex_attn_forward(query, key, value, flex_attention_key)
-        # FA3 path — Q/K/V and output are saved in _sa_forward via core_attention wrapper
-        import time as _t
-
-        import torch.distributed as _dist
-
-        get_torch_device().synchronize()
-        _t0 = _t.perf_counter()
-        out = _orig_te_forward(
-            self,
-            query,
-            key,
-            value,
-            attention_mask,
-            attn_mask_type,
-            attention_bias=attention_bias,
-            packed_seq_params=packed_seq_params,
-            num_splits=num_splits,
-            **kwargs,
-        )
-        get_torch_device().synchronize()
-        if not _dist.is_initialized() or _dist.get_rank() == 0:
-            T = query.shape[0]
-            print(f"[FA3-ATTN] T={T} {(_t.perf_counter() - _t0) * 1000:.2f}ms", flush=True)
-        return out
+        # FA3 path
+        with torch.cuda.nvtx.range("full_attn/fa3"):
+            return _orig_te_forward(
+                self,
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                num_splits=num_splits,
+                **kwargs,
+            )
 
     TEDotProductAttention.forward = _te_forward
 

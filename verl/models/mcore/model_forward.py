@@ -288,7 +288,7 @@ def gptmodel_forward_model_engine(
             )
             _t1 = _time.perf_counter()
             if pt_batch is not None:
-                _full_tokens = int(input_ids.values().shape[0])
+                _full_tokens = int(input_ids.values().shape[0]) if (hasattr(input_ids, "is_nested") and input_ids.is_nested) else int(input_ids.numel())
                 _flat_tokens = pt_batch.real_tokens
                 _share_ratio = (_full_tokens - _flat_tokens) / _full_tokens if _full_tokens > 0 else 0.0
                 if not _dist.is_initialized() or _dist.get_rank() == 0:
@@ -439,6 +439,10 @@ def gptmodel_forward_model_engine(
                     _nested = output_dict["log_probs"]
                     if hasattr(_nested, "values"):
                         _save2("after_restore_log_probs_flat", _nested.values())
+                    # entropy has the same flat layout — restore it too so batch dims match
+                    if "entropy" in output_dict:
+                        ent_flat = output_dict["entropy"].reshape(-1)[:real_tokens]
+                        output_dict["entropy"] = restore_flat_to_nested(ent_flat, pt_batch)
                 output = output_dict
             else:
                 # Strip TP padding before restoring

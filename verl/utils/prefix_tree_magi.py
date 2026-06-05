@@ -100,19 +100,31 @@ class PrefixTreeMagiBatch:
             self.local_flat_loss_mask = self.flat_loss_mask
 
 
-def _unpack_nested_to_list(x) -> Optional[list[Tensor]]:
-    """Unpack a NestedTensor into a list of 1-D tensors, one per sample."""
+def _unpack_nested_to_list(x, pad_token_id=None) -> Optional[list[Tensor]]:
+    """Unpack a NestedTensor or padded 2-D Tensor into a list of 1-D tensors.
+
+    - NestedTensor (jagged): uses ``.offsets()``
+    - Padded 2-D Tensor ``(B, T)``: trims trailing pad_token_id from each row.
+      If pad_token_id is None, trims zero-valued tokens.
+    - ``None``: returns ``None``
+    """
     if x is None:
         return None
-    offsets = x.offsets()
-    lengths = offsets.diff().tolist()
-    vals = x.values()
-    out: list[Tensor] = []
-    pos = 0
-    for length in lengths:
-        out.append(vals[pos : pos + int(length)])
-        pos += int(length)
-    return out
+    if hasattr(x, "is_nested") and x.is_nested:
+        offsets = x.offsets()
+        lengths = offsets.diff().tolist()
+        vals = x.values()
+        out: list[Tensor] = []
+        pos = 0
+        for length in lengths:
+            out.append(vals[pos : pos + int(length)])
+            pos += int(length)
+        return out
+    if x.dim() == 2:
+        # Padded 2-D tensor — cannot safely unpack without risk of pad/loss_mask misalignment.
+        # Return None to fall back to standard attention.
+        return None
+    return None
 
 
 def build_prefix_tree_micro_batch(
@@ -180,22 +192,27 @@ def build_prefix_tree_micro_batch(
         return None
     tree_root, leaf_to_sample = result
 
-    params = build_layout_from_tree_node(
-        samples,
-        tree_root,
-        leaf_to_sample,
-        loss_masks_by_sample=loss_masks_by_sample,
-        position_ids_by_sample=position_ids_by_sample,
-    )
+    try:
+        params = build_layout_from_tree_node(
+            samples,
+            tree_root,
+            leaf_to_sample,
+            loss_masks_by_sample=loss_masks_by_sample,
+            position_ids_by_sample=position_ids_by_sample,
+        )
 
-    return _finalize_prefix_tree_batch(
-        params,
-        model=model,
-        num_samples=len(samples),
-        attention_type=attention_type,
-        tp_size=tp_size,
-        cp_size=cp_size,
-    )
+        return _finalize_prefix_tree_batch(
+            params,
+            model=model,
+            num_samples=len(samples),
+            attention_type=attention_type,
+            tp_size=tp_size,
+            cp_size=cp_size,
+        )
+    except (ValueError, AssertionError, RuntimeError):
+        # Multilevel tree produced non-monotonic leaf ranges or inconsistent
+        # token layout.  Fall back to standard attention for this micro-batch.
+        return None
 
 
 def restore_flat_to_nested(

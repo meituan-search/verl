@@ -36,6 +36,10 @@ from verl.utils.prefix_tree_utils import TreeNode
 
 __all__ = [
     "build_tree_dynamic",
+    "build_mini_batch_prefix_groups",
+    "dfs_leaf_order",
+    "dfs_micro_batch_groups",
+    "compute_prefix_sharing_ratio",
     # Lower-level helpers exposed for testing / benchmarking
     "TrieNode",
     "greedy_build_tries",
@@ -262,3 +266,287 @@ def build_tree_dynamic(samples: list[Tensor]) -> Optional[tuple[TreeNode, list[i
     if not tries or len(tries) > 1:
         return None
     return convert_trie_to_tree_node(tries[0])
+
+
+# ============================================================================
+# Mini-batch level prefix grouping (for DP load balancing)
+# ============================================================================
+
+
+def _trie_seq_ids(node: TrieNode) -> list[int]:
+    """Collect all sequence IDs from leaf nodes of a compressed-trie subtree."""
+    if not node.children:
+        return list(node.sequence_ids)
+    ids: list[int] = []
+    for child in node.children.values():
+        ids.extend(_trie_seq_ids(child))
+    return ids
+
+
+def _trie_effective_tokens(node: TrieNode) -> int:
+    """Total unique (flat) tokens in a compressed-trie subtree.
+
+    Counts the tokens owned by this node plus all its descendants — i.e. the
+    flat token count that would result from laying this subtree out for
+    prefix-tree attention.
+    """
+    total = len(node.tokens)
+    for child in node.children.values():
+        total += _trie_effective_tokens(child)
+    return total
+
+
+def build_mini_batch_prefix_groups(
+    sequences: list[list[int]],
+) -> list[tuple[list[int], int]]:
+    """Build a mini-batch trie and return prefix-sharing groups for load balancing.
+
+    Builds a single compressed trie over all sequences, then walks down the
+    shared spine to the first branching point.  Each child subtree at that
+    branching point becomes one group: the sequences in the group all share a
+    common prefix, so they should be assigned to the *same* DP rank / micro-batch
+    to benefit from prefix deduplication.
+
+    Args:
+        sequences: per-sample token lists (the full mini-batch).
+
+    Returns:
+        List of ``(seq_indices, effective_token_count)`` pairs.
+
+        * ``seq_indices`` — original sample indices that share a common prefix.
+        * ``effective_token_count`` — flat (deduplicated) token count for this
+          group: shared prefix length + unique branch tokens.  Use this instead
+          of raw sequence lengths for load-balancing workload estimates.
+    """
+    if not sequences:
+        return []
+
+    max_tokens = sum(len(s) for s in sequences) * 10  # one big forest
+    tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=max_tokens)
+
+    groups: list[tuple[list[int], int]] = []
+    for trie_root in tries:
+        # Walk the spine (single-child path) accumulating the shared prefix length.
+        # trie_root is a virtual root (is_root=True, no tokens).
+        shared_len = 0
+        current = trie_root
+        while len(current.children) == 1:
+            child = next(iter(current.children.values()))
+            shared_len += len(child.tokens)
+            current = child
+
+        if not current.children:
+            # Leaf — all sequences in this trie share the full path (e.g. identical
+            # sequences, or a single sequence).
+            groups.append((list(current.sequence_ids), shared_len))
+        else:
+            # Branching node — each child subtree is an independent group.
+            for child in current.children.values():
+                seq_ids = _trie_seq_ids(child)
+                effective = shared_len + _trie_effective_tokens(child)
+                groups.append((seq_ids, effective))
+
+    return groups
+
+
+def dfs_leaf_order(
+    sequences: list[list[int]],
+) -> list[int]:
+    """Return sample indices in DFS pre-order of the mini-batch trie.
+
+    Builds one trie over all sequences then walks leaves in DFS pre-order
+    (children sorted by first token).  Consecutive indices in the returned
+    list share the longest possible common prefix — the ideal ordering for
+    prefix-tree load balancing and micro-batch grouping.
+
+    Args:
+        sequences: per-sample token lists.
+
+    Returns:
+        List of sample indices in DFS pre-order (length == len(sequences)).
+    """
+    if not sequences:
+        return []
+
+    max_tokens = sum(len(s) for s in sequences) * 10
+    tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=max_tokens)
+
+    ordered: list[int] = []
+
+    def _walk(node: TrieNode) -> None:
+        if not node.children:
+            ordered.extend(node.sequence_ids)
+        else:
+            for child in node.children.values():
+                _walk(child)
+
+    for trie_root in tries:
+        for child in trie_root.children.values():
+            _walk(child)
+
+    return ordered
+
+
+def dfs_micro_batch_groups(
+    sequences: list[list[int]],
+    max_token_len: int,
+) -> list[list[int]]:
+    """Group sequences into micro-batches in DFS trie order, budgeted by flat trie tokens.
+
+    Builds ONE trie over all sequences, then traverses leaves in DFS pre-order.
+    Greedily packs leaves into micro-batches: the **budget is flat (deduplicated)
+    trie tokens** — prefix counted once + unique branch tokens — not raw sequence
+    lengths.  This means a micro-batch of k sequences that share a long common
+    prefix uses far fewer budget tokens than k × seq_len, allowing more sequences
+    per batch.
+
+    Algorithm:
+        - Maintain ``covered``: set of trie-node IDs already in the current batch.
+        - For each leaf in DFS pre-order, its incremental cost =
+          tokens in (leaf.ancestors + [leaf]) that are NOT yet in ``covered``.
+        - If incremental cost fits within remaining budget: add to current batch.
+        - Else: flush current batch, start a new one with this leaf.
+
+    Args:
+        sequences: per-sample token lists (the full mini-batch).
+        max_token_len: flat-token budget per micro-batch.
+
+    Returns:
+        List of micro-batch groups; each group is a list of sample indices in
+        DFS pre-order.
+    """
+    if not sequences:
+        return []
+
+    max_tokens = sum(len(s) for s in sequences) * 10  # one big forest
+    tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=max_tokens)
+
+    all_groups: list[list[int]] = []
+
+    for trie_root in tries:
+        current_group: list[int] = []
+        covered: set[int] = set()  # id(TrieNode) already counted in current batch
+        current_eff = 0
+
+        def _visit(node: TrieNode) -> None:
+            nonlocal current_eff
+            if not node.children:
+                # Leaf: full path = ancestors (list of TrieNodes) + self
+                path = node.ancestors + [node]
+                new_nodes = [n for n in path if id(n) not in covered]
+                inc = sum(len(n.tokens) for n in new_nodes)
+
+                if current_group and current_eff + inc > max_token_len:
+                    # Flush — start a fresh batch with this leaf
+                    all_groups.append(current_group[:])
+                    current_group.clear()
+                    covered.clear()
+                    current_eff = 0
+                    new_nodes = path  # all nodes are new in empty batch
+                    inc = sum(len(n.tokens) for n in new_nodes)
+
+                current_group.extend(node.sequence_ids)
+                covered.update(id(n) for n in new_nodes)
+                current_eff += inc
+            else:
+                for child in node.children.values():  # sorted by token key
+                    _visit(child)
+
+        for child in trie_root.children.values():
+            _visit(child)
+
+        if current_group:
+            all_groups.append(current_group)
+
+    return all_groups
+
+
+def compute_prefix_sharing_ratio(input_ids, attention_mask=None) -> float:
+    """Compute prefix-sharing ratio from a batch of token sequences.
+
+    ratio = 1 - flat_trie_tokens / total_raw_tokens
+
+    ``flat_trie_tokens`` counts each shared token exactly once (the trie
+    representation); ``total_raw_tokens`` is the sum of all sequence lengths.
+    A ratio of 0 means no sharing; 1 means every token is shared.
+
+    Args:
+        input_ids: One of:
+            - ``torch.nested`` ``NestedTensor`` (jagged, SFT no-padding path)
+            - ``list[list[int]]`` of raw token sequences
+            - 2-D padded ``Tensor`` of shape ``(batch, max_len)`` — requires
+              ``attention_mask`` to trim padding
+        attention_mask: Optional 2-D ``Tensor`` ``(batch, max_len)`` used to
+            trim padding when ``input_ids`` is a padded 2-D tensor.
+
+    Returns:
+        ``float`` in ``[0, 1]``.  Returns ``0.0`` for empty or single-sequence
+        input, or when no prefix is shared.
+    """
+    from torch import Tensor
+
+    if isinstance(input_ids, Tensor) and input_ids.is_nested:
+        sequences = [t.tolist() for t in input_ids.unbind()]
+    elif isinstance(input_ids, Tensor) and input_ids.dim() == 2:
+        # Padded tensor path (PPO rollout output)
+        seqlens = (
+            attention_mask.sum(dim=-1).tolist()
+            if attention_mask is not None
+            else [input_ids.shape[1]] * input_ids.shape[0]
+        )
+        sequences = [input_ids[i, : int(seqlens[i])].tolist() for i in range(input_ids.shape[0])]
+    elif isinstance(input_ids, list):
+        sequences = input_ids
+    else:
+        return 0.0
+
+    total_raw = sum(len(s) for s in sequences)
+    if total_raw == 0:
+        return 0.0
+
+    _, num_tokens = greedy_build_tries(sequences, max_tokens_per_tree=total_raw * 10)
+    return 1.0 - sum(num_tokens) / total_raw
+
+
+def compute_prefix_tree_metrics(input_ids, attention_mask=None) -> dict:
+    """Compute prefix-tree metrics as a ``prefix_tree/`` namespace dict.
+
+    Returns a dict with keys:
+        ``prefix_tree/sharing_ratio``  — fraction of tokens saved by deduplication
+        ``prefix_tree/flat_tokens``    — deduplicated flat trie token count
+        ``prefix_tree/raw_tokens``     — total raw token count across all sequences
+
+    Args:
+        input_ids: NestedTensor, padded 2-D Tensor, or list[list[int]].
+        attention_mask: Optional mask for padded 2-D case.
+
+    Returns:
+        dict of float metrics, all zero if no sequences.
+    """
+    from torch import Tensor
+
+    if isinstance(input_ids, Tensor) and input_ids.is_nested:
+        sequences = [t.tolist() for t in input_ids.unbind()]
+    elif isinstance(input_ids, Tensor) and input_ids.dim() == 2:
+        seqlens = (
+            attention_mask.sum(dim=-1).tolist()
+            if attention_mask is not None
+            else [input_ids.shape[1]] * input_ids.shape[0]
+        )
+        sequences = [input_ids[i, : int(seqlens[i])].tolist() for i in range(input_ids.shape[0])]
+    elif isinstance(input_ids, list):
+        sequences = input_ids
+    else:
+        return {"prefix_tree/sharing_ratio": 0.0, "prefix_tree/flat_tokens": 0, "prefix_tree/raw_tokens": 0}
+
+    total_raw = sum(len(s) for s in sequences)
+    if total_raw == 0:
+        return {"prefix_tree/sharing_ratio": 0.0, "prefix_tree/flat_tokens": 0, "prefix_tree/raw_tokens": 0}
+
+    _, num_tokens = greedy_build_tries(sequences, max_tokens_per_tree=total_raw * 10)
+    flat = sum(num_tokens)
+    return {
+        "prefix_tree/sharing_ratio": 1.0 - flat / total_raw,
+        "prefix_tree/flat_tokens": flat,
+        "prefix_tree/raw_tokens": total_raw,
+    }
