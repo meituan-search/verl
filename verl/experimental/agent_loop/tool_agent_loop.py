@@ -253,9 +253,10 @@ class ToolAgentLoop(AgentLoopBase):
         else:
             agent_data.metrics["num_preempted"] += output.num_preempted if output.num_preempted is not None else 0
 
-        _ACCUMULATED_KEYS = set(kwargs.get("engine_server_keys", ()))
         if not agent_data.extra_fields:
-            agent_data.extra_fields.update({k: v for k, v in output.extra_fields.items() if k not in _ACCUMULATED_KEYS})
+            agent_data.extra_fields.update(
+                {k: v for k, v in output.extra_fields.items() if k not in set(kwargs.get("engine_server_keys", ()))}
+            )
         else:
             # Multi-round calls, only update the maximum max_global_steps.
             max_global_steps = output.extra_fields.get("max_global_steps", None)

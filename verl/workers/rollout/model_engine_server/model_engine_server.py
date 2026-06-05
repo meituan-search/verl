@@ -28,7 +28,7 @@ from verl.single_controller.base.decorator import Dispatch, make_nd_compute_data
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_torch_device, is_torch_npu_available
+from verl.utils.device import get_torch_device
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig
@@ -599,7 +599,7 @@ class ModelEngineReplica(RolloutReplica):
             ray_cls_with_init=self.get_ray_class_with_init_args(),
             bin_pack=False,
             name_prefix=f"model_engine_standalone_{self.name}",
-            device_name="cuda" if not is_torch_npu_available(check_device=False) else "npu",
+            device_name=self._full_config.trainer.device,
         )
         self.workers = self._worker_group.workers
 
