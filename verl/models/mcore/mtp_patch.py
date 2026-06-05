@@ -181,9 +181,7 @@ def _megatron_gptmodel_postprocess(
                 )
                 mtp_loss = self.compute_language_model_loss(mtp_labels, mtp_logits)
                 mtp_loss = loss_mask * mtp_loss
-                mtp_loss_for_log = (
-                    torch.sum(mtp_loss) / num_tokens if num_tokens > 0 else mtp_loss.new_tensor(0.0)
-                )
+                mtp_loss_for_log = torch.sum(mtp_loss) / num_tokens if num_tokens > 0 else mtp_loss.new_tensor(0.0)
                 if self.training:
                     MTPLossLoggingHelper.save_loss_to_tracker(
                         mtp_loss_for_log,
@@ -206,9 +204,7 @@ def _megatron_gptmodel_postprocess(
                     )
                 else:
                     safe_num_tokens = num_tokens.clamp(min=1)
-                    hidden_states = MTPLossAutoScaler.apply(
-                        hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens
-                    )
+                    hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens)
 
     logits, _ = self.output_layer(hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output)
     # [s b h] => [b s h]
