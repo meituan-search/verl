@@ -402,7 +402,7 @@ transfer_queue=(
 ### 依赖安装
 
 ```bash
-pip install TransferQueue==0.1.6
+pip install TransferQueue==0.1.8
 ```
 
 所有 TQ 相关代码都有 fallback：当 `import transfer_queue` 失败时，自动使用 `verl.utils.transferqueue_utils` 中的 mock 实现。

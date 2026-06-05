@@ -425,7 +425,7 @@ transfer_queue=(
 ### Dependency Installation
 
 ```bash
-pip install TransferQueue==0.1.6
+pip install TransferQueue==0.1.8
 ```
 
 All TQ-related code has fallback behavior: when `import transfer_queue` fails, the mock implementation in `verl.utils.transferqueue_utils` is automatically used.
