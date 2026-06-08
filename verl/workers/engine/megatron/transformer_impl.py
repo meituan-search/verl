@@ -838,7 +838,6 @@ class MegatronEngineWithLMHead(MegatronEngine):
             assert prefix_tree_attention in ("flex", "magi"), (
                 f"prefix_tree_attention must be 'flex' or 'magi', got {prefix_tree_attention!r}"
             )
-        prefix_segments_batch = tu.get_non_tensor_data(batch, key="prefix_segments", default=None)
 
         if calculate_sum_pi_squared and use_fused_kernels:
             raise NotImplementedError(
@@ -952,7 +951,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 "label": label,
                 "temperature": temperature,
                 "loss_mask": loss_mask,
-                **get_prefix_tree_kwargs(use_prefix_tree, prefix_tree_attention, prefix_segments_batch),
+                **get_prefix_tree_kwargs(use_prefix_tree, prefix_tree_attention),
             }
 
             output = forward_fn(

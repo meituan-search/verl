@@ -162,10 +162,8 @@ class SFTTrainer:
 
         self.loss_fn = partial(sft_loss, config=None)
 
-        # propagate data-side prefix-tree flags into engine_config so
-        # engine_workers.py can inject them into each micro-batch
-        self.engine_config.use_prefix_tree = self.config.data.get("use_prefix_tree", False)
-        self.engine_config.prefix_tree_attention = self.config.data.get("prefix_tree_attention", "flex")
+        from verl.utils.prefix_tree.trainer import apply_engine_config
+        apply_engine_config(self.engine_config, self.config.data)
 
         config = TrainingWorkerConfig(
             model_type="language_model",
@@ -358,9 +356,9 @@ class SFTTrainer:
             "global_batch_size": self.global_batch_size,
             "pad_mode": self.config.data.pad_mode,
             "pad_token_id": self.model_config.tokenizer.pad_token_id,
-            "use_prefix_tree": self.config.data.get("use_prefix_tree", False),
-            "prefix_tree_attention": self.config.data.get("prefix_tree_attention", "flex"),
         }
+        from verl.utils.prefix_tree.trainer import add_meta_info
+        add_meta_info(meta_info, self.config.data)
 
         train_time = 0
         total_tokens = 0
@@ -412,9 +410,8 @@ class SFTTrainer:
                     ).item()
                     total_tokens += metrics["train/global_tokens"]
                     metrics["train/total_tokens(B)"] = total_tokens / 1e9
-                    if self.config.data.get("use_prefix_tree", False):
-                        from verl.utils.prefix_tree.dynamic import compute_prefix_tree_metrics
-                        metrics.update(compute_prefix_tree_metrics(data["input_ids"]))
+                    from verl.utils.prefix_tree.trainer import compute_metrics
+                    compute_metrics(metrics, data["input_ids"], self.config.data)
 
                     if self.engine.get_data_parallel_rank() == 0:
                         tracking.log(data=metrics, step=global_step)

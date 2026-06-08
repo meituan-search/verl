@@ -19,7 +19,7 @@ from __future__ import annotations
 import torch
 
 
-def get_prefix_balanced_partitions(
+def get_dfs_balanced_partitions(
     data,
     config_or_data: dict,
     dp_size: int,
@@ -50,7 +50,7 @@ def get_prefix_balanced_partitions(
             partitions with ``equal_size=True``.
 
     Returns:
-        ``(global_partition_lst, global_seqlen_lst)`` or ``None``.
+        ``(global_partition_lst, global_seqlen_lst, data)`` or ``None``.
     """
     if not _is_prefix_tree_enabled(config_or_data):
         return None
@@ -95,6 +95,64 @@ def get_prefix_balanced_partitions(
         )
 
     return partition_lst, global_seqlen_lst, data
+
+
+def get_prefix_balanced_partitions(
+    sequences: list[list[int]],
+    k_partitions: int,
+) -> list[list[int]]:
+    """Partition sequences into k groups using mini-batch trie grouping.
+
+    Unlike :func:`get_seqlen_balanced_partitions`, which treats every sequence
+    independently and uses its raw length as the workload proxy, this function:
+
+    1. Builds a compressed trie over all ``sequences`` to identify prefix-sharing
+       groups (sequences that share a common prefix root).
+    2. Uses each group's **effective (flat, deduplicated) token count** as the
+       workload metric rather than the sum of raw lengths.
+    3. Applies Karmarkar-Karp to balance groups across ``k_partitions``, keeping
+       prefix-sharing sequences in the same partition so they benefit from
+       prefix-tree attention deduplication.
+
+    Args:
+        sequences: per-sample token lists (the full mini-batch, already on the
+            local DP rank).
+        k_partitions: number of output partitions (micro-batches or DP ranks).
+
+    Returns:
+        List of ``k_partitions`` lists, each containing sample indices.
+        All indices in ``range(len(sequences))`` appear exactly once.
+    """
+    from verl.utils.prefix_tree.dynamic import build_mini_batch_prefix_groups
+    from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions
+
+    if not sequences:
+        return [[] for _ in range(k_partitions)]
+
+    groups = build_mini_batch_prefix_groups(sequences)  # [(seq_ids, eff_tokens), ...]
+
+    group_workloads = [int(calculate_workload(torch.tensor([eff])).item()) for _, eff in groups]
+
+    if len(groups) <= k_partitions:
+        partitions: list[list[int]] = [list(seq_ids) for seq_ids, _ in groups]
+        while len(partitions) < k_partitions:
+            partitions.append([])
+        return partitions
+
+    group_partitions = get_seqlen_balanced_partitions(
+        seqlen_list=group_workloads,
+        k_partitions=k_partitions,
+        equal_size=False,
+    )
+
+    sample_partitions = []
+    for gp in group_partitions:
+        sample_indices: list[int] = []
+        for gi in gp:
+            sample_indices.extend(groups[gi][0])
+        sample_partitions.append(sorted(sample_indices))
+
+    return sample_partitions
 
 
 def _is_prefix_tree_enabled(config_or_data) -> bool:

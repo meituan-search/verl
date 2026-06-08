@@ -45,7 +45,6 @@ from torch.nested._internal.nested_tensor import NestedTensor
 from verl.utils.prefix_tree.hash_based import (
     _hash_prefix,  # noqa: F401  re-exported for backwards-compat callers
     build_prefix_segments_single_turn,  # noqa: F401  re-exported for backwards-compat callers
-    build_tree_hash_based,
 )
 
 
@@ -132,23 +131,14 @@ def build_prefix_tree_micro_batch(
     input_ids: NestedTensor,
     loss_mask: Optional[NestedTensor] = None,
     position_ids: Optional[NestedTensor] = None,
-    prefix_segments_batch: Optional[list[list[tuple[int, int]]]] = None,
     attention_type: str = "flex",
     tp_size: int = 1,
     cp_size: int = 1,
-    dynamic_trie: bool = False,
 ) -> Optional[PrefixTreeMagiBatch]:
     """Build a PrefixTreeMagiBatch from a micro-batch of NestedTensor sequences.
 
-    Two detection paths, selected by ``dynamic_trie``:
-
-      - ``dynamic_trie=False`` (default): hash-based fast path. Uses
-        ``prefix_segments_batch`` (per-sample turn-level hashes) when
-        provided, otherwise falls back to a token-level LCP scan. Supports
-        depth-1 and depth-2 tree shapes only.
-      - ``dynamic_trie=True``: token-by-token trie insertion. Detects
-        arbitrary-depth shared-prefix trees directly from the token
-        sequences. ``prefix_segments_batch`` is ignored on this path.
+    Detects shared-prefix trees through token-by-token trie insertion
+    (arbitrary depth, no rollout-side metadata required).
 
     Returns None when there is no shared prefix, signalling the caller to
     fall back to the standard attention path.
@@ -159,15 +149,9 @@ def build_prefix_tree_micro_batch(
         loss_mask: Optional NestedTensor matching input_ids shape.
         position_ids: Optional NestedTensor matching input_ids shape.
             When None, default RoPE-compatible position IDs are generated.
-        prefix_segments_batch: Optional per-sample prior knowledge injected by
-            the dataset or trainer (hash-path only). See
-            :func:`verl.utils.prefix_tree.hash_based.build_tree_hash_based`
-            for the expected format. Ignored when ``dynamic_trie=True``.
         attention_type: ``"flex"`` or ``"magi"``.
         tp_size / cp_size: Tensor / context parallel world sizes (for
             SP-divisibility padding).
-        dynamic_trie: when True, dispatch to the trie path in
-            :mod:`verl.utils.prefix_tree.dynamic`. Default False.
 
     Returns:
         PrefixTreeMagiBatch or None.
@@ -192,15 +176,12 @@ def build_prefix_tree_micro_batch(
     loss_masks_by_sample = _unpack_nested_to_list(loss_mask)
     position_ids_by_sample = _unpack_nested_to_list(position_ids)
 
+    from verl.utils.prefix_tree.dynamic import build_tree_dynamic
+
     if _magi_timing:
         _torch_pt.cuda.nvtx.range_push("prefix_tree/build_tree")
     t_tree0 = _ev() if _magi_timing else None
-    if dynamic_trie:
-        from verl.utils.prefix_tree.dynamic import build_tree_dynamic
-
-        result = build_tree_dynamic(samples)
-    else:
-        result = build_tree_hash_based(samples, prefix_segments_batch=prefix_segments_batch)
+    result = build_tree_dynamic(samples)
     t_tree1 = _ev() if _magi_timing else None
     if _magi_timing:
         _torch_pt.cuda.nvtx.range_pop()
@@ -475,7 +456,7 @@ def _build_magi_key_sp_scaled(original_key, model, tp_size: int):
 # ============================================================================
 
 
-_PREFIX_TREE_KEYS = frozenset({"loss_mask", "use_prefix_tree", "prefix_tree_attention", "prefix_segments_batch"})
+_PREFIX_TREE_KEYS = frozenset({"loss_mask", "use_prefix_tree", "prefix_tree_attention"})
 
 
 def strip_prefix_tree_args(logits_processor_args: dict | None) -> None:
@@ -493,7 +474,6 @@ def strip_prefix_tree_args(logits_processor_args: dict | None) -> None:
 def get_prefix_tree_kwargs(
     use_prefix_tree: bool,
     prefix_tree_attention: str,
-    prefix_segments_batch=None,
 ) -> dict:
     """Return prefix-tree keys for injection into *logits_processor_args*.
 
@@ -505,7 +485,6 @@ def get_prefix_tree_kwargs(
     return {
         "use_prefix_tree": use_prefix_tree,
         "prefix_tree_attention": prefix_tree_attention,
-        "prefix_segments_batch": prefix_segments_batch,
     }
 
 
@@ -519,16 +498,7 @@ def build_prefix_tree_batch(model, input_ids, logits_processor_args, use_prefix_
         return None
 
     prefix_tree_attention = (logits_processor_args or {}).get("prefix_tree_attention", "flex")
-    prefix_tree_dynamic = (logits_processor_args or {}).get("prefix_tree_dynamic", False)
     loss_mask_nested = (logits_processor_args or {}).get("loss_mask", None)
-    prefix_segments_batch = (logits_processor_args or {}).get("prefix_segments_batch", None)
-    if prefix_segments_batch is not None:
-        import numpy as _np
-
-        if isinstance(prefix_segments_batch, _np.ndarray):
-            prefix_segments_batch = prefix_segments_batch.tolist()
-        elif hasattr(prefix_segments_batch, "__iter__") and not isinstance(prefix_segments_batch, list):
-            prefix_segments_batch = [el.data if hasattr(el, "data") else el for el in prefix_segments_batch]
 
     from megatron.core import parallel_state as _mpu
 
@@ -536,11 +506,9 @@ def build_prefix_tree_batch(model, input_ids, logits_processor_args, use_prefix_
         model,
         input_ids,
         loss_mask_nested,
-        prefix_segments_batch=prefix_segments_batch,
         attention_type=prefix_tree_attention,
         tp_size=_mpu.get_tensor_model_parallel_world_size(),
         cp_size=_mpu.get_context_parallel_world_size(),
-        dynamic_trie=prefix_tree_dynamic,
     )
 
 
@@ -603,7 +571,7 @@ def forward_prefix_tree(
         flat_args = {
             k: v
             for k, v in orig_args.items()
-            if k not in ("label", "temperature", "loss_mask", "use_prefix_tree", "prefix_segments_batch")
+            if k not in ("label", "temperature", "loss_mask", "use_prefix_tree")
         }
         flat_args["label"] = flat_label
         flat_args["temperature"] = flat_t

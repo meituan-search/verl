@@ -19,7 +19,7 @@ Token-by-token trie insertion supporting arbitrary tree depth. Detects the
 shared-prefix tree directly from input tokens; no rollout-side metadata
 required. Invoked by
 :func:`verl.utils.prefix_tree.magi.build_prefix_tree_micro_batch` when
-``dynamic_trie=True``.
+when ``prefix_segments_batch`` is not provided.
 
 Algorithm originally derived from AReaL
 (https://github.com/inclusionAI/AReaL).

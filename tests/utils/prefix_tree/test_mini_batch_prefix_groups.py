@@ -15,7 +15,7 @@
 """Tests for mini-batch level trie grouping and prefix-aware DP load balancing.
 
 Exercises :func:`verl.utils.prefix_tree.dynamic.build_mini_batch_prefix_groups`
-and :func:`verl.utils.seqlen_balancing.get_prefix_balanced_partitions`.
+and :func:`verl.utils.prefix_tree.balancing.get_prefix_balanced_partitions`.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from __future__ import annotations
 import pytest
 
 from verl.utils.prefix_tree.dynamic import build_mini_batch_prefix_groups
-from verl.utils.seqlen_balancing import get_prefix_balanced_partitions
+from verl.utils.prefix_tree.balancing import get_prefix_balanced_partitions
 
 
 # ---------------------------------------------------------------------------
