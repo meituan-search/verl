@@ -1235,7 +1235,15 @@ class RayPPOTrainer:
             entropy = no_padding_2_padding(entropy, batch_td)
             log_probs = no_padding_2_padding(log_probs, batch_td)
         except AssertionError:
-            tu.assign_non_tensor(batch_td, use_prefix_tree=False)
+            # Disable prefix tree AND dynamic batching so the fallback uses
+            # static micro-batches (log_prob_micro_batch_size_per_gpu), not the
+            # token-budget path which would create 1-seq micro-batches at small budgets.
+            tu.assign_non_tensor(
+                batch_td,
+                use_prefix_tree=False,
+                use_dynamic_bsz=False,
+                micro_batch_size_per_gpu=self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu,
+            )
             _fb_out = self.actor_rollout_wg.compute_log_prob(batch_td)
             entropy   = no_padding_2_padding(tu.get(_fb_out, "entropy"),   batch_td)
             log_probs = no_padding_2_padding(tu.get(_fb_out, "log_probs"), batch_td)
@@ -1473,12 +1481,15 @@ class RayPPOTrainer:
                         gen_batch_output.pop(non_tensor_batch_keys=["__do_sample__"])
 
                     # Inject prefix_segments for multilevel tree support.
-                    # gen_batch (before generation) has no input_ids tensor, so segments
-                    # must be computed here on the GENERATED full sequences.
-                    # We hash the first K tokens (prompt region, identical across all
-                    # n rollouts of the same prompt) as the group identifier.
+                    # Only needed with use_dynamic_bsz=True (multiple prompt-groups per
+                    # micro-batch): enables hash-based group detection so the multilevel
+                    # tree can find per-group 700-token prefixes beyond the short global LCP.
+                    # With static mbs (use_dynamic_bsz=False), single-group micro-batches
+                    # find the prefix via LCP scan — no prefix_segments needed and the
+                    # simpler path avoids assertion failures in restore_flat_to_nested.
                     if (
                         self.config.actor_rollout_ref.rollout.get("use_prefix_tree", False)
+                        and self.config.actor_rollout_ref.actor.use_dynamic_bsz
                         and "prefix_segments" not in gen_batch_output.non_tensor_batch
                         and gen_batch_output.batch is not None
                         and "input_ids" in gen_batch_output.batch.keys()
