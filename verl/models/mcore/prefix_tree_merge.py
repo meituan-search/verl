@@ -86,31 +86,40 @@ def magi_attn_forward(
     value: Tensor,
     magi_attention_key: object,
 ) -> Tensor:
-    """Execute MAGI dispatch → calc_attn → undispatch for prefix-tree batches.
+    """Execute MAGI calc_attn for prefix-tree batches.
 
-    Input tensors are in thd layout: ``(total_tokens, 1, num_heads, head_dim)``.
-    Returns ``(total_tokens, 1, num_heads*head_dim)`` — matching the packed-seq
-    thd output shape expected by ``linear_proj``.
+    When ``magi_attention_key._no_expand`` is set, merge (dispatch) and
+    spread (undispatch) are gated by ``_is_first`` / ``_is_last`` — only
+    the first PP stage merges and the last PP stage spreads.
 
-    With SP+CP: Q/K/V arrive as (T/TP, 1, H, D) due to SP scatter. We gather
-    across TP to get full T tokens, then dispatch/calc_attn/undispatch across
-    CP ranks, then scatter back to T/TP for SP-consistent output.
+    Returns ``(total_tokens, 1, num_heads*head_dim)``.
     """
     from magi_attention.api import calc_attn, dispatch, undispatch
 
-    q = query.squeeze(1)   # (T, np, hn) — already full T (Megatron gathers SP before calling here)
+    q = query.squeeze(1)
     k = key.squeeze(1)
     v = value.squeeze(1)
 
-    dq = dispatch(q, magi_attention_key)
-    dk = dispatch(k, magi_attention_key)
-    dv = dispatch(v, magi_attention_key)
+    no_expand = getattr(magi_attention_key, "_no_expand", False)
+
+    if no_expand:
+        needs_merge = getattr(magi_attention_key, "_is_first", True)
+        needs_spread = getattr(magi_attention_key, "_is_last", True)
+    else:
+        needs_merge = True
+        needs_spread = True
+
+    if needs_merge:
+        dq = dispatch(q, magi_attention_key)
+        dk = dispatch(k, magi_attention_key)
+        dv = dispatch(v, magi_attention_key)
+    else:
+        dq, dk, dv = q, k, v
 
     out, _ = calc_attn(dq, dk, dv, magi_attention_key)
 
-    if _timing:
-        _torch.cuda.nvtx.range_push(f"{_pfx}/undispatch")
-    out = undispatch(out, magi_attention_key)
+    if needs_spread:
+        out = undispatch(out, magi_attention_key)
 
     return out.reshape(out.shape[0], 1, -1)
 

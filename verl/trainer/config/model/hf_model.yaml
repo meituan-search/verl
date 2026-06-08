@@ -42,6 +42,7 @@ use_remove_padding: True
 # Prefix-tree shared-prefix deduplication for actor/SFT training.
 use_prefix_tree: false
 prefix_tree_attention: flex
+prefix_tree_no_expand_middle: false
 
 # Set to positive value to enable LoRA (e.g., 32)
 lora_rank: 0

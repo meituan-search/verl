@@ -87,6 +87,9 @@ class PrefixTreeMagiBatch:
     local_flat_position_ids: Optional[Tensor] = None
     local_flat_loss_mask: Optional[Tensor] = None
 
+    # optimization: skip merge/spread in middle attention layers
+    no_expand_middle: bool = False
+
     def __post_init__(self):
         if self.real_tokens == 0:
             self.real_tokens = int(self.flat_input_ids.shape[0])
@@ -456,7 +459,7 @@ def _build_magi_key_sp_scaled(original_key, model, tp_size: int):
 # ============================================================================
 
 
-_PREFIX_TREE_KEYS = frozenset({"loss_mask", "use_prefix_tree", "prefix_tree_attention"})
+_PREFIX_TREE_KEYS = frozenset({"loss_mask", "use_prefix_tree", "prefix_tree_attention", "prefix_tree_no_expand_middle"})
 
 
 def strip_prefix_tree_args(logits_processor_args: dict | None) -> None:
@@ -474,6 +477,7 @@ def strip_prefix_tree_args(logits_processor_args: dict | None) -> None:
 def get_prefix_tree_kwargs(
     use_prefix_tree: bool,
     prefix_tree_attention: str,
+    prefix_tree_no_expand_middle: bool = False,
 ) -> dict:
     """Return prefix-tree keys for injection into *logits_processor_args*.
 
@@ -485,6 +489,7 @@ def get_prefix_tree_kwargs(
     return {
         "use_prefix_tree": use_prefix_tree,
         "prefix_tree_attention": prefix_tree_attention,
+        "prefix_tree_no_expand_middle": prefix_tree_no_expand_middle,
     }
 
 
@@ -499,10 +504,11 @@ def build_prefix_tree_batch(model, input_ids, logits_processor_args, use_prefix_
 
     prefix_tree_attention = (logits_processor_args or {}).get("prefix_tree_attention", "flex")
     loss_mask_nested = (logits_processor_args or {}).get("loss_mask", None)
+    no_expand_middle = (logits_processor_args or {}).get("prefix_tree_no_expand_middle", False)
 
     from megatron.core import parallel_state as _mpu
 
-    return build_prefix_tree_micro_batch(
+    pb = build_prefix_tree_micro_batch(
         model,
         input_ids,
         loss_mask_nested,
@@ -510,6 +516,9 @@ def build_prefix_tree_batch(model, input_ids, logits_processor_args, use_prefix_
         tp_size=_mpu.get_tensor_model_parallel_world_size(),
         cp_size=_mpu.get_context_parallel_world_size(),
     )
+    if pb is not None:
+        pb.no_expand_middle = no_expand_middle
+    return pb
 
 
 def forward_prefix_tree(
@@ -522,6 +531,13 @@ def forward_prefix_tree(
     flat_position_ids = pt_batch.local_flat_position_ids.unsqueeze(0)
 
     strip_prefix_tree_args(logits_processor_args)
+
+    from verl.utils.megatron_utils import unwrap_model
+
+    if pt_batch.no_expand_middle and pt_batch.magi_key is not None:
+        pt_batch.magi_key._no_expand = True
+        pt_batch.magi_key._is_first = unwrap_model(model).pre_process
+        pt_batch.magi_key._is_last = unwrap_model(model).post_process
 
     if prefix_tree_attention == "magi":
         output_orig = model(
@@ -576,9 +592,10 @@ def forward_prefix_tree(
         flat_args["label"] = flat_label
         flat_args["temperature"] = flat_t
         output_dict = logits_processor(output_orig_thd, **flat_args)
-        if isinstance(output_dict, dict) and "log_probs" in output_dict:
-            lp_flat = output_dict["log_probs"].reshape(-1)[:real_tokens]
-            output_dict["log_probs"] = restore_flat_to_nested(lp_flat, pt_batch)
+        if isinstance(output_dict, dict):
+            for key, val in list(output_dict.items()):
+                if isinstance(val, torch.Tensor):
+                    output_dict[key] = restore_flat_to_nested(val.reshape(-1)[:real_tokens], pt_batch)
         return output_dict
     else:
         real_tokens = pt_batch.real_tokens

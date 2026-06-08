@@ -1096,21 +1096,13 @@ class RayPPOTrainer:
                 k_partitions=dp_size,
             )
 
-        elif self.config.actor_rollout_ref.rollout.get("use_prefix_tree", False):
-            from verl.utils.prefix_tree.balancing import get_dfs_balanced_partitions
+        elif self.config.actor_rollout_ref.actor.get("use_prefix_tree", False):
+            from verl.utils.prefix_tree.balancing import reorder_and_balance_for_prefix_tree
 
-            result = get_dfs_balanced_partitions(
-                batch, self.config.actor_rollout_ref.rollout, dp_size,
-                attention_mask=attention_mask, contiguous_partitions=True,
-            )
-            if result is not None:
-                global_partition_lst, global_seqlen_lst, _ = result
-                global_idx = torch.arange(batch_size)
-                batch.reorder(global_idx)
-                global_balance_stats = log_seqlen_unbalance(
-                    seqlen_list=global_seqlen_lst.tolist(), partitions=global_partition_lst, prefix=logging_prefix
-                )
-                metrics.update(global_balance_stats)
+            if reorder_and_balance_for_prefix_tree(
+                batch, self.config.actor_rollout_ref.actor, dp_size,
+                attention_mask=attention_mask, metrics=metrics, logging_prefix=logging_prefix,
+            ):
                 return
 
         elif keep_minibatch:
@@ -1219,7 +1211,7 @@ class RayPPOTrainer:
             from verl.utils.prefix_tree.trainer import disable_for_log_prob
 
             disable_for_log_prob(
-                batch_td, self.config.actor_rollout_ref.rollout,
+                batch_td, self.config.actor_rollout_ref.actor,
                 self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu,
             )
             _fb_out = self.actor_rollout_wg.compute_log_prob(batch_td)
@@ -1391,7 +1383,7 @@ class RayPPOTrainer:
                 rollout_n = self.config.actor_rollout_ref.rollout.n
                 gen_batch_output = gen_batch.repeat(repeat_times=rollout_n, interleave=True)
                 from verl.utils.prefix_tree.trainer import inject_prefix_segments
-                inject_prefix_segments(gen_batch_output, self.config.actor_rollout_ref.rollout)
+                inject_prefix_segments(gen_batch_output, self.config.actor_rollout_ref.actor)
 
                 if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                     # NOTE: REMAX needs one sampled rollout plus one greedy baseline per prompt.
@@ -1427,7 +1419,7 @@ class RayPPOTrainer:
 
                     from verl.utils.prefix_tree.trainer import compute_metrics
                     compute_metrics(metrics, gen_batch_output.batch["input_ids"],
-                                    self.config.actor_rollout_ref.rollout)
+                                    self.config.actor_rollout_ref.actor)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         gen_baseline_output = combined_gen_output.slice(num_sampled_prompts, None)

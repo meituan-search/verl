@@ -155,6 +155,53 @@ def get_prefix_balanced_partitions(
     return sample_partitions
 
 
+def reorder_and_balance_for_prefix_tree(
+    data,
+    config_or_data: dict,
+    dp_size: int,
+    *,
+    attention_mask=None,
+    metrics: dict | None = None,
+    logging_prefix: str = "global_seqlen",
+) -> bool:
+    """DFS-reorder batch and compute contiguous partitions for prefix-tree.
+
+    Returns ``True`` if balancing was applied (caller should return early),
+    ``False`` otherwise.
+
+    Args:
+        data: ``DataProto`` with ``.batch`` and ``.reorder()``.
+        config_or_data: config dict.
+        dp_size: number of DP ranks.
+        attention_mask: optional mask tensor.
+        metrics: mutable dict to update with balance stats.
+        logging_prefix: prefix for log messages.
+    """
+    if not _is_prefix_tree_enabled(config_or_data):
+        return False
+
+    from verl.utils.seqlen_balancing import log_seqlen_unbalance
+
+    result = get_dfs_balanced_partitions(
+        data, config_or_data, dp_size,
+        attention_mask=attention_mask, contiguous_partitions=True,
+    )
+    if result is None:
+        return False
+
+    global_partition_lst, global_seqlen_lst, _ = result
+    global_idx = torch.arange(global_seqlen_lst.shape[0])
+    data.reorder(global_idx)
+    if metrics is not None:
+        stats = log_seqlen_unbalance(
+            seqlen_list=global_seqlen_lst.tolist(),
+            partitions=global_partition_lst,
+            prefix=logging_prefix,
+        )
+        metrics.update(stats)
+    return True
+
+
 def _is_prefix_tree_enabled(config_or_data) -> bool:
     if isinstance(config_or_data, dict):
         return config_or_data.get("use_prefix_tree", False)
