@@ -101,13 +101,9 @@ def apply_chat_template(
             **kwargs,
         )
     except Exception:
-        # Qwen3.5 apply_chat_template needs messages with at least one user message.
-        # Two sub-cases:
-        #   (a) messages starts with system → insert dummy user AFTER system so system
-        #       stays at position 0; the dummy user is a suffix → strip from the END.
-        #   (b) otherwise (e.g. assistant-only) → prepend dummy user; strip from START.
+        # Qwen3.5 apply_chat_template needs messages with at least one user message
         dummy_user_message = [{"role": "user", "content": [{"type": "text", "text": ""}]}]
-        dummy_probe = processor.apply_chat_template(
+        dummy_user_prefix = processor.apply_chat_template(
             dummy_user_message,
             tokenize=tokenize,
             add_generation_prompt=False,
@@ -115,13 +111,8 @@ def apply_chat_template(
             return_dict=return_dict,
             **kwargs,
         )
-        system_leading = bool(messages and messages[0].get("role") == "system")
-        if system_leading:
-            augmented = [messages[0]] + dummy_user_message + messages[1:]
-        else:
-            augmented = dummy_user_message + messages
         output = processor.apply_chat_template(
-            augmented,
+            dummy_user_message + messages,
             tokenize=tokenize,
             add_generation_prompt=add_generation_prompt,
             tools=tools,
@@ -129,28 +120,20 @@ def apply_chat_template(
             **kwargs,
         )
 
-        if not tokenize:  # tokenize=False → strings
-            pad = len(dummy_probe)
-            return output[:-pad] if system_leading else output[pad:]
-        elif not return_dict:  # tokenize=True, return_dict=False → list[int]
-            if isinstance(output[0], list):  # transformers>=5 returns list[list[int]]
-                assert len(output) == 1
-                dummy_probe = dummy_probe[0]
+        if not tokenize:  # tokenize=False
+            return output[len(dummy_user_prefix) :]
+        elif not return_dict:  # tokenize=True and return_dict=False
+            if isinstance(output[0], list):  # transformers>=5
+                assert len(output) == 1, "output must be a list[int] or list[list[int]]"
+                dummy_user_prefix = dummy_user_prefix[0]
                 output = output[0]
-            pad = len(dummy_probe)
-            return output[:-pad] if system_leading else output[pad:]
-        else:  # tokenize=True, return_dict=True, return_tensors="pt" → dict of tensors
-            dummy_probe = dict(dummy_probe)
+            return output[len(dummy_user_prefix) :]
+        else:  # tokenize=True and return_dict=True and return_tensors="pt"
+            dummy_user_prefix = dict(dummy_user_prefix)
             output = dict(output)
-            pad = dummy_probe["input_ids"].shape[1]
-            if system_leading:
-                output["input_ids"] = output["input_ids"][:, :-pad]
-                output["attention_mask"] = output["attention_mask"][:, :-pad]
-                if "mm_token_type_ids" in output:
-                    output["mm_token_type_ids"] = output["mm_token_type_ids"][:, :-pad]
-            else:
-                output["input_ids"] = output["input_ids"][:, pad:]
-                output["attention_mask"] = output["attention_mask"][:, pad:]
-                if "mm_token_type_ids" in output:
-                    output["mm_token_type_ids"] = output["mm_token_type_ids"][:, pad:]
+            prefix_len = dummy_user_prefix["input_ids"].shape[1]
+            output["input_ids"] = output["input_ids"][:, prefix_len:]
+            output["attention_mask"] = output["attention_mask"][:, prefix_len:]
+            if "mm_token_type_ids" in output:
+                output["mm_token_type_ids"] = output["mm_token_type_ids"][:, prefix_len:]
             return output
