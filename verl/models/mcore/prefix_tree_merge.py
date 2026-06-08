@@ -108,6 +108,8 @@ def magi_attn_forward(
 
     out, _ = calc_attn(dq, dk, dv, magi_attention_key)
 
+    if _timing:
+        _torch.cuda.nvtx.range_push(f"{_pfx}/undispatch")
     out = undispatch(out, magi_attention_key)
 
     return out.reshape(out.shape[0], 1, -1)
