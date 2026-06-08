@@ -110,9 +110,8 @@ class SFTTrainer:
         from verl.workers.utils.losses import sft_loss
 
         self.loss_fn = partial(sft_loss, config=None)
-
-        self.engine_config.use_prefix_tree = self.config.data.get("use_prefix_tree", False)
-        self.engine_config.prefix_tree_attention = self.config.data.get("prefix_tree_attention", "flex")
+        from verl.utils.prefix_tree.trainer import apply_engine_config
+        apply_engine_config(self.engine_config, self.config.data)
 
         config = TrainingWorkerConfig(
             model_type="language_model",
@@ -291,9 +290,9 @@ class SFTTrainer:
             "global_batch_size": self.global_batch_size,
             "pad_mode": self.config.data.pad_mode,
             "pad_token_id": self.model_config.tokenizer.pad_token_id,
-            "use_prefix_tree": self.config.data.get("use_prefix_tree", False),
-            "prefix_tree_attention": self.config.data.get("prefix_tree_attention", "flex"),
         }
+        from verl.utils.prefix_tree.trainer import add_meta_info
+        add_meta_info(meta_info, self.config.data)
 
         train_time = 0
         total_tokens = 0
@@ -321,24 +320,18 @@ class SFTTrainer:
                     global_seqlen_lst = torch.Tensor([item.size()[0] for item in data["input_ids"]])
                     dp_size = max(self.training_client._query_dispatch_info("train")) + 1
 
-                    if self.config.data.get("use_prefix_tree", False) and data["input_ids"].is_nested:
-                        # Prefix-tree path: pre-sort in DFS trie order so nearby samples
-                        # share prefixes, then KK partitions DFS-consecutive sequences.
-                        from verl.utils.prefix_tree.dynamic import dfs_leaf_order
-                        _seqs = [t.tolist() for t in data["input_ids"].unbind()]
-                        _dfs_order = dfs_leaf_order(_seqs)
-                        data = tu.index_select_tensor_dict(data, torch.tensor(_dfs_order))
-                        # Recompute seqlens after DFS reorder
-                        global_seqlen_lst = torch.Tensor([item.size()[0] for item in data["input_ids"]])
-                        global_partition_lst = get_seqlen_balanced_partitions(
-                            calculate_workload(global_seqlen_lst), k_partitions=dp_size, equal_size=True
-                        )
-                        # Skip bubble sort to preserve DFS order within partitions
+                    from verl.utils.prefix_tree.balancing import get_prefix_balanced_partitions
+
+                    result = get_prefix_balanced_partitions(
+                        data, self.config.data, dp_size,
+                        attention_mask=None, contiguous_partitions=False,
+                    )
+                    if result is not None:
+                        global_partition_lst, global_seqlen_lst, data = result
                     else:
                         global_partition_lst = get_seqlen_balanced_partitions(
                             calculate_workload(global_seqlen_lst), k_partitions=dp_size, equal_size=True
                         )
-                        # Place smaller micro-batches at both ends to reduce pipeline bubbles.
                         for idx, partition in enumerate(global_partition_lst):
                             partition.sort(key=lambda x: (global_seqlen_lst[x], x))
                             global_partition_lst[idx] = partition[::2] + partition[1::2][::-1]
@@ -367,9 +360,8 @@ class SFTTrainer:
                 metrics["train/global_tokens"] = torch.sum(torch.tensor(batch_seqlens, device=self.device_name)).item()
                 total_tokens += metrics["train/global_tokens"]
                 metrics["train/total_tokens(B)"] = total_tokens / 1e9
-                if self.config.data.get("use_prefix_tree", False):
-                    from verl.utils.prefix_tree.dynamic import compute_prefix_tree_metrics
-                    metrics.update(compute_prefix_tree_metrics(data["input_ids"]))
+                from verl.utils.prefix_tree.trainer import compute_metrics
+                compute_metrics(metrics, data["input_ids"], self.config.data)
                 tracking.log(data=metrics, step=global_step)
 
                 is_last_step = global_step >= self.total_training_steps
