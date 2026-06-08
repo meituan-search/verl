@@ -946,13 +946,13 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 ret["log_probs"] = log_probs
                 return ret
 
+            from verl.utils.prefix_tree.magi import get_prefix_tree_kwargs
+
             logits_processor_args = {
                 "label": label,
                 "temperature": temperature,
                 "loss_mask": loss_mask,
-                "use_prefix_tree": use_prefix_tree,
-                "prefix_tree_attention": prefix_tree_attention,
-                "prefix_segments_batch": prefix_segments_batch,
+                **get_prefix_tree_kwargs(use_prefix_tree, prefix_tree_attention, prefix_segments_batch),
             }
 
             output = forward_fn(

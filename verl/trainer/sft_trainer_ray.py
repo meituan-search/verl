@@ -324,7 +324,7 @@ class SFTTrainer:
                     if self.config.data.get("use_prefix_tree", False) and data["input_ids"].is_nested:
                         # Prefix-tree path: pre-sort in DFS trie order so nearby samples
                         # share prefixes, then KK partitions DFS-consecutive sequences.
-                        from verl.utils.prefix_tree_dynamic import dfs_leaf_order
+                        from verl.utils.prefix_tree.dynamic import dfs_leaf_order
                         _seqs = [t.tolist() for t in data["input_ids"].unbind()]
                         _dfs_order = dfs_leaf_order(_seqs)
                         data = tu.index_select_tensor_dict(data, torch.tensor(_dfs_order))
@@ -368,7 +368,7 @@ class SFTTrainer:
                 total_tokens += metrics["train/global_tokens"]
                 metrics["train/total_tokens(B)"] = total_tokens / 1e9
                 if self.config.data.get("use_prefix_tree", False):
-                    from verl.utils.prefix_tree_dynamic import compute_prefix_tree_metrics
+                    from verl.utils.prefix_tree.dynamic import compute_prefix_tree_metrics
                     metrics.update(compute_prefix_tree_metrics(data["input_ids"]))
                 tracking.log(data=metrics, step=global_step)
 

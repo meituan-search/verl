@@ -14,9 +14,9 @@
 
 """Hash-based prefix detection.
 
-Counterpart to :func:`verl.utils.prefix_tree_dynamic.build_tree_dynamic` —
+Counterpart to :func:`verl.utils.prefix_tree.dynamic.build_tree_dynamic` —
 both produce the same ``(TreeNode, leaf_to_sample)`` contract consumed by
-:func:`verl.utils.prefix_tree_utils.build_layout_from_tree_node`.
+:func:`verl.utils.prefix_tree.utils.build_layout_from_tree_node`.
 
 Two-stage detection:
   1. Root prefix length — from per-turn hashes (``prefix_segments_batch``)
@@ -37,7 +37,7 @@ from typing import Optional
 
 from torch import Tensor
 
-from verl.utils.prefix_tree_utils import TreeNode, longest_common_prefix_length
+from verl.utils.prefix_tree.utils import TreeNode, longest_common_prefix_length
 
 __all__ = [
     "_hash_prefix",

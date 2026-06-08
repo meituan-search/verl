@@ -247,14 +247,25 @@ def gptmodel_forward_model_engine(
     if data_format == "thd":
         use_prefix_tree = (logits_processor_args or {}).get("use_prefix_tree", False)
         prefix_tree_attention = (logits_processor_args or {}).get("prefix_tree_attention", "flex")
-        pb = _build_prefix_tree_batch(
-            model, input_ids, logits_processor_args, use_prefix_tree,
-            vision_model, mtp_enable_train,
+        from verl.utils.prefix_tree.magi import build_prefix_tree_batch, forward_prefix_tree
+
+        pb = build_prefix_tree_batch(
+            model,
+            input_ids,
+            logits_processor_args,
+            use_prefix_tree,
+            vision_model,
+            mtp_enable_train,
         )
         if pb is not None:
-            output = _forward_prefix_tree(
-                model, pb, prefix_tree_attention, logits_processor,
-                logits_processor_args, post_process, model_kwargs,
+            output = forward_prefix_tree(
+                model,
+                pb,
+                prefix_tree_attention,
+                logits_processor,
+                logits_processor_args,
+                post_process,
+                model_kwargs,
             )
         else:
             input_ids_rmpad, packed_seq_params, position_ids_rmpad = preprocess_thd_engine(
@@ -285,9 +296,9 @@ def gptmodel_forward_model_engine(
                 model_kwargs["labels"] = args["label"].contiguous()
                 model_kwargs["loss_mask"] = args["loss_mask"].contiguous()
 
-            for _k in ("loss_mask", "use_prefix_tree", "prefix_tree_attention", "prefix_segments_batch"):
-                if logits_processor_args and _k in logits_processor_args:
-                    logits_processor_args.pop(_k)
+            from verl.utils.prefix_tree.magi import strip_prefix_tree_args
+
+            strip_prefix_tree_args(logits_processor_args)
 
             attention_mask = None
             if vision_model:
@@ -315,15 +326,23 @@ def gptmodel_forward_model_engine(
                 output_dict = logits_processor(output_orig, **args)
                 output = {
                     k: postprocess_thd_engine(
-                        v, packed_seq_params, input_ids, batch_size,
-                        post_process=post_process, local_cp_size=local_cp_size,
+                        v,
+                        packed_seq_params,
+                        input_ids,
+                        batch_size,
+                        post_process=post_process,
+                        local_cp_size=local_cp_size,
                     )
                     for k, v in output_dict.items()
                 }
             else:
                 output = postprocess_thd_engine(
-                    output_orig, packed_seq_params, input_ids, batch_size,
-                    post_process=post_process, local_cp_size=local_cp_size,
+                    output_orig,
+                    packed_seq_params,
+                    input_ids,
+                    batch_size,
+                    post_process=post_process,
+                    local_cp_size=local_cp_size,
                 )
     else:
         """
@@ -348,7 +367,9 @@ def gptmodel_forward_model_engine(
                 v = logits_processor_args[k]
                 v = _convert_to_nested_tensor(v, input_ids_lengths)
                 logits_processor_args[k] = v
-                args[k] = preprocess_bshd_engine(v, pre_process=True, need_roll=True, use_fp8_padding=use_fp8_padding)[0]
+                args[k] = preprocess_bshd_engine(v, pre_process=True, need_roll=True, use_fp8_padding=use_fp8_padding)[
+                    0
+                ]
             model_kwargs["labels"] = args["label"].contiguous()
             model_kwargs["loss_mask"] = args["loss_mask"].contiguous()
 
@@ -385,102 +406,3 @@ def gptmodel_forward_model_engine(
         output = output.squeeze(-1)
 
     return output
-
-
-def _build_prefix_tree_batch(model, input_ids, logits_processor_args, use_prefix_tree, vision_model, mtp_enable_train):
-    """Build prefix-tree micro-batch. Returns PrefixTreeMagiBatch or None."""
-    if not use_prefix_tree or vision_model or mtp_enable_train:
-        return None
-
-    from verl.utils.prefix_tree_magi import build_prefix_tree_micro_batch
-
-    prefix_tree_attention = (logits_processor_args or {}).get("prefix_tree_attention", "flex")
-    prefix_tree_dynamic = (logits_processor_args or {}).get("prefix_tree_dynamic", False)
-    loss_mask_nested = (logits_processor_args or {}).get("loss_mask", None)
-    prefix_segments_batch = (logits_processor_args or {}).get("prefix_segments_batch", None)
-    if prefix_segments_batch is not None:
-        import numpy as _np
-        if isinstance(prefix_segments_batch, _np.ndarray):
-            prefix_segments_batch = prefix_segments_batch.tolist()
-        elif hasattr(prefix_segments_batch, "__iter__") and not isinstance(prefix_segments_batch, list):
-            prefix_segments_batch = [el.data if hasattr(el, "data") else el for el in prefix_segments_batch]
-
-    from megatron.core import parallel_state as _mpu
-    return build_prefix_tree_micro_batch(
-        model, input_ids, loss_mask_nested,
-        prefix_segments_batch=prefix_segments_batch,
-        attention_type=prefix_tree_attention,
-        tp_size=_mpu.get_tensor_model_parallel_world_size(),
-        cp_size=_mpu.get_context_parallel_world_size(),
-        dynamic_trie=prefix_tree_dynamic,
-    )
-
-
-def _forward_prefix_tree(model, pt_batch, prefix_tree_attention, logits_processor, logits_processor_args, post_process, model_kwargs):
-    """Forward pass for prefix-tree batches using magi or flex attention."""
-    from verl.utils.prefix_tree_magi import restore_flat_to_nested
-
-    flat_input_ids = pt_batch.local_flat_input_ids.unsqueeze(0)
-    flat_position_ids = pt_batch.local_flat_position_ids.unsqueeze(0)
-
-    for _k in ("loss_mask", "use_prefix_tree", "prefix_tree_attention", "prefix_segments_batch"):
-        if logits_processor_args and _k in logits_processor_args:
-            logits_processor_args.pop(_k)
-
-    if prefix_tree_attention == "magi":
-        output_orig = model(
-            input_ids=flat_input_ids, attention_mask=None,
-            position_ids=flat_position_ids, packed_seq_params=None,
-            magi_attention_key=pt_batch.magi_key, **model_kwargs,
-        )
-    else:
-        output_orig = model(
-            input_ids=flat_input_ids, attention_mask=None,
-            position_ids=flat_position_ids, packed_seq_params=None,
-            flex_attention_key=pt_batch.flex_key, **model_kwargs,
-        )
-
-    from verl.utils.device import get_torch_device
-    get_torch_device().synchronize()
-
-    if post_process and logits_processor is not None:
-        real_tokens = pt_batch.real_tokens
-        if output_orig.shape[0] == 1:
-            output_orig = output_orig[:, :real_tokens]
-        else:
-            output_orig = output_orig[:real_tokens].permute(1, 0, 2)
-
-        output_orig_thd = output_orig.squeeze(0).unsqueeze(1)
-        flat_label = torch.roll(pt_batch.flat_input_ids[:real_tokens], shifts=-1, dims=0).unsqueeze(1)
-        orig_args = logits_processor_args or {}
-        total_tokens = flat_label.shape[0]
-        if "temperature" in orig_args:
-            t = orig_args["temperature"]
-            if isinstance(t, torch.Tensor) and t.is_nested:
-                scalar_t = t.values()[0].item()
-            elif isinstance(t, torch.Tensor):
-                scalar_t = t.flatten()[0].item()
-            else:
-                scalar_t = float(t)
-            flat_t = torch.full((total_tokens, 1), scalar_t, dtype=torch.float32, device=flat_label.device)
-        else:
-            flat_t = torch.ones(total_tokens, 1, dtype=torch.float32, device=flat_label.device)
-        flat_args = {
-            k: v for k, v in orig_args.items()
-            if k not in ("label", "temperature", "loss_mask", "use_prefix_tree", "prefix_segments_batch")
-        }
-        flat_args["label"] = flat_label
-        flat_args["temperature"] = flat_t
-        output_dict = logits_processor(output_orig_thd, **flat_args)
-        if isinstance(output_dict, dict) and "log_probs" in output_dict:
-            lp_flat = output_dict["log_probs"].reshape(-1)[:real_tokens]
-            output_dict["log_probs"] = restore_flat_to_nested(lp_flat, pt_batch)
-        return output_dict
-    else:
-        real_tokens = pt_batch.real_tokens
-        out_stripped = (
-            output_orig[:, :real_tokens].squeeze(0)
-            if output_orig.shape[0] == 1
-            else output_orig[:real_tokens].squeeze(1)
-        )
-        return restore_flat_to_nested(out_stripped, pt_batch)

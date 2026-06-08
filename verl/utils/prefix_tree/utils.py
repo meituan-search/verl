@@ -21,7 +21,7 @@ from typing import Optional
 import torch
 from torch import Tensor
 
-from verl.utils.prefix_tree_params import PrefixTreeParams, RangeSpec
+from verl.utils.prefix_tree.params import PrefixTreeParams, RangeSpec
 
 __all__ = [
     "TreeNode",

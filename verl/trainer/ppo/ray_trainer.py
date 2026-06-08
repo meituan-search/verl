@@ -1100,7 +1100,7 @@ class RayPPOTrainer:
             # Prefix-tree path: reorder batch in DFS trie order so sequences sharing
             # the same prompt prefix land on the same DP rank and micro-batch.
             # Combined with use_prefix_grouper, same-prompt rollouts stay co-located.
-            from verl.utils.prefix_tree_dynamic import dfs_leaf_order
+            from verl.utils.prefix_tree.dynamic import dfs_leaf_order
 
             _ids = batch.batch["input_ids"]
             _mask = batch.batch.get("attention_mask", None)
@@ -1426,7 +1426,7 @@ class RayPPOTrainer:
 
                     # Inject prefix_segments when dataset doesn't supply them.
                     if "prefix_segments" not in gen_batch_output.non_tensor_batch:
-                        from verl.utils.prefix_tree_magi import build_prefix_segments_single_turn
+                        from verl.utils.prefix_tree.magi import build_prefix_segments_single_turn
 
                         # gen_batch_output = gen_batch.repeat(rollout_n, interleave=True)
                         # All rollout_n copies of each prompt are identical at this point,
@@ -1494,7 +1494,7 @@ class RayPPOTrainer:
                         and gen_batch_output.batch is not None
                         and "input_ids" in gen_batch_output.batch.keys()
                     ):
-                        from verl.utils.prefix_tree_hash_based import _hash_prefix
+                        from verl.utils.prefix_tree.hash_based import _hash_prefix
                         _ids_t = gen_batch_output.batch["input_ids"]  # (B, max_seq_len)
                         _mask_t = gen_batch_output.batch.get("attention_mask", None)
                         _K = 50  # first 50 tokens are always prompt (chat template start)
@@ -1509,7 +1509,7 @@ class RayPPOTrainer:
                     # Compute prefix sharing ratio on full prompt+response sequences
                     # (must be after generation so responses are included).
                     if self.config.actor_rollout_ref.rollout.get("use_prefix_tree", False):
-                        from verl.utils.prefix_tree_dynamic import compute_prefix_tree_metrics
+                        from verl.utils.prefix_tree.dynamic import compute_prefix_tree_metrics
 
                         metrics.update(
                             compute_prefix_tree_metrics(

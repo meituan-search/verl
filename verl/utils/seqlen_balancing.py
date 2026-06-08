@@ -652,7 +652,7 @@ def get_prefix_balanced_partitions(
         List of ``k_partitions`` lists, each containing sample indices.
         All indices in ``range(len(sequences))`` appear exactly once.
     """
-    from verl.utils.prefix_tree_dynamic import build_mini_batch_prefix_groups
+    from verl.utils.prefix_tree.dynamic import build_mini_batch_prefix_groups
 
     if not sequences:
         return [[] for _ in range(k_partitions)]

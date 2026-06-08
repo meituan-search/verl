@@ -73,46 +73,15 @@ def prepare_micro_batches(
     force_group_size = tu.get_non_tensor_data(data=data, key="force_group_size", default=1)
 
     if use_dynamic_bsz and use_prefix_tree:
-        # Prefix-tree path: build one trie, traverse in DFS order, budget by flat tokens.
-        # This replaces KK (which ignores prefix structure) with a trie-greedy grouper
-        # where the budget is deduplicated (flat) token count rather than raw seq lengths.
-        #
-        # Engine interface (Megatron + FSDP):
-        #   - This branch is engine-agnostic: micro-batches are index lists only.
-        #   - Megatron: transformer_impl calls build_prefix_tree_micro_batch() per micro-batch,
-        #     rebuilding the trie from the DFS-ordered micro-batch input_ids.
-        #   - FSDP: when FSDP prefix-tree attention is supported, it can use the same
-        #     DFS-ordered micro-batches; the attention mechanism is the only FSDP-specific
-        #     addition needed (flex_attention block_mask for packed sequences).
-        import logging as _logging
-        _logging.getLogger(__name__).warning_once(
-            "prefix_tree is on: max_token_len_per_gpu is interpreted as "
-            "deduplicated (flat trie) token count, not raw sequence length."
+        from verl.utils.prefix_tree.dynamic import prepare_prefix_tree_micro_batches
+
+        micro_batches, batch_idx_list = prepare_prefix_tree_micro_batches(
+            data,
+            sp_size=sp_size,
+            dp_group=dp_group,
+            same_micro_num_in_dp=same_micro_num_in_dp,
+            num_batches_divided_by=num_batches_divided_by,
         )
-        from verl.utils.prefix_tree_dynamic import dfs_micro_batch_groups
-
-        assert "max_token_len_per_gpu" in data.keys(), "max_token_len_per_gpu must be set when use_dynamic_bsz is True"
-        max_token_len_per_gpu = data["max_token_len_per_gpu"]
-        max_token_len = max_token_len_per_gpu * sp_size
-
-        input_ids = data["input_ids"]
-        seqs = [t.tolist() for t in input_ids.unbind()]
-        batch_idx_list = dfs_micro_batch_groups(seqs, max_token_len)
-
-        # Sync number of micro-batches across DP ranks
-        if torch.distributed.is_initialized() and same_micro_num_in_dp and dp_group is not None:
-            n_mb = torch.tensor([len(batch_idx_list)], device=torch.cuda.current_device())
-            torch.distributed.all_reduce(n_mb, op=torch.distributed.ReduceOp.MAX, group=dp_group)
-            while len(batch_idx_list) < n_mb.item():
-                batch_idx_list.append(batch_idx_list[-1])  # repeat last batch as padding
-
-        if num_batches_divided_by is not None:
-            from verl.utils.seqlen_balancing import roundup_divisible
-            target = roundup_divisible(len(batch_idx_list), num_batches_divided_by)
-            while len(batch_idx_list) < target:
-                batch_idx_list.append(batch_idx_list[-1])
-
-        micro_batches = [tu.index_select_tensor_dict(data, idx) for idx in batch_idx_list]
 
     elif use_dynamic_bsz:
         assert "max_token_len_per_gpu" in data.keys(), "max_token_len_per_gpu must be set when use_dynamic_bsz is True"

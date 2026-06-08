@@ -14,7 +14,7 @@
 
 """Tests for mini-batch level trie grouping and prefix-aware DP load balancing.
 
-Exercises :func:`verl.utils.prefix_tree_dynamic.build_mini_batch_prefix_groups`
+Exercises :func:`verl.utils.prefix_tree.dynamic.build_mini_batch_prefix_groups`
 and :func:`verl.utils.seqlen_balancing.get_prefix_balanced_partitions`.
 """
 
@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 
-from verl.utils.prefix_tree_dynamic import build_mini_batch_prefix_groups
+from verl.utils.prefix_tree.dynamic import build_mini_batch_prefix_groups
 from verl.utils.seqlen_balancing import get_prefix_balanced_partitions
 
 
@@ -286,7 +286,7 @@ def test_partition_effective_tokens_used_as_workload():
 # dfs_leaf_order
 # ---------------------------------------------------------------------------
 
-from verl.utils.prefix_tree_dynamic import dfs_leaf_order
+from verl.utils.prefix_tree.dynamic import dfs_leaf_order
 
 
 def test_dfs_leaf_order_covers_all():
@@ -334,7 +334,7 @@ def test_dfs_micro_batch_groups_flat_budget():
     # 4 seqs sharing prefix [1,2,3] (3 tokens) + 2 unique tokens each = 5 tokens raw
     # flat for 4 seqs = 3 (shared) + 4*2 (unique) = 11 tokens
     seqs = [[1, 2, 3, i, i+10] for i in range(4)]
-    from verl.utils.prefix_tree_dynamic import dfs_micro_batch_groups
+    from verl.utils.prefix_tree.dynamic import dfs_micro_batch_groups
 
     # budget=11 → fits all 4 in one group
     groups = dfs_micro_batch_groups(seqs, max_token_len=11)

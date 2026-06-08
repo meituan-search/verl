@@ -18,7 +18,7 @@
 Token-by-token trie insertion supporting arbitrary tree depth. Detects the
 shared-prefix tree directly from input tokens; no rollout-side metadata
 required. Invoked by
-:func:`verl.utils.prefix_tree_magi.build_prefix_tree_micro_batch` when
+:func:`verl.utils.prefix_tree.magi.build_prefix_tree_micro_batch` when
 ``dynamic_trie=True``.
 
 Algorithm originally derived from AReaL
@@ -32,7 +32,7 @@ from typing import Any, Optional
 
 from torch import Tensor
 
-from verl.utils.prefix_tree_utils import TreeNode
+from verl.utils.prefix_tree.utils import TreeNode
 
 __all__ = [
     "build_tree_dynamic",
@@ -204,7 +204,7 @@ def convert_trie_to_tree_node(
     trie: TrieNode,
 ) -> Optional[tuple[TreeNode, list[int]]]:
     """Convert a compressed trie to ``(TreeNode, leaf_to_sample)`` consumed by
-    :func:`verl.utils.prefix_tree_utils.build_layout_from_tree_node`.
+    :func:`verl.utils.prefix_tree.utils.build_layout_from_tree_node`.
 
     The trie root is a virtual placeholder with no tokens. We promote the
     trie's only child as the TreeNode root so the downstream flex-spec
@@ -252,7 +252,7 @@ def build_tree_dynamic(samples: list[Tensor]) -> Optional[tuple[TreeNode, list[i
 
     Builds a compressed trie of the input samples, then converts it to the
     canonical ``TreeNode`` representation consumed by
-    :func:`verl.utils.prefix_tree_utils.build_layout_from_tree_node`.
+    :func:`verl.utils.prefix_tree.utils.build_layout_from_tree_node`.
 
     ``leaf_to_sample[i]`` gives the original sample index for the i-th leaf in
     DFS pre-order. Returns ``None`` when there's no shared prefix (empty input,
@@ -550,3 +550,71 @@ def compute_prefix_tree_metrics(input_ids, attention_mask=None) -> dict:
         "prefix_tree/flat_tokens": flat,
         "prefix_tree/raw_tokens": total_raw,
     }
+
+
+# ============================================================================
+# Micro-batch preparation (consumed by engine utils)
+# ============================================================================
+
+
+def prepare_prefix_tree_micro_batches(
+    data,
+    sp_size: int,
+    dp_group=None,
+    same_micro_num_in_dp: bool = True,
+    num_batches_divided_by: int | None = None,
+):
+    """Prepare micro-batches using prefix-tree DFS grouping.
+
+    Builds one trie over all sequences, traverses leaves in DFS pre-order,
+    and budgets by flat (deduplicated) trie tokens.  Syncs the number of
+    micro-batches across DP ranks when ``same_micro_num_in_dp`` is set.
+
+    Args:
+        data: ``TensorDict`` containing ``input_ids`` and
+            ``max_token_len_per_gpu``.
+        sp_size: sequence-parallel size (multiplier for max_token_len).
+        dp_group: optional DP process group for sync.
+        same_micro_num_in_dp: if True, pad shortest rank to match max.
+        num_batches_divided_by: if set, round up micro-batch count to be
+            divisible by this value.
+
+    Returns:
+        ``(micro_batches, batch_idx_list)``.
+    """
+    import logging as _logging
+
+    import torch
+
+    from verl.utils import tensordict_utils as tu
+
+    _logging.getLogger(__name__).warning_once(
+        "prefix_tree is on: max_token_len_per_gpu is interpreted as "
+        "deduplicated (flat trie) token count, not raw sequence length."
+    )
+
+    assert "max_token_len_per_gpu" in data.keys(), "max_token_len_per_gpu must be set when use_dynamic_bsz is True"
+    max_token_len_per_gpu = data["max_token_len_per_gpu"]
+    max_token_len = max_token_len_per_gpu * sp_size
+
+    input_ids = data["input_ids"]
+    seqs = [t.tolist() for t in input_ids.unbind()]
+    batch_idx_list = dfs_micro_batch_groups(seqs, max_token_len)
+
+    if torch.distributed.is_initialized() and same_micro_num_in_dp and dp_group is not None:
+        from verl.utils.device import get_torch_device
+
+        n_mb = torch.tensor([len(batch_idx_list)], device=get_torch_device().current_device())
+        torch.distributed.all_reduce(n_mb, op=torch.distributed.ReduceOp.MAX, group=dp_group)
+        while len(batch_idx_list) < n_mb.item():
+            batch_idx_list.append(batch_idx_list[-1])
+
+    if num_batches_divided_by is not None:
+        from verl.utils.seqlen_balancing import roundup_divisible
+
+        target = roundup_divisible(len(batch_idx_list), num_batches_divided_by)
+        while len(batch_idx_list) < target:
+            batch_idx_list.append(batch_idx_list[-1])
+
+    micro_batches = [tu.index_select_tensor_dict(data, idx) for idx in batch_idx_list]
+    return micro_batches, batch_idx_list
