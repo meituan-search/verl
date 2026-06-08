@@ -14,7 +14,7 @@
 
 """Unit tests for the dynamic-trie prefix tree builder.
 
-Exercises :mod:`verl.utils.prefix_tree_dynamic` in isolation (no model / GPU).
+Exercises :mod:`verl.utils.prefix_tree.dynamic` in isolation (no model / GPU).
 Validates that the token-by-token trie correctly recovers the shared-prefix
 structure across a range of branching factors and tree depths.
 """
@@ -23,13 +23,13 @@ from __future__ import annotations
 
 import torch
 
-from verl.utils.prefix_tree_dynamic import (
+from verl.utils.prefix_tree.dynamic import (
     TrieNode,
     build_tree_dynamic,
     convert_trie_to_tree_node,
     greedy_build_tries,
 )
-from verl.utils.prefix_tree_utils import TreeNode, build_layout_from_tree_node
+from verl.utils.prefix_tree.utils import TreeNode, build_layout_from_tree_node
 
 # ---------------------------------------------------------------------------
 # Lower-level helpers

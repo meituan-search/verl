@@ -413,7 +413,7 @@ class SFTTrainer:
                     total_tokens += metrics["train/global_tokens"]
                     metrics["train/total_tokens(B)"] = total_tokens / 1e9
                     if self.config.data.get("use_prefix_tree", False):
-                        from verl.utils.prefix_tree_dynamic import compute_prefix_tree_metrics
+                        from verl.utils.prefix_tree.dynamic import compute_prefix_tree_metrics
                         metrics.update(compute_prefix_tree_metrics(data["input_ids"]))
 
                     if self.engine.get_data_parallel_rank() == 0:

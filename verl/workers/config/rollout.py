@@ -281,9 +281,6 @@ class RolloutConfig(BaseConfig):
 
     disaggregation: DisaggregationConfig = field(default_factory=DisaggregationConfig)
 
-    # Prefix-tree shared-prefix deduplication for actor training.
-    use_prefix_tree: bool = False
-
     def __post_init__(self):
         """Validate the rollout config"""
         # Deprecation warning for mode field - only async mode is supported

@@ -478,7 +478,3 @@ disaggregation:
 
   # InfiniBand device (required for mooncake over RDMA).
   ib_device: null
-
-
-# Prefix-tree shared-prefix deduplication for actor training.
-use_prefix_tree: false

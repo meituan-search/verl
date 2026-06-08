@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU-only unit tests for verl/utils/prefix_tree_magi.py.
+"""CPU-only unit tests for verl/utils/prefix_tree/magi.py.
 
 These tests exercise build_prefix_tree_micro_batch (without the MAGI key
 construction, which requires GPU + distributed) and restore_flat_to_nested.
@@ -51,7 +51,7 @@ class TestBuildPrefixTreeLayout:
     """
 
     def test_basic_shared_prefix(self):
-        from verl.utils.prefix_tree_utils import (
+        from verl.utils.prefix_tree.utils import (
             build_prefix_tree_params,
             longest_common_prefix_length,
         )
@@ -73,7 +73,7 @@ class TestBuildPrefixTreeLayout:
         assert params.total_seqlen_q == 9
 
     def test_no_shared_prefix_returns_zero(self):
-        from verl.utils.prefix_tree_utils import longest_common_prefix_length
+        from verl.utils.prefix_tree.utils import longest_common_prefix_length
 
         tokens = [
             torch.tensor([1, 2, 3]),
@@ -82,7 +82,7 @@ class TestBuildPrefixTreeLayout:
         assert longest_common_prefix_length(tokens) == 0
 
     def test_position_ids_default(self):
-        from verl.utils.prefix_tree_utils import build_prefix_tree_params
+        from verl.utils.prefix_tree.utils import build_prefix_tree_params
 
         tokens = [
             torch.tensor([10, 20, 30, 41, 42]),
@@ -94,7 +94,7 @@ class TestBuildPrefixTreeLayout:
         assert torch.equal(params.flat_position_ids, torch.tensor([0, 1, 2, 3, 4, 3]))
 
     def test_flex_spec_structure(self):
-        from verl.utils.prefix_tree_utils import build_prefix_tree_params
+        from verl.utils.prefix_tree.utils import build_prefix_tree_params
 
         tokens = [
             torch.tensor([10, 20, 30, 41, 42]),
@@ -127,8 +127,8 @@ class TestRestoreFlatToNested:
 
     def _build_pt_batch(self, tokens, prefix_len):
         """Build a PrefixTreeMagiBatch stub without the MAGI key."""
-        from verl.utils.prefix_tree_magi import PrefixTreeMagiBatch
-        from verl.utils.prefix_tree_utils import build_prefix_tree_params
+        from verl.utils.prefix_tree.magi import PrefixTreeMagiBatch
+        from verl.utils.prefix_tree.utils import build_prefix_tree_params
 
         params = build_prefix_tree_params(tokens, prefix_len=prefix_len)
         return PrefixTreeMagiBatch(
@@ -144,7 +144,7 @@ class TestRestoreFlatToNested:
         )
 
     def test_restore_token_ids(self):
-        from verl.utils.prefix_tree_magi import restore_flat_to_nested
+        from verl.utils.prefix_tree.magi import restore_flat_to_nested
 
         tokens = [
             torch.tensor([10, 20, 30, 41, 42]),
@@ -170,7 +170,7 @@ class TestRestoreFlatToNested:
 
     def test_restore_with_extra_dim(self):
         """restore_flat_to_nested should work for (total_tokens, D) tensors too."""
-        from verl.utils.prefix_tree_magi import restore_flat_to_nested
+        from verl.utils.prefix_tree.magi import restore_flat_to_nested
 
         tokens = [
             torch.tensor([10, 20, 30, 41, 42]),
@@ -188,7 +188,7 @@ class TestRestoreFlatToNested:
 
     def test_restore_preserves_prefix(self):
         """Each restored sample must start with the shared prefix tokens."""
-        from verl.utils.prefix_tree_magi import restore_flat_to_nested
+        from verl.utils.prefix_tree.magi import restore_flat_to_nested
 
         tokens = [
             torch.tensor([10, 20, 30, 41]),
@@ -211,8 +211,8 @@ class TestRestoreFlatToNested:
 
     def test_custom_sample_indices(self):
         """sample_indices remapping: leaf_to_sample=[1,0] → restored in index order."""
-        from verl.utils.prefix_tree_magi import PrefixTreeMagiBatch, restore_flat_to_nested
-        from verl.utils.prefix_tree_utils import build_prefix_tree_params
+        from verl.utils.prefix_tree.magi import PrefixTreeMagiBatch, restore_flat_to_nested
+        from verl.utils.prefix_tree.utils import build_prefix_tree_params
 
         # sample_indices=[1,0] means the first token list maps to sample 1,
         # and the second maps to sample 0.
@@ -258,7 +258,7 @@ class TestNestedTensorUnpack:
 
     def test_nested_tensor_unpack_and_flat_layout(self, monkeypatch):
         """Monkeypatch _build_magi_key to skip GPU/dist; verify flat layout."""
-        import verl.utils.prefix_tree_magi as ptm
+        import verl.utils.prefix_tree.magi as ptm
 
         # Stub out _build_magi_key so we don't need GPU
         monkeypatch.setattr(ptm, "_build_magi_key", lambda model, params: object())
@@ -293,7 +293,7 @@ class TestNestedTensorUnpack:
         assert result.leaf_ranges == [(3, 5), (5, 6), (6, 9)]
 
     def test_no_shared_prefix_returns_none(self, monkeypatch):
-        import verl.utils.prefix_tree_magi as ptm
+        import verl.utils.prefix_tree.magi as ptm
 
         monkeypatch.setattr(ptm, "_build_magi_key", lambda model, params: object())
 
@@ -315,7 +315,7 @@ class TestNestedTensorUnpack:
 
     def test_loss_mask_flattened(self, monkeypatch):
         """loss_mask NestedTensor is correctly flattened into flat_loss_mask."""
-        import verl.utils.prefix_tree_magi as ptm
+        import verl.utils.prefix_tree.magi as ptm
 
         monkeypatch.setattr(ptm, "_build_magi_key", lambda model, params: object())
 
@@ -356,7 +356,7 @@ class TestPrefixSegmentsPrior:
 
     def _make_segments(self, token_lists: list[list[int]]) -> list[list[tuple[int, int]]]:
         """Build ground-truth prefix_segments for a list of token sequences."""
-        from verl.utils.prefix_tree_magi import _hash_prefix
+        from verl.utils.prefix_tree.magi import _hash_prefix
 
         result = []
         for tokens in token_lists:
@@ -382,7 +382,7 @@ class TestPrefixSegmentsPrior:
 
     def test_prior_matches_scan(self, monkeypatch):
         """Prior-knowledge path returns same prefix_len as the token-scan path."""
-        import verl.utils.prefix_tree_magi as ptm
+        import verl.utils.prefix_tree.magi as ptm
 
         monkeypatch.setattr(ptm, "_build_magi_key", lambda model, params: object())
 
@@ -402,11 +402,11 @@ class TestPrefixSegmentsPrior:
 
     def test_prior_uses_coarsest_shared_boundary(self, monkeypatch):
         """Prior with turn-level segments finds the longest sub-turn boundary."""
-        import verl.utils.prefix_tree_magi as ptm
+        import verl.utils.prefix_tree.magi as ptm
 
         monkeypatch.setattr(ptm, "_build_magi_key", lambda model, params: object())
 
-        from verl.utils.prefix_tree_magi import _hash_prefix
+        from verl.utils.prefix_tree.magi import _hash_prefix
 
         # Two samples sharing the first 3 tokens (one sub-turn boundary).
         # Sub-turn 0 ends at token index 3; sub-turn 1 ends at 5/4 respectively.
@@ -428,7 +428,7 @@ class TestPrefixSegmentsPrior:
 
     def test_prior_fallback_on_missing(self, monkeypatch):
         """When prefix_segments_batch is None, the scan path is used."""
-        import verl.utils.prefix_tree_magi as ptm
+        import verl.utils.prefix_tree.magi as ptm
 
         monkeypatch.setattr(ptm, "_build_magi_key", lambda model, params: object())
 
@@ -441,11 +441,11 @@ class TestPrefixSegmentsPrior:
 
     def test_prior_no_shared_entry_returns_none(self, monkeypatch):
         """When no hash is shared across all samples, returns None (no prefix)."""
-        import verl.utils.prefix_tree_magi as ptm
+        import verl.utils.prefix_tree.magi as ptm
 
         monkeypatch.setattr(ptm, "_build_magi_key", lambda model, params: object())
 
-        from verl.utils.prefix_tree_magi import _hash_prefix
+        from verl.utils.prefix_tree.magi import _hash_prefix
 
         t0 = torch.tensor([1, 2, 3], dtype=torch.long)
         t1 = torch.tensor([4, 5, 6], dtype=torch.long)
@@ -462,7 +462,7 @@ class TestPrefixSegmentsPrior:
 
     def test_prior_after_shuffle(self, monkeypatch):
         """Hash lookup still finds the correct prefix after index reordering."""
-        import verl.utils.prefix_tree_magi as ptm
+        import verl.utils.prefix_tree.magi as ptm
 
         monkeypatch.setattr(ptm, "_build_magi_key", lambda model, params: object())
 
@@ -488,7 +488,7 @@ class TestPrefixSegmentsPrior:
 
     def test_build_prefix_segments_single_turn(self):
         """build_prefix_segments_single_turn produces a one-entry list."""
-        from verl.utils.prefix_tree_magi import _hash_prefix, build_prefix_segments_single_turn
+        from verl.utils.prefix_tree.magi import _hash_prefix, build_prefix_segments_single_turn
 
         ids = torch.tensor([1, 2, 3, 4, 5], dtype=torch.long)
         segs = build_prefix_segments_single_turn(ids)
@@ -499,7 +499,7 @@ class TestPrefixSegmentsPrior:
 
     def test_build_prefix_segments_single_turn_with_mask(self):
         """Padding tokens are excluded when attention_mask is provided."""
-        from verl.utils.prefix_tree_magi import _hash_prefix, build_prefix_segments_single_turn
+        from verl.utils.prefix_tree.magi import _hash_prefix, build_prefix_segments_single_turn
 
         ids = torch.tensor([1, 2, 3, 0, 0], dtype=torch.long)
         mask = torch.tensor([1, 1, 1, 0, 0], dtype=torch.long)
