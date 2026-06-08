@@ -342,6 +342,8 @@ def gptmodel_forward_model_engine(
             get_torch_device().synchronize()
             get_torch_device().reset_peak_memory_stats()
             _mem_before = get_torch_device().memory_allocated() / 1024**2
+            _magi_prof = _os.environ.get("MAGI_TIMING") == "1"
+            if _magi_prof: torch.cuda.nvtx.range_push(f"prefix_tree/model_fwd/{prefix_tree_attention}")
             if prefix_tree_attention == "magi":
                 output_orig = model(
                     input_ids=flat_input_ids,
@@ -360,6 +362,7 @@ def gptmodel_forward_model_engine(
                     flex_attention_key=pt_batch.flex_key,
                     **model_kwargs,
                 )
+            if _magi_prof: torch.cuda.nvtx.range_pop()
             get_torch_device().synchronize()
             _tf1 = _time.perf_counter()
             if not _dist.is_initialized() or _dist.get_rank() == 0:
@@ -431,11 +434,9 @@ def gptmodel_forward_model_engine(
                 # log_probs: (total_tokens, 1) from logits_processor — squeeze and restore.
                 # restore_flat_to_nested gives per-sample NestedTensor in original token order.
                 if isinstance(output_dict, dict) and "log_probs" in output_dict:
-                    # log_probs shape: (1, T) — batch-first from vocab_parallel_log_probs_from_logits
                     lp_flat = output_dict["log_probs"].reshape(-1)[:real_tokens]  # (real_tokens,)
                     _save2("before_restore_log_probs_flat", lp_flat)
                     output_dict["log_probs"] = restore_flat_to_nested(lp_flat, pt_batch)
-                    # save per-sample log_probs after restore
                     _nested = output_dict["log_probs"]
                     if hasattr(_nested, "values"):
                         _save2("after_restore_log_probs_flat", _nested.values())

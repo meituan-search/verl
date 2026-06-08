@@ -140,36 +140,56 @@ def _magi_attn_forward(
             flush=True,
         )
 
-    # MAGI_TIMING=1 → print dispatch/calc_attn/undispatch breakdown for layer 0
-    _timing = _os.environ.get("MAGI_TIMING") == "1" and _layer_idx == 0 and _cp_rank == 0
+    # MAGI_TIMING=1 → CUDA-event timing for every layer on rank 0
+    _timing = _os.environ.get("MAGI_TIMING") == "1" and _cp_rank == 0
 
     def _evt():
         e = _torch.cuda.Event(enable_timing=True); e.record(); return e
 
-    # before_dispatch_Q/K/V saved by _sa_forward wrapper (covers both FA3 and MAGI)
-    with _torch.cuda.nvtx.range("prefix_attn/magi"):
-        t0 = _evt() if _timing else None
-        dq = dispatch(q, magi_attention_key)
-        dk = dispatch(k, magi_attention_key)
-        dv = dispatch(v, magi_attention_key)
-        t1 = _evt() if _timing else None
+    # NVTX and CUDA-event timing for nsys / MAGI_TIMING profiling.
+    # Gated behind _timing to avoid per-layer overhead in production
+    # (36 layers × n_micro_batches × 6 NVTX calls = significant overhead otherwise).
+    _pfx = f"magi/L{_layer_idx}"
+    if _timing:
+        _torch.cuda.nvtx.range_push(f"{_pfx}/dispatch")
+    t0 = _evt() if _timing else None
+    dq = dispatch(q, magi_attention_key)
+    t0b = _evt() if _timing else None
+    dk = dispatch(k, magi_attention_key)
+    t0c = _evt() if _timing else None
+    dv = dispatch(v, magi_attention_key)
+    t1 = _evt() if _timing else None
+    if _timing:
+        _torch.cuda.nvtx.range_pop()
 
-        _save("after_dispatch_Q", dq)
-        _save("after_dispatch_K", dk)
-        _save("after_dispatch_V", dv)
+    _save("after_dispatch_Q", dq)
+    _save("after_dispatch_K", dk)
+    _save("after_dispatch_V", dv)
 
-        out, _ = calc_attn(dq, dk, dv, magi_attention_key)
-        t2 = _evt() if _timing else None
-        _save("after_calc_attn_out", out)
+    if _timing:
+        _torch.cuda.nvtx.range_push(f"{_pfx}/calc_attn")
+    out, _ = calc_attn(dq, dk, dv, magi_attention_key)
+    t2 = _evt() if _timing else None
+    if _timing:
+        _torch.cuda.nvtx.range_pop()
 
-        out = undispatch(out, magi_attention_key)
-        t3 = _evt() if _timing else None
+    _save("after_calc_attn_out", out)
+
+    if _timing:
+        _torch.cuda.nvtx.range_push(f"{_pfx}/undispatch")
+    out = undispatch(out, magi_attention_key)
+    t3 = _evt() if _timing else None
+    if _timing:
+        _torch.cuda.nvtx.range_pop()
 
     if _timing:
         _torch.cuda.synchronize()
         T = q.shape[0]
         print(
             f"[MAGI-TIMING] layer={_layer_idx} tokens={T}"
+            f" dq={t0.elapsed_time(t0b):.2f}ms"
+            f" dk={t0b.elapsed_time(t0c):.2f}ms"
+            f" dv={t0c.elapsed_time(t1):.2f}ms"
             f" dispatch={t0.elapsed_time(t1):.2f}ms"
             f" calc_attn={t1.elapsed_time(t2):.2f}ms"
             f" undispatch={t2.elapsed_time(t3):.2f}ms"

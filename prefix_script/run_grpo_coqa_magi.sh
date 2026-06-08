@@ -55,8 +55,7 @@ TENSORBOARD_DIR="$OUTDIR/tb" python3 -m verl.trainer.main_ppo \
     \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.ppo_mini_batch_size=128 \
-    actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8000 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.actor.ppo_epochs=1 \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=4 \
@@ -73,13 +72,14 @@ TENSORBOARD_DIR="$OUTDIR/tb" python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.max_model_len=2048 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.rollout.use_prefix_tree=True \
+    actor_rollout_ref.rollout.calculate_log_probs=True \
     \
     reward.custom_reward_function.path="$REWARD_FN" \
     reward.num_workers=2 \
     \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
-    trainer.total_training_steps=100 \
+    trainer.total_training_steps=50 \
     trainer.logger='["console","tensorboard"]' \
     trainer.project_name=grpo_coqa_4b \
     trainer.experiment_name=coqa_magi_4b \

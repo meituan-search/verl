@@ -173,7 +173,12 @@ def build_prefix_tree_micro_batch(
         PrefixTreeMagiBatch or None.
     """
 
+    import os as _os_pt
+    import torch as _torch_pt
     from verl.utils.prefix_tree_utils import build_layout_from_tree_node
+
+    _magi_timing = _os_pt.environ.get("MAGI_TIMING") == "1"
+    def _ev(): e = _torch_pt.cuda.Event(enable_timing=True); e.record(); return e
 
     samples = _unpack_nested_to_list(input_ids)
     if not samples:
@@ -181,18 +186,23 @@ def build_prefix_tree_micro_batch(
     loss_masks_by_sample = _unpack_nested_to_list(loss_mask)
     position_ids_by_sample = _unpack_nested_to_list(position_ids)
 
+    if _magi_timing: _torch_pt.cuda.nvtx.range_push("prefix_tree/build_tree")
+    t_tree0 = _ev() if _magi_timing else None
     if dynamic_trie:
         from verl.utils.prefix_tree_dynamic import build_tree_dynamic
-
         result = build_tree_dynamic(samples)
     else:
         result = build_tree_hash_based(samples, prefix_segments_batch=prefix_segments_batch)
+    t_tree1 = _ev() if _magi_timing else None
+    if _magi_timing: _torch_pt.cuda.nvtx.range_pop()
 
     if result is None:
         return None
     tree_root, leaf_to_sample = result
 
     try:
+        if _magi_timing: _torch_pt.cuda.nvtx.range_push("prefix_tree/build_layout")
+        t_layout0 = _ev() if _magi_timing else None
         params = build_layout_from_tree_node(
             samples,
             tree_root,
@@ -200,8 +210,12 @@ def build_prefix_tree_micro_batch(
             loss_masks_by_sample=loss_masks_by_sample,
             position_ids_by_sample=position_ids_by_sample,
         )
+        t_layout1 = _ev() if _magi_timing else None
+        if _magi_timing: _torch_pt.cuda.nvtx.range_pop()
 
-        return _finalize_prefix_tree_batch(
+        if _magi_timing: _torch_pt.cuda.nvtx.range_push("prefix_tree/finalize")
+        t_final0 = _ev() if _magi_timing else None
+        ret = _finalize_prefix_tree_batch(
             params,
             model=model,
             num_samples=len(samples),
@@ -209,6 +223,21 @@ def build_prefix_tree_micro_batch(
             tp_size=tp_size,
             cp_size=cp_size,
         )
+        t_final1 = _ev() if _magi_timing else None
+        if _magi_timing: _torch_pt.cuda.nvtx.range_pop()
+
+        if _magi_timing:
+            _torch_pt.cuda.synchronize()
+            N = len(samples)
+            print(
+                f"[MAGI-TIMING] build_tree_mb n={N}"
+                f" tree={t_tree0.elapsed_time(t_tree1):.2f}ms"
+                f" layout={t_layout0.elapsed_time(t_layout1):.2f}ms"
+                f" finalize={t_final0.elapsed_time(t_final1):.2f}ms"
+                f" total={t_tree0.elapsed_time(t_final1):.2f}ms",
+                flush=True,
+            )
+        return ret
     except (ValueError, AssertionError, RuntimeError):
         # Multilevel tree produced non-monotonic leaf ranges or inconsistent
         # token layout.  Fall back to standard attention for this micro-batch.
