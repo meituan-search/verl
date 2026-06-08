@@ -319,20 +319,31 @@ class SFTTrainer:
 
                 if self.config.trainer.balance_batch:
                     global_seqlen_lst = torch.Tensor([item.size()[0] for item in data["input_ids"]])
-                    global_seqlen_lst = calculate_workload(global_seqlen_lst)
                     dp_size = max(self.training_client._query_dispatch_info("train")) + 1
 
-                    global_partition_lst = get_seqlen_balanced_partitions(
-                        global_seqlen_lst, k_partitions=dp_size, equal_size=True
-                    )
-                    # Place smaller micro-batches at both ends to reduce the bubbles in pipeline parallel.
-                    for idx, partition in enumerate(global_partition_lst):
-                        partition.sort(key=lambda x: (global_seqlen_lst[x], x))
-                        ordered_partition = partition[::2] + partition[1::2][::-1]
-                        global_partition_lst[idx] = ordered_partition
+                    if self.config.data.get("use_prefix_tree", False) and data["input_ids"].is_nested:
+                        # Prefix-tree path: pre-sort in DFS trie order so nearby samples
+                        # share prefixes, then KK partitions DFS-consecutive sequences.
+                        from verl.utils.prefix_tree_dynamic import dfs_leaf_order
+                        _seqs = [t.tolist() for t in data["input_ids"].unbind()]
+                        _dfs_order = dfs_leaf_order(_seqs)
+                        data = tu.index_select_tensor_dict(data, torch.tensor(_dfs_order))
+                        # Recompute seqlens after DFS reorder
+                        global_seqlen_lst = torch.Tensor([item.size()[0] for item in data["input_ids"]])
+                        global_partition_lst = get_seqlen_balanced_partitions(
+                            calculate_workload(global_seqlen_lst), k_partitions=dp_size, equal_size=True
+                        )
+                        # Skip bubble sort to preserve DFS order within partitions
+                    else:
+                        global_partition_lst = get_seqlen_balanced_partitions(
+                            calculate_workload(global_seqlen_lst), k_partitions=dp_size, equal_size=True
+                        )
+                        # Place smaller micro-batches at both ends to reduce pipeline bubbles.
+                        for idx, partition in enumerate(global_partition_lst):
+                            partition.sort(key=lambda x: (global_seqlen_lst[x], x))
+                            global_partition_lst[idx] = partition[::2] + partition[1::2][::-1]
 
                     global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
-
                     data = tu.index_select_tensor_dict(data, global_idx)
 
                 # start profile in SPMD mode
@@ -356,6 +367,9 @@ class SFTTrainer:
                 metrics["train/global_tokens"] = torch.sum(torch.tensor(batch_seqlens, device=self.device_name)).item()
                 total_tokens += metrics["train/global_tokens"]
                 metrics["train/total_tokens(B)"] = total_tokens / 1e9
+                if self.config.data.get("use_prefix_tree", False):
+                    from verl.utils.prefix_tree_dynamic import compute_prefix_tree_metrics
+                    metrics.update(compute_prefix_tree_metrics(data["input_ids"]))
                 tracking.log(data=metrics, step=global_step)
 
                 is_last_step = global_step >= self.total_training_steps

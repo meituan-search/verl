@@ -115,6 +115,11 @@ def build_tree_hash_based(
                 f"n_segs={[len(s) for s in prefix_segments_batch]}",
                 flush=True,
             )
+        # If segments share no global prefix, fall through to LCP so that
+        # _resolve_multilevel_tree can still detect per-group sub-prefixes
+        # (e.g. GRPO: n=4 rollouts per prompt, multiple prompt groups per mbs).
+        if prefix_len == 0:
+            prefix_len = longest_common_prefix_length(samples)
     else:
         prefix_len = longest_common_prefix_length(samples)
 
@@ -127,9 +132,14 @@ def build_tree_hash_based(
             multilevel = _resolve_multilevel_tree(samples, prefix_segments_batch, actual_root_len)
             if multilevel is not None:
                 root_len, children_info = multilevel  # [(idxs, group_TreeNode), ...]
-                root = TreeNode(segment_len=root_len, children=[g for _, g in children_info])
                 leaf_to_sample = [int(idx) for idxs, _ in children_info for idx in idxs]
-                return root, leaf_to_sample
+                # Only use multilevel if ALL n sequences are covered; otherwise a
+                # partial group (single-member prompt) would cause restore_flat_to_nested
+                # to leave some sample_tensors[i] as None → AssertionError.
+                if len(set(leaf_to_sample)) == n:
+                    root = TreeNode(segment_len=root_len, children=[g for _, g in children_info])
+                    return root, leaf_to_sample
+                # else: fall through to single-level fallback
 
     # Single-level fallback: root + per-sample leaves (one leaf per sample).
     leaves = [TreeNode(segment_len=int(t.shape[0]) - prefix_len) for t in samples]
@@ -199,6 +209,11 @@ def _resolve_multilevel_tree(
     useful = [(h, idxs) for h, idxs in groups.items() if len(idxs) >= 2]
     if len(useful) < 2:
         return None
+
+    # Sort children by first sequence index so DFS traversal order matches
+    # the flat-trie token layout (build_layout_from_tree_node expects
+    # non-decreasing leaf ranges — violating this raises ValueError).
+    useful.sort(key=lambda x: min(x[1]))
 
     # Use token scan (not segment hashes) to get exact turn2 shared prefix length
     # per group; segment hashes can mis-align due to chat-template boundary effects.
