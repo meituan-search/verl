@@ -608,9 +608,10 @@ def forward_prefix_tree(
         flat_args["label"] = flat_label
         flat_args["temperature"] = flat_t
         output_dict = logits_processor(output_orig_thd, **flat_args)
-        if isinstance(output_dict, dict) and "log_probs" in output_dict:
-            lp_flat = output_dict["log_probs"].reshape(-1)[:real_tokens]
-            output_dict["log_probs"] = restore_flat_to_nested(lp_flat, pt_batch)
+        if isinstance(output_dict, dict):
+            for key, val in list(output_dict.items()):
+                if isinstance(val, torch.Tensor):
+                    output_dict[key] = restore_flat_to_nested(val.reshape(-1)[:real_tokens], pt_batch)
         return output_dict
     else:
         real_tokens = pt_batch.real_tokens
