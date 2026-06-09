@@ -163,6 +163,7 @@ class SFTTrainer:
         self.loss_fn = partial(sft_loss, config=None)
 
         from verl.utils.prefix_tree.trainer import apply_engine_config
+
         apply_engine_config(self.engine_config, self.config.data)
 
         config = TrainingWorkerConfig(
@@ -358,6 +359,7 @@ class SFTTrainer:
             "pad_token_id": self.model_config.tokenizer.pad_token_id,
         }
         from verl.utils.prefix_tree.trainer import add_meta_info
+
         add_meta_info(meta_info, self.config.data)
 
         train_time = 0
@@ -411,6 +413,7 @@ class SFTTrainer:
                     total_tokens += metrics["train/global_tokens"]
                     metrics["train/total_tokens(B)"] = total_tokens / 1e9
                     from verl.utils.prefix_tree.trainer import compute_metrics
+
                     compute_metrics(metrics, data["input_ids"], self.config.data)
 
                     if self.engine.get_data_parallel_rank() == 0:

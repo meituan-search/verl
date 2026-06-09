@@ -1096,12 +1096,17 @@ class RayPPOTrainer:
                 k_partitions=dp_size,
             )
 
-        elif self.config.actor_rollout_ref.actor.get("use_prefix_tree", False):
+        elif self.config.actor_rollout_ref.model.get("use_prefix_tree", False):
+            # DFS reorder for prefix sharing.
             from verl.utils.prefix_tree.balancing import reorder_and_balance_for_prefix_tree
 
             if reorder_and_balance_for_prefix_tree(
-                batch, self.config.actor_rollout_ref.actor, dp_size,
-                attention_mask=attention_mask, metrics=metrics, logging_prefix=logging_prefix,
+                batch,
+                self.config.actor_rollout_ref.model,
+                dp_size,
+                attention_mask=attention_mask,
+                metrics=metrics,
+                logging_prefix=logging_prefix,
             ):
                 return
 
@@ -1211,11 +1216,12 @@ class RayPPOTrainer:
             from verl.utils.prefix_tree.trainer import disable_for_log_prob
 
             disable_for_log_prob(
-                batch_td, self.config.actor_rollout_ref.actor,
+                batch_td,
+                self.config.actor_rollout_ref.model,
                 self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu,
             )
             _fb_out = self.actor_rollout_wg.compute_log_prob(batch_td)
-            entropy   = no_padding_2_padding(tu.get(_fb_out, "entropy"),   batch_td)
+            entropy = no_padding_2_padding(tu.get(_fb_out, "entropy"), batch_td)
             log_probs = no_padding_2_padding(tu.get(_fb_out, "log_probs"), batch_td)
             del _fb_out
         if sum_pi_squared is not None:
@@ -1228,6 +1234,7 @@ class RayPPOTrainer:
             result["sum_pi_squared"] = sum_pi_squared.float()
         old_log_prob = tu.get_tensordict(result)
         old_log_prob = DataProto.from_tensordict(old_log_prob)
+
         return old_log_prob, old_log_prob_mfu
 
     def _update_actor(self, batch: DataProto) -> DataProto:
@@ -1383,7 +1390,8 @@ class RayPPOTrainer:
                 rollout_n = self.config.actor_rollout_ref.rollout.n
                 gen_batch_output = gen_batch.repeat(repeat_times=rollout_n, interleave=True)
                 from verl.utils.prefix_tree.trainer import inject_prefix_segments
-                inject_prefix_segments(gen_batch_output, self.config.actor_rollout_ref.actor)
+
+                inject_prefix_segments(gen_batch_output, self.config.actor_rollout_ref.model)
 
                 if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                     # NOTE: REMAX needs one sampled rollout plus one greedy baseline per prompt.
@@ -1418,8 +1426,8 @@ class RayPPOTrainer:
                         gen_batch_output.pop(non_tensor_batch_keys=["__do_sample__"])
 
                     from verl.utils.prefix_tree.trainer import compute_metrics
-                    compute_metrics(metrics, gen_batch_output.batch["input_ids"],
-                                    self.config.actor_rollout_ref.actor)
+
+                    compute_metrics(metrics, gen_batch_output.batch["input_ids"], self.config.actor_rollout_ref.model)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         gen_baseline_output = combined_gen_output.slice(num_sampled_prompts, None)

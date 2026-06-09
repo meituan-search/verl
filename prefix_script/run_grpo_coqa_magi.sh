@@ -71,7 +71,6 @@ TENSORBOARD_DIR="$OUTDIR/tb" python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     actor_rollout_ref.rollout.max_model_len=2048 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
-    actor_rollout_ref.rollout.use_prefix_tree=True \
     actor_rollout_ref.rollout.calculate_log_probs=True \
     \
     reward.custom_reward_function.path="$REWARD_FN" \

@@ -532,12 +532,8 @@ def forward_prefix_tree(
 
     strip_prefix_tree_args(logits_processor_args)
 
-    from verl.utils.megatron_utils import unwrap_model
-
     if pt_batch.no_expand_middle and pt_batch.magi_key is not None:
-        pt_batch.magi_key._no_expand = True
-        pt_batch.magi_key._is_first = unwrap_model(model).pre_process
-        pt_batch.magi_key._is_last = unwrap_model(model).post_process
+        pt_batch.magi_key.no_expand = True
 
     if prefix_tree_attention == "magi":
         output_orig = model(
@@ -571,6 +567,13 @@ def forward_prefix_tree(
 
         output_orig_thd = output_orig.squeeze(0).unsqueeze(1)
         flat_label = torch.roll(pt_batch.flat_input_ids[:real_tokens], shifts=-1, dims=0).unsqueeze(1)
+        # Fix leaf-boundary labels: after the roll, the last token of each leaf gets the first
+        # token of the next leaf as its label, which is wrong. Reset to self-prediction
+        # (same token) so the log_prob at that position is not systematically biased.
+        # This mirrors standard packed-seq behaviour where the last position has loss_mask=0.
+        for _, leaf_end in pt_batch.leaf_ranges:
+            if leaf_end <= real_tokens:
+                flat_label[leaf_end - 1, 0] = pt_batch.flat_input_ids[leaf_end - 1]
         orig_args = logits_processor_args or {}
         total_tokens = flat_label.shape[0]
         if "temperature" in orig_args:
@@ -585,9 +588,7 @@ def forward_prefix_tree(
         else:
             flat_t = torch.ones(total_tokens, 1, dtype=torch.float32, device=flat_label.device)
         flat_args = {
-            k: v
-            for k, v in orig_args.items()
-            if k not in ("label", "temperature", "loss_mask", "use_prefix_tree")
+            k: v for k, v in orig_args.items() if k not in ("label", "temperature", "loss_mask", "use_prefix_tree")
         }
         flat_args["label"] = flat_label
         flat_args["temperature"] = flat_t

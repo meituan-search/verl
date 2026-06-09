@@ -59,7 +59,11 @@ def get_dfs_balanced_partitions(
 
     batch_size = data.batch["input_ids"].shape[0] if hasattr(data, "batch") else len(data["input_ids"])
     _ids = data.batch["input_ids"] if hasattr(data, "batch") else data["input_ids"]
-    _mask = attention_mask or (data.batch.get("attention_mask", None) if hasattr(data, "batch") else None)
+    _mask = (
+        attention_mask
+        if attention_mask is not None
+        else (data.batch.get("attention_mask", None) if hasattr(data, "batch") else None)
+    )
 
     if _mask is not None:
         seqs = [_ids[i][_mask[i].bool()].tolist() or [0] for i in range(batch_size)]
@@ -183,8 +187,11 @@ def reorder_and_balance_for_prefix_tree(
     from verl.utils.seqlen_balancing import log_seqlen_unbalance
 
     result = get_dfs_balanced_partitions(
-        data, config_or_data, dp_size,
-        attention_mask=attention_mask, contiguous_partitions=True,
+        data,
+        config_or_data,
+        dp_size,
+        attention_mask=attention_mask,
+        contiguous_partitions=True,
     )
     if result is None:
         return False

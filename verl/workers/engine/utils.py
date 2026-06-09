@@ -98,23 +98,18 @@ def prepare_micro_batches(
             force_group_size=force_group_size,
         )
     else:
-        if use_prefix_tree:
-            from verl.utils.prefix_tree.dynamic import dfs_leaf_order
-
-            input_ids = data["input_ids"]
-            seqs = [t.tolist() for t in input_ids.unbind()]
-            dfs_order = dfs_leaf_order(seqs)
-            if len(dfs_order) < len(data):
-                missing = [i for i in range(len(data)) if i not in set(dfs_order)]
-                dfs_order = dfs_order + missing
-            data = tu.index_select_tensor_dict(data, torch.tensor(dfs_order))
-
+        # When use_prefix_tree=True, the batch is already DFS-ordered by the
+        # global _balance_batch step (reorder_and_balance_for_prefix_tree).
+        # Contiguous micro-batch slices then naturally group same-prompt sequences
+        # together so the prefix tree can find shared prefixes.  No local re-sort needed.
         total_data_size = len(data)
         micro_batch_size_per_gpu = data["micro_batch_size_per_gpu"]
         assert total_data_size % (force_group_size * micro_batch_size_per_gpu) == 0, (
             "data size must be divisible by force_group_size * micro_batch_size_per_gpu"
         )
-        micro_batches = tu.chunk_tensordict(data, total_data_size // (micro_batch_size_per_gpu * force_group_size))
+        mbs = micro_batch_size_per_gpu * force_group_size
+        n_micro = total_data_size // mbs
+        micro_batches = tu.chunk_tensordict(data, n_micro)
         batch_idx_list = None
     return micro_batches, batch_idx_list
 

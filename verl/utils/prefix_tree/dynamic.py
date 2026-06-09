@@ -229,14 +229,20 @@ def convert_trie_to_tree_node(
         children: list[TreeNode] = [_convert(child) for _tok, child in sorted(trie_node.children.items())]
         node = TreeNode(segment_len=segment_len, children=children)
         if not children:
-            assert len(trie_node.sequence_ids) == 1, (
-                f"Trie leaf should belong to exactly 1 sample, got {trie_node.sequence_ids}"
-            )
+            if len(trie_node.sequence_ids) != 1:
+                # Identical sequences share a leaf (common in GRPO with n>1 rollouts).
+                # Fall back to standard computation by signalling failure.
+                raise ValueError(
+                    f"Trie leaf has duplicate sequences {trie_node.sequence_ids}; falling back to standard attention."
+                )
             leaf_to_sample.append(trie_node.sequence_ids[0])
         return node
 
     only_child = next(iter(trie.children.values()))
-    root = _convert(only_child)
+    try:
+        root = _convert(only_child)
+    except ValueError:
+        return None  # duplicate sequences — fall back to standard attention
     if not root.children:
         return None
     return root, leaf_to_sample
@@ -433,20 +439,20 @@ def dfs_micro_batch_groups(
             if not node.children:
                 # Leaf: full path = ancestors (list of TrieNodes) + self
                 path = node.ancestors + [node]
-                new_nodes = [n for n in path if id(n) not in covered]
+                new_nodes = [n for n in path if id(n) not in covered]  # noqa: B023
                 inc = sum(len(n.tokens) for n in new_nodes)
 
-                if current_group and current_eff + inc > max_token_len:
+                if current_group and current_eff + inc > max_token_len:  # noqa: B023
                     # Flush — start a fresh batch with this leaf
-                    all_groups.append(current_group[:])
-                    current_group.clear()
-                    covered.clear()
+                    all_groups.append(current_group[:])  # noqa: B023
+                    current_group.clear()  # noqa: B023
+                    covered.clear()  # noqa: B023
                     current_eff = 0
                     new_nodes = path  # all nodes are new in empty batch
                     inc = sum(len(n.tokens) for n in new_nodes)
 
-                current_group.extend(node.sequence_ids)
-                covered.update(id(n) for n in new_nodes)
+                current_group.extend(node.sequence_ids)  # noqa: B023
+                covered.update(id(n) for n in new_nodes)  # noqa: B023
                 current_eff += inc
             else:
                 for child in node.children.values():  # sorted by token key

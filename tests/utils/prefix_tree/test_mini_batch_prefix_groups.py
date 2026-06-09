@@ -22,9 +22,8 @@ from __future__ import annotations
 
 import pytest
 
-from verl.utils.prefix_tree.dynamic import build_mini_batch_prefix_groups
 from verl.utils.prefix_tree.balancing import get_prefix_balanced_partitions
-
+from verl.utils.prefix_tree.dynamic import build_mini_batch_prefix_groups, dfs_leaf_order
 
 # ---------------------------------------------------------------------------
 # build_mini_batch_prefix_groups — grouping correctness
@@ -168,8 +167,8 @@ def test_groups_effective_per_group_includes_shared_prefix():
     is realised when both groups land on the *same* DP rank (micro-batch builds
     a joint prefix tree at runtime)."""
     seqs = [
-        [1, 2, 3, 4, 5],   # len=5
-        [1, 2, 3, 6, 7],   # len=5
+        [1, 2, 3, 4, 5],  # len=5
+        [1, 2, 3, 6, 7],  # len=5
     ]
     groups = build_mini_batch_prefix_groups(seqs)
     assert len(groups) == 2
@@ -203,10 +202,10 @@ def test_partition_prefix_sharing_sequences_colocated():
     when k < number of groups."""
     # 4 sequences forming 2 groups of 2 (sharing [10,11] then [20] / [50])
     seqs = [
-        [10, 11, 20, 30],   # group A: seq0
-        [10, 11, 20, 40],   # group A: seq1
-        [10, 11, 50, 60],   # group B: seq2
-        [10, 11, 50, 70],   # group B: seq3
+        [10, 11, 20, 30],  # group A: seq0
+        [10, 11, 20, 40],  # group A: seq1
+        [10, 11, 50, 60],  # group B: seq2
+        [10, 11, 50, 70],  # group B: seq3
     ]
     # With k=2, the two groups should each land in a separate partition.
     partitions = get_prefix_balanced_partitions(seqs, k_partitions=2)
@@ -286,8 +285,6 @@ def test_partition_effective_tokens_used_as_workload():
 # dfs_leaf_order
 # ---------------------------------------------------------------------------
 
-from verl.utils.prefix_tree.dynamic import dfs_leaf_order
-
 
 def test_dfs_leaf_order_covers_all():
     """Every sample index appears exactly once."""
@@ -333,7 +330,7 @@ def test_dfs_micro_batch_groups_flat_budget():
     """Budget counts flat (deduplicated) tokens, not raw."""
     # 4 seqs sharing prefix [1,2,3] (3 tokens) + 2 unique tokens each = 5 tokens raw
     # flat for 4 seqs = 3 (shared) + 4*2 (unique) = 11 tokens
-    seqs = [[1, 2, 3, i, i+10] for i in range(4)]
+    seqs = [[1, 2, 3, i, i + 10] for i in range(4)]
     from verl.utils.prefix_tree.dynamic import dfs_micro_batch_groups
 
     # budget=11 → fits all 4 in one group

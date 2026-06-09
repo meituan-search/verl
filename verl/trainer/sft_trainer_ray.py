@@ -111,6 +111,7 @@ class SFTTrainer:
 
         self.loss_fn = partial(sft_loss, config=None)
         from verl.utils.prefix_tree.trainer import apply_engine_config
+
         apply_engine_config(self.engine_config, self.config.data)
 
         config = TrainingWorkerConfig(
@@ -292,6 +293,7 @@ class SFTTrainer:
             "pad_token_id": self.model_config.tokenizer.pad_token_id,
         }
         from verl.utils.prefix_tree.trainer import add_meta_info
+
         add_meta_info(meta_info, self.config.data)
 
         train_time = 0
@@ -323,8 +325,11 @@ class SFTTrainer:
                     from verl.utils.prefix_tree.balancing import get_dfs_balanced_partitions
 
                     result = get_dfs_balanced_partitions(
-                        data, self.config.data, dp_size,
-                        attention_mask=None, contiguous_partitions=False,
+                        data,
+                        self.config.data,
+                        dp_size,
+                        attention_mask=None,
+                        contiguous_partitions=False,
                     )
                     if result is not None:
                         global_partition_lst, global_seqlen_lst, data = result
@@ -361,6 +366,7 @@ class SFTTrainer:
                 total_tokens += metrics["train/global_tokens"]
                 metrics["train/total_tokens(B)"] = total_tokens / 1e9
                 from verl.utils.prefix_tree.trainer import compute_metrics
+
                 compute_metrics(metrics, data["input_ids"], self.config.data)
                 tracking.log(data=metrics, step=global_step)
 

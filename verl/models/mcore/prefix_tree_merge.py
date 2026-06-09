@@ -88,9 +88,8 @@ def magi_attn_forward(
 ) -> Tensor:
     """Execute MAGI calc_attn for prefix-tree batches.
 
-    When ``magi_attention_key._no_expand`` is set, merge (dispatch) and
-    spread (undispatch) are gated by ``_is_first`` / ``_is_last`` — only
-    the first PP stage merges and the last PP stage spreads.
+    When ``needs_merge`` / ``needs_spread`` are set on ``magi_attention_key``
+    they gate dispatch/undispatch.  Otherwise both default to True.
 
     Returns ``(total_tokens, 1, num_heads*head_dim)``.
     """
@@ -100,14 +99,8 @@ def magi_attn_forward(
     k = key.squeeze(1)
     v = value.squeeze(1)
 
-    no_expand = getattr(magi_attention_key, "_no_expand", False)
-
-    if no_expand:
-        needs_merge = getattr(magi_attention_key, "_is_first", True)
-        needs_spread = getattr(magi_attention_key, "_is_last", True)
-    else:
-        needs_merge = True
-        needs_spread = True
+    needs_merge = getattr(magi_attention_key, "needs_merge", True)
+    needs_spread = getattr(magi_attention_key, "needs_spread", True)
 
     if needs_merge:
         dq = dispatch(q, magi_attention_key)
@@ -169,10 +162,18 @@ def apply_prefix_tree_patch() -> None:
         if flex_attention_key is not None:
             return flex_attn_forward(query, key, value, flex_attention_key)
         # FA3 path
-        return _orig_te_forward(self, query, key, value, attention_mask, attn_mask_type,
-                                attention_bias=attention_bias,
-                                packed_seq_params=packed_seq_params,
-                                num_splits=num_splits, **kwargs)
+        return _orig_te_forward(
+            self,
+            query,
+            key,
+            value,
+            attention_mask,
+            attn_mask_type,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+            num_splits=num_splits,
+            **kwargs,
+        )
 
     TEDotProductAttention.forward = _te_forward
 
@@ -277,6 +278,13 @@ def apply_prefix_tree_patch() -> None:
         if attn_key is None:
             out = _orig_tl_forward(self, hidden_states, attention_mask, **kwargs)
         else:
+            no_expand = getattr(attn_key, "no_expand", False)
+            if no_expand:
+                attn_key.needs_merge = self.layer_number == 0
+                attn_key.needs_spread = self.layer_number == self.config.num_layers - 1
+            else:
+                attn_key.needs_merge = True
+                attn_key.needs_spread = True
             _real_sa_forward = self.self_attention.forward
 
             @functools.wraps(_real_sa_forward)
