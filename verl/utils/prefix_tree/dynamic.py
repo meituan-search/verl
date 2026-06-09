@@ -467,6 +467,151 @@ def dfs_micro_batch_groups(
     return all_groups
 
 
+def trie_dfs_leaf_order(trie: TrieNode) -> list[int]:
+    """Return sample indices in DFS pre-order from an existing trie."""
+    ordered: list[int] = []
+
+    def _walk(node: TrieNode) -> None:
+        if not node.children:
+            ordered.extend(node.sequence_ids)
+        else:
+            for child in node.children.values():
+                _walk(child)
+
+    if trie.is_root:
+        for child in trie.children.values():
+            _walk(child)
+    else:
+        _walk(trie)
+    return ordered
+
+
+def trie_to_leaf_ids(trie: TrieNode) -> np.ndarray:  # type: ignore[type-arg]  # noqa: F821
+    """Return np.array mapping sample_idx → leaf_id (DFS order)."""
+    import numpy as np
+
+    leaf_id = [-1]  # counter
+    mapping: dict[int, int] = {}
+
+    def _walk(node: TrieNode) -> None:
+        if not node.children:
+            for sid in node.sequence_ids:
+                mapping[sid] = leaf_id[0]
+            leaf_id[0] += 1
+        else:
+            for child in node.children.values():
+                _walk(child)
+
+    if trie.is_root:
+        for child in trie.children.values():
+            _walk(child)
+    else:
+        _walk(trie)
+
+    max_idx = max(mapping.keys()) if mapping else -1
+    result = np.full(max_idx + 1, -1, dtype=np.int32)
+    for sid, lid in mapping.items():
+        result[sid] = lid
+    return result
+
+
+def mbs_groups_from_trie(
+    trie: TrieNode,
+    max_token_len: int,
+) -> list[list[int]]:
+    """Group sequences into micro-batches from an existing trie.
+
+    Same algorithm as :func:`dfs_micro_batch_groups` but accepts a pre-built
+    trie instead of rebuilding from sequences.
+    """
+    all_groups: list[list[int]] = []
+    for trie_root in [trie]:
+        current_group: list[int] = []
+        covered: set[int] = set()
+        current_eff = 0
+
+        def _visit(node: TrieNode) -> None:
+            nonlocal current_eff
+            if not node.children:
+                path = node.ancestors + [node]
+                new_nodes = [n for n in path if id(n) not in covered]  # noqa: B023
+                inc = sum(len(n.tokens) for n in new_nodes)
+
+                if current_group and current_eff + inc > max_token_len:  # noqa: B023
+                    all_groups.append(current_group[:])  # noqa: B023
+                    current_group.clear()  # noqa: B023
+                    covered.clear()  # noqa: B023
+                    current_eff = 0
+                    new_nodes = path
+                    inc = sum(len(n.tokens) for n in new_nodes)
+
+                current_group.extend(node.sequence_ids)  # noqa: B023
+                covered.update(id(n) for n in new_nodes)  # noqa: B023
+                current_eff += inc
+            else:
+                for child in node.children.values():
+                    _visit(child)
+
+        if trie_root.is_root:
+            for child in trie_root.children.values():
+                _visit(child)
+        else:
+            _visit(trie_root)
+
+        if current_group:
+            all_groups.append(current_group)
+
+    return all_groups
+
+
+def prune_trie(
+    trie: TrieNode,
+    keep_leaf_ids: set[int],
+) -> Optional[tuple[TreeNode, list[int]]]:  # noqa: F821
+    """Extract a subtree containing only the given leaf sample indices.
+
+    Returns ``(tree_root, leaf_to_sample)`` ready for
+    :func:`build_layout_from_tree_node`, or ``None`` if no leaves match.
+    """
+    from verl.utils.prefix_tree.utils import TreeNode
+
+    if not keep_leaf_ids:
+        return None
+
+    def _build_subtree(node: TrieNode) -> Optional[TreeNode]:
+        segment_len = len(node.tokens)
+        children: list[TreeNode] = []
+
+        if not node.children:
+            # Leaf: keep if any of this leaf's sequence_ids are in keep_leaf_ids
+            if not set(node.sequence_ids) & keep_leaf_ids:
+                return None
+            leaf_to_sample.extend(node.sequence_ids)
+            return TreeNode(segment_len=segment_len, children=[])
+
+        # Internal node: keep children that intersect keep_leaf_ids
+        for child in node.children.values():
+            if not set(child.sequence_ids) & keep_leaf_ids:
+                continue
+            child_tree = _build_subtree(child)
+            if child_tree is not None:
+                children.append(child_tree)
+
+        if segment_len == 0 and len(children) <= 1:
+            # zero-length internal node with ≤1 child → skip (chain compression)
+            if len(children) == 1:
+                return children[0]
+            return None
+
+        return TreeNode(segment_len=segment_len, children=children)
+
+    leaf_to_sample: list[int] = []
+    root = _build_subtree(trie)
+    if root is None or not root.children and not root.is_leaf:
+        return None
+    return root, leaf_to_sample
+
+
 def compute_prefix_sharing_ratio(input_ids, attention_mask=None) -> float:
     """Compute prefix-sharing ratio from a batch of token sequences.
 
@@ -572,21 +717,9 @@ def prepare_prefix_tree_micro_batches(
 ):
     """Prepare micro-batches using prefix-tree DFS grouping.
 
-    Builds one trie over all sequences, traverses leaves in DFS pre-order,
-    and budgets by flat (deduplicated) trie tokens.  Syncs the number of
-    micro-batches across DP ranks when ``same_micro_num_in_dp`` is set.
-
-    Args:
-        data: ``TensorDict`` containing ``input_ids`` and
-            ``max_token_len_per_gpu``.
-        sp_size: sequence-parallel size (multiplier for max_token_len).
-        dp_group: optional DP process group for sync.
-        same_micro_num_in_dp: if True, pad shortest rank to match max.
-        num_batches_divided_by: if set, round up micro-batch count to be
-            divisible by this value.
-
-    Returns:
-        ``(micro_batches, batch_idx_list)``.
+    Expects a pre-built trie stored via ``tu.set_non_tensor_data(data,
+    "prefix_tree", trie)``. If not present, builds one from sequences
+    (backward-compatible fallback).
     """
     import logging as _logging
 
@@ -603,9 +736,13 @@ def prepare_prefix_tree_micro_batches(
     max_token_len_per_gpu = data["max_token_len_per_gpu"]
     max_token_len = max_token_len_per_gpu * sp_size
 
-    input_ids = data["input_ids"]
-    seqs = [t.tolist() for t in input_ids.unbind()]
-    batch_idx_list = dfs_micro_batch_groups(seqs, max_token_len)
+    trie = tu.get_non_tensor_data(data, "prefix_tree", default=None)
+    if trie is not None:
+        batch_idx_list = mbs_groups_from_trie(trie, max_token_len)
+    else:
+        input_ids = data["input_ids"]
+        seqs = [t.tolist() for t in input_ids.unbind()]
+        batch_idx_list = dfs_micro_batch_groups(seqs, max_token_len)
 
     if torch.distributed.is_initialized() and same_micro_num_in_dp and dp_group is not None:
         from verl.utils.device import get_torch_device

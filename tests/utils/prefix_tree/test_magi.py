@@ -46,15 +46,22 @@ def _make_nested_float(value_lists: list[list[float]], device="cpu") -> torch.Te
 class TestBuildPrefixTreeLayout:
     """Tests that verify the flat layout and PrefixTreeParams fields.
 
-    We call build_prefix_tree_params directly (bypassing the MAGI key
-    construction) to keep these tests CPU-only.
+    Uses the trie-based path (build_tree_dynamic → build_layout_from_tree_node)
+    to keep these tests CPU-only.
     """
 
+    @staticmethod
+    def _build_params_from_tokens(tokens):
+        from verl.utils.prefix_tree.dynamic import build_tree_dynamic
+        from verl.utils.prefix_tree.utils import build_layout_from_tree_node
+
+        result = build_tree_dynamic(tokens)
+        assert result is not None, "Expected shared prefix trie"
+        tree_root, leaf_to_sample = result
+        return build_layout_from_tree_node(tokens, tree_root, leaf_to_sample)
+
     def test_basic_shared_prefix(self):
-        from verl.utils.prefix_tree.utils import (
-            build_prefix_tree_params,
-            longest_common_prefix_length,
-        )
+        from verl.utils.prefix_tree.utils import longest_common_prefix_length
 
         tokens = [
             torch.tensor([10, 20, 30, 41, 42]),
@@ -64,7 +71,7 @@ class TestBuildPrefixTreeLayout:
         prefix_len = longest_common_prefix_length(tokens)
         assert prefix_len == 3
 
-        params = build_prefix_tree_params(tokens, prefix_len=prefix_len)
+        params = self._build_params_from_tokens(tokens)
 
         # flat layout: [10,20,30] + [41,42] + [51] + [61,62,63]
         assert torch.equal(params.flat_tokens, torch.tensor([10, 20, 30, 41, 42, 51, 61, 62, 63]))
@@ -81,26 +88,12 @@ class TestBuildPrefixTreeLayout:
         ]
         assert longest_common_prefix_length(tokens) == 0
 
-    def test_position_ids_default(self):
-        from verl.utils.prefix_tree.utils import build_prefix_tree_params
-
-        tokens = [
-            torch.tensor([10, 20, 30, 41, 42]),
-            torch.tensor([10, 20, 30, 51]),
-        ]
-        params = build_prefix_tree_params(tokens, prefix_len=3)
-
-        # prefix: [0,1,2], leaf_0: [3,4], leaf_1: [3]
-        assert torch.equal(params.flat_position_ids, torch.tensor([0, 1, 2, 3, 4, 3]))
-
     def test_flex_spec_structure(self):
-        from verl.utils.prefix_tree.utils import build_prefix_tree_params
-
         tokens = [
             torch.tensor([10, 20, 30, 41, 42]),
             torch.tensor([10, 20, 30, 51]),
         ]
-        params = build_prefix_tree_params(tokens, prefix_len=3)
+        params = self._build_params_from_tokens(tokens)
 
         # Expected rectangles:
         # (0,3)→(0,3) causal  — prefix self
@@ -125,12 +118,17 @@ class TestBuildPrefixTreeLayout:
 class TestRestoreFlatToNested:
     """Tests that verify round-trip: build params → restore → original tensors."""
 
-    def _build_pt_batch(self, tokens, prefix_len):
+    @staticmethod
+    def _build_pt_batch(tokens):
         """Build a PrefixTreeMagiBatch stub without the MAGI key."""
+        from verl.utils.prefix_tree.dynamic import build_tree_dynamic
         from verl.utils.prefix_tree.magi import PrefixTreeMagiBatch
-        from verl.utils.prefix_tree.utils import build_prefix_tree_params
+        from verl.utils.prefix_tree.utils import build_layout_from_tree_node
 
-        params = build_prefix_tree_params(tokens, prefix_len=prefix_len)
+        result = build_tree_dynamic(tokens)
+        assert result is not None
+        tree_root, leaf_to_sample = result
+        params = build_layout_from_tree_node(tokens, tree_root, leaf_to_sample)
         return PrefixTreeMagiBatch(
             flat_input_ids=params.flat_tokens,
             flat_position_ids=params.flat_position_ids,
@@ -151,7 +149,7 @@ class TestRestoreFlatToNested:
             torch.tensor([10, 20, 30, 51]),
             torch.tensor([10, 20, 30, 61, 62, 63]),
         ]
-        pt_batch = self._build_pt_batch(tokens, prefix_len=3)
+        pt_batch = self._build_pt_batch(tokens)
         flat = pt_batch.flat_input_ids  # (9,)
 
         restored = restore_flat_to_nested(flat, pt_batch)
@@ -176,7 +174,7 @@ class TestRestoreFlatToNested:
             torch.tensor([10, 20, 30, 41, 42]),
             torch.tensor([10, 20, 30, 51]),
         ]
-        pt_batch = self._build_pt_batch(tokens, prefix_len=3)
+        pt_batch = self._build_pt_batch(tokens)
 
         # Simulate logit output: (total_tokens=6, vocab=8)
         flat_logits = torch.randn(6, 8)
@@ -194,7 +192,7 @@ class TestRestoreFlatToNested:
             torch.tensor([10, 20, 30, 41]),
             torch.tensor([10, 20, 30, 51, 52]),
         ]
-        pt_batch = self._build_pt_batch(tokens, prefix_len=3)
+        pt_batch = self._build_pt_batch(tokens)
         flat = pt_batch.flat_input_ids
 
         restored = restore_flat_to_nested(flat, pt_batch)
@@ -208,44 +206,6 @@ class TestRestoreFlatToNested:
             sample = vals[pos : pos + int(length)]
             assert torch.equal(sample[:3], torch.tensor([10, 20, 30]))
             pos += int(length)
-
-    def test_custom_sample_indices(self):
-        """sample_indices remapping: leaf_to_sample=[1,0] → restored in index order."""
-        from verl.utils.prefix_tree.magi import PrefixTreeMagiBatch, restore_flat_to_nested
-        from verl.utils.prefix_tree.utils import build_prefix_tree_params
-
-        # sample_indices=[1,0] means the first token list maps to sample 1,
-        # and the second maps to sample 0.
-        tokens = [
-            torch.tensor([10, 20, 30, 41, 42]),  # → sample 1
-            torch.tensor([10, 20, 30, 51]),  # → sample 0
-        ]
-        params = build_prefix_tree_params(tokens, prefix_len=3, sample_indices=[1, 0])
-        pt_batch = PrefixTreeMagiBatch(
-            flat_input_ids=params.flat_tokens,
-            flat_position_ids=params.flat_position_ids,
-            flat_loss_mask=None,
-            magi_key=None,
-            flex_key=None,
-            leaf_to_sample=params.leaf_to_sample,  # [1, 0]
-            leaf_ranges=params.leaf_ranges,
-            prefix_range=params.prefix_range,
-            original_batch_size=2,
-        )
-
-        flat = params.flat_tokens
-        restored = restore_flat_to_nested(flat, pt_batch)
-        offsets = restored.offsets()
-        vals = restored.values()
-        lengths = offsets.diff().tolist()
-
-        assert len(lengths) == 2
-        # slot 0 → tokens[1] = [10,20,30,51]
-        pos0 = 0
-        assert torch.equal(vals[pos0 : pos0 + 4], tokens[1])
-        # slot 1 → tokens[0] = [10,20,30,41,42]
-        pos1 = int(lengths[0])
-        assert torch.equal(vals[pos1 : pos1 + 5], tokens[0])
 
 
 # ---------------------------------------------------------------------------

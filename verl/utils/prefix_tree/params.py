@@ -24,12 +24,7 @@ RangeSpec = tuple[int, int]
 
 @dataclass
 class PrefixTreeParams:
-    """Metadata for a flattened PrefixTree batch.
-
-    ``multilevel`` should be set to ``True`` when the tree has more than one
-    level of shared prefixes (built via ``build_multilevel_flex_spec``).  In
-    that mode the strict single-level rectangle layout check is skipped.
-    """
+    """Metadata for a flattened PrefixTree batch."""
 
     prefix_range: RangeSpec
     prefix_segments: list[RangeSpec]
@@ -46,7 +41,6 @@ class PrefixTreeParams:
     flat_labels: Optional[Tensor] = None
     flat_loss_mask: Optional[Tensor] = None
     flat_position_ids: Optional[Tensor] = None
-    multilevel: bool = False
 
     def __post_init__(self) -> None:
         if len(self.leaf_ranges) != len(self.leaf_segments):
@@ -78,27 +72,6 @@ class PrefixTreeParams:
         if not self.leaf_ranges and self.prefix_range[1] != self.total_seqlen_q:
             raise ValueError("prefix-only PrefixTree must end at total sequence length")
 
-        if not self.multilevel:
-            # Single-level layout: validate exact rectangle structure.
-            if self.prefix_segments != [self.prefix_range]:
-                raise ValueError("root-shared PrefixTree expects prefix_segments to equal [prefix_range]")
-            for leaf_start, _ in self.leaf_ranges:
-                if leaf_start < prefix_end:
-                    raise ValueError("leaf ranges must start at or after the shared prefix")
-            expected_ranges = [self.prefix_range]
-            expected_k_ranges = [self.prefix_range]
-            expected_mask_types = ["causal"]
-            for leaf_range in self.leaf_ranges:
-                expected_ranges.extend([leaf_range, leaf_range])
-                expected_k_ranges.extend([self.prefix_range, leaf_range])
-                expected_mask_types.extend(["full", "causal"])
-            if self.q_ranges != expected_ranges:
-                raise ValueError("q_ranges do not match root-shared PrefixTree layout")
-            if self.k_ranges != expected_k_ranges:
-                raise ValueError("k_ranges do not match root-shared PrefixTree layout")
-            if self.mask_types != expected_mask_types:
-                raise ValueError("mask_types do not match root-shared PrefixTree layout")
-
         for sample_idx, leaf_range in zip(self.leaf_to_sample, self.leaf_ranges, strict=False):
             if self.sample_to_leaf_range[sample_idx] != leaf_range:
                 raise ValueError("sample_to_leaf_range does not match leaf_to_sample ordering")
@@ -111,16 +84,6 @@ class PrefixTreeParams:
         }.items():
             if tensor is not None and tensor.numel() != self.total_seqlen_q:
                 raise ValueError(f"{name} must have total_seqlen_q elements")
-
-        if self.flat_position_ids is not None and self.flat_position_ids.numel() > 0 and not self.multilevel:
-            prefix_len = self.prefix_len
-            if prefix_len > 0 and self.flat_position_ids[:prefix_len].tolist() != list(range(prefix_len)):
-                raise ValueError("prefix positions must be contiguous starting at 0")
-            for leaf_start, leaf_end in self.leaf_ranges:
-                branch_len = leaf_end - leaf_start
-                expected = list(range(prefix_len, prefix_len + branch_len))
-                if self.flat_position_ids[leaf_start:leaf_end].tolist() != expected:
-                    raise ValueError("leaf positions must continue after the shared prefix")
 
     @property
     def prefix_len(self) -> int:

@@ -73,7 +73,24 @@ def prepare_micro_batches(
     force_group_size = tu.get_non_tensor_data(data=data, key="force_group_size", default=1)
 
     if use_dynamic_bsz and use_prefix_tree:
-        from verl.utils.prefix_tree.dynamic import prepare_prefix_tree_micro_batches
+        from verl.utils.prefix_tree.dynamic import (
+            greedy_build_tries,
+            prepare_prefix_tree_micro_batches,
+            trie_dfs_leaf_order,
+            trie_to_leaf_ids,
+        )
+
+        # Build trie once, thread through batch metadata.
+        input_ids = data["input_ids"]
+        seqs = [t.tolist() for t in input_ids.unbind()]
+        max_tokens = sum(len(s) for s in seqs) * 10
+        tries, _ = greedy_build_tries(seqs, max_tokens_per_tree=max_tokens)
+        if tries:
+            trie = tries[0]
+            dfs_order = trie_dfs_leaf_order(trie)
+            data = tu.index_select_tensor_dict(data, torch.tensor(dfs_order))
+            data.non_tensor_batch["leaf_id"] = trie_to_leaf_ids(trie)
+            tu.set_non_tensor_data(data, "prefix_tree", trie)
 
         micro_batches, batch_idx_list = prepare_prefix_tree_micro_batches(
             data,

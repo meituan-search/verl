@@ -23,7 +23,11 @@ from .dynamic import (
     dfs_leaf_order,
     dfs_micro_batch_groups,
     greedy_build_tries,
+    mbs_groups_from_trie,
     prepare_prefix_tree_micro_batches,
+    prune_trie,
+    trie_dfs_leaf_order,
+    trie_to_leaf_ids,
 )
 from .hash_based import _hash_prefix as hash_prefix
 from .magi import (
@@ -36,7 +40,7 @@ from .magi import (
     restore_flat_to_nested,
     strip_prefix_tree_args,
 )
-from .utils import TreeNode, build_layout_from_tree_node, build_prefix_tree_params, longest_common_prefix_length
+from .utils import TreeNode, build_layout_from_tree_node, longest_common_prefix_length
 
 __all__ = [
     # dynamic
@@ -49,7 +53,12 @@ __all__ = [
     "dfs_leaf_order",
     "dfs_micro_batch_groups",
     "greedy_build_tries",
+    "mbs_groups_from_trie",
     "prepare_prefix_tree_micro_batches",
+    "prune_trie",
+    "trie_dfs_leaf_order",
+    "trie_to_leaf_ids",
+    # hash_based
     # hash_based
     "hash_prefix",
     # magi
@@ -64,6 +73,5 @@ __all__ = [
     # utils
     "TreeNode",
     "build_layout_from_tree_node",
-    "build_prefix_tree_params",
     "longest_common_prefix_length",
 ]
