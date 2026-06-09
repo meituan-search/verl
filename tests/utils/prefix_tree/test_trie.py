@@ -348,3 +348,158 @@ class TestAttentionSpec:
         # leaf1 → prefix: full, then leaf1 self: causal
         assert ((200, 300), (0, 100), "full") in rects
         assert ((200, 300), (200, 300), "causal") in rects
+
+    def test_3layer_tree_7_leaves(self):
+        """1 root, 2 intermediates, 4 leaves = 7 leaves total.
+
+        Tree: root(3) → leaf0(2) direct
+                      → child_a(2) → leaf1(2), leaf2(2)
+                      → child_b(2) → leaf3(2), leaf4(2), leaf5(2), leaf6(2)
+
+        Flat layout: [root(3)][leaf0(2)][child_a(2)][leaf1(2)][leaf2(2)]
+                     [child_b(2)][leaf3(2)][leaf4(2)][leaf5(2)][leaf6(2)]
+        = 21 tokens, 25 attention rects.
+        """
+        from verl.utils.prefix_tree.dynamic import build_tree_dynamic
+        from verl.utils.prefix_tree.utils import build_prefix_tree_attention_spec
+
+        root_tok = [1, 2, 3]
+        samples = [
+            torch.tensor(root_tok + [10, 11]),  # idx 0: leaf0
+            torch.tensor(root_tok + [20, 21, 41, 42]),  # idx 1: child_a → leaf1
+            torch.tensor(root_tok + [20, 21, 51, 52]),  # idx 2: child_a → leaf2
+            torch.tensor(root_tok + [30, 31, 61, 62]),  # idx 3: child_b → leaf3
+            torch.tensor(root_tok + [30, 31, 71, 72]),  # idx 4: child_b → leaf4
+            torch.tensor(root_tok + [30, 31, 81, 82]),  # idx 5: child_b → leaf5
+            torch.tensor(root_tok + [30, 31, 91, 92]),  # idx 6: child_b → leaf6
+        ]
+
+        result = build_tree_dynamic(samples)
+        assert result is not None
+        tree_root, leaf_to_sample = result
+        assert len(leaf_to_sample) == 7
+
+        q_ranges, k_ranges, mask_types = build_prefix_tree_attention_spec(tree_root)
+        assert len(q_ranges) == 25
+        rects = list(zip(q_ranges, k_ranges, mask_types, strict=False))
+
+        # root causal: (0,3)→(0,3)
+        assert rects[0] == ((0, 3), (0, 3), "causal")
+
+        # Every leaf sees root (FULL rects)
+        full_to_root = [(q, k, t) for q, k, t in rects if k == (0, 3) and t == "full"]
+        assert len(full_to_root) == 9  # leaf0 + child_a + leaf1~2 + child_b + leaf3~6
+
+        # leaf0 directly under root
+        assert ((3, 5), (3, 5), "causal") in rects  # leaf0 self
+
+        # child_a subtree
+        assert ((5, 7), (5, 7), "causal") in rects  # child_a self
+        assert ((7, 9), (5, 7), "full") in rects  # leaf1 → child_a
+        assert ((9, 11), (5, 7), "full") in rects  # leaf2 → child_a
+
+        # child_b subtree
+        assert ((11, 13), (11, 13), "causal") in rects  # child_b self
+        assert ((13, 15), (11, 13), "full") in rects  # leaf3 → child_b
+        assert ((15, 17), (11, 13), "full") in rects  # leaf4 → child_b
+
+    def test_prune_3layer_to_4_leaves(self):
+        """Prune the 7-leaf tree from test_3layer_tree_7_leaves to 4 leaves.
+
+        Keep samples {0, 1, 2, 3}: leaf0, leaf1+leaf2 (under child_a), leaf3 (under child_b).
+        child_b prunes from 4 leaves to 1 leaf.
+        """
+        from verl.utils.prefix_tree.dynamic import greedy_build_tries, prune_trie
+        from verl.utils.prefix_tree.utils import build_prefix_tree_attention_spec
+
+        raw = [
+            [1, 2, 3, 10, 11],
+            [1, 2, 3, 20, 21, 41, 42],
+            [1, 2, 3, 20, 21, 51, 52],
+            [1, 2, 3, 30, 31, 61, 62],
+            [1, 2, 3, 30, 31, 71, 72],
+            [1, 2, 3, 30, 31, 81, 82],
+            [1, 2, 3, 30, 31, 91, 92],
+        ]
+        tries, _ = greedy_build_tries(raw, max_tokens_per_tree=1000)
+        trie = tries[0]
+
+        result = prune_trie(trie, {0, 1, 2, 3})
+        assert result is not None
+        tree_root, leaf_to_sample = result
+        assert len(leaf_to_sample) == 4
+
+        q_ranges, k_ranges, mask_types = build_prefix_tree_attention_spec(tree_root)
+        rects = list(zip(q_ranges, k_ranges, mask_types, strict=False))
+
+        # Fewer rects than the full 25 (no leaf4-6)
+        assert len(rects) < 25
+
+        # root causal and leaf→root FULL rects still exist
+        assert ((0, 3), (0, 3), "causal") in rects
+        full_to_root = [(q, k, t) for q, k, t in rects if k == (0, 3) and t == "full"]
+        assert len(full_to_root) > 0
+
+        # child_a still has 2 leaves
+        assert ((7, 9), (5, 7), "full") in rects  # leaf1 → child_a
+        assert ((9, 11), (5, 7), "full") in rects  # leaf2 → child_a
+
+        # child_b now has only 1 leaf (leaf3)
+        assert ((13, 15), (11, 13), "full") in rects
+
+        # leaf4-6 rects must be absent
+        child_b_full_rects = [q for q, k, t in rects if k == (11, 13) and t == "full"]
+        assert len(child_b_full_rects) == 1  # only leaf3
+
+    def test_zero_length_leaf_nodes(self):
+        """A/AB/ABC: nested prefixes produce zero-length leaf nodes.
+
+        A:   [1,2]           → leaf at root (0 tokens of its own)
+        AB:  [1,2,3,4]       → leaf under child (0 tokens of its own)
+        ABC: [1,2,3,4,5,6]   → leaf [5,6] at deepest level
+
+        Zero-length leaves are skipped by mask generation — their tokens
+        are covered by ancestor rects.
+        """
+        from verl.utils.prefix_tree.dynamic import build_tree_dynamic
+        from verl.utils.prefix_tree.utils import build_prefix_tree_attention_spec
+
+        samples = [
+            torch.tensor([1, 2]),  # A
+            torch.tensor([1, 2, 3, 4]),  # AB
+            torch.tensor([1, 2, 3, 4, 5, 6]),  # ABC
+        ]
+
+        result = build_tree_dynamic(samples)
+        assert result is not None
+        tree_root, leaf_to_sample = result
+
+        q_ranges, k_ranges, mask_types = build_prefix_tree_attention_spec(tree_root)
+        assert len(q_ranges) == 6  # root causal + 2 full→root + child causal + 1 full→child + ABC causal
+        rects = list(zip(q_ranges, k_ranges, mask_types, strict=False))
+
+        # root [1,2] = flat positions (0,2)
+        assert ((0, 2), (0, 2), "causal") in rects  # root self
+
+        # child [3,4] = flat positions (2,4)
+        assert ((2, 4), (0, 2), "full") in rects  # child → root
+        assert ((2, 4), (2, 4), "causal") in rects  # child self
+
+        # ABC leaf [5,6] = flat positions (4,6)
+        assert ((4, 6), (0, 2), "full") in rects  # ABC → root
+        assert ((4, 6), (2, 4), "full") in rects  # ABC → child
+        assert ((4, 6), (4, 6), "causal") in rects  # ABC self
+
+        # No rects from the zero-length leaf nodes (they don't appear)
+        assert len(rects) == 6
+
+        # Verify flat token layout: [1,2] + [3,4] + [5,6] = 6 tokens
+        from verl.utils.prefix_tree.utils import build_layout_from_tree_node
+
+        params = build_layout_from_tree_node(
+            samples,
+            tree_root,
+            leaf_to_sample,
+        )
+        assert torch.equal(params.flat_tokens, torch.tensor([1, 2, 3, 4, 5, 6]))
+        assert params.total_seqlen_q == 6
