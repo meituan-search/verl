@@ -532,9 +532,6 @@ def forward_prefix_tree(
 
     strip_prefix_tree_args(logits_processor_args)
 
-    if pt_batch.no_expand_middle and pt_batch.magi_key is not None:
-        pt_batch.magi_key.no_expand = True
-
     if prefix_tree_attention == "magi":
         output_orig = model(
             input_ids=flat_input_ids,

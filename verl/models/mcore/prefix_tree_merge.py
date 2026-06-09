@@ -88,10 +88,8 @@ def magi_attn_forward(
 ) -> Tensor:
     """Execute MAGI calc_attn for prefix-tree batches.
 
-    When ``needs_merge`` / ``needs_spread`` are set on ``magi_attention_key``
-    they gate dispatch/undispatch.  Otherwise both default to True.
-
-    Returns ``(total_tokens, 1, num_heads*head_dim)``.
+    Always dispatches/undispatches for CP correctness. Returns
+    ``(total_tokens, 1, num_heads*head_dim)``.
     """
     from magi_attention.api import calc_attn, dispatch, undispatch
 
@@ -99,20 +97,13 @@ def magi_attn_forward(
     k = key.squeeze(1)
     v = value.squeeze(1)
 
-    needs_merge = getattr(magi_attention_key, "needs_merge", True)
-    needs_spread = getattr(magi_attention_key, "needs_spread", True)
-
-    if needs_merge:
-        dq = dispatch(q, magi_attention_key)
-        dk = dispatch(k, magi_attention_key)
-        dv = dispatch(v, magi_attention_key)
-    else:
-        dq, dk, dv = q, k, v
+    dq = dispatch(q, magi_attention_key)
+    dk = dispatch(k, magi_attention_key)
+    dv = dispatch(v, magi_attention_key)
 
     out, _ = calc_attn(dq, dk, dv, magi_attention_key)
 
-    if needs_spread:
-        out = undispatch(out, magi_attention_key)
+    out = undispatch(out, magi_attention_key)
 
     return out.reshape(out.shape[0], 1, -1)
 
@@ -278,13 +269,6 @@ def apply_prefix_tree_patch() -> None:
         if attn_key is None:
             out = _orig_tl_forward(self, hidden_states, attention_mask, **kwargs)
         else:
-            no_expand = getattr(attn_key, "no_expand", False)
-            if no_expand:
-                attn_key.needs_merge = self.layer_number == 0
-                attn_key.needs_spread = self.layer_number == self.config.num_layers - 1
-            else:
-                attn_key.needs_merge = True
-                attn_key.needs_spread = True
             _real_sa_forward = self.self_attention.forward
 
             @functools.wraps(_real_sa_forward)

@@ -77,7 +77,6 @@ def prepare_micro_batches(
             greedy_build_tries,
             prepare_prefix_tree_micro_batches,
             trie_dfs_leaf_order,
-            trie_to_leaf_ids,
         )
 
         # Build trie once, thread through batch metadata.
@@ -89,7 +88,6 @@ def prepare_micro_batches(
             trie = tries[0]
             dfs_order = trie_dfs_leaf_order(trie)
             data = tu.index_select_tensor_dict(data, torch.tensor(dfs_order))
-            data.non_tensor_batch["leaf_id"] = trie_to_leaf_ids(trie)
             tu.set_non_tensor_data(data, "prefix_tree", trie)
 
         micro_batches, batch_idx_list = prepare_prefix_tree_micro_batches(
