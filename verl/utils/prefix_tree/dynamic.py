@@ -764,6 +764,12 @@ def prepare_prefix_tree_micro_batches(
             batch_idx_list.append(batch_idx_list[-1])
 
     micro_batches = [tu.index_select_tensor_dict(data, idx) for idx in batch_idx_list]
+    # Attach pruned subtree to each micro-batch for downstream trie reuse.
+    if trie is not None:
+        for idx, mb in zip(batch_idx_list, micro_batches, strict=False):
+            subtree = prune_trie(trie, set(idx))
+            if subtree is not None:
+                tu.set_non_tensor_data(mb, "prefix_tree_subtree", subtree)
     return micro_batches, batch_idx_list
 
 

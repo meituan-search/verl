@@ -129,11 +129,15 @@ def build_prefix_tree_micro_batch(
     attention_type: str = "flex",
     tp_size: int = 1,
     cp_size: int = 1,
+    cached_result: tuple | None = None,
 ) -> Optional[PrefixTreeMagiBatch]:
     """Build a PrefixTreeMagiBatch from a micro-batch of NestedTensor sequences.
 
     Detects shared-prefix trees through token-by-token trie insertion
     (arbitrary depth, no rollout-side metadata required).
+
+    When ``cached_result=(tree_root, leaf_to_sample)`` is provided, skips
+    trie construction and uses the pre-computed tree.
 
     Returns None when there is no shared prefix, signalling the caller to
     fall back to the standard attention path.
@@ -171,19 +175,22 @@ def build_prefix_tree_micro_batch(
     loss_masks_by_sample = _unpack_nested_to_list(loss_mask)
     position_ids_by_sample = _unpack_nested_to_list(position_ids)
 
-    from verl.utils.prefix_tree.dynamic import build_tree_dynamic
+    if cached_result is not None:
+        tree_root, leaf_to_sample = cached_result
+    else:
+        from verl.utils.prefix_tree.dynamic import build_tree_dynamic
 
-    if _magi_timing:
-        _torch_pt.cuda.nvtx.range_push("prefix_tree/build_tree")
-    t_tree0 = _ev() if _magi_timing else None
-    result = build_tree_dynamic(samples)
-    t_tree1 = _ev() if _magi_timing else None
-    if _magi_timing:
-        _torch_pt.cuda.nvtx.range_pop()
+        if _magi_timing:
+            _torch_pt.cuda.nvtx.range_push("prefix_tree/build_tree")
+        t_tree0 = _ev() if _magi_timing else None
+        result = build_tree_dynamic(samples)
+        t_tree1 = _ev() if _magi_timing else None
+        if _magi_timing:
+            _torch_pt.cuda.nvtx.range_pop()
 
-    if result is None:
-        return None
-    tree_root, leaf_to_sample = result
+        if result is None:
+            return None
+        tree_root, leaf_to_sample = result
 
     try:
         if _magi_timing:
@@ -494,6 +501,7 @@ def build_prefix_tree_batch(model, input_ids, logits_processor_args, use_prefix_
 
     prefix_tree_attention = (logits_processor_args or {}).get("prefix_tree_attention", "flex")
     loss_mask_nested = (logits_processor_args or {}).get("loss_mask", None)
+    cached_result = (logits_processor_args or {}).get("prefix_tree_subtree")
 
     from megatron.core import parallel_state as _mpu
 
@@ -504,6 +512,7 @@ def build_prefix_tree_batch(model, input_ids, logits_processor_args, use_prefix_
         attention_type=prefix_tree_attention,
         tp_size=_mpu.get_tensor_model_parallel_world_size(),
         cp_size=_mpu.get_context_parallel_world_size(),
+        cached_result=cached_result,
     )
 
 

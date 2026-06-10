@@ -952,6 +952,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 "temperature": temperature,
                 "loss_mask": loss_mask,
                 **get_prefix_tree_kwargs(use_prefix_tree, prefix_tree_attention),
+                "prefix_tree_subtree": tu.get_non_tensor_data(batch, "prefix_tree_subtree", default=None),
             }
 
             output = forward_fn(
