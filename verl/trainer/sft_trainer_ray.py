@@ -322,7 +322,7 @@ class SFTTrainer:
                     global_seqlen_lst = torch.Tensor([item.size()[0] for item in data["input_ids"]])
                     dp_size = max(self.training_client._query_dispatch_info("train")) + 1
 
-                    from verl.utils.prefix_tree.balancing import get_dfs_balanced_partitions
+                    from verl.utils.prefix_tree.dynamic import get_dfs_balanced_partitions
 
                     result = get_dfs_balanced_partitions(
                         data,

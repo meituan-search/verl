@@ -627,4 +627,4 @@ def get_group_balanced_partitions(
 
 
 # Moved to verl.utils.prefix_tree.balancing — keep alias for backward compat
-from verl.utils.prefix_tree.balancing import get_prefix_balanced_partitions  # noqa: E402, F401
+from verl.utils.prefix_tree.dynamic import get_prefix_balanced_partitions  # noqa: E402, F401

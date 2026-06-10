@@ -1098,7 +1098,7 @@ class RayPPOTrainer:
 
         elif self.config.actor_rollout_ref.model.get("use_prefix_tree", False):
             # DFS reorder for prefix sharing.
-            from verl.utils.prefix_tree.balancing import reorder_and_balance_for_prefix_tree
+            from verl.utils.prefix_tree.dynamic import reorder_and_balance_for_prefix_tree
 
             if reorder_and_balance_for_prefix_tree(
                 batch,

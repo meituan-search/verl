@@ -22,8 +22,11 @@ from __future__ import annotations
 
 import pytest
 
-from verl.utils.prefix_tree.balancing import get_prefix_balanced_partitions
-from verl.utils.prefix_tree.dynamic import build_mini_batch_prefix_groups, dfs_leaf_order
+from verl.utils.prefix_tree.dynamic import (
+    build_mini_batch_prefix_groups,
+    dfs_leaf_order,
+    get_prefix_balanced_partitions,
+)
 
 # ---------------------------------------------------------------------------
 # build_mini_batch_prefix_groups — grouping correctness

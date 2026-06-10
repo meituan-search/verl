@@ -42,10 +42,36 @@ import torch
 from torch import Tensor
 from torch.nested._internal.nested_tensor import NestedTensor
 
-from verl.utils.prefix_tree.hash_based import (
-    _hash_prefix,  # noqa: F401  re-exported for backwards-compat callers
-    build_prefix_segments_single_turn,  # noqa: F401  re-exported for backwards-compat callers
-)
+# ============================================================================
+# Hash utilities (consumed by train-time prefix segment builders)
+# ============================================================================
+
+
+def _hash_prefix(token_ids_flat: torch.Tensor) -> int:  # noqa: F821
+    """128-bit hash of a 1-D token-id tensor."""
+    raw = token_ids_flat.numpy().tobytes()
+    try:
+        import xxhash
+
+        return xxhash.xxh128_intdigest(raw)
+    except ImportError:
+        import hashlib
+
+        return int.from_bytes(hashlib.md5(raw).digest(), "little")
+
+
+def build_prefix_segments_single_turn(
+    input_ids: torch.Tensor,  # noqa: F821
+    attention_mask=None,
+) -> list[tuple[int, int]]:
+    """Build a single-entry prefix_segments list for one sample."""
+
+    ids = input_ids.flatten()
+    if attention_mask is not None:
+        mask = attention_mask.flatten().bool()
+        ids = ids[mask]
+    h = _hash_prefix(ids.cpu())
+    return [(h, int(ids.numel()))]
 
 
 @dataclass
