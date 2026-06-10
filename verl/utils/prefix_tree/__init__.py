@@ -34,16 +34,12 @@ from .dynamic import (
 )
 from .magi import (
     PrefixTreeMagiBatch,
-    build_prefix_segments_single_turn,
     build_prefix_tree_batch,
     build_prefix_tree_micro_batch,
     forward_prefix_tree,
     get_prefix_tree_kwargs,
     restore_flat_to_nested,
     strip_prefix_tree_args,
-)
-from .magi import (
-    _hash_prefix as hash_prefix,
 )
 from .utils import (
     PrefixTreeParams,
@@ -74,12 +70,10 @@ __all__ = [
     "trie_to_leaf_ids",
     # magi
     "PrefixTreeMagiBatch",
-    "build_prefix_segments_single_turn",
     "build_prefix_tree_batch",
     "build_prefix_tree_micro_batch",
     "forward_prefix_tree",
     "get_prefix_tree_kwargs",
-    "hash_prefix",
     "restore_flat_to_nested",
     "strip_prefix_tree_args",
     # utils

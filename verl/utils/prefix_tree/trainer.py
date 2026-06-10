@@ -20,8 +20,6 @@ the caller never needs to gate on ``use_prefix_tree``.
 
 from __future__ import annotations
 
-import numpy as np
-
 # ──────────────────────── engine config ──────────────────────────
 
 
@@ -53,47 +51,6 @@ def compute_metrics(metrics: dict, input_ids, config_or_data: dict) -> None:
     from verl.utils.prefix_tree.dynamic import compute_prefix_tree_metrics
 
     metrics.update(compute_prefix_tree_metrics(input_ids))
-
-
-# ──────────────────────── prefix segments injection ──────────────
-
-
-def inject_prefix_segments(gen_batch_output, config_or_data: dict) -> None:
-    """Build ``prefix_segments`` for prefix-tree MAGI attention after generation.
-
-    Mutates ``gen_batch_output.non_tensor_batch["prefix_segments"]``.
-    No-op when *use_prefix_tree* is disabled or segments already exist.
-    """
-    if not _is_prefix_tree_enabled(config_or_data):
-        return
-    if gen_batch_output.batch is None or "input_ids" not in gen_batch_output.batch.keys():
-        return
-
-    if "prefix_segments" in gen_batch_output.non_tensor_batch:
-        return
-
-    from verl.utils.prefix_tree.magi import build_prefix_segments_single_turn
-
-    _ids = gen_batch_output.batch["input_ids"]
-    _mask = gen_batch_output.batch.get("attention_mask", None)
-    rollout_n = config_or_data.get("n", 1)
-
-    # Compute once per unique prompt (before repeat), then repeat.
-    if hasattr(gen_batch_output, "_orig_ids"):
-        _orig_ids = gen_batch_output._orig_ids
-        _orig_mask = gen_batch_output._orig_mask
-    else:
-        _orig_ids = gen_batch_output.batch["input_ids"]
-        _orig_mask = gen_batch_output.batch.get("attention_mask", None)
-
-    unique_segs = np.array(
-        [
-            build_prefix_segments_single_turn(_orig_ids[i], _orig_mask[i] if _orig_mask is not None else None)
-            for i in range(_orig_ids.shape[0])
-        ],
-        dtype=object,
-    )
-    gen_batch_output.non_tensor_batch["prefix_segments"] = np.repeat(unique_segs, repeats=rollout_n, axis=0)
 
 
 # ──────────────────────── disable for log-prob ───────────────────

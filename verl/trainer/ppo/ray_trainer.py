@@ -1389,9 +1389,6 @@ class RayPPOTrainer:
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 rollout_n = self.config.actor_rollout_ref.rollout.n
                 gen_batch_output = gen_batch.repeat(repeat_times=rollout_n, interleave=True)
-                from verl.utils.prefix_tree.trainer import inject_prefix_segments
-
-                inject_prefix_segments(gen_batch_output, self.config.actor_rollout_ref.model)
 
                 if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                     # NOTE: REMAX needs one sampled rollout plus one greedy baseline per prompt.
