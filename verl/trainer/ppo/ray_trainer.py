@@ -1193,6 +1193,9 @@ class RayPPOTrainer:
             calculate_sum_pi_squared=calculate_sum_pi_squared,
             compute_loss=False,
         )
+        from verl.utils.prefix_tree.trainer import configure_olb_backend
+
+        configure_olb_backend(batch_td, self.config.actor_rollout_ref.model)
         output = self.actor_rollout_wg.compute_log_prob(batch_td)
         # gather output
         entropy = tu.get(output, "entropy")
@@ -1213,12 +1216,11 @@ class RayPPOTrainer:
             # Disable prefix tree AND dynamic batching so the fallback uses
             # static micro-batches (log_prob_micro_batch_size_per_gpu), not the
             # token-budget path which would create 1-seq micro-batches at small budgets.
-            from verl.utils.prefix_tree.trainer import disable_for_log_prob
-
-            disable_for_log_prob(
+            tu.assign_non_tensor(
                 batch_td,
-                self.config.actor_rollout_ref.model,
-                self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu,
+                use_prefix_tree=False,
+                use_dynamic_bsz=False,
+                micro_batch_size_per_gpu=self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu,
             )
             _fb_out = self.actor_rollout_wg.compute_log_prob(batch_td)
             entropy = no_padding_2_padding(tu.get(_fb_out, "entropy"), batch_td)

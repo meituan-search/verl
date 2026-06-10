@@ -413,6 +413,7 @@ actor_rollout_ref:
     use_remove_padding: true
     use_prefix_tree: false
     prefix_tree_attention: flex
+    prefix_tree_olb_backend: null
     lora_rank: 0
     lora_alpha: 16
     target_modules: all-linear
@@ -644,6 +645,7 @@ critic:
     use_remove_padding: true
     use_prefix_tree: false
     prefix_tree_attention: flex
+    prefix_tree_olb_backend: null
     lora_rank: 0
     lora_alpha: 16
     target_modules: all-linear

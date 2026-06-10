@@ -770,6 +770,31 @@ def prepare_prefix_tree_micro_batches(
             batch_idx_list.append(batch_idx_list[-1])
 
     micro_batches = [tu.index_select_tensor_dict(data, idx) for idx in batch_idx_list]
+    # Reorder micro-batches in inc-then-dec flat-token pattern to reduce PP bubble.
+    # Preserves prefix locality: samples within a group share prefixes and stay together.
+    if trie is not None and len(batch_idx_list) > 1:
+
+        def _group_flat_tokens(group: list[int]) -> int:
+            keep = set(group)
+
+            def _count(node):
+                total = 0
+                if not node.children:
+                    return len(node.tokens) if set(node.sequence_ids) & keep else 0
+                kept = False
+                for child in node.children.values():
+                    if set(child.sequence_ids) & keep:
+                        kept = True
+                        total += _count(child)
+                return total + len(node.tokens) if kept else total
+
+            return sum(_count(c) for c in trie.children.values())
+
+        tokens_per_group = [_group_flat_tokens(g) for g in batch_idx_list]
+        sorted_groups = sorted(zip(tokens_per_group, batch_idx_list, range(len(batch_idx_list)), strict=False))
+        ordered = [g for _, g, _ in sorted_groups]
+        batch_idx_list = ordered[::2] + ordered[1::2][::-1]
+        micro_batches = [tu.index_select_tensor_dict(data, idx) for idx in batch_idx_list]
     # Attach pruned subtree to each micro-batch for downstream trie reuse.
     if trie is not None:
         for idx, mb in zip(batch_idx_list, micro_batches, strict=False):
