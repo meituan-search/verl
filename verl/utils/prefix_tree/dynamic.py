@@ -234,12 +234,18 @@ def convert_trie_to_tree_node(
         node = TreeNode(segment_len=segment_len, children=children)
         if not children:
             if len(trie_node.sequence_ids) != 1:
-                # Identical sequences share a leaf (common in GRPO with n>1 rollouts).
-                # Fall back to standard computation by signalling failure.
                 raise ValueError(
                     f"Trie leaf has duplicate sequences {trie_node.sequence_ids}; falling back to standard attention."
                 )
             leaf_to_sample.append(trie_node.sequence_ids[0])
+        else:
+            # Samples that terminate at this intermediate node need zero-length leaves.
+            child_ids = set().union(*(c.sequence_ids for c in trie_node.children.values()))
+            for sid in trie_node.sequence_ids:
+                if sid not in child_ids:
+                    leaf_to_sample.append(sid)
+                    # zero-length leaf: sample's tokens are entirely in ancestors
+                    node.children.append(TreeNode(segment_len=0, children=[]))
         return node
 
     only_child = next(iter(trie.children.values()))
