@@ -52,10 +52,15 @@ class DefaultDynamicScalingPolicy(DynamicScalingPolicyBase):
 
         total_wait = sum(ctx.step_wait_times)
 
-        if total_wait > 10:   # trainer wait over 10 seconds in last step
+        if total_wait > 10:                 # trainer wait over 10 seconds in last step
             self.deactivate_ratio = min(1.0, self.deactivate_ratio + 0.05)
-        elif ctx.total_generated_samples > ctx.expected_samples + ctx.buffer_samples * 0.8:
-            self.deactivate_ratio -= 0.05
+        else:
+            if ctx.buffer_samples > 0 and ctx.total_generated_samples > ctx.expected_samples + ctx.buffer_samples * 0.8:
+                self.deactivate_ratio -= 0.05
+
+            if ctx.buffer_samples == 0:
+                self.deactivate_ratio = max(0, self.deactivate_ratio - 0.02)
+
 
         print(
             f"[DefaultDynamicScalingPolicy] step={global_steps} "
@@ -71,4 +76,4 @@ class DefaultDynamicScalingPolicy(DynamicScalingPolicyBase):
         print(f"[should_activate_after_step] ctx.total_generated_samples:{ctx.total_generated_samples}, ctx.expected_samples:{ctx.expected_samples}, self.deactivate_ratio:{self.deactivate_ratio}, ctx.buffer_samples:{ctx.buffer_samples}")
         print(f"DynamicScaleContext:{ctx}")
 
-        return ctx.total_generated_samples - ctx.expected_samples < self.deactivate_ratio * ctx.buffer_samples
+        return ctx.total_generated_samples - ctx.expected_samples < self.deactivate_ratio * ctx.required_samples * ctx.trigger_parameter_sync_step
