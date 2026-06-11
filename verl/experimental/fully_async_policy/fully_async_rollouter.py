@@ -541,6 +541,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Keeps the most recent _STEP_HISTORY_SIZE entries for throughput diff analysis.
         self._STEP_HISTORY_SIZE: int = 10
         self._step_samples_history: collections.deque = collections.deque(maxlen=self._STEP_HISTORY_SIZE)
+        # Monotonically increasing counter of completed param-sync steps.
+        # Must NOT be capped by _STEP_HISTORY_SIZE; used by get_completed_steps() to
+        # compute expected_samples in the trainer, which grows without bound.
+        self._completed_steps: int = 0
         # we start from step 1
         self.global_steps = 1
         self.idle_start_time = time.time()
@@ -630,10 +634,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             timing_raw["fully_async/rollouter/version_time"] = rollout_version_time
             timing_raw["fully_async/rollouter/idle_ratio"] = idle_ratio
 
-            # --- per-step throughput snapshot ---
-            step_idx = len(self._step_samples_history) + 1
             if self._step_generated_samples > 0:
-                self._step_samples_history.append((step_idx, self._step_generated_samples))
+                self._completed_steps += 1
+                self._step_samples_history.append((self._completed_steps, self._step_generated_samples))
             timing_raw["fully_async/rollouter/step_generated_samples"] = self._step_generated_samples
             timing_raw["fully_async/rollouter/recent_step_samples_history"] = list(self._step_samples_history)
             # Reset per-step counter for the next param version.
@@ -1240,8 +1243,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         return self.total_generated_samples
 
     def get_completed_steps(self) -> int:
-        """Number of param-sync steps that have produced at least one sample."""
-        return len(self._step_samples_history)
+        """Number of param-sync steps completed (monotonically increasing)."""
+        return self._completed_steps
 
     async def get_sample_collection_ratio(self) -> float:
         """Return the fraction of required samples already collected for the current step."""

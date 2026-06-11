@@ -63,6 +63,7 @@ class GlobalRequestLoadBalancer:
         self._servers: dict[str, ray.actor.ActorHandle] = dict(servers)
         self._inflight_requests: dict[str, int] = {sid: 0 for sid in servers}
         self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
+        self._acquire_call_count: int = 0
 
     def acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
         """Acquire a server for the given request (sticky + least-loaded).
@@ -71,22 +72,37 @@ class GlobalRequestLoadBalancer:
             A tuple of ``(server_id, actor_handle)`` in a single atomic call.
         """
         # Try sticky session first
+        sticky_hit = False
         if request_id in self._request_id_to_server:
             server_id = self._request_id_to_server[request_id]
             # Check if server is still in the active pool
             if server_id in self._inflight_requests:
                 self._inflight_requests[server_id] += 1
-                return server_id, self._servers[server_id]
-            # Server was removed, clear stale cache entry and re-select
-            del self._request_id_to_server[request_id]
+                sticky_hit = True
+            else:
+                # Server was removed, clear stale cache entry and re-select
+                del self._request_id_to_server[request_id]
 
-        # Select new server (least-loaded among available)
-        if not self._inflight_requests:
-            raise RuntimeError("No available servers in load balancer")
+        if not sticky_hit:
+            # Select new server (least-loaded among available)
+            if not self._inflight_requests:
+                raise RuntimeError("No available servers in load balancer")
 
-        server_id = min(self._inflight_requests, key=self._inflight_requests.get)
-        self._request_id_to_server[request_id] = server_id
-        self._inflight_requests[server_id] += 1
+            server_id = min(self._inflight_requests, key=self._inflight_requests.get)
+            self._request_id_to_server[request_id] = server_id
+            self._inflight_requests[server_id] += 1
+
+        self._acquire_call_count += 1
+        if self._acquire_call_count % 10 == 0:
+            load_str = ", ".join(
+                f"{sid}={self._inflight_requests[sid]}" for sid in sorted(self._inflight_requests)
+            )
+            print(
+                f"[GlobalLoadBalancer][acquire_server] call_count={self._acquire_call_count} "
+                f"assigned_to={server_id} sticky={sticky_hit} "
+                f"server_loads=({load_str})"
+            )
+
         return server_id, self._servers[server_id]
 
     def release_server(self, server_id: str) -> None:
