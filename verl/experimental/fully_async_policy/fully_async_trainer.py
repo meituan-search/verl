@@ -633,12 +633,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             f"hybrid_checkpoint_manager: {'None' if hcm is None else f'backend={hcm.backend}, replicas({len(hcm.replicas)})={_fmt_replicas(hcm.replicas)}'}"
         )
 
-        # Reset staleness in rollouter
-        timing_raw = await asyncio.wrap_future(self.rollouter.reset_staleness.remote().future())
-        # Print per-step rollout throughput history for trainer/rollouter diff analysis.
-        # The history is a list of (step_idx, sample_count) for the last 10 param versions.
-        _step_history = timing_raw.pop("fully_async/rollouter/recent_step_samples_history", [])
-        _this_step_samples = timing_raw.get("fully_async/rollouter/step_generated_samples", "N/A")
+
         _total_generated_samples, _completed_steps = ray.get(
             [self.rollouter.get_total_produced_samples.remote(), self.rollouter.get_completed_steps.remote()]
         )
@@ -685,6 +680,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
                 self.dynamic_scale_ctx.last_activate_duration_s = time.time() - _act_start
 
+        timing_raw = await asyncio.wrap_future(self.rollouter.reset_staleness.remote().future())
+
         print(
             f"[FullyAsyncTrainer] _fit_update_weights, "
             f"timing_s/param_sync: {self.timing_raw['timing_s/param_sync']:.4f} seconds "
@@ -700,6 +697,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             )
 
         self._step_wait_times = []  # reset for next step
+
+        print("zs-log: timing_raw:", timing_raw)
+
         self.logger.log(
             data=timing_raw,
             step=self.current_param_version,

@@ -544,7 +544,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Monotonically increasing counter of completed param-sync steps.
         # Must NOT be capped by _STEP_HISTORY_SIZE; used by get_completed_steps() to
         # compute expected_samples in the trainer, which grows without bound.
-        self._completed_steps: int = 0
+        self._completed_steps: int = 1
         # we start from step 1
         self.global_steps = 1
         self.idle_start_time = time.time()
@@ -638,7 +638,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 self._completed_steps += 1
                 self._step_samples_history.append((self._completed_steps, self._step_generated_samples))
             timing_raw["fully_async/rollouter/step_generated_samples"] = self._step_generated_samples
-            timing_raw["fully_async/rollouter/recent_step_samples_history"] = list(self._step_samples_history)
             # Reset per-step counter for the next param version.
             self._step_generated_samples = 0
 
