@@ -218,6 +218,31 @@ class FSDPEngine(BaseEngine):
 
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
+        # Magi CP device mesh + group (orthogonal to FSDP DP). Always built —
+        # even at cp_size=1 — so we can pass a concrete cp_group instead of
+        # dist.group.WORLD, which Magi would treat as CP=world and break a2av.
+        self.context_parallel_size = getattr(self.engine_config, "context_parallel_size", 1)
+        self.cp_device_mesh = None
+        self.cp_group = None
+        if self.context_parallel_size > 1:
+            assert not self.use_ulysses_sp, (
+                "context_parallel_size > 1 (Magi CP) is mutually exclusive with "
+                "ulysses_sequence_parallel_size > 1; pick one parallelism scheme."
+            )
+        # Compute the CP-side dp locally (get_data_parallel_size doesn't account
+        # for CP). cp_size=1 → (world, 1) mesh, each rank gets a size-1 cp_group.
+        cp_dp_size = world_size // self.context_parallel_size
+        assert cp_dp_size * self.context_parallel_size == world_size, (
+            f"world_size ({world_size}) not divisible by context_parallel_size "
+            f"({self.context_parallel_size}); choose a cp_size that divides world_size"
+        )
+        self.cp_device_mesh = init_device_mesh(
+            device_name,
+            mesh_shape=(cp_dp_size, self.context_parallel_size),
+            mesh_dim_names=["dp", "cp"],
+        )
+        self.cp_group = self.cp_device_mesh["cp"].get_group()
+
     def _build_module(self):
         from verl.utils.model import get_hf_auto_model_class
         from verl.utils.torch_dtypes import PrecisionType
@@ -286,7 +311,29 @@ class FSDPEngine(BaseEngine):
                 ulysses_sp_size=self.ulysses_sequence_parallel_size,
                 use_fused_kernels=use_fused_kernels,
                 fused_kernels_backend=fused_kernels_backend,
+                use_prefix_tree_dynamic=getattr(self.engine_config, "use_prefix_tree_dynamic", False),
             )
+
+            # dynamic prefix-tree + Magi: attach cp_group to every attention
+            # module and flip _attn_implementation so HF dispatches through Magi.
+            if getattr(self.engine_config, "use_prefix_tree_dynamic", False):
+                # FSDP1 + Magi has EVAL/TRAIN forward divergence (ppo_kl ≈ 3,
+                # intermittent NaN grad). MagiAttention's reference example uses FSDP2.
+                assert self.engine_config.strategy == "fsdp2", (
+                    f"use_prefix_tree_dynamic=True requires engine.strategy='fsdp2'; "
+                    f"got '{self.engine_config.strategy}'."
+                )
+                attn_backend = getattr(self.engine_config, "prefix_tree_attention", "magi")
+                assert attn_backend == "magi", f"prefix_tree_attention='{attn_backend}' unsupported on FSDP."
+                self._attach_magi_cp_group_to_attention_modules(module)
+                # HF reads _attn_implementation per-config; cover composite (VL) configs too.
+                cfgs_to_flip = [module.config]
+                for sub in ("text_config", "vision_config"):
+                    sub_cfg = getattr(module.config, sub, None)
+                    if sub_cfg is not None:
+                        cfgs_to_flip.append(sub_cfg)
+                for cfg in cfgs_to_flip:
+                    cfg._attn_implementation = "Magi_Attention"
 
             # some parameters may not in torch_dtype
             module.to(torch_dtype)
@@ -294,6 +341,29 @@ class FSDPEngine(BaseEngine):
             if self.model_config.enable_gradient_checkpointing:
                 module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         return module
+
+    def _attach_magi_cp_group_to_attention_modules(self, model):
+        """Walk model and attach ``cp_group`` attribute to each attention layer.
+
+        Magi's HF backend reads the group via ``module.cp_group``. We use the
+        CP process group from ``_init_device_mesh``; falls back to the world
+        group when CP is not configured (cp_size=1 single-rank case).
+        """
+        cp_group = self.cp_group
+        if cp_group is None and torch.distributed.is_initialized():
+            cp_group = torch.distributed.group.WORLD
+        attached = 0
+        for name, mod in model.named_modules():
+            cls_name = mod.__class__.__name__.lower()
+            if cls_name.endswith("attention") or cls_name.endswith("self_attn") or cls_name.endswith("selfattention"):
+                mod.cp_group = cp_group
+                attached += 1
+        if (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_rank() == 0
+            or not torch.distributed.is_initialized()
+        ):
+            print(f"[PrefixTreeDynamic] Attached cp_group to {attached} attention modules")
 
     def _build_lora_module(self, module):
         module.enable_input_require_grads()
@@ -602,7 +672,9 @@ class FSDPEngine(BaseEngine):
         raise NotImplementedError
 
     def get_context_parallel_group(self):
-        raise NotImplementedError
+        # Magi CP group when context_parallel_size > 1, else fall back to a
+        # single-rank group (None / world).
+        return self.cp_group
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> list[TensorDict]:
         # note that the global_batch_size should include data on all the dp
@@ -1208,6 +1280,36 @@ class FSDPEngineWithLMHead(FSDPEngine):
         micro_batch = micro_batch.to(get_device_id())
         model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
+        # ── Optional memory profiling (set PROFILE_MEMORY_LOG=1 to enable).
+        # Logs allocated + max_allocated at three checkpoints per forward_step
+        # so we can A/B tree vs dense and find the phase where the diff lives.
+        _profile_mem = os.environ.get("PROFILE_MEMORY_LOG", "0") == "1"
+        _profile_mem_rank = int(os.environ.get("PROFILE_MEMORY_LOG_RANK", "0"))
+        _profile_mem_active = _profile_mem and torch.distributed.get_rank() == _profile_mem_rank
+
+        def _mem_log(phase: str):
+            if not _profile_mem_active:
+                return
+            alloc = torch.cuda.memory_allocated() / 1e9
+            peak = torch.cuda.max_memory_allocated() / 1e9
+            print(
+                f"[MEM] forward_step phase={phase} forward_only={forward_only} "
+                f"tree={tu.get_non_tensor_data(data=micro_batch, key='use_prefix_tree_dynamic', default=False)} "
+                f"alloc={alloc:.3f}GB peak={peak:.3f}GB",
+                flush=True,
+            )
+
+        _mem_log("enter")
+
+        # dynamic prefix-tree opt-in flag (passed via non-tensor data on the micro-batch).
+        use_prefix_tree_dynamic = tu.get_non_tensor_data(data=micro_batch, key="use_prefix_tree_dynamic", default=False)
+        prefix_tree_attention = tu.get_non_tensor_data(data=micro_batch, key="prefix_tree_attention", default="magi")
+        if use_prefix_tree_dynamic and prefix_tree_attention != "magi":
+            raise ValueError(
+                f"prefix_tree_attention={prefix_tree_attention!r} is unsupported on FSDP; "
+                "only 'magi' is supported (flex was retired due to the AReaL 8x entropy bug)."
+            )
+
         # Honor mixed_precision.param_dtype resolved during FSDP setup. When dtype is fp32,
         # autocast is a no-op at best and a footgun at worst, so skip it entirely.
         # getattr fallback: some subclasses (e.g. VeOmniEngine) bypass FSDPEngine.__init__
@@ -1219,10 +1321,112 @@ class FSDPEngineWithLMHead(FSDPEngine):
             else torch.autocast(device_type=device_name, dtype=autocast_dtype)
         )
         with autocast_ctx:
-            raw_output = self.module(
-                **model_inputs,
-                use_cache=False,
-            )  # prevent model thinks we are generating
+            pt_batch = None
+            tree_metrics: dict[str, float] = {}
+            if use_prefix_tree_dynamic:
+                # Defense-in-depth: _build_module already asserts strategy=fsdp2,
+                # but re-check in forward_step in case a code path constructs the
+                # engine without going through _build_module's dynamic-trie setup.
+                assert self.engine_config.strategy == "fsdp2", (
+                    f"use_prefix_tree_dynamic=True requires engine.strategy='fsdp2'; "
+                    f"got strategy='{self.engine_config.strategy}'. "
+                    "FSDP1 + Magi attention is unsupported."
+                )
+
+                # Build prefix-tree micro-batch + Magi key. Returns None on no
+                # shared prefix → transparently fall back to the dense path below.
+                # Magi CP and Ulysses SP are mutually exclusive.
+                assert not self.use_ulysses_sp, (
+                    "use_prefix_tree_dynamic + Magi conflicts with Ulysses SP; "
+                    "set actor.ulysses_sequence_parallel_size=1."
+                )
+                from verl.utils.prefix_tree_magi import build_prefix_tree_micro_batch, restore_flat_to_nested
+
+                # pass loss_mask=None: in RL flow it's response-only and we
+                # read loss_mask off the original micro_batch downstream anyway.
+                _mem_log("before_pt_batch_build")
+                pt_batch = build_prefix_tree_micro_batch(
+                    self.module,
+                    micro_batch["input_ids"],
+                    loss_mask=None,
+                    position_ids=micro_batch.get("position_ids", None),
+                    attention_type="magi",
+                    tp_size=1,
+                    cp_size=self.context_parallel_size,
+                    dynamic_trie=True,
+                )
+                _mem_log("after_pt_batch_build")
+
+                # Tree-dedup metrics: ratio<1 means tokens saved; ratio==1 means
+                # we fell back to dense.
+                _nested = micro_batch["input_ids"]
+                if hasattr(_nested, "values"):
+                    _orig = int(_nested.values().shape[0])
+                else:
+                    _orig = int(sum(int(s.shape[0]) for s in _nested))
+                _packed = int(pt_batch.real_tokens) if pt_batch is not None else _orig
+                tree_metrics = {
+                    "prefix_tree/original_tokens": float(_orig),
+                    "prefix_tree/packed_tokens": float(_packed),
+                    "prefix_tree/token_ratio": float(_packed) / max(float(_orig), 1.0),
+                    "prefix_tree/tokens_saved": float(_orig - _packed),
+                    "prefix_tree/fell_back_to_dense": 1.0 if pt_batch is None else 0.0,
+                }
+
+            if pt_batch is not None:
+                # Magi packed forward. Key is attached per attention module via
+                # set_magi_attention_key_fsdp (module attribute survives activation
+                # checkpoint recompute; see set_magi_attention_key_fsdp docstring).
+                from verl.models.transformers.monkey_patch import set_magi_attention_key_fsdp
+
+                # Magi dispatch/undispatch operate on flat (seq,) along dim=0.
+                # Pattern matches Magi's examples/transformers/magi_trainer.py.
+                if self.context_parallel_size > 1:
+                    from magi_attention.api import dispatch
+
+                    local_flat_input_ids = dispatch(pt_batch.local_flat_input_ids, pt_batch.magi_key)
+                    local_flat_position_ids = dispatch(pt_batch.local_flat_position_ids, pt_batch.magi_key)
+                else:
+                    local_flat_input_ids = pt_batch.local_flat_input_ids
+                    local_flat_position_ids = pt_batch.local_flat_position_ids
+
+                flat_input_ids = local_flat_input_ids.unsqueeze(0)
+                flat_position_ids = local_flat_position_ids.unsqueeze(0)
+
+                set_magi_attention_key_fsdp(self.module, pt_batch.magi_key)
+                _mem_log("before_magi_forward")
+                raw_output = self.module(
+                    input_ids=flat_input_ids,
+                    attention_mask=None,
+                    position_ids=flat_position_ids,
+                    use_cache=False,
+                )
+                _mem_log("after_magi_forward_packed_logits")
+
+                # Per-rank logits (1, local_seq, V) → full flat (full_seq, V).
+                logits = raw_output.logits
+                if self.context_parallel_size > 1:
+                    from magi_attention.api import undispatch
+
+                    logits = undispatch(logits.squeeze(0), pt_batch.magi_key)
+                else:
+                    logits = logits.squeeze(0)
+                _mem_log("after_squeeze_undispatch")
+
+                # Trim prefix-tree padding → restore per-sample → rmpad layout
+                # so prepare_model_outputs sees the standard shape.
+                flat_logits = logits[: pt_batch.real_tokens]
+                _mem_log("after_trim_to_real_tokens")
+                nested_logits = restore_flat_to_nested(flat_logits, pt_batch)
+                _mem_log("after_restore_to_nested")
+                raw_output.logits = nested_logits.values().unsqueeze(0)
+                _mem_log("after_tree_forward")
+            else:
+                raw_output = self.module(
+                    **model_inputs,
+                    use_cache=False,
+                )  # prevent model thinks we are generating
+                _mem_log("after_dense_forward")
 
             model_output = self.prepare_model_outputs(
                 output=raw_output, output_args=output_args, micro_batch=micro_batch, logits_processor_func=loss_function
@@ -1237,12 +1441,18 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 loss = torch.tensor(1.0, device=device_name)
                 metrics = {}
 
+            # Merge in tree-dedup visibility metrics so they roll up alongside
+            # actor/* and perf/* in the per-step training log + wandb.
+            if tree_metrics:
+                metrics.update(tree_metrics)
+
             output = {
                 "model_output": model_output,
                 "loss": loss.detach().item(),
                 "metrics": metrics,
             }
 
+            _mem_log("before_return")
             return loss, output
 
 
