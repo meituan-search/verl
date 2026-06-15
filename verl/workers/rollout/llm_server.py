@@ -310,6 +310,11 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 final_output.num_preempted += output.num_preempted
             final_output.stop_reason = output.stop_reason
 
+            for key in engine_server_keys:
+                if output.extra_fields.get(key) is not None:
+                    final_output.extra_fields.setdefault(key, [])
+                    final_output.extra_fields[key].extend(output.extra_fields[key])
+
             # update model weights version
             global_steps = output.extra_fields.get("global_steps", None)
             if min_global_steps is None:
@@ -335,6 +340,15 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         final_output.extra_fields["min_global_steps"] = min_global_steps
         final_output.extra_fields["max_global_steps"] = max_global_steps
         return final_output
+
+    async def _compute_chunk_log_probs(
+        self, output: TokenOutput, context_prompt_ids: list[int], sampling_params: dict
+    ) -> None:
+        if len(output.token_ids) == 0:
+            return
+        temperature = sampling_params.get("temperature", 1.0)
+        results = await self._model_engine_manager.compute_log_probs(context_prompt_ids, output.token_ids, temperature)
+        output.extra_fields.update(results)
 
 
 class LLMServerManager:
