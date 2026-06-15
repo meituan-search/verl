@@ -101,7 +101,7 @@ class FullyAsyncLLMServerManager(LLMServerManager):
             return [self._model_engine_manager._old_instance]
         return []
 
-    def get_client(self, client_cls=LLMServerClient, **kwargs) -> LLMServerClient:
+    def get_client(self, client_cls=FullyAsyncLLMServerClient, **kwargs) -> FullyAsyncLLMServerClient:
         kwargs.setdefault("model_engine_manager", self._model_engine_manager)
         return super().get_client(client_cls=client_cls, **kwargs)
 

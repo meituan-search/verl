@@ -227,6 +227,10 @@ class FullyAsyncLLMServerClient(LLMServerClient):
     invisible to the AgentLoop.
     """
 
+    def __init__(self, *args, **kwargs):
+        self._model_engine_manager = kwargs.pop("model_engine_manager", None)
+        super().__init__(*args, **kwargs)
+
     @rollout_trace_op
     async def generate(
         self,
@@ -238,6 +242,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         video_data: Optional[list[Any]] = None,
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        **kwargs: Any,
     ) -> TokenOutput:
         """Generate tokens from prompt ids.
 
@@ -254,6 +259,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             TokenOutput: token output
         """
         prompt_ids = normalize_token_ids(prompt_ids)
+        engine_server_keys = kwargs.pop("engine_server_keys", ())
 
         limit_key = None
         if "max_tokens" in sampling_params:
@@ -271,15 +277,20 @@ class FullyAsyncLLMServerClient(LLMServerClient):
 
         while True:
             # 1. generate tokens
+            context_prompt_ids = prompt_ids + final_output.token_ids
             output = await super().generate(
                 request_id=request_id,
-                prompt_ids=prompt_ids + final_output.token_ids,
+                prompt_ids=context_prompt_ids,
                 sampling_params=sampling_params,
                 image_data=image_data,
                 video_data=video_data,
                 audio_data=audio_data,
                 mm_processor_kwargs=mm_processor_kwargs,
             )
+
+            # Compute log probs immediately after this chunk with current model weights.
+            if len(engine_server_keys) > 0 and self._model_engine_manager is not None:
+                await self._compute_chunk_log_probs(output, context_prompt_ids, sampling_params)
 
             # 2. merge output into final_output
             final_output.token_ids.extend(output.token_ids)
