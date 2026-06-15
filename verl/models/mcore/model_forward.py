@@ -247,7 +247,7 @@ def gptmodel_forward_model_engine(
     if data_format == "thd":
         use_prefix_tree = (logits_processor_args or {}).get("use_prefix_tree", False)
         prefix_tree_attention = (logits_processor_args or {}).get("prefix_tree_attention", "flex")
-        from verl.utils.prefix_tree.magi import build_prefix_tree_batch, forward_prefix_tree
+        from verl.utils.prefix_tree.magi import build_prefix_tree_batch, forward_prefix_tree, strip_prefix_tree_args
 
         pb = build_prefix_tree_batch(
             model,
@@ -267,6 +267,9 @@ def gptmodel_forward_model_engine(
                 post_process,
                 model_kwargs,
             )
+        # No prefix sharing in this batch — strip prefix-tree keys so the
+        # preprocess_thd_engine loop below doesn't receive non-tensor values.
+        strip_prefix_tree_args(logits_processor_args)
 
         input_ids_rmpad, packed_seq_params, position_ids_rmpad = preprocess_thd_engine(
             input_ids,

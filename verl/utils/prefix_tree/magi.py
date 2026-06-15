@@ -189,6 +189,11 @@ def build_prefix_tree_micro_batch(
             _torch_pt.cuda.nvtx.range_pop()
 
         if result is None:
+            import logging as _log
+            _log.getLogger(__name__).warning(
+                "build_prefix_tree_micro_batch: no prefix sharing found (n=%d); "
+                "falling back to standard attention", len(samples)
+            )
             return None
         tree_root, leaf_to_sample = result
 
@@ -234,7 +239,12 @@ def build_prefix_tree_micro_batch(
                 flush=True,
             )
         return ret
-    except (ValueError, AssertionError, RuntimeError):
+    except (ValueError, AssertionError, RuntimeError) as _e:
+        import logging as _log, traceback as _tb
+        _log.getLogger(__name__).warning(
+            "build_prefix_tree_micro_batch: falling back to standard attention "
+            "(%s: %s)\n%s", type(_e).__name__, _e, _tb.format_exc()
+        )
         # Multilevel tree produced non-monotonic leaf ranges or inconsistent
         # token layout.  Fall back to standard attention for this micro-batch.
         return None

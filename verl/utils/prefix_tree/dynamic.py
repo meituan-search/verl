@@ -566,8 +566,15 @@ def mbs_groups_from_trie(
 
     Same algorithm as :func:`dfs_micro_batch_groups` but accepts a pre-built
     trie instead of rebuilding from sequences.
+
+    When a trie leaf holds multiple sequence_ids (identical sequences), all IDs
+    stay in the same DFS group.  prune_trie returns None for that group
+    (len(kept)>1), causing FA3 fallback for that one group only.  Keeping
+    duplicates in-group avoids an extra singleton group that would cause
+    same_micro_num_in_dp to pad the other DP rank, double-counting its gradients.
     """
     all_groups: list[list[int]] = []
+
     for trie_root in [trie]:
         current_group: list[int] = []
         covered: set[int] = set()
@@ -588,6 +595,11 @@ def mbs_groups_from_trie(
                     new_nodes = path
                     inc = sum(len(n.tokens) for n in new_nodes)
 
+                # Keep all sequence_ids (including duplicates) in the same group.
+                # Duplicates land in the same group as their originals → prune_trie
+                # returns None for that group → FA3 fallback for that one group.
+                # This avoids creating an extra singleton group that would upset
+                # same_micro_num_in_dp and double-count gradients on the other rank.
                 current_group.extend(node.sequence_ids)  # noqa: B023
                 covered.update(id(n) for n in new_nodes)  # noqa: B023
                 current_eff += inc
@@ -626,10 +638,15 @@ def prune_trie(
         children: list[TreeNode] = []
 
         if not node.children:
-            # Leaf: keep if any of this leaf's sequence_ids are in keep_leaf_ids
-            if not set(node.sequence_ids) & keep_leaf_ids:
+            # Leaf: keep only the sequence_ids that are in keep_leaf_ids.
+            kept = [s for s in node.sequence_ids if s in keep_leaf_ids]
+            if not kept:
                 return None
-            leaf_to_sample.extend(node.sequence_ids)
+            if len(kept) > 1:
+                # Two identical sequences in this micro-batch share the same trie
+                # leaf — can't represent as a single TreeNode.  Fall back.
+                return None
+            leaf_to_sample.extend(kept)
             return TreeNode(segment_len=segment_len, children=[])
 
         # Internal node: keep children that intersect keep_leaf_ids
@@ -651,6 +668,10 @@ def prune_trie(
     leaf_to_sample: list[int] = []
     root = _build_subtree(trie)
     if root is None or not root.children and not root.is_leaf:
+        return None
+    # Guard: if any keep_leaf_id was dropped (e.g. duplicate sequences sharing a
+    # trie leaf), fall back so restore_flat_to_nested never sees missing slots.
+    if set(leaf_to_sample) != keep_leaf_ids:
         return None
     return root, leaf_to_sample
 
