@@ -120,6 +120,8 @@ python3 -X faulthandler -m verl.experimental.fully_async_policy.fully_async_main
    +actor_rollout_ref.rollout.engine_kwargs.sglang.enable_memory_saver=False \
    +actor_rollout_ref.rollout.engine_kwargs.sglang.cuda_graph_max_bs=256 \
    +actor_rollout_ref.rollout.engine_kwargs.sglang.max_running_requests=256 \
+   +actor_rollout_ref.rollout.engine_kwargs.sglang.soft_watchdog_timeout=300 \
+   +actor_rollout_ref.rollout.engine_kwargs.sglang.watchdog_timeout=999999 \
    +trainer.worker_env.PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
    +actor_rollout_ref.rollout.engine_kwargs.sglang.disable_cuda_graph=False \
     trainer.total_epochs=1 $@

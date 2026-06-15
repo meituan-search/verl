@@ -183,6 +183,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._dynamic_scaling_deactivate_ratio_init: float = config.async_training.get(
             "dynamic_scaling_deactivate_ratio", 0.3
         )
+        # Whether to enable request rebalancing (abort + clear sticky cache +
+        # resume) after hybrid replica activation. Default False.
+        self._dynamic_scaling_enable_rebalance: bool = config.async_training.get(
+            "dynamic_scaling_enable_rebalance", False
+        )
         self.staleness_threshold: float = config.async_training.get("staleness_threshold", 1)
 
         # When standalone rollout resources are 0 (rollout.nnodes == 0), there are no
@@ -673,10 +678,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 await self.dynamic_resource_controller.activate_hybrid_replicas(self.current_param_version)
 
                 # Allow policy to redistribute requests across newly activated replicas.
-                self.dynamic_resource_controller.policy.request_rebalance(
-                    global_steps=self.current_param_version,
-                    ctx=ctx,
-                )
+                if self._dynamic_scaling_enable_rebalance:
+                    self.dynamic_resource_controller.policy.request_rebalance(
+                        global_steps=self.current_param_version,
+                        ctx=ctx,
+                    )
 
                 self.dynamic_scale_ctx.last_activate_duration_s = time.time() - _act_start
 

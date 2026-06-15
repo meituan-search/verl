@@ -1195,6 +1195,56 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self._update_max_concurrent_samples()
         return n
 
+    async def rebalance_requests(self) -> dict:
+        """Redistribute in-flight requests evenly across all active replicas.
+
+        This performs a full rebalance cycle:
+
+        1. **Clear sticky cache** — so subsequent ``acquire_server()`` calls use
+           least-loaded selection rather than sticky routing.
+        2. **Abort all replicas** — interrupt in-flight requests on all active
+           replicas (standalone + hybrid).  :class:`FullyAsyncLLMServerClient`
+           catches the abort and retries automatically.
+        3. **Resume generation** — unpause all replicas so they accept retried
+           requests, which are now routed via least-loaded selection to the
+           replicas with the fewest in-flight requests (typically the newly
+           activated hybrid replicas, which start at 0).
+
+        Returns:
+            Diagnostics dict from :meth:`GlobalRequestLoadBalancer.clear_sticky_cache`.
+        """
+        import asyncio
+
+        # Step 1: Clear sticky cache so retried requests use least-loaded routing.
+        result = await self.llm_server_manager.global_load_balancer.clear_sticky_cache.remote()
+        print(
+            f"[FullyAsyncRollouter] Rebalance step 1/3: sticky cache cleared, "
+            f"{result['cleared_entries']} entries, loads={result['server_loads']}"
+        )
+
+        # Step 2: Abort in-flight requests on all active replicas.
+        active_replicas = self.llm_server_manager.get_replicas()
+        if active_replicas:
+            await asyncio.gather(
+                *[replica.abort_all_requests() for replica in active_replicas]
+            )
+            print(
+                f"[FullyAsyncRollouter] Rebalance step 2/3: aborted requests "
+                f"on {len(active_replicas)} replicas"
+            )
+
+        # Step 3: Resume generation so retried requests can be accepted.
+        if active_replicas:
+            await asyncio.gather(
+                *[replica.resume_generation() for replica in active_replicas]
+            )
+            print(
+                f"[FullyAsyncRollouter] Rebalance step 3/3: resumed generation "
+                f"on {len(active_replicas)} replicas"
+            )
+
+        return result
+
     def _update_max_concurrent_samples(self):
         """Recompute max_concurrent_samples based on current active replica count."""
         if self.max_required_samples is None:

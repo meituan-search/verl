@@ -14,6 +14,8 @@
 
 """Built-in "default" dynamic scaling policy."""
 
+import ray
+
 from .base import DynamicScalingPolicyBase, DynamicScaleContext, register_policy
 
 
@@ -77,3 +79,34 @@ class DefaultDynamicScalingPolicy(DynamicScalingPolicyBase):
         print(f"DynamicScaleContext:{ctx}")
 
         return ctx.total_generated_samples - ctx.expected_samples < self.deactivate_ratio * ctx.required_samples * ctx.trigger_parameter_sync_step
+
+    def request_rebalance(self, global_steps: int, ctx: DynamicScaleContext) -> None:
+        """Redistribute requests across all active replicas after activation.
+
+        Performs a full rebalance via the rollouter:
+
+        1. Clears the load-balancer sticky-session cache.
+        2. Aborts in-flight requests on all active replicas (standalone + hybrid),
+           triggering :class:`FullyAsyncLLMServerClient` retry.
+        3. Resumes generation so retried requests are accepted and routed via
+           least-loaded selection — naturally balancing load toward the newly
+           activated hybrid replicas (which start with 0 in-flight requests).
+        """
+        if not hasattr(self, "_rollouter") or self._rollouter is None:
+            print(
+                "[DefaultDynamicScalingPolicy] request_rebalance skipped: "
+                "no rollouter reference available"
+            )
+            return
+
+        try:
+            result = ray.get(self._rollouter.rebalance_requests.remote())
+            print(
+                f"[DefaultDynamicScalingPolicy] request_rebalance done at step {global_steps}: "
+                f"cleared {result.get('cleared_entries', 0)} sticky entries, "
+                f"server loads: {result.get('server_loads', {})}"
+            )
+        except Exception as e:
+            print(
+                f"[DefaultDynamicScalingPolicy] request_rebalance failed at step {global_steps}: {e}"
+            )

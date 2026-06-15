@@ -97,11 +97,11 @@ class GlobalRequestLoadBalancer:
             load_str = ", ".join(
                 f"{sid}={self._inflight_requests[sid]}" for sid in sorted(self._inflight_requests)
             )
-            print(
-                f"[GlobalLoadBalancer][acquire_server] call_count={self._acquire_call_count} "
-                f"assigned_to={server_id} sticky={sticky_hit} "
-                f"server_loads=({load_str})"
-            )
+            # print(
+            #     f"[GlobalLoadBalancer][acquire_server] call_count={self._acquire_call_count} "
+            #     f"assigned_to={server_id} sticky={sticky_hit} "
+            #     f"server_loads=({load_str})"
+            # )
 
         return server_id, self._servers[server_id]
 
@@ -147,6 +147,30 @@ class GlobalRequestLoadBalancer:
     def get_all_servers(self) -> list[str]:
         """Get list of all active server IDs."""
         return list(self._inflight_requests.keys())
+
+    def clear_sticky_cache(self) -> dict:
+        """Clear the sticky-session cache to force request redistribution.
+
+        After clearing, all subsequent ``acquire_server()`` calls will select
+        the least-loaded server (based on ``_inflight_requests``), which
+        naturally balances load across all active replicas — including newly
+        added ones with zero in-flight requests.
+
+        Returns:
+            A dict with ``cleared_entries`` (number of cache entries dropped)
+            and ``server_loads`` (current per-server inflight counts for
+            diagnostics).
+        """
+        cleared = len(self._request_id_to_server)
+        self._request_id_to_server.clear()
+        logger.info(
+            f"[GlobalLoadBalancer] Sticky cache cleared: {cleared} entries dropped. "
+            f"Server loads: {dict(self._inflight_requests)}"
+        )
+        return {
+            "cleared_entries": cleared,
+            "server_loads": dict(self._inflight_requests),
+        }
 
     def get_status(self) -> dict:
         """Return current load balancer state for debugging."""

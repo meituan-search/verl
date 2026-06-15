@@ -83,6 +83,8 @@ class DynamicResourceController:
             policy if policy is not None
             else DefaultDynamicScalingPolicy(only_hybrid=self._only_hybrid)
         )
+        # Inject rollouter reference so the policy can perform request rebalancing.
+        self.policy._rollouter = rollouter
 
     @property
     def is_hybrid_active(self) -> bool:
