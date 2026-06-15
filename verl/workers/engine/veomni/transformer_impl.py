@@ -21,7 +21,7 @@ import torch
 import torch.distributed as dist
 from tensordict import TensorDict
 from torch.distributed.tensor import DTensor
-from veomni.arguments import OpsImplementationConfig
+from veomni.arguments import MixedPrecisionConfig, OpsImplementationConfig
 from veomni.distributed import parallel_state
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.torch_parallelize import build_parallelize_model
@@ -277,13 +277,18 @@ class VeOmniEngine(FSDPEngine):
             swiglu_mlp_implementation=self.engine_config.swiglu_mlp_implementation,
             rotary_pos_emb_implementation=self.engine_config.rotary_pos_emb_implementation,
             load_balancing_loss_implementation=self.engine_config.load_balancing_loss_implementation,
+            rms_norm_gated_implementation=self.engine_config.rms_norm_gated_implementation,
+            causal_conv1d_implementation=self.engine_config.causal_conv1d_implementation,
+            chunk_gated_delta_rule_implementation=self.engine_config.chunk_gated_delta_rule_implementation,
         )
+
+        veomni_mixed_precision_config = MixedPrecisionConfig(enable=self.engine_config.mixed_precision)
 
         # Load base model with specified configuration and dtype
         module = build_foundation_model(
             config_path=self._get_model_config_path(),
             weights_path=self.model_config.local_path,
-            torch_dtype="float32" if self.engine_config.mixed_precision else "bfloat16",
+            torch_dtype="float32" if veomni_mixed_precision_config.enable else "bfloat16",
             attn_implementation=self.engine_config.attn_implementation,
             ops_implementation=ops_implementation,
             init_device=self.engine_config.init_device,
@@ -297,7 +302,7 @@ class VeOmniEngine(FSDPEngine):
             init_device=self.engine_config.init_device,
             weights_path=self.model_config.local_path,
             enable_full_shard=self.engine_config.enable_full_shard,
-            enable_mixed_precision=self.engine_config.mixed_precision,
+            mixed_precision=veomni_mixed_precision_config,
             enable_gradient_checkpointing=self.model_config.enable_gradient_checkpointing,
             enable_fsdp_offload=self.engine_config.enable_fsdp_offload,
             basic_modules=list(
@@ -652,10 +657,9 @@ class VeOmniEngine(FSDPEngine):
         if self._is_offload_param:
             offload_veomni_model_to_cpu(self.module)
 
-        device = get_device_id()
         ps = parallel_state.get_parallel_state()
         model_type = getattr(self.module.config, "model_type", "default")
-        process_func = MOE_PARAM_HANDERS.get(model_type, lambda n, t: iter([(n, t)]))
+        process_func = MOE_PARAM_HANDERS.get(model_type, lambda n, t, ep_rank: iter([(n, t)]))
 
         def param_generator():
             for name, param in params.items():
@@ -665,18 +669,16 @@ class VeOmniEngine(FSDPEngine):
                 is_proj = any(p in name for p in ["down_proj", "gate_proj", "up_proj", "gate_up_proj"])
 
                 if is_expert_layer and is_proj and ps.ep_enabled:
-                    output_shape = list(unsharded_tensor.shape)
-                    output_shape[0] *= ps.extra_parallel_sizes["ep"]
-                    stacked_tensor = torch.empty(output_shape, dtype=unsharded_tensor.dtype, device=device)
+                    ep_rank, ep_size = ps.ep_rank, ps.ep_size
+                    buffer = torch.empty_like(unsharded_tensor)  # [num_experts/ep_size, H, I]
+                    for src_ep_rank in range(ep_size):
+                        tensor = unsharded_tensor if src_ep_rank == ep_rank else buffer
+                        torch.distributed.broadcast(tensor, group_src=src_ep_rank, group=ps.ep_group)
+                        yield from process_func(name, tensor, ep_rank=src_ep_rank)
 
-                    # all gather expert tensors [32, H, I] -> [128, H, I]
-                    torch.distributed.all_gather_into_tensor(stacked_tensor, unsharded_tensor, group=ps.ep_group)
-                    yield from process_func(name, stacked_tensor)
-
-                    del stacked_tensor
                 else:
                     if is_expert_layer:
-                        yield from process_func(name, unsharded_tensor)
+                        yield from process_func(name, unsharded_tensor, ep_rank=0)
                     else:
                         yield name, unsharded_tensor
 

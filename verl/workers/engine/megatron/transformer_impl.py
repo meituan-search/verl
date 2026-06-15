@@ -221,7 +221,10 @@ class MegatronEngine(BaseEngine):
             for key, value in override_transformer_config.items():
                 provider_overrides[key] = value
             if self.enable_routing_replay:
-                provider_overrides["enable_routing_replay"] = True
+                if hasattr(provider, "moe_enable_routing_replay"):
+                    provider_overrides["moe_enable_routing_replay"] = True
+                else:
+                    provider_overrides["enable_routing_replay"] = True
 
             if self._qat_enabled:
                 from megatron.bridge.models.gpt_provider import modelopt_transformer_layer_spec
@@ -429,10 +432,10 @@ class MegatronEngine(BaseEngine):
             optimizer_scheduler=self.lr_scheduler,
             use_distributed_optimizer=self.engine_config.use_distributed_optimizer,
             use_checkpoint_opt_param_scheduler=self.optimizer_config.use_checkpoint_opt_param_scheduler,
+            use_dist_checkpointing=self.engine_config.use_dist_checkpointing,
             bridge=self.bridge,
             provider=self.provider,
             peft_cls=self.peft_cls,
-            use_dist_checkpointing=self.engine_config.use_dist_checkpointing,
             use_megatron_fsdp=self.engine_config.use_megatron_fsdp,
         )
 
