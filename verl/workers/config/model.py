@@ -125,6 +125,9 @@ class HFModelConfig(BaseConfig):
     # Attention backend for old log-prob computation.  None means use the
     # same backend as training (prefix_tree_attention).
     prefix_tree_olb_backend: str | None = None
+    # Override use_prefix_tree for old-log-prob (infer_batch) only.
+    # None means inherit use_prefix_tree.
+    prefix_tree_for_olp: Optional[bool] = None
 
     # TODO: unify fsdp and megatron lora config
     # fsdp lora related. We may setup a separate config later

@@ -458,7 +458,15 @@ def _build_magi_key_sp_scaled(original_key, model, tp_size: int):
 # ============================================================================
 
 
-_PREFIX_TREE_KEYS = frozenset({"loss_mask", "use_prefix_tree", "prefix_tree_attention"})
+_PREFIX_TREE_KEYS = frozenset(
+    {
+        "loss_mask",
+        "use_prefix_tree",
+        "prefix_tree_attention",
+        "prefix_tree_subtree",
+        "prefix_tree_no_expand_middle",
+    }
+)
 
 
 def strip_prefix_tree_args(logits_processor_args: dict | None) -> None:

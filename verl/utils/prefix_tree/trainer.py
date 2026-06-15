@@ -67,7 +67,8 @@ def configure_olb_backend(batch_td, config_or_data: dict) -> None:
 
     - ``None``: no-op, keep training backend
     - ``"magi"`` / ``"flex"``: override to that prefix-tree backend
-    - ``"fa3"``: disable prefix-tree for this pass
+    - ``"fa3"``: explicitly disable prefix-tree (use plain FA3) for this pass
+    - anything else: raises ``ValueError`` — prevents silent fallback to FA3
     """
     if not _is_prefix_tree_enabled(config_or_data):
         return
@@ -76,10 +77,12 @@ def configure_olb_backend(batch_td, config_or_data: dict) -> None:
     olb = config_or_data.get("prefix_tree_olb_backend", None)
     if olb is None:
         return
-    if olb == "magi" or olb == "flex":
+    if olb in ("magi", "flex"):
         tu.assign_non_tensor(batch_td, prefix_tree_attention=olb)
-    else:
+    elif olb == "fa3":
         tu.assign_non_tensor(batch_td, use_prefix_tree=False)
+    else:
+        raise ValueError(f"Unknown prefix_tree_olb_backend {olb!r}. Valid values: None, 'magi', 'flex', 'fa3'.")
 
 
 # ──────────────────────── internal ──────────────────────────────

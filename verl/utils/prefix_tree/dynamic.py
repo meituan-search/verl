@@ -43,8 +43,11 @@ __all__ = [
     # Lower-level helpers exposed for testing / benchmarking
     "TrieNode",
     "greedy_build_tries",
+    "mbs_groups_from_trie",
     "convert_trie_to_tree_node",
     # Load balancing
+    "trie_group_flat_tokens",
+    "get_prefix_tree_mbs_dp_partitions",
     "get_dfs_balanced_partitions",
     "get_prefix_balanced_partitions",
     "reorder_and_balance_for_prefix_tree",
@@ -310,6 +313,36 @@ def _trie_effective_tokens(node: TrieNode) -> int:
     for child in node.children.values():
         total += _trie_effective_tokens(child)
     return total
+
+
+def trie_group_flat_tokens(group: list[int], trie: TrieNode) -> int:
+    """Flat (deduplicated) token count for a subset of sequences within a trie.
+
+    Counts tokens on the minimal sub-trie spanning exactly the sequences in
+    ``group`` — i.e. the effective forward-pass token budget when those
+    sequences are processed together with prefix sharing.
+
+    Args:
+        group: Sequence indices as stored in ``TrieNode.sequence_ids``.
+        trie: Root of the compressed trie (``trie.is_root == True``).
+
+    Returns:
+        Total number of unique tokens required to process this group.
+    """
+    keep = frozenset(group)
+
+    def _count(node: TrieNode) -> int:
+        if not node.children:
+            return len(node.tokens) if set(node.sequence_ids) & keep else 0
+        has_relevant = False
+        relevant_total = 0
+        for child in node.children.values():
+            if set(child.sequence_ids) & keep:
+                has_relevant = True
+                relevant_total += _count(child)
+        return relevant_total + len(node.tokens) if has_relevant else 0
+
+    return sum(_count(c) for c in trie.children.values())
 
 
 def build_mini_batch_prefix_groups(
@@ -727,9 +760,8 @@ def prepare_prefix_tree_micro_batches(
 ):
     """Prepare micro-batches using prefix-tree DFS grouping.
 
-    Expects a pre-built trie stored via ``tu.set_non_tensor_data(data,
-    "prefix_tree", trie)``. If not present, builds one from sequences
-    (backward-compatible fallback).
+    Expects a pre-built trie stored via ``tu.assign_non_tensor(data, prefix_tree=trie)``.
+    If not present, builds one from sequences (backward-compatible fallback).
     """
     import logging as _logging
 
@@ -800,7 +832,10 @@ def prepare_prefix_tree_micro_batches(
         for idx, mb in zip(batch_idx_list, micro_batches, strict=False):
             subtree = prune_trie(trie, set(idx))
             if subtree is not None:
-                tu.set_non_tensor_data(mb, "prefix_tree_subtree", subtree)
+                tree_root, leaf_to_sample_global = subtree
+                global_to_local = {g: loc for loc, g in enumerate(idx)}
+                leaf_to_sample_local = [global_to_local[g] for g in leaf_to_sample_global]
+                tu.assign_non_tensor(mb, prefix_tree_subtree=(tree_root, leaf_to_sample_local))
     return micro_batches, batch_idx_list
 
 
@@ -908,6 +943,73 @@ def get_prefix_balanced_partitions(
         sample_partitions.append(sorted(sample_indices))
 
     return sample_partitions
+
+
+def get_prefix_tree_mbs_dp_partitions(
+    sequences: list[list[int]],
+    max_token_len: int,
+    dp_size: int,
+) -> tuple[list[list[list[int]]], list[int]]:
+    """Partition micro-batches across DP ranks using flat-token workload balance.
+
+    Forms micro-batches globally from the full batch trie, estimates the flat
+    (deduplicated) token cost of each mbs via :func:`trie_group_flat_tokens`,
+    then assigns whole mbs to DP ranks with equal mbs count per rank.
+
+    Treating mbs as atomic units preserves the prefix-sharing ratio: no mbs is
+    ever split across ranks, so the deduplicated token count computed at mbs
+    formation time remains valid after DP assignment.
+
+    Args:
+        sequences: Per-sample token lists for the full global batch.
+        max_token_len: Flat-token budget per micro-batch
+            (``max_token_len_per_gpu * sp_size``).
+        dp_size: Number of data-parallel ranks.
+
+    Returns:
+        mbs_per_rank: ``mbs_per_rank[i]`` is the list of mbs groups (each a
+            ``list[int]`` of sequence indices) assigned to rank ``i``.
+        new_seq_order: Flat list of original sequence indices in the order they
+            should appear after ``data.reorder()`` — rank 0's sequences first,
+            rank 1's next, etc.
+    """
+    from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions
+
+    def _fallback_equal_split():
+        per_rank = len(sequences) // dp_size
+        mbs_per_rank = [[[i] for i in range(r * per_rank, (r + 1) * per_rank)] for r in range(dp_size)]
+        return mbs_per_rank, list(range(len(sequences)))
+
+    max_total = sum(len(s) for s in sequences) * 10
+    tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=max_total)
+    if not tries:
+        return _fallback_equal_split()
+
+    trie = tries[0]
+    mbs_groups = mbs_groups_from_trie(trie, max_token_len)
+    if len(mbs_groups) < dp_size:
+        return _fallback_equal_split()
+
+    # Estimate flat token cost per mbs.
+    mbs_flat_tokens = [trie_group_flat_tokens(g, trie) for g in mbs_groups]
+
+    # Pad to a multiple of dp_size so equal_size=True is satisfied.
+    while len(mbs_groups) % dp_size:
+        mbs_groups.append(mbs_groups[-1])
+        mbs_flat_tokens.append(mbs_flat_tokens[-1])
+
+    # Assign equal mbs count per rank, balanced by flat token workload.
+    mbs_assignment = get_seqlen_balanced_partitions(mbs_flat_tokens, dp_size, equal_size=True)
+
+    mbs_per_rank: list[list[list[int]]] = []
+    new_seq_order: list[int] = []
+    for rank_mbs_indices in mbs_assignment:
+        rank_mbs = [mbs_groups[i] for i in rank_mbs_indices]
+        mbs_per_rank.append(rank_mbs)
+        for grp in rank_mbs:
+            new_seq_order.extend(grp)
+
+    return mbs_per_rank, new_seq_order
 
 
 def reorder_and_balance_for_prefix_tree(
