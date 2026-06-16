@@ -89,7 +89,7 @@ class FullyAsyncLLMServerManager(LLMServerManager):
         return instance
 
     async def _init_model_engine_replica(self):
-        from verl.workers.rollout.model_engine_server import ModelEngineServerManager
+        from verl.experimental.fully_async_policy.model_engine_server import ModelEngineServerManager
 
         self._model_engine_manager = ModelEngineServerManager(full_config=self.config)
         await self._model_engine_manager.initialize()
