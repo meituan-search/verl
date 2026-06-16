@@ -262,7 +262,7 @@ def convert_trie_to_tree_node(
 
 
 # ============================================================================
-# Detection entry: build_tree_dynamic
+# Tree Detection entry: build_tree_dynamic
 # ============================================================================
 
 
@@ -529,7 +529,7 @@ def trie_dfs_leaf_order(trie: TrieNode) -> list[int]:
     return ordered
 
 
-def trie_to_leaf_ids(trie: TrieNode) -> np.ndarray:  # type: ignore[type-arg]  # noqa: F821
+def trie_to_leaf_ids(trie: TrieNode) -> np.ndarray:  # noqa: F821
     """Return np.array mapping sample_idx → leaf_id (DFS order)."""
     import numpy as np
 

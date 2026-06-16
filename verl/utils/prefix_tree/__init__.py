@@ -40,6 +40,7 @@ from .magi import (
     get_prefix_tree_kwargs,
     restore_flat_to_nested,
     strip_prefix_tree_args,
+    try_forward_prefix_tree,
 )
 from .utils import (
     PrefixTreeParams,
@@ -76,6 +77,7 @@ __all__ = [
     "get_prefix_tree_kwargs",
     "restore_flat_to_nested",
     "strip_prefix_tree_args",
+    "try_forward_prefix_tree",
     # utils
     "PrefixTreeParams",
     "RangeSpec",

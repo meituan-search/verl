@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import os
+
 import torch
 from tensordict import TensorDict
 
@@ -99,6 +101,26 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     loss_agg_mode = config.loss_agg_mode
 
     loss_mode = config.policy_loss.get("loss_mode", "vanilla")
+
+    # Diagnostic: compare old_log_prob vs new_log_prob (MAGI_DIAG=1)
+    if os.environ.get("MAGI_DIAG") == "1" and "response_mask" in data:
+        old_lp = old_log_prob
+        new_lp = log_prob
+        response_mask = data["response_mask"].to(bool)
+        diff = (new_lp - old_lp).abs()
+        mean_diff = (diff * response_mask).sum() / response_mask.sum().clamp(min=1)
+        max_diff = (diff * response_mask).max()
+        num_nonzero = (diff * response_mask > 1e-6).sum().item()
+        num_total = response_mask.sum().item()
+        import logging
+
+        _lg = logging.getLogger(__name__)
+        _lg.warning(
+            f"[MAGI-DIAG] old_log_prob vs new_log_prob diff: "
+            f"mean={mean_diff.item():.6f} max={max_diff.item():.6f} "
+            f"nonzero={num_nonzero}/{num_total} "
+            f"frac={num_nonzero / num_total * 100:.2f}%"
+        )
 
     policy_loss_fn = get_policy_loss_fn(loss_mode)
     pg_loss, pg_metrics = policy_loss_fn(
