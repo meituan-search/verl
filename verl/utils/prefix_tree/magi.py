@@ -42,6 +42,19 @@ import torch
 from torch import Tensor
 from torch.nested._internal.nested_tensor import NestedTensor
 
+# ---------------------------------------------------------------------------
+# RoPE monkey-patch — per-sample positions for MAGI RoPE
+# ---------------------------------------------------------------------------
+
+_per_sample_pos_ids: Optional[Tensor] = None
+
+
+def set_prefix_tree_position_ids(pos_ids: Optional[Tensor]) -> None:
+    """Set per-sample position IDs for the current forward. Call before model(),
+    reset to None after."""
+    global _per_sample_pos_ids
+    _per_sample_pos_ids = pos_ids
+
 
 @dataclass
 class PrefixTreeMagiBatch:
@@ -293,7 +306,22 @@ def expand_flat_to_per_sample(
     assert all(t is not None for t in sample_tensors), (
         "expand_flat_to_per_sample: some sample indices were not covered by leaf_to_sample"
     )
-    return torch.cat(sample_tensors, dim=0)
+    result = torch.cat(sample_tensors, dim=0)
+    # Verify roundtrip: expanded total should equal n*prefix + sum(leaves)
+    prefix_len = prefix_end - prefix_start
+    leaf_total = sum(e - s for s, e in pt_batch.leaf_ranges)
+    expected = n * prefix_len + leaf_total
+    if pt_batch.leaf_ancestor_ranges is not None:
+        ancestor_total = sum(
+            sum(e - s for s, e in pt_batch.leaf_ancestor_ranges[li])
+            for li in range(len(pt_batch.leaf_ancestor_ranges))
+        )
+        expected = ancestor_total + leaf_total
+    assert result.shape[0] == expected, (
+        f"expand_flat_to_per_sample: expanded size {result.shape[0]} != expected {expected} "
+        f"(n={n}, prefix_len={prefix_len}, leaf_total={leaf_total})"
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -533,8 +561,6 @@ def try_forward_prefix_tree(
     standard THD path.
     """
     if vision_model or mtp_enable_train:
-        from verl.utils.prefix_tree.magi import strip_prefix_tree_args
-
         strip_prefix_tree_args(logits_processor_args)
         return None
 
@@ -590,7 +616,22 @@ def forward_prefix_tree(
     import torch
 
     flat_input_ids = pt_batch.local_flat_input_ids.unsqueeze(0)
-    flat_position_ids = pt_batch.local_flat_position_ids.unsqueeze(0)
+    flat_position_ids = torch.arange(
+        flat_input_ids.shape[1], device=flat_input_ids.device, dtype=torch.long
+    ).unsqueeze(0)
+
+    # Set per-sample position IDs for the RoPE monkey-patch.
+    # Each leaf's per-sample position starts at the total ancestor length
+    # (prefix + intermediate nodes shared by that leaf).
+    per_sample_pos = flat_position_ids.squeeze(0).clone()
+    prefix_len = pt_batch.prefix_range[1] - pt_batch.prefix_range[0]
+    for li, (s, e) in enumerate(pt_batch.leaf_ranges):
+        if pt_batch.leaf_ancestor_ranges is not None and li < len(pt_batch.leaf_ancestor_ranges):
+            ancestor_total = sum(b - a for a, b in pt_batch.leaf_ancestor_ranges[li])
+        else:
+            ancestor_total = prefix_len
+        per_sample_pos[s:e] = torch.arange(ancestor_total, ancestor_total + e - s, device=flat_input_ids.device)
+    set_prefix_tree_position_ids(per_sample_pos)
 
     strip_prefix_tree_args(logits_processor_args)
 
@@ -616,6 +657,9 @@ def forward_prefix_tree(
     from verl.utils.device import get_torch_device
 
     get_torch_device().synchronize()
+
+    # Clean up per-sample position IDs
+    set_prefix_tree_position_ids(None)
 
     real_tokens = pt_batch.real_tokens
     if output_orig.shape[0] == 1:
