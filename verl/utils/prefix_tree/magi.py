@@ -251,7 +251,49 @@ def restore_flat_to_nested(
     )
 
     # Use as_nested_tensor (not nested_tensor) to preserve grad_fn through the cat ops.
+    # TODO: future optimization — torch.cat in the loop replicates shared prefix P
+    # N times (O(N*P) copy). Could avoid by storing shared+unique parts separately
+    # and using a view-based NestedTensor, but PyTorch jagged needs contiguous views.
     return torch.nested.as_nested_tensor(sample_tensors, layout=torch.jagged)
+
+
+def expand_flat_to_per_sample(
+    flat_tensor: Tensor,
+    pt_batch: PrefixTreeMagiBatch,
+) -> Tensor:
+    """Expand deduplicated flat tensor to per-sample flat tensor via torch.cat.
+
+    Replicates shared prefix/anchor slices for each sample, returning a single
+    flat tensor ordered by original sample index (matching restore_flat_to_nested).
+    Uses torch.cat instead of nested tensors — safe for autograd (training).
+
+    Args:
+        flat_tensor: (total_flat_tokens, ...) deduplicated representation.
+        pt_batch: PrefixTreeMagiBatch from build_prefix_tree_micro_batch.
+
+    Returns:
+        (total_expanded, ...) flat tensor with per-sample concatenation.
+    """
+    prefix_start, prefix_end = pt_batch.prefix_range
+    prefix_slice = flat_tensor[prefix_start:prefix_end]
+
+    n = pt_batch.original_batch_size
+    sample_tensors: list[Optional[Tensor]] = [None] * n
+
+    for leaf_idx, sample_idx in enumerate(pt_batch.leaf_to_sample):
+        s, e = pt_batch.leaf_ranges[leaf_idx]
+        leaf_slice = flat_tensor[s:e]
+        if pt_batch.leaf_ancestor_ranges is not None:
+            parts = [flat_tensor[a:b] for a, b in pt_batch.leaf_ancestor_ranges[leaf_idx]]
+            parts.append(leaf_slice)
+            sample_tensors[sample_idx] = torch.cat(parts, dim=0)
+        else:
+            sample_tensors[sample_idx] = torch.cat([prefix_slice, leaf_slice], dim=0)
+
+    assert all(t is not None for t in sample_tensors), (
+        "expand_flat_to_per_sample: some sample indices were not covered by leaf_to_sample"
+    )
+    return torch.cat(sample_tensors, dim=0)
 
 
 # ---------------------------------------------------------------------------
@@ -582,14 +624,20 @@ def forward_prefix_tree(
         output_orig = output_orig[:real_tokens].permute(1, 0, 2)
 
     if post_process and logits_processor is not None:
-        # Restore flat logits to per-sample, roll per-sample labels, flatten back.
-        # Each sample gets its own correct next-token label.
+        # Compute per-sample labels from flat input_ids (no autograd nesting).
+        # Expand logits via torch.cat (safe for autograd, no nested tensor).
         output_orig_thd = output_orig.squeeze(0).unsqueeze(1)
-        nested_logits, nested_labels = _restore_and_roll_labels(
-            output_orig_thd.squeeze(1), pt_batch.flat_input_ids[:real_tokens], pt_batch
-        )
-        flat_logits = nested_logits.values().unsqueeze(1)  # (total_nnz, 1, vocab)
-        flat_label = nested_labels.values().unsqueeze(1)  # (total_nnz, 1)
+        logits_flat = output_orig_thd.squeeze(1)[:real_tokens]  # (real_tokens, vocab)
+        nested_ids = restore_flat_to_nested(pt_batch.flat_input_ids[:real_tokens], pt_batch)
+        labels = [torch.roll(t, shifts=-1, dims=0) for t in nested_ids.unbind()]
+        nested_labels = torch.nested.as_nested_tensor(labels, layout=torch.jagged)
+        cu_seqlens = nested_labels.offsets()
+        flat_label = nested_labels.values().unsqueeze(1)  # expanded: (total_expanded, 1)
+
+        # Expand logits to match expanded labels — torch.cat, no nested tensor in autograd
+        # TODO: future optimization — torch.cat replicates prefix_logits N times
+        # (O(N*P*vocab) copy). Could pass flat logits + index-map to logits_processor.
+        flat_logits = expand_flat_to_per_sample(logits_flat, pt_batch).unsqueeze(1)  # (total_expanded, 1, vocab)
 
         orig_args = logits_processor_args or {}
         total_tokens = flat_label.shape[0]
@@ -611,11 +659,11 @@ def forward_prefix_tree(
         flat_args["temperature"] = flat_t
         output_dict = logits_processor(flat_logits, **flat_args)
         if isinstance(output_dict, dict):
-            cu_seqlens = nested_logits.offsets()
             for key, val in list(output_dict.items()):
                 if isinstance(val, torch.Tensor):
                     val = val.reshape(-1)[:total_tokens]
-                    output_dict[key] = torch.nested.nested_tensor_from_jagged(val, cu_seqlens)
+                    tensors = [val[cu_seqlens[i]:cu_seqlens[i + 1]] for i in range(len(cu_seqlens) - 1)]
+                    output_dict[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
         return output_dict
     else:
         out_stripped = (

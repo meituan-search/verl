@@ -320,6 +320,7 @@ def gptmodel_forward_model_engine(
                     local_cp_size=local_cp_size,
                 )[0]
                 for k, v in logits_processor_args.items()
+                if v is not None
             }
             output_dict = logits_processor(output_orig, **args)
             output = {

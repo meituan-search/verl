@@ -13,8 +13,8 @@ export HYDRA_FULL_ERROR=1
 MODEL_BASE="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-ai-search/deepsearch_files_ssd/LLMbasemodels/huggingface.co/Qwen"
 MODEL_PATH="${MODEL_PATH:-$MODEL_BASE/Qwen3-4B-Base}"
 # Dataset: coqa_grpo.parquet prepared from CoQA via prefix_script/data/coqa/prepare_coqa_grpo.py
-TRAIN_FILES="${VERL_DIR:-/home/hadoop-djst-algoplat/prefix-tree/verl_prefix_tree}/prefix_script/data/coqa/coqa_grpo.parquet"
-REWARD_FN="${VERL_DIR:-/home/hadoop-djst-algoplat/prefix-tree/verl_prefix_tree}/prefix_script/data/coqa/coqa_reward.py"
+TRAIN_FILES="${TRAIN_FILES:-${VERL_DIR:-/home/hadoop-djst-algoplat/prefix-tree/verl_prefix_tree}/prefix_script/data/coqa/coqa_grpo.parquet}"
+REWARD_FN="${REWARD_FN:-${VERL_DIR:-/home/hadoop-djst-algoplat/prefix-tree/verl_prefix_tree}/prefix_script/data/coqa/coqa_reward.py}"
 
 TS="${TS:-$(date +%Y%m%d_%H%M%S)}"
 OUTDIR="${OUTDIR:-/tmp/claude/grpo_coqa_4b/magi/${TS}}"
