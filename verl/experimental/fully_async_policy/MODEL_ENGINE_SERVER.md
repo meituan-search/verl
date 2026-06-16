@@ -60,6 +60,12 @@ Furthermore, `ModelEngineReplica` is composed of `ModelEngineServer` and `RayWor
 - **ModelEngineWorker**: The execution unit holding model weights. Inherits from `CheckpointEngineWorker` and participates in weight synchronization.
 - **ModelEngineServerAdapter**: Wraps `TrainingWorker` as an inference interface to execute the actual log prob calculation in forward-only mode.
 
+## Dependencies
+
+`ModelEngineServer` requires **mbridge** with support for asynchronous weight loading. The necessary changes  require the following PR:
+
+- [mbridge PR #117](https://github.com/ISEEKYAN/mbridge/pull/117) — adds `load_weights_from_async_generator`, which is used by `ModelEngineWorker` to receive weight updates streamed from the actor.
+
 ## Configuration
 
 ### Parameter Reference
