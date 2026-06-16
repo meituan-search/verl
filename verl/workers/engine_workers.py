@@ -120,8 +120,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
         # Thread prefix-tree flags from model config → engine meta_info (actor training dedup)
         self.engine_config.use_prefix_tree = self.model_config.get("use_prefix_tree", False)
         self.engine_config.prefix_tree_attention = self.model_config.get("prefix_tree_attention", "flex")
-        self.engine_config.prefix_tree_for_olp = self.model_config.get(
-            "prefix_tree_for_olp", self.engine_config.use_prefix_tree
+        # prefix_tree_for_olp=None means "inherit from use_prefix_tree".
+        # model_config.get returns None when the key exists with value None,
+        # ignoring the fallback — handle explicitly.
+        _olp = self.model_config.get("prefix_tree_for_olp", None)
+        self.engine_config.prefix_tree_for_olp = (
+            _olp if _olp is not None else self.engine_config.use_prefix_tree
         )
 
         self.profiler_config = self.config.profiler_config
