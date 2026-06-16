@@ -108,7 +108,6 @@ def no_padding_2_padding(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor
     Returns:
         tensor: sliced response tensor of shape [bsz, max_response_len, *]
     """
-    values = tensor.values() if tensor.is_nested else tensor
     prompt_ids = data["prompts"]
     response_ids = data["responses"]
 
@@ -119,12 +118,30 @@ def no_padding_2_padding(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor
         response_lens = response_ids.offsets().diff()
         if max_response_len < 0:
             max_response_len = response_lens.max().item()
+        # MAGI nested tensors may have extra DP-padding sequences appended by
+        # restore_dynamic_batch.  Truncate to the expected batch size so the
+        # token-count assertion below doesn't spuriously fire.
+        if tensor.is_nested:
+            expected_bsz = prompt_lens.shape[0]
+            actual_bsz = tensor.offsets().shape[0] - 1
+            if actual_bsz > expected_bsz:
+                import logging as _log
+                _log.getLogger(__name__).error(
+                    "no_padding_2_padding: MAGI nested tensor has %d seqs, "
+                    "expected %d — DP-padding duplicate, truncating",
+                    actual_bsz, expected_bsz,
+                )
+                tensor = torch.nested.as_nested_tensor(
+                    list(tensor.unbind())[:expected_bsz], layout=torch.jagged
+                )
     else:
         attention_mask = data["attention_mask"]
         assert not attention_mask.is_nested
         prompt_lens = attention_mask[:, : prompt_ids.shape[1]].sum(dim=1)
         response_lens = attention_mask[:, prompt_ids.shape[1] :].sum(dim=1)
         max_response_len = response_ids.shape[1]
+
+    values = tensor.values() if tensor.is_nested else tensor
 
     sequence_lens = prompt_lens + response_lens
     sequence_offsets = sequence_lens.cumsum(dim=0)

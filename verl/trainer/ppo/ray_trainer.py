@@ -1212,13 +1212,19 @@ class RayPPOTrainer:
         try:
             entropy = no_padding_2_padding(entropy, batch_td)
             log_probs = no_padding_2_padding(log_probs, batch_td)
-        except AssertionError:
-            # Disable prefix tree AND dynamic batching so the fallback uses
-            # static micro-batches (log_prob_micro_batch_size_per_gpu), not the
-            # token-budget path which would create 1-seq micro-batches at small budgets.
+        except AssertionError as _e:
+            import logging as _log, traceback as _tb
+            _log.getLogger(__name__).error(
+                "_compute_old_log_prob: no_padding_2_padding assertion failed (%s). "
+                "old_log_prob MUST use MAGI — falling back to static micro-batches "
+                "WITH prefix tree enabled. Fix the root cause.\n%s",
+                _e, _tb.format_exc(),
+            )
+            # Keep prefix tree enabled (use_prefix_tree stays True) so old_log_prob
+            # still uses MAGI. Only switch to static micro-batches to avoid the
+            # token-budget path that creates 1-seq micro-batches at small budgets.
             tu.assign_non_tensor(
                 batch_td,
-                use_prefix_tree=False,
                 use_dynamic_bsz=False,
                 micro_batch_size_per_gpu=self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu,
             )
