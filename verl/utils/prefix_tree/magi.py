@@ -1,4 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2025-2026 Meituan Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -41,10 +41,6 @@ from typing import Optional
 import torch
 from torch import Tensor
 from torch.nested._internal.nested_tensor import NestedTensor
-
-# ---------------------------------------------------------------------------
-# RoPE monkey-patch — per-sample positions for MAGI RoPE
-# ---------------------------------------------------------------------------
 
 _per_sample_pos_ids: Optional[Tensor] = None
 
@@ -246,6 +242,10 @@ def restore_flat_to_nested(
     prefix_start, prefix_end = pt_batch.prefix_range
     prefix_slice = flat_tensor[prefix_start:prefix_end]
 
+    # leaf_to_sample is a permutation of [0 .. N-1] (same length as original batch).
+    # We allocate sample_tensors by sample index, then fill by leaf iteration.
+    # This is an inverse permutation: no matter the DFS leaf order,
+    # sample_tensors[sample_idx] = ... restores original sample order.
     n = pt_batch.original_batch_size
     sample_tensors: list[Optional[Tensor]] = [None] * n
 
@@ -313,8 +313,7 @@ def expand_flat_to_per_sample(
     expected = n * prefix_len + leaf_total
     if pt_batch.leaf_ancestor_ranges is not None:
         ancestor_total = sum(
-            sum(e - s for s, e in pt_batch.leaf_ancestor_ranges[li])
-            for li in range(len(pt_batch.leaf_ancestor_ranges))
+            sum(e - s for s, e in pt_batch.leaf_ancestor_ranges[li]) for li in range(len(pt_batch.leaf_ancestor_ranges))
         )
         expected = ancestor_total + leaf_total
     assert result.shape[0] == expected, (
@@ -322,11 +321,6 @@ def expand_flat_to_per_sample(
         f"(n={n}, prefix_len={prefix_len}, leaf_total={leaf_total})"
     )
     return result
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 
 def _finalize_prefix_tree_batch(
@@ -497,9 +491,7 @@ def _build_magi_key_sp_scaled(original_key, model, tp_size: int):
     )
 
 
-# ============================================================================
 # model-forward helpers — consumed by verl/models/mcore/model_forward.py
-# ============================================================================
 
 
 _PREFIX_TREE_KEYS = frozenset(
@@ -616,21 +608,12 @@ def forward_prefix_tree(
     import torch
 
     flat_input_ids = pt_batch.local_flat_input_ids.unsqueeze(0)
-    flat_position_ids = torch.arange(
-        flat_input_ids.shape[1], device=flat_input_ids.device, dtype=torch.long
-    ).unsqueeze(0)
+    flat_position_ids = torch.arange(flat_input_ids.shape[1], device=flat_input_ids.device, dtype=torch.long).unsqueeze(
+        0
+    )
 
-    # Set per-sample position IDs for the RoPE monkey-patch.
-    # Each leaf's per-sample position starts at the total ancestor length
-    # (prefix + intermediate nodes shared by that leaf).
-    per_sample_pos = flat_position_ids.squeeze(0).clone()
-    prefix_len = pt_batch.prefix_range[1] - pt_batch.prefix_range[0]
-    for li, (s, e) in enumerate(pt_batch.leaf_ranges):
-        if pt_batch.leaf_ancestor_ranges is not None and li < len(pt_batch.leaf_ancestor_ranges):
-            ancestor_total = sum(b - a for a, b in pt_batch.leaf_ancestor_ranges[li])
-        else:
-            ancestor_total = prefix_len
-        per_sample_pos[s:e] = torch.arange(ancestor_total, ancestor_total + e - s, device=flat_input_ids.device)
+    # Use layout builder's flat_position_ids (already correct per-sample positions)
+    per_sample_pos = pt_batch.local_flat_position_ids.clone()
     set_prefix_tree_position_ids(per_sample_pos)
 
     strip_prefix_tree_args(logits_processor_args)
@@ -675,7 +658,7 @@ def forward_prefix_tree(
         nested_ids = restore_flat_to_nested(pt_batch.flat_input_ids[:real_tokens], pt_batch)
         labels = [torch.roll(t, shifts=-1, dims=0) for t in nested_ids.unbind()]
         nested_labels = torch.nested.as_nested_tensor(labels, layout=torch.jagged)
-        cu_seqlens = nested_labels.offsets()
+        cu_seqlen = nested_labels.offsets()
         flat_label = nested_labels.values().unsqueeze(1)  # expanded: (total_expanded, 1)
 
         # Expand logits to match expanded labels — torch.cat, no nested tensor in autograd
@@ -703,11 +686,16 @@ def forward_prefix_tree(
         flat_args["temperature"] = flat_t
         output_dict = logits_processor(flat_logits, **flat_args)
         if isinstance(output_dict, dict):
-            for key, val in list(output_dict.items()):
+            for key, val in output_dict.items():
                 if isinstance(val, torch.Tensor):
-                    val = val.reshape(-1)[:total_tokens]
-                    tensors = [val[cu_seqlens[i]:cu_seqlens[i + 1]] for i in range(len(cu_seqlens) - 1)]
-                    output_dict[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
+                    # Only restore per-token tensors (numel == total_tokens).
+                    # Scalars (e.g. sum_pi_squared) or CP-local tensors are
+                    # left as-is — they don't need per-sample splitting.
+                    val_flat = val.reshape(-1)
+                    if val_flat.shape[0] >= total_tokens:
+                        val_flat = val_flat[:total_tokens]
+                        tensors = [val_flat[cu_seqlen[i] : cu_seqlen[i + 1]] for i in range(len(cu_seqlen) - 1)]
+                        output_dict[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
         return output_dict
     else:
         out_stripped = (

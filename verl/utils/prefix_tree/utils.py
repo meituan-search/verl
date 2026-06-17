@@ -1,4 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2025-2026 Meituan Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -196,7 +196,6 @@ def build_prefix_tree_attention_spec(
             return
         node_range: RangeSpec = (node._flat_start, node._flat_end)
 
-        # Self-attention: causal over this node's own tokens.
         q_ranges.append(node_range)
         k_ranges.append(node_range)
         mask_types.append("causal")
@@ -204,7 +203,6 @@ def build_prefix_tree_attention_spec(
         if node.is_leaf:
             return
 
-        # Every descendant attends fully to this node's tokens.
         for desc in _collect_descendants(node):
             if desc.segment_len == 0:
                 continue
@@ -289,7 +287,6 @@ def build_layout_from_tree_node(
 
     _annotate(tree_root, 0)
 
-    # Emit flat tokens via DFS pre-order using each node's (owner_sample, owner_offset).
     device = samples[0].device
     flat_pieces: list[Tensor] = []
     flat_lm_pieces: Optional[list[Tensor]] = [] if loss_masks_by_sample is not None else None

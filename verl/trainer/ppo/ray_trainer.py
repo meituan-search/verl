@@ -1213,12 +1213,15 @@ class RayPPOTrainer:
             entropy = no_padding_2_padding(entropy, batch_td)
             log_probs = no_padding_2_padding(log_probs, batch_td)
         except AssertionError as _e:
-            import logging as _log, traceback as _tb
+            import logging as _log
+            import traceback as _tb
+
             _log.getLogger(__name__).error(
                 "_compute_old_log_prob: no_padding_2_padding assertion failed (%s). "
                 "old_log_prob MUST use MAGI — falling back to static micro-batches "
                 "WITH prefix tree enabled. Fix the root cause.\n%s",
-                _e, _tb.format_exc(),
+                _e,
+                _tb.format_exc(),
             )
             # Keep prefix tree enabled (use_prefix_tree stays True) so old_log_prob
             # still uses MAGI. Only switch to static micro-batches to avoid the
@@ -1242,6 +1245,15 @@ class RayPPOTrainer:
             result["sum_pi_squared"] = sum_pi_squared.float()
         old_log_prob = tu.get_tensordict(result)
         old_log_prob = DataProto.from_tensordict(old_log_prob)
+
+        from verl.utils.prefix_tree.rope import cmp_magi_vs_fa3
+
+        cmp_magi_vs_fa3(
+            log_probs,
+            batch,
+            config=self.config.actor_rollout_ref.model,
+            compute_log_prob_fn=self.actor_rollout_wg.compute_log_prob,
+        )
 
         return old_log_prob, old_log_prob_mfu
 

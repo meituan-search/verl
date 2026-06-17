@@ -397,7 +397,8 @@ def apply_prefix_tree_patch() -> None:
 
         emb = _rope_wrapped(self, max_seq_len, offset, packed_seq, cp_group)
         if _per_sample_pos_ids is not None:
-            emb = emb[_per_sample_pos_ids.to(emb.device)]
+            pids = _per_sample_pos_ids.to(emb.device)
+            emb = emb[pids]
         return emb
 
     RotaryEmbedding.forward = _rope_forward_with_per_sample

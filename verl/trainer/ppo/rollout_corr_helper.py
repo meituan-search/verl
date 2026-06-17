@@ -842,27 +842,6 @@ def compute_rollout_correction_and_rejection_mask(
     log_ratio: torch.Tensor = old_log_prob - rollout_log_prob
     metrics: dict[str, float] = {}
 
-    # DIAGNOSTIC: per-position diff breakdown (first call only)
-    import os as _os, torch.distributed as _dist
-    _diag = "/tmp/claude/rollout_vs_olp_pos_diag.txt"
-    if not _os.path.exists(_diag):
-        _rank = _dist.get_rank() if _dist.is_initialized() else 0
-        if _rank == 0:
-            _m = response_mask.bool()
-            _pos0_mask = _m.clone(); _pos0_mask[:, 1:] = False  # only position 0
-            _rest_mask = _m.clone(); _rest_mask[:, 0] = False   # positions 1+
-            _abs = log_ratio.abs()
-            _p0 = _abs[_pos0_mask].mean().item() if _pos0_mask.any() else float("nan")
-            _rest = _abs[_rest_mask].mean().item() if _rest_mask.any() else float("nan")
-            _all = _abs[_m].mean().item() if _m.any() else float("nan")
-            with open(_diag, "w") as _f:
-                _f.write(f"rollout vs old_log_prob absolute diff:\n")
-                _f.write(f"  pos 0  (boundary): {_p0:.6f}\n")
-                _f.write(f"  pos 1+ (rest):     {_rest:.6f}\n")
-                _f.write(f"  overall mean:      {_all:.6f}\n\n")
-                _f.write(f"  batch={old_log_prob.shape[0]} resp_len_max={response_mask.sum(-1).max().item()}\n")
-                _f.write(f"  pos0 diff per seq: {log_ratio[:, 0].tolist()[:8]}\n")
-
     # Step 2: Compute IS weights (if enabled)
     rollout_is_weights: Optional[torch.Tensor] = None
     if rollout_is is not None and rollout_is_threshold is not None:

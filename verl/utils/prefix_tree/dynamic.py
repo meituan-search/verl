@@ -1,4 +1,4 @@
-# Copyright 2026 Bytedance Ltd. and/or its affiliates
+# Copyright 2025-2026 Meituan Ltd. and/or its affiliates
 # Copyright 2025-2026 The AReaL Authors (Ant Group, Tsinghua University, HKUST)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -52,11 +52,6 @@ __all__ = [
     "get_prefix_balanced_partitions",
     "reorder_and_balance_for_prefix_tree",
 ]
-
-
-# ============================================================================
-# Trie construction (token-by-token insertion)
-# ============================================================================
 
 
 @dataclass
@@ -202,11 +197,6 @@ def greedy_build_tries(
     return tries, num_tokens_list
 
 
-# ============================================================================
-# Trie → TreeNode conversion (arbitrary depth preserved)
-# ============================================================================
-
-
 def convert_trie_to_tree_node(
     trie: TrieNode,
 ) -> Optional[tuple[TreeNode, list[int]]]:
@@ -243,7 +233,7 @@ def convert_trie_to_tree_node(
             leaf_to_sample.append(trie_node.sequence_ids[0])
         else:
             # Samples that terminate at this intermediate node need zero-length leaves.
-            child_ids = set().union(*(c.sequence_ids for c in trie_node.children.values()))
+            child_ids = {sid for c in trie_node.children.values() for sid in c.sequence_ids}
             for sid in trie_node.sequence_ids:
                 if sid not in child_ids:
                     leaf_to_sample.append(sid)
@@ -259,11 +249,6 @@ def convert_trie_to_tree_node(
     if not root.children:
         return None
     return root, leaf_to_sample
-
-
-# ============================================================================
-# Tree Detection entry: build_tree_dynamic
-# ============================================================================
 
 
 def build_tree_dynamic(samples: list[Tensor]) -> Optional[tuple[TreeNode, list[int]]]:
@@ -285,11 +270,6 @@ def build_tree_dynamic(samples: list[Tensor]) -> Optional[tuple[TreeNode, list[i
     if not tries or len(tries) > 1:
         return None
     return convert_trie_to_tree_node(tries[0])
-
-
-# ============================================================================
-# Mini-batch level prefix grouping (for DP load balancing)
-# ============================================================================
 
 
 def _trie_seq_ids(node: TrieNode) -> list[int]:
@@ -333,11 +313,11 @@ def trie_group_flat_tokens(group: list[int], trie: TrieNode) -> int:
 
     def _count(node: TrieNode) -> int:
         if not node.children:
-            return len(node.tokens) if set(node.sequence_ids) & keep else 0
+            return len(node.tokens) if any(s in keep for s in node.sequence_ids) else 0
         has_relevant = False
         relevant_total = 0
         for child in node.children.values():
-            if set(child.sequence_ids) & keep:
+            if any(s in keep for s in child.sequence_ids):
                 has_relevant = True
                 relevant_total += _count(child)
         return relevant_total + len(node.tokens) if has_relevant else 0
@@ -651,7 +631,7 @@ def prune_trie(
 
         # Internal node: keep children that intersect keep_leaf_ids
         for child in node.children.values():
-            if not set(child.sequence_ids) & keep_leaf_ids:
+            if keep_leaf_ids.isdisjoint(child.sequence_ids):
                 continue
             child_tree = _build_subtree(child)
             if child_tree is not None:
@@ -767,11 +747,6 @@ def compute_prefix_tree_metrics(input_ids, attention_mask=None) -> dict:
     }
 
 
-# ============================================================================
-# Micro-batch preparation (consumed by engine utils)
-# ============================================================================
-
-
 def prepare_prefix_tree_micro_batches(
     data,
     sp_size: int,
@@ -833,10 +808,10 @@ def prepare_prefix_tree_micro_batches(
             def _count(node):
                 total = 0
                 if not node.children:
-                    return len(node.tokens) if set(node.sequence_ids) & keep else 0
+                    return len(node.tokens) if any(s in keep for s in node.sequence_ids) else 0
                 kept = False
                 for child in node.children.values():
-                    if set(child.sequence_ids) & keep:
+                    if any(s in keep for s in child.sequence_ids):
                         kept = True
                         total += _count(child)
                 return total + len(node.tokens) if kept else total
@@ -858,11 +833,6 @@ def prepare_prefix_tree_micro_batches(
                 leaf_to_sample_local = [global_to_local[g] for g in leaf_to_sample_global]
                 tu.assign_non_tensor(mb, prefix_tree_subtree=(tree_root, leaf_to_sample_local))
     return micro_batches, batch_idx_list
-
-
-# ============================================================================
-# Load balancing (consumed by trainers)
-# ============================================================================
 
 
 def _is_prefix_tree_enabled(config_or_data) -> bool:
