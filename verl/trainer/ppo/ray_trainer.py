@@ -1243,49 +1243,6 @@ class RayPPOTrainer:
         old_log_prob = tu.get_tensordict(result)
         old_log_prob = DataProto.from_tensordict(old_log_prob)
 
-        import logging, os
-        _lgg = logging.getLogger(__name__)
-        prefix_enabled = self.config.actor_rollout_ref.model.get("use_prefix_tree", False)
-        if prefix_enabled:
-            _lgg.warning("[MAGI-CMP] prefix_tree OLP done. Re-running with FA3 for comparison...")
-            batch_td2 = batch.to_tensordict()
-            batch_td2 = left_right_2_no_padding(batch_td2)
-            tu.assign_non_tensor(
-                batch_td2, calculate_entropy=False, calculate_sum_pi_squared=False, compute_loss=False,
-                use_prefix_tree=False,
-            )
-            try:
-                out2 = self.actor_rollout_wg.compute_log_prob(batch_td2)
-                fa3_log_probs = no_padding_2_padding(tu.get(out2, "log_probs"), batch_td2)
-            except Exception:
-                _lgg.warning("[MAGI-CMP] FA3 forward failed (expected if not supported), skipping compare")
-                fa3_log_probs = None
-            if fa3_log_probs is not None:
-                mask = batch.batch["response_mask"].bool()
-                magi_lp = log_probs[:, :fa3_log_probs.shape[-1]]
-                fa3_lp = fa3_log_probs[:, :magi_lp.shape[-1]]
-                diff = (magi_lp.float() - fa3_lp.float()).abs()
-                pos0 = mask.clone(); pos0[:, 1:] = False
-                rest = mask.clone(); rest[:, 0] = False
-                p0 = diff[pos0].mean().item() if pos0.any() else 0
-                pr = diff[rest].mean().item() if rest.any() else 0
-                all_ = diff[mask].mean().item() if mask.any() else 0
-                _lgg.warning(
-                    f"[MAGI-CMP] MAGI vs FA3 log_prob diff: "
-                    f"mean={all_:.6f} pos0={p0:.6f} pos1+={pr:.6f}"
-                )
-                # Per-sequence RAW
-                for i in range(min(diff.shape[0], 4)):
-                    valid_len = mask[i].sum().item()
-                    d_row = diff[i, :int(valid_len)].tolist()
-                    m_row = magi_lp[i, :int(valid_len)].tolist()
-                    f_row = fa3_lp[i, :int(valid_len)].tolist()
-                    _lgg.warning(f"[MAGI-CMP-RAW] seq={i}")
-                    _lgg.warning(f"magi={m_row}")
-                    _lgg.warning(f"fa3={f_row}")
-                    _lgg.warning(f"diff={d_row}")
-            del batch_td2
-
         return old_log_prob, old_log_prob_mfu
 
     def _update_actor(self, batch: DataProto) -> DataProto:
