@@ -1,3 +1,17 @@
+# Copyright 2025-2026 Meituan Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Check if the 2 fixes are present in the codebase."""
 
 import sys
@@ -18,9 +32,9 @@ with open("verl/workers/engine_workers.py") as f:
 if "prefix_tree_for_olp" in content:
     # Extract relevant lines around line 407
     lines = content.split("\n")
-    for i, l in enumerate(lines[400:415], start=400):
-        if "prefix_tree" in l.lower() or "use_prefix_tree" in l.lower():
-            print(f"  L{i}: {l.strip()}")
+    for i, _l in enumerate(lines[400:415], start=400):
+        if "prefix_tree" in _l.lower() or "use_prefix_tree" in _l.lower():
+            print(f"  L{i}: {_l.strip()}")
 
     # Check if fix is present: should check for None before using
     has_fix = (
@@ -57,9 +71,9 @@ print(f"  OLD flat roll still present: {has_old_roll}")
 
 if has_magi_fix:
     lines = magi_content.split("\n")
-    for i, l in enumerate(lines):
-        if "_restore_and_roll_labels" in l:
-            print(f"  L{i}: {l.strip()}")
+    for i, _l in enumerate(lines):
+        if "_restore_and_roll_labels" in _l:
+            print(f"  L{i}: {_l.strip()}")
     # Show the fix function
     idx = magi_content.find("def _restore_and_roll_labels")
     if idx > 0:
@@ -67,9 +81,9 @@ if has_magi_fix:
 
 if has_old_roll:
     lines = magi_content.split("\n")
-    for i, l in enumerate(lines):
-        if "torch.roll(pt_batch.flat_input_ids[:real_tokens]" in l:
-            print(f"  OLD flat roll at L{i}: {l.strip()}")
+    for i, _l in enumerate(lines):
+        if "torch.roll(pt_batch.flat_input_ids[:real_tokens]" in _l:
+            print(f"  OLD flat roll at L{i}: {_l.strip()}")
 
 print()
 print("SUMMARY:")
