@@ -1193,9 +1193,6 @@ class RayPPOTrainer:
             calculate_sum_pi_squared=calculate_sum_pi_squared,
             compute_loss=False,
         )
-        from verl.utils.prefix_tree.trainer import configure_olb_backend
-
-        configure_olb_backend(batch_td, self.config.actor_rollout_ref.model)
         output = self.actor_rollout_wg.compute_log_prob(batch_td)
         # gather output
         entropy = tu.get(output, "entropy")

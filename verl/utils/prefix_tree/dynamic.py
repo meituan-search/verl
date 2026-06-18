@@ -227,10 +227,13 @@ def convert_trie_to_tree_node(
         node = TreeNode(segment_len=segment_len, children=children)
         if not children:
             if len(trie_node.sequence_ids) != 1:
-                raise ValueError(
-                    f"Trie leaf has duplicate sequences {trie_node.sequence_ids}; falling back to standard attention."
-                )
-            leaf_to_sample.append(trie_node.sequence_ids[0])
+                # Create zero-length leaves for ALL duplicate sequences (incl. first)
+                # so leaf_to_sample count matches leaf count in TreeNode DFS walk
+                for sid in trie_node.sequence_ids:
+                    leaf_to_sample.append(sid)
+                    node.children.append(TreeNode(segment_len=0, children=[]))
+            else:
+                leaf_to_sample.append(trie_node.sequence_ids[0])
         else:
             # Samples that terminate at this intermediate node need zero-length leaves.
             child_ids = {sid for c in trie_node.children.values() for sid in c.sequence_ids}
@@ -703,17 +706,19 @@ def compute_prefix_sharing_ratio(input_ids, attention_mask=None) -> float:
     return 1.0 - sum(num_tokens) / total_raw
 
 
-def compute_prefix_tree_metrics(input_ids, attention_mask=None) -> dict:
+def compute_prefix_tree_metrics(input_ids, attention_mask=None, n_responses: int = 0) -> dict:
     """Compute prefix-tree metrics as a ``prefix_tree/`` namespace dict.
 
     Returns a dict with keys:
-        ``prefix_tree/sharing_ratio``  — fraction of tokens saved by deduplication
-        ``prefix_tree/flat_tokens``    — deduplicated flat trie token count
-        ``prefix_tree/raw_tokens``     — total raw token count across all sequences
+        ``prefix_tree/global_shared_ratio``  — fraction of tokens saved by deduplication
+        ``prefix_tree/micro_batch_shared_ratio``     — mean per-group sharing ratio (only when n_responses > 0)
+        ``prefix_tree/flat_tokens``          — deduplicated flat trie token count
+        ``prefix_tree/raw_tokens``           — total raw token count across all sequences
 
     Args:
         input_ids: NestedTensor, padded 2-D Tensor, or list[list[int]].
         attention_mask: Optional mask for padded 2-D case.
+        n_responses: Group size for per-micro-batch sharing ratio. 0 disables.
 
     Returns:
         dict of float metrics, all zero if no sequences.
@@ -732,19 +737,45 @@ def compute_prefix_tree_metrics(input_ids, attention_mask=None) -> dict:
     elif isinstance(input_ids, list):
         sequences = input_ids
     else:
-        return {"prefix_tree/sharing_ratio": 0.0, "prefix_tree/flat_tokens": 0, "prefix_tree/raw_tokens": 0}
+        return {
+            "prefix_tree/global_shared_ratio": 0.0,
+            "prefix_tree/micro_batch_shared_ratio": 0.0,
+            "prefix_tree/flat_tokens": 0,
+            "prefix_tree/raw_tokens": 0,
+        }
 
     total_raw = sum(len(s) for s in sequences)
     if total_raw == 0:
-        return {"prefix_tree/sharing_ratio": 0.0, "prefix_tree/flat_tokens": 0, "prefix_tree/raw_tokens": 0}
+        return {
+            "prefix_tree/global_shared_ratio": 0.0,
+            "prefix_tree/micro_batch_shared_ratio": 0.0,
+            "prefix_tree/flat_tokens": 0,
+            "prefix_tree/raw_tokens": 0,
+        }
 
     _, num_tokens = greedy_build_tries(sequences, max_tokens_per_tree=total_raw * 10)
     flat = sum(num_tokens)
-    return {
-        "prefix_tree/sharing_ratio": 1.0 - flat / total_raw,
+    result = {
+        "prefix_tree/global_shared_ratio": 1.0 - flat / total_raw,
+        "prefix_tree/micro_batch_shared_ratio": 0.0,
         "prefix_tree/flat_tokens": flat,
         "prefix_tree/raw_tokens": total_raw,
     }
+
+    if n_responses > 0 and len(sequences) >= n_responses:
+        group_ratios = []
+        for i in range(0, len(sequences), n_responses):
+            group_seqs = sequences[i : i + n_responses]
+            group_raw = sum(len(s) for s in group_seqs)
+            if group_raw == 0:
+                continue
+            _, group_num = greedy_build_tries(group_seqs, max_tokens_per_tree=group_raw * 10)
+            group_flat = sum(group_num)
+            group_ratios.append(1.0 - group_flat / group_raw)
+        if group_ratios:
+            result["prefix_tree/micro_batch_shared_ratio"] = sum(group_ratios) / len(group_ratios)
+
+    return result
 
 
 def prepare_prefix_tree_micro_batches(

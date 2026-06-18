@@ -103,12 +103,14 @@ class PrefixTreeMagiBatch:
             self.local_flat_loss_mask = self.flat_loss_mask
 
 
-def _unpack_nested_to_list(x, pad_token_id=None) -> Optional[list[Tensor]]:
+def _unpack_nested_to_list(x, pad_token_id=None, mask: Optional[Tensor] = None) -> Optional[list[Tensor]]:
     """Unpack a NestedTensor or padded 2-D Tensor into a list of 1-D tensors.
 
     - NestedTensor (jagged): uses ``.offsets()``
-    - Padded 2-D Tensor ``(B, T)``: trims trailing pad_token_id from each row.
-      If pad_token_id is None, trims zero-valued tokens.
+    - Padded 2-D Tensor ``(B, T)``:
+      * If ``mask`` is provided: uses ``mask.sum(dim=-1).tolist()`` as
+        sequence lengths
+      * If ``mask`` is None: returns None (cannot safely unpack)
     - ``None``: returns ``None``
     """
     if x is None:
@@ -124,8 +126,9 @@ def _unpack_nested_to_list(x, pad_token_id=None) -> Optional[list[Tensor]]:
             pos += int(length)
         return out
     if x.dim() == 2:
-        # Padded 2-D tensor — cannot safely unpack without risk of pad/loss_mask misalignment.
-        # Return None to fall back to standard attention.
+        if mask is not None:
+            seqlens = mask.sum(dim=-1).tolist()
+            return [x[i, : int(seqlens[i])] for i in range(x.shape[0])]
         return None
     return None
 
@@ -167,11 +170,11 @@ def build_prefix_tree_micro_batch(
 
     from verl.utils.prefix_tree.utils import build_layout_from_tree_node
 
-    samples = _unpack_nested_to_list(input_ids)
+    samples = _unpack_nested_to_list(input_ids, mask=loss_mask)
     if not samples:
         return None
     loss_masks_by_sample = _unpack_nested_to_list(loss_mask)
-    position_ids_by_sample = _unpack_nested_to_list(position_ids)
+    position_ids_by_sample = _unpack_nested_to_list(position_ids, mask=loss_mask)
 
     if cached_result is not None:
         tree_root, leaf_to_sample = cached_result
