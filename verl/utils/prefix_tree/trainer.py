@@ -25,24 +25,47 @@ def apply_engine_config(engine_config, config_or_data: dict) -> None:
     """Thread prefix-tree flags from config into *engine_config*."""
     engine_config.use_prefix_tree = config_or_data.get("use_prefix_tree", False)
     engine_config.prefix_tree_attention = config_or_data.get("prefix_tree_attention", "flex")
+    engine_config.prefix_tree_dynbsz_length_estimator = config_or_data.get(
+        "prefix_tree_dynbsz_length_estimator", "length"
+    )
 
 
 def add_meta_info(meta_dict: dict, config_or_data: dict) -> None:
     """Add prefix-tree entries to a meta-info dict (mutates in-place)."""
     meta_dict["use_prefix_tree"] = config_or_data.get("use_prefix_tree", False)
     meta_dict["prefix_tree_attention"] = config_or_data.get("prefix_tree_attention", "flex")
+    meta_dict["prefix_tree_dynbsz_length_estimator"] = config_or_data.get(
+        "prefix_tree_dynbsz_length_estimator", "length"
+    )
 
 
-def compute_metrics(metrics: dict, input_ids, config_or_data: dict) -> None:
+def compute_metrics(
+    metrics: dict,
+    input_ids,
+    config_or_data: dict,
+    max_token_len_per_gpu: int | None = None,
+) -> None:
     """Compute prefix-sharing metrics if *use_prefix_tree* is enabled.
 
     Updates *metrics* in-place with keys like ``prefix_tree/sharing_ratio``.
+    Pass *max_token_len_per_gpu* to also log ``prefix_tree/avg_mbs``.
     """
     if not _is_prefix_tree_enabled(config_or_data):
         return
     from verl.utils.prefix_tree.dynamic import compute_prefix_tree_metrics
 
-    metrics.update(compute_prefix_tree_metrics(input_ids))
+    estimator = (
+        config_or_data.get("prefix_tree_dynbsz_length_estimator", "length")
+        if isinstance(config_or_data, dict)
+        else getattr(config_or_data, "prefix_tree_dynbsz_length_estimator", "length")
+    )
+    metrics.update(
+        compute_prefix_tree_metrics(
+            input_ids,
+            max_token_len_per_gpu=max_token_len_per_gpu,
+            dynbsz_estimator=estimator,
+        )
+    )
 
 
 def _is_prefix_tree_enabled(config_or_data) -> bool:

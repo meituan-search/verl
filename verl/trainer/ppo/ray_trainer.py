@@ -1432,7 +1432,14 @@ class RayPPOTrainer:
 
                     from verl.utils.prefix_tree.trainer import compute_metrics
 
-                    compute_metrics(metrics, gen_batch_output.batch["input_ids"], self.config.actor_rollout_ref.model)
+                    compute_metrics(
+                        metrics,
+                        gen_batch_output.batch["input_ids"],
+                        self.config.actor_rollout_ref.model,
+                        max_token_len_per_gpu=getattr(
+                            self.config.actor_rollout_ref.actor, "ppo_max_token_len_per_gpu", None
+                        ),
+                    )
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         gen_baseline_output = combined_gen_output.slice(num_sampled_prompts, None)

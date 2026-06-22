@@ -212,18 +212,37 @@ def build_prefix_tree_micro_batch(
         )
     except (ValueError, AssertionError, RuntimeError) as _e:
         import logging as _log
-        import traceback as _tb
 
         _log.getLogger(__name__).error(
-            "build_prefix_tree_micro_batch: falling back to standard attention "
-            "(%s: %s) — this micro-batch will use FA3, causing ppo_kl != 0\n%s",
+            "build_prefix_tree_micro_batch: falling back to standard attention (%s: %s)",
             type(_e).__name__,
             _e,
-            _tb.format_exc(),
         )
         # Multilevel tree produced non-monotonic leaf ranges or inconsistent
         # token layout.  Fall back to standard attention for this micro-batch.
         return None
+
+
+def _build_sample_tensors(flat_tensor: Tensor, pt_batch: PrefixTreeMagiBatch) -> list:
+    """Build a per-sample list of tensors from a flat deduplicated tensor.
+
+    Shared logic for restore_flat_to_nested and expand_flat_to_per_sample.
+    Returns sample_tensors[sample_idx] = cat(ancestor_slices..., leaf_slice).
+    """
+    prefix_start, prefix_end = pt_batch.prefix_range
+    prefix_slice = flat_tensor[prefix_start:prefix_end]
+    n = pt_batch.original_batch_size
+    sample_tensors: list[Optional[Tensor]] = [None] * n
+    for leaf_idx, sample_idx in enumerate(pt_batch.leaf_to_sample):
+        s, e = pt_batch.leaf_ranges[leaf_idx]
+        leaf_slice = flat_tensor[s:e]
+        if pt_batch.leaf_ancestor_ranges is not None:
+            parts = [flat_tensor[a:b] for a, b in pt_batch.leaf_ancestor_ranges[leaf_idx]]
+            parts.append(leaf_slice)
+            sample_tensors[sample_idx] = torch.cat(parts, dim=0)
+        else:
+            sample_tensors[sample_idx] = torch.cat([prefix_slice, leaf_slice], dim=0)
+    return sample_tensors
 
 
 def restore_flat_to_nested(
@@ -242,34 +261,11 @@ def restore_flat_to_nested(
     Returns:
         NestedTensor of shape (batch_size, variable_seqlen, ...).
     """
-    prefix_start, prefix_end = pt_batch.prefix_range
-    prefix_slice = flat_tensor[prefix_start:prefix_end]
-
-    # leaf_to_sample is a permutation of [0 .. N-1] (same length as original batch).
-    # We allocate sample_tensors by sample index, then fill by leaf iteration.
-    # This is an inverse permutation: no matter the DFS leaf order,
-    # sample_tensors[sample_idx] = ... restores original sample order.
-    n = pt_batch.original_batch_size
-    sample_tensors: list[Optional[Tensor]] = [None] * n
-
-    for leaf_idx, sample_idx in enumerate(pt_batch.leaf_to_sample):
-        leaf_start, leaf_end = pt_batch.leaf_ranges[leaf_idx]
-        leaf_slice = flat_tensor[leaf_start:leaf_end]
-        if pt_batch.leaf_ancestor_ranges is not None:
-            parts = [flat_tensor[s:e] for s, e in pt_batch.leaf_ancestor_ranges[leaf_idx]]
-            parts.append(leaf_slice)
-            sample_tensors[sample_idx] = torch.cat(parts, dim=0)
-        else:
-            sample_tensors[sample_idx] = torch.cat([prefix_slice, leaf_slice], dim=0)
-
+    sample_tensors = _build_sample_tensors(flat_tensor, pt_batch)
     assert all(t is not None for t in sample_tensors), (
         "restore_flat_to_nested: some sample indices were not covered by leaf_to_sample"
     )
-
-    # Use as_nested_tensor (not nested_tensor) to preserve grad_fn through the cat ops.
-    # TODO: future optimization — torch.cat in the loop replicates shared prefix P
-    # N times (O(N*P) copy). Could avoid by storing shared+unique parts separately
-    # and using a view-based NestedTensor, but PyTorch jagged needs contiguous views.
+    # as_nested_tensor (not nested_tensor) preserves grad_fn through the cat ops.
     return torch.nested.as_nested_tensor(sample_tensors, layout=torch.jagged)
 
 
@@ -290,40 +286,11 @@ def expand_flat_to_per_sample(
     Returns:
         (total_expanded, ...) flat tensor with per-sample concatenation.
     """
-    prefix_start, prefix_end = pt_batch.prefix_range
-    prefix_slice = flat_tensor[prefix_start:prefix_end]
-
-    n = pt_batch.original_batch_size
-    sample_tensors: list[Optional[Tensor]] = [None] * n
-
-    for leaf_idx, sample_idx in enumerate(pt_batch.leaf_to_sample):
-        s, e = pt_batch.leaf_ranges[leaf_idx]
-        leaf_slice = flat_tensor[s:e]
-        if pt_batch.leaf_ancestor_ranges is not None:
-            parts = [flat_tensor[a:b] for a, b in pt_batch.leaf_ancestor_ranges[leaf_idx]]
-            parts.append(leaf_slice)
-            sample_tensors[sample_idx] = torch.cat(parts, dim=0)
-        else:
-            sample_tensors[sample_idx] = torch.cat([prefix_slice, leaf_slice], dim=0)
-
+    sample_tensors = _build_sample_tensors(flat_tensor, pt_batch)
     assert all(t is not None for t in sample_tensors), (
         "expand_flat_to_per_sample: some sample indices were not covered by leaf_to_sample"
     )
-    result = torch.cat(sample_tensors, dim=0)
-    # Verify roundtrip: expanded total should equal n*prefix + sum(leaves)
-    prefix_len = prefix_end - prefix_start
-    leaf_total = sum(e - s for s, e in pt_batch.leaf_ranges)
-    expected = n * prefix_len + leaf_total
-    if pt_batch.leaf_ancestor_ranges is not None:
-        ancestor_total = sum(
-            sum(e - s for s, e in pt_batch.leaf_ancestor_ranges[li]) for li in range(len(pt_batch.leaf_ancestor_ranges))
-        )
-        expected = ancestor_total + leaf_total
-    assert result.shape[0] == expected, (
-        f"expand_flat_to_per_sample: expanded size {result.shape[0]} != expected {expected} "
-        f"(n={n}, prefix_len={prefix_len}, leaf_total={leaf_total})"
-    )
-    return result
+    return torch.cat(sample_tensors, dim=0)
 
 
 def _finalize_prefix_tree_batch(
@@ -455,45 +422,6 @@ def _build_magi_key(model, params):
     )
 
 
-def _build_magi_key_sp_scaled(original_key, model, tp_size: int):
-    """Rebuild a MAGI key scaled for the SP-scattered token domain (T/TP seqlen).
-
-    With sequence_parallel=True, the embedding scatter gives T/TP tokens per TP rank.
-    The MAGI key must use T/TP as total_seqlen so dispatch/undispatch in
-    _magi_attn_forward operate on T/TP tokens → T/(TP*CP) per rank → back to T/TP.
-    """
-    import torch.distributed as dist
-    from magi_attention.api import DistAttnConfig, magi_attn_flex_key
-    from magi_attention.common import AttnRanges
-    from magi_attention.meta.solver.dispatch_solver import DispatchConfig
-
-    try:
-        from megatron.core import parallel_state as mpu
-
-        cp_group = mpu.get_context_parallel_group()
-    except Exception:
-        cp_group = dist.group.WORLD
-
-    q_ranges_sp = [(r.start // tp_size, r.end // tp_size) for r in original_key.q_ranges]
-    k_ranges_sp = [(r.start // tp_size, r.end // tp_size) for r in original_key.k_ranges]
-    total_q_sp = original_key.total_seqlen_q // tp_size
-    total_k_sp = original_key.total_seqlen_k // tp_size
-
-    return magi_attn_flex_key(
-        q_ranges=AttnRanges.from_ranges(q_ranges_sp),
-        k_ranges=AttnRanges.from_ranges(k_ranges_sp),
-        attn_mask_type=list(original_key.attn_mask_type),
-        total_seqlen_q=total_q_sp,
-        total_seqlen_k=total_k_sp,
-        num_heads_q=original_key.num_heads_q,
-        num_heads_kv=original_key.num_heads_kv,
-        head_dim=original_key.head_dim,
-        pad_size=0,
-        cp_group_or_mesh=cp_group,
-        dist_attn_config=DistAttnConfig(dispatch_config=DispatchConfig(uneven_shard=True)),
-    )
-
-
 # model-forward helpers — consumed by verl/models/mcore/model_forward.py
 
 
@@ -534,6 +462,38 @@ def get_prefix_tree_kwargs(
     return {
         "use_prefix_tree": use_prefix_tree,
         "prefix_tree_attention": prefix_tree_attention,
+    }
+
+
+def read_prefix_tree_batch_config(batch, tu, use_remove_padding: bool = True) -> tuple[bool, str]:
+    """Read and validate prefix-tree flags from a batch non-tensor dict.
+
+    Returns (use_prefix_tree, prefix_tree_attention).
+    """
+    use_prefix_tree = tu.get_non_tensor_data(batch, key="use_prefix_tree", default=False)
+    prefix_tree_attention = tu.get_non_tensor_data(batch, key="prefix_tree_attention", default="flex")
+    if use_prefix_tree:
+        assert use_remove_padding, (
+            "use_prefix_tree=True requires use_remove_padding=True (THD format). "
+            "Set model.use_remove_padding=True in your config."
+        )
+        assert prefix_tree_attention in ("flex", "magi"), (
+            f"prefix_tree_attention must be 'flex' or 'magi', got {prefix_tree_attention!r}"
+        )
+    return use_prefix_tree, prefix_tree_attention
+
+
+def get_prefix_tree_logits_args(batch, tu) -> dict:
+    """Build the prefix-tree fragment for logits_processor_args from a batch.
+
+    Reads use_prefix_tree, prefix_tree_attention, and prefix_tree_subtree
+    from *batch* internally and returns the ready-to-unpack dict.
+    """
+    use_prefix_tree = tu.get_non_tensor_data(batch, key="use_prefix_tree", default=False)
+    prefix_tree_attention = tu.get_non_tensor_data(batch, key="prefix_tree_attention", default="flex")
+    return {
+        **get_prefix_tree_kwargs(use_prefix_tree, prefix_tree_attention),
+        "prefix_tree_subtree": tu.get_non_tensor_data(batch, "prefix_tree_subtree", default=None),
     }
 
 
@@ -608,8 +568,6 @@ def forward_prefix_tree(
     model, pt_batch, prefix_tree_attention, logits_processor, logits_processor_args, post_process, model_kwargs
 ):
     """Forward pass for prefix-tree batches using magi or flex attention."""
-    import torch
-
     flat_input_ids = pt_batch.local_flat_input_ids.unsqueeze(0)
     flat_position_ids = torch.arange(flat_input_ids.shape[1], device=flat_input_ids.device, dtype=torch.long).unsqueeze(
         0
@@ -654,23 +612,16 @@ def forward_prefix_tree(
         output_orig = output_orig[:real_tokens].permute(1, 0, 2)
 
     if post_process and logits_processor is not None:
-        # Compute per-sample labels from flat input_ids (no autograd nesting).
-        # Expand logits via torch.cat (safe for autograd, no nested tensor).
-        output_orig_thd = output_orig.squeeze(0).unsqueeze(1)
-        logits_flat = output_orig_thd.squeeze(1)[:real_tokens]  # (real_tokens, vocab)
-        nested_ids = restore_flat_to_nested(pt_batch.flat_input_ids[:real_tokens], pt_batch)
-        labels = [torch.roll(t, shifts=-1, dims=0) for t in nested_ids.unbind()]
-        nested_labels = torch.nested.as_nested_tensor(labels, layout=torch.jagged)
-        cu_seqlen = nested_labels.offsets()
-        flat_label = nested_labels.values().unsqueeze(1)  # expanded: (total_expanded, 1)
+        logits_flat = output_orig.squeeze(0)  # (flat_tokens, vocab)
+        flat_ids = pt_batch.flat_input_ids[:real_tokens]  # (flat_tokens,)
 
-        # Expand logits to match expanded labels — torch.cat, no nested tensor in autograd
-        # TODO: future optimization — torch.cat replicates prefix_logits N times
-        # (O(N*P*vocab) copy). Could pass flat logits + index-map to logits_processor.
-        flat_logits = expand_flat_to_per_sample(logits_flat, pt_batch).unsqueeze(1)  # (total_expanded, 1, vocab)
+        # Flat labels: roll flat_ids by -1.  The two boundary positions that
+        # cross sample edges (last prefix token, last token of each leaf) receive
+        # wrong values, but those positions are always covered by loss_mask=0.
+        flat_label = torch.roll(flat_ids, shifts=-1, dims=0).unsqueeze(1)  # (flat_tokens, 1)
 
         orig_args = logits_processor_args or {}
-        total_tokens = flat_label.shape[0]
+        total_flat = flat_ids.shape[0]
         if "temperature" in orig_args:
             t = orig_args["temperature"]
             if isinstance(t, torch.Tensor) and t.is_nested:
@@ -679,34 +630,43 @@ def forward_prefix_tree(
                 scalar_t = t.flatten()[0].item()
             else:
                 scalar_t = float(t)
-            flat_t = torch.full((total_tokens, 1), scalar_t, dtype=torch.float32, device=flat_label.device)
+            flat_t = torch.full((total_flat, 1), scalar_t, dtype=torch.float32, device=flat_label.device)
         else:
-            flat_t = torch.ones(total_tokens, 1, dtype=torch.float32, device=flat_label.device)
+            flat_t = torch.ones(total_flat, 1, dtype=torch.float32, device=flat_label.device)
         flat_args = {
             k: v for k, v in orig_args.items() if k not in ("label", "temperature", "loss_mask", "use_prefix_tree")
         }
         flat_args["label"] = flat_label
         flat_args["temperature"] = flat_t
-        output_dict = logits_processor(flat_logits, **flat_args)
+
+        # logits_processor runs on flat (flat_tokens, 1, vocab).
+        # Clone so in-place ops inside the processor don't alias output_orig.
+        # This avoids the O(N·P·vocab) expansion before the vocab-dimension ops.
+        output_dict = logits_processor(logits_flat.clone().unsqueeze(1), **flat_args)
+
         if isinstance(output_dict, dict):
+            # Per-token flat results are expanded after the vocab ops:
+            # expand_flat_to_per_sample replicates the prefix slice per sample (1-D, cheap),
+            # then split into a per-sample NestedTensor using the expanded offsets.
+            nested_ids = restore_flat_to_nested(flat_ids, pt_batch)
+            cu_seqlen = nested_ids.offsets()  # cumulative lengths in original sample order
+
             for key, val in output_dict.items():
                 if isinstance(val, torch.Tensor):
-                    # Only restore per-token tensors (numel == total_tokens).
-                    # Scalars (e.g. sum_pi_squared) or CP-local tensors are
-                    # left as-is — they don't need per-sample splitting.
-                    val_flat = val.reshape(-1)
-                    if val_flat.shape[0] >= total_tokens:
-                        val_flat = val_flat[:total_tokens]
-                        tensors = [val_flat[cu_seqlen[i] : cu_seqlen[i + 1]] for i in range(len(cu_seqlen) - 1)]
+                    # Only per-token tensors (numel == flat_tokens) need expanding.
+                    # Scalars (e.g. sum_pi_squared) are left as-is.
+                    val_1d = val.reshape(-1)
+                    if val_1d.shape[0] == total_flat:
+                        val_expanded = expand_flat_to_per_sample(val_1d, pt_batch)
+                        tensors = [val_expanded[cu_seqlen[i] : cu_seqlen[i + 1]] for i in range(len(cu_seqlen) - 1)]
                         output_dict[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
         return output_dict
     else:
-        out_stripped = (
-            output_orig[:, :real_tokens].squeeze(0)
-            if output_orig.shape[0] == 1
-            else output_orig[:real_tokens].squeeze(1)
-        )
-        return restore_flat_to_nested(out_stripped, pt_batch)
+        # Intermediate PP stage (post_process=False) or no logits_processor.
+        # output_orig is already (1, flat_tokens, hidden_dim) after the shape block above.
+        # Return it as-is so Megatron P2P communicates the correct 3-D shape to stage 1.
+        # Squeezing to 2-D causes NumelIn=0 / shape mismatch in _communicate_shapes.
+        return output_orig
 
 
 def _restore_and_roll_labels(flat_logits, flat_input_ids, pt_batch):

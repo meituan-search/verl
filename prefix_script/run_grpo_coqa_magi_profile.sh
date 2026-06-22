@@ -24,16 +24,13 @@ export MAGI_DIAG=1
 
 MODEL_PATH="${MODEL_PATH:-/mnt/dolphinfs/ssd_pool/docker/user/hadoop-ai-search/deepsearch_files_ssd/LLMbasemodels/huggingface.co/Qwen/Qwen3-4B-Base}"
 # Dataset: coqa_grpo.parquet prepared from CoQA via prefix_script/data/coqa/prepare_coqa_grpo.py
-TRAIN_FILES="${TRAIN_FILES:-/home/hadoop-djst-algoplat/prefix-tree/verl_prefix_tree/prefix_script/data/coqa/coqa_grpo.parquet}"
-REWARD_FN="${REWARD_FN:-/home/hadoop-djst-algoplat/prefix-tree/verl_prefix_tree/prefix_script/data/coqa/coqa_reward.py}"
+TRAIN_FILES="${TRAIN_FILES:-$HOME/prefix-tree/verl_prefix_tree/prefix_script/data/coqa/coqa_grpo.parquet}"
+REWARD_FN="${REWARD_FN:-$HOME/prefix-tree/verl_prefix_tree/prefix_script/data/coqa/coqa_reward.py}"
 PROFILE_MODE="${PROFILE_MODE:-timing}"
 
 TS=$(date +%Y%m%d_%H%M%S)
 OUTDIR="/tmp/verl_submit/profiles/magi/${TS}"
 mkdir -p "$OUTDIR"
-
-VERL_DIR="${VERL_DIR:-/home/hadoop-djst-algoplat/prefix-tree/verl_prefix_tree}"
-cd "$VERL_DIR"
 
 echo "================================================================"
 echo "MAGI profile run  mode=$PROFILE_MODE  TS=$TS"
@@ -65,7 +62,7 @@ BASE_ARGS=(
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8
     actor_rollout_ref.actor.ppo_epochs=1
     actor_rollout_ref.actor.optim.lr=1e-6
-    actor_rollout_ref.actor.megatron.tensor_model_parallel_size=4
+    actor_rollout_ref.actor.megatron.tensor_model_parallel_size=1
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=1
     actor_rollout_ref.actor.megatron.use_mbridge=True
     actor_rollout_ref.actor.megatron.vanilla_mbridge=True
@@ -91,6 +88,9 @@ BASE_ARGS=(
     trainer.balance_batch=True
 )
 
+export TENSORBOARD_DIR="${TENSORBOARD_DIR:-$HOME/profiles/magi_${TS}/tb}"
+mkdir -p "$TENSORBOARD_DIR"
+
 if [ "$PROFILE_MODE" = "nsys" ]; then
     # nsys: profile actor update_actor only at steps 20,25
     NSYS_ARGS=(
@@ -101,14 +101,10 @@ if [ "$PROFILE_MODE" = "nsys" ]; then
         ++actor_rollout_ref.actor.profiler.enable=True
         ++actor_rollout_ref.actor.profiler.all_ranks=True
     )
-    export TENSORBOARD_DIR=$HOME/profiles/magi_${TS}/tb
-    mkdir -p "$TENSORBOARD_DIR"
     python3 -m verl.trainer.main_ppo \
         "${BASE_ARGS[@]}" "${NSYS_ARGS[@]}" 2>&1 | tee "$OUTDIR/run.log"
 else
     # timing mode: MAGI_TIMING=1 already set above
-    export TENSORBOARD_DIR=$HOME/profiles/magi_${TS}/tb
-    mkdir -p "$TENSORBOARD_DIR"
     python3 -m verl.trainer.main_ppo \
         "${BASE_ARGS[@]}" 2>&1 | tee "$OUTDIR/run.log"
 fi

@@ -61,6 +61,7 @@ from verl.utils.megatron_utils import (
     unwrap_model,
 )
 from verl.utils.model import extract_multi_modal_inputs, load_mcore_dist_weights
+from verl.utils.prefix_tree.magi import get_prefix_tree_logits_args, read_prefix_tree_batch_config
 from verl.utils.seqlen_balancing import restore_dynamic_batch
 from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
 
@@ -831,16 +832,9 @@ class MegatronEngineWithLMHead(MegatronEngine):
         calculate_entropy = tu.get_non_tensor_data(batch, key="calculate_entropy", default=False)
         calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
         distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
-        use_prefix_tree = tu.get_non_tensor_data(batch, key="use_prefix_tree", default=False)
-        prefix_tree_attention = tu.get_non_tensor_data(batch, key="prefix_tree_attention", default="flex")
-        if use_prefix_tree:
-            assert self.engine_config.use_remove_padding, (
-                "use_prefix_tree=True requires use_remove_padding=True (THD format). "
-                "Set model.use_remove_padding=True in your config."
-            )
-            assert prefix_tree_attention in ("flex", "magi"), (
-                f"prefix_tree_attention must be 'flex' or 'magi', got {prefix_tree_attention!r}"
-            )
+        use_prefix_tree, prefix_tree_attention = read_prefix_tree_batch_config(
+            batch, tu, self.engine_config.use_remove_padding
+        )
 
         if calculate_sum_pi_squared and use_fused_kernels:
             raise NotImplementedError(
@@ -948,14 +942,11 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 ret["log_probs"] = log_probs
                 return ret
 
-            from verl.utils.prefix_tree.magi import get_prefix_tree_kwargs
-
             logits_processor_args = {
                 "label": label,
                 "temperature": temperature,
                 "loss_mask": loss_mask,
-                **get_prefix_tree_kwargs(use_prefix_tree, prefix_tree_attention),
-                "prefix_tree_subtree": tu.get_non_tensor_data(batch, "prefix_tree_subtree", default=None),
+                **get_prefix_tree_logits_args(batch, tu),
             }
 
             output = forward_fn(

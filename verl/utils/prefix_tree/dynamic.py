@@ -44,6 +44,7 @@ __all__ = [
     "TrieNode",
     "greedy_build_tries",
     "mbs_groups_from_trie",
+    "trie_group_attn_area",
     "convert_trie_to_tree_node",
     # Load balancing
     "trie_group_flat_tokens",
@@ -328,6 +329,60 @@ def trie_group_flat_tokens(group: list[int], trie: TrieNode) -> int:
     return sum(_count(c) for c in trie.children.values())
 
 
+def _leaf_attn_area_inc(node: TrieNode, covered: set[int]) -> tuple[int, list[TrieNode]]:
+    """Incremental non-masked attention area for adding *node* (a leaf) to a group.
+
+    Derived from the prefix-tree block mask (same three block types as
+    ``_build_flex_key``):
+        - new ancestor self-attention  (paid once when first seen)
+        - leaf attending to all its ancestors
+        - leaf self-attention
+
+        inc = new_anc_len²  +  (shared_anc_len + new_anc_len) × leaf_len  +  leaf_len²
+
+    Works correctly for single-level and multi-level trees, and for groups that
+    mix multiple prefix families (different subtrees of the same trie root).
+
+    Returns:
+        (inc, new_anc): incremental area cost and the newly-covered ancestor nodes.
+    """
+    new_anc = [n for n in node.ancestors if id(n) not in covered]
+    shared_anc_len = sum(len(n.tokens) for n in node.ancestors if id(n) in covered)
+    new_anc_len = sum(len(n.tokens) for n in new_anc)
+    leaf_len = len(node.tokens)
+    inc = new_anc_len * new_anc_len + (shared_anc_len + new_anc_len) * leaf_len + leaf_len * leaf_len
+    return inc, new_anc
+
+
+def trie_group_attn_area(group: list[int], trie: TrieNode) -> int:
+    """Total non-masked attention area for a subset of sequences within a trie.
+
+    Mirrors :func:`trie_group_flat_tokens` but returns the attention area instead
+    of flat token count.  The area equals ``sqrt(area)`` effective tokens — the
+    budget unit used by :func:`mbs_groups_from_trie` when ``use_n2_cost=True``.
+    """
+    keep = frozenset(group)
+    covered: set[int] = set()
+    total = 0
+
+    def _visit(node: TrieNode) -> None:
+        nonlocal total
+        if not node.children:
+            if any(s in keep for s in node.sequence_ids):
+                inc, new_anc = _leaf_attn_area_inc(node, covered)
+                total += inc
+                covered.update(id(n) for n in new_anc + [node])
+        else:
+            for child in node.children.values():
+                if any(s in keep for s in child.sequence_ids):
+                    _visit(child)
+
+    for child in trie.children.values():
+        if any(s in keep for s in child.sequence_ids):
+            _visit(child)
+    return total
+
+
 def build_mini_batch_prefix_groups(
     sequences: list[list[int]],
 ) -> list[tuple[list[int], int]]:
@@ -544,11 +599,23 @@ def trie_to_leaf_ids(trie: TrieNode) -> np.ndarray:  # noqa: F821
 def mbs_groups_from_trie(
     trie: TrieNode,
     max_token_len: int,
+    use_n2_cost: bool = False,
 ) -> list[list[int]]:
     """Group sequences into micro-batches from an existing trie.
 
-    Same algorithm as :func:`dfs_micro_batch_groups` but accepts a pre-built
-    trie instead of rebuilding from sequences.
+    When ``use_n2_cost=False`` (default): budget is flat (deduplicated) tokens.
+
+    When ``use_n2_cost=True``: budget is the *effective attention length*
+    ``sqrt(non_masked_area)`` where the non-masked area matches the prefix-tree
+    block mask exactly — prefix self-attention + each leaf attending to all its
+    ancestors + leaf self-attention.  For each new leaf the incremental area is:
+
+        inc = new_anc_len²  +  (shared_anc_len + new_anc_len) × leaf_len  +  leaf_len²
+
+    where ``new_anc_len`` are ancestor tokens not yet in ``covered`` (paid once,
+    like the mask's prefix block) and ``shared_anc_len`` are already covered.
+    Budget check: ``total_area + inc > max_token_len²`` (avoids sqrt in hot path).
+    This handles arbitrary tree depth and multi-family groups correctly.
 
     When a trie leaf holds multiple sequence_ids (identical sequences), all IDs
     stay in the same DFS group.  prune_trie returns None for that group
@@ -557,35 +624,46 @@ def mbs_groups_from_trie(
     same_micro_num_in_dp to pad the other DP rank, double-counting its gradients.
     """
     all_groups: list[list[int]] = []
+    budget_sq = max_token_len * max_token_len  # used only when use_n2_cost=True
 
     for trie_root in [trie]:
         current_group: list[int] = []
         covered: set[int] = set()
-        current_eff = 0
+        current_eff = 0  # flat tokens (use_n2_cost=False) or accumulated area (True)
 
         def _visit(node: TrieNode) -> None:
             nonlocal current_eff
             if not node.children:
-                path = node.ancestors + [node]
-                new_nodes = [n for n in path if id(n) not in covered]  # noqa: B023
-                inc = sum(len(n.tokens) for n in new_nodes)
-
-                if current_group and current_eff + inc > max_token_len:  # noqa: B023
-                    all_groups.append(current_group[:])  # noqa: B023
-                    current_group.clear()  # noqa: B023
-                    covered.clear()  # noqa: B023
-                    current_eff = 0
-                    new_nodes = path
+                if use_n2_cost:  # noqa: B023
+                    inc, new_anc = _leaf_attn_area_inc(node, covered)  # noqa: B023
+                    if current_group and current_eff + inc > budget_sq:  # noqa: B023
+                        all_groups.append(current_group[:])  # noqa: B023
+                        current_group.clear()  # noqa: B023
+                        covered.clear()  # noqa: B023
+                        current_eff = 0
+                        inc, new_anc = _leaf_attn_area_inc(node, covered)  # recompute after flush  # noqa: B023
+                    current_group.extend(node.sequence_ids)  # noqa: B023
+                    covered.update(id(n) for n in new_anc + [node])  # noqa: B023
+                    current_eff += inc
+                else:
+                    path = node.ancestors + [node]
+                    new_nodes = [n for n in path if id(n) not in covered]  # noqa: B023
                     inc = sum(len(n.tokens) for n in new_nodes)
-
-                # Keep all sequence_ids (including duplicates) in the same group.
-                # Duplicates land in the same group as their originals → prune_trie
-                # returns None for that group → FA3 fallback for that one group.
-                # This avoids creating an extra singleton group that would upset
-                # same_micro_num_in_dp and double-count gradients on the other rank.
-                current_group.extend(node.sequence_ids)  # noqa: B023
-                covered.update(id(n) for n in new_nodes)  # noqa: B023
-                current_eff += inc
+                    if current_group and current_eff + inc > max_token_len:  # noqa: B023
+                        all_groups.append(current_group[:])  # noqa: B023
+                        current_group.clear()  # noqa: B023
+                        covered.clear()  # noqa: B023
+                        current_eff = 0
+                        new_nodes = path
+                        inc = sum(len(n.tokens) for n in new_nodes)
+                    # Keep all sequence_ids (including duplicates) in the same group.
+                    # Duplicates land in the same group as their originals → prune_trie
+                    # returns None for that group → FA3 fallback for that one group.
+                    # This avoids creating an extra singleton group that would upset
+                    # same_micro_num_in_dp and double-count gradients on the other rank.
+                    current_group.extend(node.sequence_ids)  # noqa: B023
+                    covered.update(id(n) for n in new_nodes)  # noqa: B023
+                    current_eff += inc
             else:
                 for child in node.children.values():
                     _visit(child)
@@ -706,19 +784,28 @@ def compute_prefix_sharing_ratio(input_ids, attention_mask=None) -> float:
     return 1.0 - sum(num_tokens) / total_raw
 
 
-def compute_prefix_tree_metrics(input_ids, attention_mask=None, n_responses: int = 0) -> dict:
+def compute_prefix_tree_metrics(
+    input_ids,
+    attention_mask=None,
+    n_responses: int = 0,
+    max_token_len_per_gpu: int | None = None,
+    dynbsz_estimator: str = "length",
+) -> dict:
     """Compute prefix-tree metrics as a ``prefix_tree/`` namespace dict.
 
     Returns a dict with keys:
-        ``prefix_tree/global_shared_ratio``  — fraction of tokens saved by deduplication
-        ``prefix_tree/micro_batch_shared_ratio``     — mean per-group sharing ratio (only when n_responses > 0)
-        ``prefix_tree/flat_tokens``          — deduplicated flat trie token count
-        ``prefix_tree/raw_tokens``           — total raw token count across all sequences
+        ``prefix_tree/global_shared_ratio``      — fraction of tokens saved by deduplication
+        ``prefix_tree/micro_batch_shared_ratio`` — mean per-group sharing ratio (only when n_responses > 0)
+        ``prefix_tree/flat_tokens``              — deduplicated flat trie token count
+        ``prefix_tree/raw_tokens``               — total raw token count across all sequences
+        ``prefix_tree/avg_mbs``                  — avg sequences per micro-batch (only when max_token_len_per_gpu set)
 
     Args:
         input_ids: NestedTensor, padded 2-D Tensor, or list[list[int]].
         attention_mask: Optional mask for padded 2-D case.
         n_responses: Group size for per-micro-batch sharing ratio. 0 disables.
+        max_token_len_per_gpu: dynbsz budget; if set, computes avg_mbs via the same grouping as training.
+        dynbsz_estimator: ``"length"`` (flat tokens) or ``"area"`` (sqrt of attention area).
 
     Returns:
         dict of float metrics, all zero if no sequences.
@@ -775,6 +862,13 @@ def compute_prefix_tree_metrics(input_ids, attention_mask=None, n_responses: int
         if group_ratios:
             result["prefix_tree/micro_batch_shared_ratio"] = sum(group_ratios) / len(group_ratios)
 
+    if max_token_len_per_gpu is not None:
+        tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=total_raw * 10)
+        if tries:
+            use_n2 = dynbsz_estimator == "area"
+            groups = mbs_groups_from_trie(tries[0], max_token_len_per_gpu, use_n2_cost=use_n2)
+            result["prefix_tree/avg_mbs"] = len(sequences) / len(groups) if groups else 0.0
+
     return result
 
 
@@ -805,9 +899,12 @@ def prepare_prefix_tree_micro_batches(
     max_token_len_per_gpu = data["max_token_len_per_gpu"]
     max_token_len = max_token_len_per_gpu * sp_size
 
+    estimator = tu.get_non_tensor_data(data, "prefix_tree_dynbsz_length_estimator", default="length")
+    use_n2_cost = estimator == "area"
+
     trie = tu.get_non_tensor_data(data, "prefix_tree", default=None)
     if trie is not None:
-        batch_idx_list = mbs_groups_from_trie(trie, max_token_len)
+        batch_idx_list = mbs_groups_from_trie(trie, max_token_len, use_n2_cost=use_n2_cost)
     else:
         input_ids = data["input_ids"]
         seqs = [t.tolist() for t in input_ids.unbind()]

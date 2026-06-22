@@ -120,6 +120,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
         # Thread prefix-tree flags from model config → engine meta_info (actor training dedup)
         self.engine_config.use_prefix_tree = self.model_config.get("use_prefix_tree", False)
         self.engine_config.prefix_tree_attention = self.model_config.get("prefix_tree_attention", "flex")
+        self.engine_config.prefix_tree_dynbsz_length_estimator = self.model_config.get(
+            "prefix_tree_dynbsz_length_estimator", "length"
+        )
 
         self.profiler_config = self.config.profiler_config
         if self.profiler_config is not None:
@@ -347,6 +350,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
             use_fused_kernels=self.engine_config.use_fused_kernels,
             use_prefix_tree=getattr(self.engine_config, "use_prefix_tree", False),
             prefix_tree_attention=getattr(self.engine_config, "prefix_tree_attention", "flex"),
+            prefix_tree_dynbsz_length_estimator=getattr(
+                self.engine_config, "prefix_tree_dynbsz_length_estimator", "length"
+            ),
         )
 
         for key, val in default_keys.items():
@@ -403,6 +409,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
             use_fused_kernels=self.engine_config.use_fused_kernels,
             use_prefix_tree=self.engine_config.use_prefix_tree,
             prefix_tree_attention=getattr(self.engine_config, "prefix_tree_attention", "flex"),
+            prefix_tree_dynbsz_length_estimator=getattr(
+                self.engine_config, "prefix_tree_dynbsz_length_estimator", "length"
+            ),
         )
 
         for key, val in default_keys.items():
