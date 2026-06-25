@@ -24,9 +24,9 @@ Usage (inside gptmodel_forward_model_engine):
     pt_batch = build_prefix_tree_micro_batch(model, input_ids, loss_mask, position_ids)
     if pt_batch is not None:
         output = model(
-            input_ids=pt_batch.flat_input_ids,
+            input_ids=pt_batch.tree_packed_input_ids,
             attention_mask=None,
-            position_ids=pt_batch.flat_position_ids,
+            position_ids=pt_batch.tree_packed_position_ids,
             packed_seq_params=None,
             magi_attention_key=pt_batch.magi_key,
         )
@@ -35,31 +35,31 @@ Usage (inside gptmodel_forward_model_engine):
 
 from __future__ import annotations
 
+import logging as _log
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
+import torch.distributed as _dist
+from megatron.core import parallel_state as mpu
 from torch import Tensor
 from torch.nested._internal.nested_tensor import NestedTensor
+from torch.nn.attention.flex_attention import create_block_mask
 
-_per_sample_pos_ids: Optional[Tensor] = None
-
-
-def set_prefix_tree_position_ids(pos_ids: Optional[Tensor]) -> None:
-    """Set per-sample position IDs for the current forward. Call before model(),
-    reset to None after."""
-    global _per_sample_pos_ids
-    _per_sample_pos_ids = pos_ids
+from verl.utils.device import get_torch_device
+from verl.utils.megatron_utils import unwrap_model
+from verl.utils.prefix_tree.dynamic import build_tree_dynamic
+from verl.utils.prefix_tree.utils import build_layout_from_tree_node
 
 
 @dataclass
 class PrefixTreeMagiBatch:
-    """Holds the flat layout and MAGI key for one prefix-tree micro-batch."""
+    """Holds the tree-packed layout and MAGI key for one prefix-tree micro-batch."""
 
-    # flat input tensors ready to pass to model(...)
-    flat_input_ids: Tensor  # (total_tokens,)
-    flat_position_ids: Tensor  # (total_tokens,)
-    flat_loss_mask: Optional[Tensor]  # (total_tokens,) or None
+    # tree-packed input tensors ready to pass to model(...)
+    tree_packed_input_ids: Tensor  # (total_tokens,)
+    tree_packed_position_ids: Tensor  # (total_tokens,)
+    tree_packed_loss_mask: Optional[Tensor]  # (total_tokens,) or None
 
     # Attention keys — one will be None depending on prefix_tree_attention setting
     magi_key: object  # MAGI key (None when using flex)
@@ -75,7 +75,7 @@ class PrefixTreeMagiBatch:
     # original batch size (= number of leaves for single-level tree)
     original_batch_size: int
 
-    # number of real (non-padding) tokens; may be < flat_input_ids.shape[0]
+    # number of real (non-padding) tokens; may be < tree_packed_input_ids.shape[0]
     # when tp_size > 1 padding was added for sequence-parallel divisibility
     real_tokens: int = 0
 
@@ -85,22 +85,22 @@ class PrefixTreeMagiBatch:
     leaf_ancestor_ranges: Optional[list[list[tuple[int, int]]]] = None
 
     # CP-local tensors: after magi dispatch, each CP rank only processes its assigned tokens.
-    # When CP=1, these equal flat_input_ids/flat_position_ids/flat_loss_mask.
+    # When CP=1, these equal tree_packed_input_ids/tree_packed_position_ids/tree_packed_loss_mask.
     # Shape: (local_tokens, ...) where local_tokens = total_tokens / cp_effective
-    local_flat_input_ids: Optional[Tensor] = None
-    local_flat_position_ids: Optional[Tensor] = None
-    local_flat_loss_mask: Optional[Tensor] = None
+    local_tree_packed_input_ids: Optional[Tensor] = None
+    local_tree_packed_position_ids: Optional[Tensor] = None
+    local_tree_packed_loss_mask: Optional[Tensor] = None
 
     def __post_init__(self):
         if self.real_tokens == 0:
-            self.real_tokens = int(self.flat_input_ids.shape[0])
+            self.real_tokens = int(self.tree_packed_input_ids.shape[0])
         # Default local to full when not set (CP=1 or flex path)
-        if self.local_flat_input_ids is None:
-            self.local_flat_input_ids = self.flat_input_ids
-        if self.local_flat_position_ids is None:
-            self.local_flat_position_ids = self.flat_position_ids
-        if self.local_flat_loss_mask is None:
-            self.local_flat_loss_mask = self.flat_loss_mask
+        if self.local_tree_packed_input_ids is None:
+            self.local_tree_packed_input_ids = self.tree_packed_input_ids
+        if self.local_tree_packed_position_ids is None:
+            self.local_tree_packed_position_ids = self.tree_packed_position_ids
+        if self.local_tree_packed_loss_mask is None:
+            self.local_tree_packed_loss_mask = self.tree_packed_loss_mask
 
 
 def _unpack_nested_to_list(x, pad_token_id=None, mask: Optional[Tensor] = None) -> Optional[list[Tensor]]:
@@ -168,10 +168,11 @@ def build_prefix_tree_micro_batch(
         PrefixTreeMagiBatch or None.
     """
 
-    from verl.utils.prefix_tree.utils import build_layout_from_tree_node
-
     samples = _unpack_nested_to_list(input_ids, mask=loss_mask)
     if not samples:
+        _log.getLogger(__name__).warning(
+            "prefix_tree: build_prefix_tree_micro_batch got empty samples — returning None"
+        )
         return None
     loss_masks_by_sample = _unpack_nested_to_list(loss_mask)
     position_ids_by_sample = _unpack_nested_to_list(position_ids, mask=loss_mask)
@@ -179,12 +180,8 @@ def build_prefix_tree_micro_batch(
     if cached_result is not None:
         tree_root, leaf_to_sample = cached_result
     else:
-        from verl.utils.prefix_tree.dynamic import build_tree_dynamic
-
         result = build_tree_dynamic(samples)
         if result is None:
-            import logging as _log
-
             _log.getLogger(__name__).error(
                 "build_prefix_tree_micro_batch: no prefix sharing found (n=%d); "
                 "falling back to standard attention — old_log_prob will use FA3, "
@@ -211,8 +208,6 @@ def build_prefix_tree_micro_batch(
             cp_size=cp_size,
         )
     except (ValueError, AssertionError, RuntimeError) as _e:
-        import logging as _log
-
         _log.getLogger(__name__).error(
             "build_prefix_tree_micro_batch: falling back to standard attention (%s: %s)",
             type(_e).__name__,
@@ -308,17 +303,21 @@ def _finalize_prefix_tree_batch(
     added to the attention rectangles — they are stripped before loss, and
     MAGI assigns zero attention weight to out-of-range positions.
     """
-    real_tokens = params.flat_tokens.shape[0]
+    real_tokens = params.tree_packed_tokens.shape[0]
     if tp_size > 1:
         align_size = (tp_size * cp_size * 2) if cp_size > 1 else tp_size
         pad_len = (align_size - real_tokens % align_size) % align_size
         if pad_len > 0:
-            params.flat_tokens = torch.cat([params.flat_tokens, params.flat_tokens.new_zeros(pad_len)])
-            params.flat_position_ids = torch.cat(
-                [params.flat_position_ids, params.flat_position_ids.new_zeros(pad_len)]
+            params.tree_packed_tokens = torch.cat(
+                [params.tree_packed_tokens, params.tree_packed_tokens.new_zeros(pad_len)]
             )
-            if params.flat_loss_mask is not None:
-                params.flat_loss_mask = torch.cat([params.flat_loss_mask, params.flat_loss_mask.new_zeros(pad_len)])
+            params.tree_packed_position_ids = torch.cat(
+                [params.tree_packed_position_ids, params.tree_packed_position_ids.new_zeros(pad_len)]
+            )
+            if params.tree_packed_loss_mask is not None:
+                params.tree_packed_loss_mask = torch.cat(
+                    [params.tree_packed_loss_mask, params.tree_packed_loss_mask.new_zeros(pad_len)]
+                )
             params.total_seqlen_q += pad_len
             params.total_seqlen_k += pad_len
 
@@ -326,13 +325,13 @@ def _finalize_prefix_tree_batch(
         magi_key = _build_magi_key(model, params)
         flex_key = None
     else:
-        flex_key = _build_flex_key(params, params.flat_tokens.device)
+        flex_key = _build_flex_key(params, params.tree_packed_tokens.device)
         magi_key = None
 
     return PrefixTreeMagiBatch(
-        flat_input_ids=params.flat_tokens,
-        flat_position_ids=params.flat_position_ids,
-        flat_loss_mask=params.flat_loss_mask,
+        tree_packed_input_ids=params.tree_packed_tokens,
+        tree_packed_position_ids=params.tree_packed_position_ids,
+        tree_packed_loss_mask=params.tree_packed_loss_mask,
         magi_key=magi_key,
         flex_key=flex_key,
         leaf_to_sample=params.leaf_to_sample,
@@ -341,9 +340,9 @@ def _finalize_prefix_tree_batch(
         original_batch_size=num_samples,
         real_tokens=real_tokens,
         leaf_ancestor_ranges=getattr(params, "_leaf_ancestor_ranges", None),
-        local_flat_input_ids=params.flat_tokens,
-        local_flat_position_ids=params.flat_position_ids,
-        local_flat_loss_mask=params.flat_loss_mask,
+        local_tree_packed_input_ids=params.tree_packed_tokens,
+        local_tree_packed_position_ids=params.tree_packed_position_ids,
+        local_tree_packed_loss_mask=params.tree_packed_loss_mask,
     )
 
 
@@ -357,8 +356,6 @@ def _build_flex_key(params, device):
 
     Returns a compiled block_mask usable with torch.nn.attention.flex_attention.
     """
-    from torch.nn.attention.flex_attention import create_block_mask
-
     total = params.total_seqlen_q
     prefix_end = params.prefix_range[1]  # == prefix_len
 
@@ -386,13 +383,10 @@ def _build_flex_key(params, device):
 
 def _build_magi_key(model, params):
     """Construct a magi_attn_flex_key from PrefixTreeParams and model config."""
-    import torch.distributed as dist
     from magi_attention.api import DistAttnConfig, magi_attn_flex_key
     from magi_attention.common import AttnRanges
     from magi_attention.common.enum import AttnMaskType
     from magi_attention.meta.solver.dispatch_solver import DispatchConfig
-
-    from verl.utils.megatron_utils import unwrap_model
 
     cfg = unwrap_model(model).config
     num_heads_q = cfg.num_attention_heads
@@ -401,11 +395,9 @@ def _build_magi_key(model, params):
     head_dim = cfg.kv_channels  # hidden_size // num_attention_heads
 
     try:
-        from megatron.core import parallel_state as mpu
-
         cp_group = mpu.get_context_parallel_group()
     except Exception:
-        cp_group = dist.group.WORLD
+        cp_group = _dist.group.WORLD
 
     return magi_attn_flex_key(
         q_ranges=AttnRanges.from_ranges(params.q_ranges),
@@ -490,9 +482,12 @@ def get_prefix_tree_logits_args(batch, tu) -> dict:
     from *batch* internally and returns the ready-to-unpack dict.
     """
     use_prefix_tree = tu.get_non_tensor_data(batch, key="use_prefix_tree", default=False)
+    if not use_prefix_tree:
+        return {}
     prefix_tree_attention = tu.get_non_tensor_data(batch, key="prefix_tree_attention", default="flex")
     return {
-        **get_prefix_tree_kwargs(use_prefix_tree, prefix_tree_attention),
+        "use_prefix_tree": True,
+        "prefix_tree_attention": prefix_tree_attention,
         "prefix_tree_subtree": tu.get_non_tensor_data(batch, "prefix_tree_subtree", default=None),
     }
 
@@ -516,6 +511,12 @@ def try_forward_prefix_tree(
     standard THD path.
     """
     if vision_model or mtp_enable_train:
+        _log.getLogger(__name__).warning(
+            "prefix_tree: skipping prefix-tree path (vision_model=%s, mtp_enable_train=%s) — "
+            "falling back to standard THD",
+            vision_model,
+            mtp_enable_train,
+        )
         strip_prefix_tree_args(logits_processor_args)
         return None
 
@@ -537,6 +538,12 @@ def try_forward_prefix_tree(
             model_kwargs,
         )
 
+    _log.getLogger(__name__).warning(
+        "prefix_tree: build_prefix_tree_batch returned None — falling back to standard THD path "
+        "(post_process=%s). If this appears for one PP stage but not the other, the hidden-state "
+        "format will mismatch between stages.",
+        post_process,
+    )
     strip_prefix_tree_args(logits_processor_args)
     return None
 
@@ -551,15 +558,13 @@ def build_prefix_tree_batch(model, input_ids, logits_processor_args, vision_mode
     loss_mask_nested = (logits_processor_args or {}).get("loss_mask", None)
     cached_result = (logits_processor_args or {}).get("prefix_tree_subtree")
 
-    from megatron.core import parallel_state as _mpu
-
     return build_prefix_tree_micro_batch(
         model,
         input_ids,
         loss_mask_nested,
         attention_type=prefix_tree_attention,
-        tp_size=_mpu.get_tensor_model_parallel_world_size(),
-        cp_size=_mpu.get_context_parallel_world_size(),
+        tp_size=mpu.get_tensor_model_parallel_world_size(),
+        cp_size=mpu.get_context_parallel_world_size(),
         cached_result=cached_result,
     )
 
@@ -568,42 +573,47 @@ def forward_prefix_tree(
     model, pt_batch, prefix_tree_attention, logits_processor, logits_processor_args, post_process, model_kwargs
 ):
     """Forward pass for prefix-tree batches using magi or flex attention."""
-    flat_input_ids = pt_batch.local_flat_input_ids.unsqueeze(0)
-    flat_position_ids = torch.arange(flat_input_ids.shape[1], device=flat_input_ids.device, dtype=torch.long).unsqueeze(
-        0
-    )
-
-    # Use layout builder's flat_position_ids (already correct per-sample positions)
-    per_sample_pos = pt_batch.local_flat_position_ids.clone()
-    set_prefix_tree_position_ids(per_sample_pos)
+    tree_packed_input_ids = pt_batch.local_tree_packed_input_ids.unsqueeze(0)
+    # Use the layout builder's per-sample position IDs (resets within each sample,
+    # stays within max_position_embeddings).  torch.arange(flat_tokens) would produce
+    # monotonic IDs up to 172437+ which OOB the RoPE embedding table on large batches.
+    tree_packed_position_ids = pt_batch.local_tree_packed_position_ids.unsqueeze(0)
 
     strip_prefix_tree_args(logits_processor_args)
 
     if prefix_tree_attention == "magi":
+        from magi_attention.api import get_position_ids, undispatch
+
+        # Pre-dispatch: each CP rank processes only its local token slice through
+        # embedding, FFN, MoE, and layer norms — not the full flat sequence.
+        # calc_attn handles cross-rank attention communication internally.
+        local_indices = get_position_ids(pt_batch.magi_key)  # (local_tokens,) global positions
+        local_input_ids = pt_batch.tree_packed_input_ids[local_indices].unsqueeze(0)
+        local_position_ids = pt_batch.tree_packed_position_ids[local_indices].unsqueeze(0)
+
         output_orig = model(
-            input_ids=flat_input_ids,
+            input_ids=local_input_ids,
             attention_mask=None,
-            position_ids=flat_position_ids,
+            position_ids=local_position_ids,
             packed_seq_params=None,
             magi_attention_key=pt_batch.magi_key,
             **model_kwargs,
         )
+
+        if post_process:
+            # Gather local logit slices → full flat_tokens vocab tensor for loss computation.
+            output_orig = undispatch(output_orig.squeeze(0), pt_batch.magi_key).unsqueeze(0)
     else:
         output_orig = model(
-            input_ids=flat_input_ids,
+            input_ids=tree_packed_input_ids,
             attention_mask=None,
-            position_ids=flat_position_ids,
+            position_ids=tree_packed_position_ids,
             packed_seq_params=None,
             flex_attention_key=pt_batch.flex_key,
             **model_kwargs,
         )
 
-    from verl.utils.device import get_torch_device
-
     get_torch_device().synchronize()
-
-    # Clean up per-sample position IDs
-    set_prefix_tree_position_ids(None)
 
     real_tokens = pt_batch.real_tokens
     if output_orig.shape[0] == 1:
@@ -613,15 +623,15 @@ def forward_prefix_tree(
 
     if post_process and logits_processor is not None:
         logits_flat = output_orig.squeeze(0)  # (flat_tokens, vocab)
-        flat_ids = pt_batch.flat_input_ids[:real_tokens]  # (flat_tokens,)
+        tree_packed_ids = pt_batch.tree_packed_input_ids[:real_tokens]  # (flat_tokens,)
 
-        # Flat labels: roll flat_ids by -1.  The two boundary positions that
+        # Tree-packed labels: roll tree_packed_ids by -1.  The two boundary positions that
         # cross sample edges (last prefix token, last token of each leaf) receive
         # wrong values, but those positions are always covered by loss_mask=0.
-        flat_label = torch.roll(flat_ids, shifts=-1, dims=0).unsqueeze(1)  # (flat_tokens, 1)
+        tree_packed_label = torch.roll(tree_packed_ids, shifts=-1, dims=0).unsqueeze(1)  # (flat_tokens, 1)
 
         orig_args = logits_processor_args or {}
-        total_flat = flat_ids.shape[0]
+        total_flat = tree_packed_ids.shape[0]
         if "temperature" in orig_args:
             t = orig_args["temperature"]
             if isinstance(t, torch.Tensor) and t.is_nested:
@@ -630,14 +640,14 @@ def forward_prefix_tree(
                 scalar_t = t.flatten()[0].item()
             else:
                 scalar_t = float(t)
-            flat_t = torch.full((total_flat, 1), scalar_t, dtype=torch.float32, device=flat_label.device)
+            tree_packed_t = torch.full((total_flat, 1), scalar_t, dtype=torch.float32, device=tree_packed_label.device)
         else:
-            flat_t = torch.ones(total_flat, 1, dtype=torch.float32, device=flat_label.device)
+            tree_packed_t = torch.ones(total_flat, 1, dtype=torch.float32, device=tree_packed_label.device)
         flat_args = {
             k: v for k, v in orig_args.items() if k not in ("label", "temperature", "loss_mask", "use_prefix_tree")
         }
-        flat_args["label"] = flat_label
-        flat_args["temperature"] = flat_t
+        flat_args["label"] = tree_packed_label
+        flat_args["temperature"] = tree_packed_t
 
         # logits_processor runs on flat (flat_tokens, 1, vocab).
         # Clone so in-place ops inside the processor don't alias output_orig.
@@ -648,7 +658,7 @@ def forward_prefix_tree(
             # Per-token flat results are expanded after the vocab ops:
             # expand_flat_to_per_sample replicates the prefix slice per sample (1-D, cheap),
             # then split into a per-sample NestedTensor using the expanded offsets.
-            nested_ids = restore_flat_to_nested(flat_ids, pt_batch)
+            nested_ids = restore_flat_to_nested(tree_packed_ids, pt_batch)
             cu_seqlen = nested_ids.offsets()  # cumulative lengths in original sample order
 
             for key, val in output_dict.items():
@@ -663,18 +673,8 @@ def forward_prefix_tree(
         return output_dict
     else:
         # Intermediate PP stage (post_process=False) or no logits_processor.
-        # output_orig is already (1, flat_tokens, hidden_dim) after the shape block above.
-        # Return it as-is so Megatron P2P communicates the correct 3-D shape to stage 1.
-        # Squeezing to 2-D causes NumelIn=0 / shape mismatch in _communicate_shapes.
-        return output_orig
-
-
-def _restore_and_roll_labels(flat_logits, flat_input_ids, pt_batch):
-    """Restore flat logits/input_ids to per-sample nested, roll labels per-sample.
-
-    Returns (nested_logits, nested_labels) where nested_labels[i][j] = input_ids[i][j+1].
-    """
-    nested_logits = restore_flat_to_nested(flat_logits, pt_batch)
-    nested_ids = restore_flat_to_nested(flat_input_ids, pt_batch)
-    labels = [torch.roll(t, shifts=-1, dims=0) for t in nested_ids.unbind()]
-    return nested_logits, torch.nested.as_nested_tensor(labels, layout=torch.jagged)
+        # output_orig is (1, flat_tokens, hidden_dim) after normalization above.
+        # Stage 0 transposes BSH→SBHD internally (embedding → seq-first).
+        # We must send the same seq-first format (seq, 1, hidden) so all downstream
+        # stages also get seq-first Q — no per-stage conditional needed, PP=N safe.
+        return output_orig.permute(1, 0, 2)  # (1,seq,hid) → (seq,1,hid)

@@ -39,10 +39,10 @@ class PrefixTreeParams:
     mask_types: list[str]
     total_seqlen_q: int
     total_seqlen_k: int
-    flat_tokens: Optional[Tensor] = None
-    flat_labels: Optional[Tensor] = None
-    flat_loss_mask: Optional[Tensor] = None
-    flat_position_ids: Optional[Tensor] = None
+    tree_packed_tokens: Optional[Tensor] = None
+    tree_packed_labels: Optional[Tensor] = None
+    tree_packed_loss_mask: Optional[Tensor] = None
+    tree_packed_position_ids: Optional[Tensor] = None
 
     def __post_init__(self) -> None:
         if len(self.leaf_ranges) != len(self.leaf_segments):
@@ -79,10 +79,10 @@ class PrefixTreeParams:
                 raise ValueError("sample_to_leaf_range does not match leaf_to_sample ordering")
 
         for name, tensor in {
-            "flat_tokens": self.flat_tokens,
-            "flat_labels": self.flat_labels,
-            "flat_loss_mask": self.flat_loss_mask,
-            "flat_position_ids": self.flat_position_ids,
+            "tree_packed_tokens": self.tree_packed_tokens,
+            "tree_packed_labels": self.tree_packed_labels,
+            "tree_packed_loss_mask": self.tree_packed_loss_mask,
+            "tree_packed_position_ids": self.tree_packed_position_ids,
         }.items():
             if tensor is not None and tensor.numel() != self.total_seqlen_q:
                 raise ValueError(f"{name} must have total_seqlen_q elements")
@@ -310,12 +310,14 @@ def build_layout_from_tree_node(
 
     _emit(tree_root)
 
-    flat_tokens = torch.cat(flat_pieces) if flat_pieces else torch.empty(0, dtype=samples[0].dtype, device=device)
-    flat_loss_mask = torch.cat(flat_lm_pieces) if flat_lm_pieces is not None else None
+    tree_packed_tokens = (
+        torch.cat(flat_pieces) if flat_pieces else torch.empty(0, dtype=samples[0].dtype, device=device)
+    )
+    tree_packed_loss_mask = torch.cat(flat_lm_pieces) if flat_lm_pieces is not None else None
     if flat_pid_pieces is not None:
-        flat_position_ids = torch.cat(flat_pid_pieces)
+        tree_packed_position_ids = torch.cat(flat_pid_pieces)
     else:
-        flat_position_ids = (
+        tree_packed_position_ids = (
             torch.cat(default_pid_pieces) if default_pid_pieces else torch.empty(0, dtype=torch.long, device=device)
         )
 
@@ -345,12 +347,12 @@ def build_layout_from_tree_node(
         q_ranges=q_ranges,
         k_ranges=k_ranges,
         mask_types=mask_types,
-        total_seqlen_q=flat_tokens.numel(),
-        total_seqlen_k=flat_tokens.numel(),
-        flat_tokens=flat_tokens,
-        flat_labels=None,
-        flat_loss_mask=flat_loss_mask,
-        flat_position_ids=flat_position_ids,
+        total_seqlen_q=tree_packed_tokens.numel(),
+        total_seqlen_k=tree_packed_tokens.numel(),
+        tree_packed_tokens=tree_packed_tokens,
+        tree_packed_labels=None,
+        tree_packed_loss_mask=tree_packed_loss_mask,
+        tree_packed_position_ids=tree_packed_position_ids,
     )
     params._leaf_ancestor_ranges = leaf_ancestor_ranges
     return params

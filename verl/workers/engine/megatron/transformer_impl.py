@@ -61,7 +61,6 @@ from verl.utils.megatron_utils import (
     unwrap_model,
 )
 from verl.utils.model import extract_multi_modal_inputs, load_mcore_dist_weights
-from verl.utils.prefix_tree.magi import get_prefix_tree_logits_args, read_prefix_tree_batch_config
 from verl.utils.seqlen_balancing import restore_dynamic_batch
 from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
 
@@ -126,9 +125,12 @@ class MegatronEngine(BaseEngine):
 
         if is_cuda_available:
             from verl.models.mcore.patch import apply_patch_megatron_recomputation_backward
-            from verl.models.mcore.prefix_tree_merge import apply_prefix_tree_patch as apply_magi_patch
 
             apply_patch_megatron_recomputation_backward()
+
+        if self.engine_config.use_prefix_tree:
+            from verl.utils.prefix_tree.prefix_tree_patch_impl import apply_prefix_tree_patch as apply_magi_patch
+
             apply_magi_patch()
 
     def _init_device_mesh(self):
@@ -676,6 +678,13 @@ class MegatronEngine(BaseEngine):
             forward_only=forward_only,
         )
 
+        if losses_reduced and self.is_mp_src_rank_with_outputs():
+            pt_metrics = tu.get_non_tensor_data(data, "prefix_tree_metrics", default=None)
+            if pt_metrics:
+                if "metrics" not in losses_reduced[0]:
+                    losses_reduced[0]["metrics"] = {}
+                losses_reduced[0]["metrics"].update(pt_metrics)
+
         if self.model_config.mtp.enable and mpu.is_pipeline_last_stage(ignore_virtual=True):
             # All CP ranks must participate in the all_reduce inside get_megatron_mtp_loss,
             # because save_loss_to_tracker uses avg_group=DP+CP group.
@@ -824,17 +833,24 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 dp_rank=mpu.get_data_parallel_rank(),
             )
 
-        _pt_subtree = tu.pop(batch, key="prefix_tree_subtree", default=None)
-        batch = batch.to(get_device_id())
-        if _pt_subtree is not None:
-            tu.assign_non_tensor(batch, prefix_tree_subtree=_pt_subtree)
+        if self.engine_config.use_prefix_tree:
+            from verl.utils.prefix_tree.magi import read_prefix_tree_batch_config
+            _pt_subtree = tu.pop(batch, key="prefix_tree_subtree", default=None)
+            batch = batch.to(get_device_id())
+            if _pt_subtree is not None:
+                tu.assign_non_tensor(batch, prefix_tree_subtree=_pt_subtree)
+        else:
+            batch = batch.to(get_device_id())
         use_fused_kernels = tu.get_non_tensor_data(batch, key="use_fused_kernels", default=False)
         calculate_entropy = tu.get_non_tensor_data(batch, key="calculate_entropy", default=False)
         calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
         distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
-        use_prefix_tree, prefix_tree_attention = read_prefix_tree_batch_config(
-            batch, tu, self.engine_config.use_remove_padding
-        )
+        if self.engine_config.use_prefix_tree:
+            use_prefix_tree, _ = read_prefix_tree_batch_config(
+                batch, tu, self.engine_config.use_remove_padding
+            )
+        else:
+            use_prefix_tree = False
 
         if calculate_sum_pi_squared and use_fused_kernels:
             raise NotImplementedError(
@@ -942,11 +958,16 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 ret["log_probs"] = log_probs
                 return ret
 
+            if use_prefix_tree:
+                from verl.utils.prefix_tree.magi import get_prefix_tree_logits_args
+                _pt_logits_args = get_prefix_tree_logits_args(batch, tu)
+            else:
+                _pt_logits_args = {}
             logits_processor_args = {
                 "label": label,
                 "temperature": temperature,
                 "loss_mask": loss_mask,
-                **get_prefix_tree_logits_args(batch, tu),
+                **_pt_logits_args,
             }
 
             output = forward_fn(
