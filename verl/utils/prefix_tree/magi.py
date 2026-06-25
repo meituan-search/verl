@@ -660,6 +660,8 @@ def forward_prefix_tree(
         }
         flat_args["label"] = tree_packed_label
         flat_args["temperature"] = tree_packed_t
+        if pt_batch.tree_packed_loss_mask is not None:
+            flat_args["loss_mask"] = pt_batch.tree_packed_loss_mask[:real_tokens].unsqueeze(1)
 
         # logits_processor runs on flat (flat_tokens, 1, vocab).
         # Clone so in-place ops inside the processor don't alias output_orig.
