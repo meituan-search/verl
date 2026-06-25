@@ -1,0 +1,252 @@
+# Copyright 2025-2026 Meituan Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Prefix-tree data structures.
+
+Class hierarchy:
+
+    TrieNode        — compressed trie node; root holds flat DFS-ordered ``nodes``
+                      list; ``nodes[i].flat_idx == i`` for O(1) lookup and future
+                      KV-cache indexing.
+
+    PrefixTrie      — common interface for navigating a prefix trie.
+                      Both the global trie and per-micro-batch view expose this
+                      interface so callers need not distinguish between them.
+                      Future: ``kv_cache: list[Tensor]`` indexed by ``flat_idx``.
+
+    PrefixSubTrie   — per-micro-batch view into a PrefixTrie.  Inherits the
+                      PrefixTrie interface.  Serialisable: ``leaf_node_ids`` and
+                      ``leaf_to_sample`` are plain int lists; ``source`` is a
+                      local-only back-reference, never transmitted cross-node.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# TrieNode — compressed trie node (immutable after construction)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TrieNode:
+    """Compressed-trie node produced by the ``_compress`` pass.
+
+    Each non-root node represents a contiguous run of tokens shared by the same
+    set of sequences.  The root has no tokens and no parent (``ancestor=None``).
+
+    ``nodes`` (root-only): flat DFS-ordered list of all non-root nodes.
+    ``nodes[i].flat_idx == i`` — assigned once during construction and never
+    mutated, making the trie effectively immutable after build.
+    """
+
+    tree_id: int
+    start_idx: int = -1
+    end_idx: int = -1
+    input_ids: list[int] = field(default_factory=list)
+    position_ids: list[int] = field(default_factory=list)
+    children: dict[int, TrieNode] = field(default_factory=dict)
+    # Sequence IDs that pass through this node (from trie construction).
+    sequence_ids: list[int] = field(default_factory=list)
+    # Direct parent reference — single hop upward; None on root.
+    ancestor: Optional[TrieNode] = None
+    # Root-only: flat DFS list; nodes[i].flat_idx == i.
+    nodes: list[TrieNode] = field(default_factory=list)
+    # DFS index in root.nodes — set once by _compress_trie; -1 on root.
+    flat_idx: int = -1
+
+    @property
+    def is_root(self) -> bool:
+        return self.flat_idx == -1
+
+
+# ---------------------------------------------------------------------------
+# PrefixTrie — common interface (global trie + subtrie view)
+# ---------------------------------------------------------------------------
+
+
+class PrefixTrie:
+    """Common interface for navigating a prefix trie.
+
+    Concrete subclasses:
+      - PrefixTrie itself  — wraps the global TrieNode root for a full batch
+      - PrefixSubTrie      — filtered view for one micro-batch
+
+    Both expose the same interface so downstream code (layout builder, MAGI
+    key construction, KV-cache lookup) works identically on either.
+    """
+
+    nodes: list[TrieNode]  # flat DFS list; nodes[i].flat_idx == i
+    root: TrieNode  # virtual root (is_root=True)
+
+    def __init__(self, root: TrieNode) -> None:
+        self.root = root
+        self.nodes = root.nodes  # shared reference — no copy
+
+    # ── navigation ────────────────────────────────────────────────────────
+
+    def __getitem__(self, flat_idx: int) -> TrieNode:
+        """O(1) node lookup by flat_idx."""
+        return self.nodes[flat_idx]
+
+    def __iter__(self):
+        """Iterate nodes in DFS order."""
+        return iter(self.nodes)
+
+    def __len__(self) -> int:
+        return len(self.nodes)
+
+    # ── factory ───────────────────────────────────────────────────────────
+
+    def create_sub_trie(
+        self,
+        leaf_node_ids: list[int],
+        leaf_to_sample: list[int],
+    ) -> PrefixSubTrie:
+        """Return a PrefixSubTrie view for the given leaf flat_idx values.
+
+        Replaces ``prune_trie(trie, keep_leaf_ids)``.
+        """
+        return PrefixSubTrie(
+            source=self,
+            leaf_node_ids=leaf_node_ids,
+            leaf_to_sample=leaf_to_sample,
+            batch_size=max(leaf_to_sample) + 1 if leaf_to_sample else 0,
+        )
+
+    # ── metrics ───────────────────────────────────────────────────────────
+
+    def global_shared_ratio(self) -> float:
+        """Fraction of tokens saved by prefix deduplication across the full batch.
+
+        = 1 - (flat_trie_tokens / total_raw_tokens)
+
+        Replaces ``prefix_tree/global_shared_ratio`` in ``compute_prefix_tree_metrics``.
+        """
+        # sequence_ids has been removed from TrieNode; raw token count cannot be
+        # computed without knowing how many sequences each leaf serves.
+        raise NotImplementedError("global_shared_ratio not yet implemented for PrefixTrie")
+
+    def mbs_shared_ratio(
+        self,
+    ) -> float:
+        """
+        after create a series of subtries, calculate for each subtrie and pass upward
+        Replaces ``prefix_tree/micro_batch_shared_ratio`` in ``compute_prefix_tree_metrics``.
+        """
+        raise NotImplementedError
+
+    # ── future: KV cache ──────────────────────────────────────────────────
+    # kv_cache: list[Optional[Tensor]]  # indexed by flat_idx — same as nodes
+
+
+# ---------------------------------------------------------------------------
+# PrefixSubTrie — per-micro-batch view
+# ---------------------------------------------------------------------------
+
+
+class PrefixSubTrie(PrefixTrie):
+    """Per-micro-batch view into a PrefixTrie.
+
+    Exposes the same PrefixTrie interface so callers treat it identically to
+    the global trie.  ``nodes`` contains only the TrieNodes relevant to this
+    micro-batch (leaves and their ancestor path).
+
+    Serialisation
+    -------------
+    ``leaf_node_ids`` and ``leaf_to_sample`` are plain int lists — tiny cross-
+    node footprint.  ``source`` is a local-only reference (not serialised);
+    re-attach after deserialisation to enable KV-cache lookup.
+    """
+
+    leaf_to_sample: list[int]  # leaf i → local sample index (batch order)
+    leaf_node_ids: list[int]  # leaf i → flat_idx of its TrieNode in source
+    source: Optional[PrefixTrie]  # back-ref to global trie; not serialised
+    # leaf_ids[local_sample_idx] = flat_idx of that sample's leaf; -1 if absent.
+    # Computed at construction time in batch input order — ready for non_tensor_data.
+    leaf_ids: np.ndarray  # shape (batch_size,), dtype int64
+
+    def __init__(
+        self,
+        source: PrefixTrie,
+        leaf_node_ids: list[int],
+        leaf_to_sample: list[int],
+        batch_size: int,
+    ) -> None:
+        import numpy as np
+
+        self.source = source
+        self.leaf_node_ids = leaf_node_ids
+        self.leaf_to_sample = leaf_to_sample
+        self.root = source.root
+        self.nodes = self._collect_nodes(source, leaf_node_ids)
+        # Build batch-ordered leaf id array at creation time.
+        self.leaf_ids = np.full(batch_size, -1, dtype=np.int64)
+        for i, sample_idx in enumerate(leaf_to_sample):
+            self.leaf_ids[sample_idx] = leaf_node_ids[i]
+
+    @staticmethod
+    def _collect_nodes(source: PrefixTrie, leaf_node_ids: list[int]) -> list[TrieNode]:
+        """Collect nodes reachable from the given leaves (leaves + all ancestors)."""
+        seen: set[int] = set()
+        result: list[TrieNode] = []
+        for idx in leaf_node_ids:
+            node = source[idx]
+            path: list[TrieNode] = []
+            cur: Optional[TrieNode] = node
+            while cur is not None and cur.flat_idx not in seen:
+                path.append(cur)
+                cur = cur.ancestor
+            for n in reversed(path):
+                if n.flat_idx not in seen:
+                    seen.add(n.flat_idx)
+                    result.append(n)
+        return result
+
+    def create_sub_trie(
+        self,
+        leaf_node_ids: list[int],
+        leaf_to_sample: list[int],
+    ) -> PrefixSubTrie:
+        """Create a further-pruned sub-view from this subtrie."""
+        return PrefixSubTrie(
+            source=self.source or self,
+            leaf_node_ids=leaf_node_ids,
+            leaf_to_sample=leaf_to_sample,
+            batch_size=max(leaf_to_sample) + 1 if leaf_to_sample else 0,
+        )
+
+    # ── layout builder ────────────────────────────────────────────────────
+
+    def build_layout(
+        self,
+        samples: list,
+        position_ids_by_sample=None,
+        loss_masks_by_sample=None,
+    ):
+        """Build flat token layout and attention range specs for this micro-batch.
+
+        Returns a ``PrefixTreeParams`` with q_ranges, k_ranges, mask_types, packed tensors.
+        """
+        from verl.utils.prefix_tree.utils import build_layout_from_tree_node
+
+        return build_layout_from_tree_node(
+            samples,
+            self,
+            loss_masks_by_sample=loss_masks_by_sample,
+            position_ids_by_sample=position_ids_by_sample,
+        )

@@ -28,7 +28,6 @@ Algorithm originally derived from AReaL
 from __future__ import annotations
 
 import logging as _logging
-from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import numpy as np
@@ -37,7 +36,6 @@ from torch import Tensor
 
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_torch_device
-from verl.utils.prefix_tree.utils import TreeNode
 from verl.utils.seqlen_balancing import (
     calculate_workload,
     get_seqlen_balanced_partitions,
@@ -66,27 +64,9 @@ __all__ = [
 ]
 
 
-@dataclass
-class TrieNode:
-    """Compressed-trie node (after `_compress` pass).
-
-    Each non-root node represents a contiguous run of tokens shared by the same
-    set of sequences. Root has ``start_idx == end_idx == -1`` and stores no
-    tokens — children are accessed via ``.children: dict[first_token, TrieNode]``.
-    """
-
-    tree_id: int
-    start_idx: int = -1
-    end_idx: int = -1
-    tokens: list[int] = field(default_factory=list)
-    sequence_ids: list[int] = field(default_factory=list)
-    children: dict[int, TrieNode] = field(default_factory=dict)
-    ancestors: list[TrieNode] = field(default_factory=list)
-    nodes: list[TrieNode] = field(default_factory=list)
-
-    @property
-    def is_root(self) -> bool:
-        return self.start_idx == -1 and self.end_idx == -1
+# TrieNode is canonical in tree.py — import from there (single definition).
+# Old code using .ancestors (list) will raise AttributeError immediately.
+from verl.utils.prefix_tree.tree import PrefixSubTrie, PrefixTrie, TrieNode  # noqa: E402
 
 
 class _BuildNode:
@@ -131,10 +111,21 @@ def _insert_sequence(
     current.is_end = True
 
 
+def _ancestors(node: TrieNode) -> list[TrieNode]:
+    """Return ancestor chain from root-child down to node's parent (exclusive of node)."""
+    chain: list[TrieNode] = []
+    cur = node.ancestor
+    while cur is not None:
+        chain.append(cur)
+        cur = cur.ancestor
+    chain.reverse()
+    return chain
+
+
 def _compress_trie(root: _BuildNode) -> TrieNode:
     trie_root = TrieNode(tree_id=root.tree_id)
 
-    def _compress_chain(node: _BuildNode, ancestors: list[TrieNode]) -> TrieNode:
+    def _compress_chain(node: _BuildNode, parent: Optional[TrieNode]) -> TrieNode:
         tokens: list[int] = []
         current = node
         start_id = node.node_id
@@ -149,23 +140,25 @@ def _compress_trie(root: _BuildNode) -> TrieNode:
                 raise ValueError("Node IDs not consecutive along chain")
             current = next_child
 
+        flat_idx = len(trie_root.nodes)
         trie_node = TrieNode(
             tree_id=root.tree_id,
             start_idx=start_id,
             end_idx=current.node_id,
-            tokens=tokens,
+            input_ids=tokens,
             sequence_ids=current.sequence_ids.copy(),
-            ancestors=ancestors.copy(),
+            ancestor=parent,
+            flat_idx=flat_idx,
         )
         trie_root.nodes.append(trie_node)
         if current.children:
             for token, child in sorted(current.children.items()):
-                trie_node.children[token] = _compress_chain(child, ancestors + [trie_node])
+                trie_node.children[token] = _compress_chain(child, trie_node)
         return trie_node
 
     if root.children:
         for token, child in sorted(root.children.items()):
-            trie_root.children[token] = _compress_chain(child, [])
+            trie_root.children[token] = _compress_chain(child, None)
     return trie_root
 
 
@@ -211,20 +204,11 @@ def greedy_build_tries(
 
 def convert_trie_to_tree_node(
     trie: TrieNode,
-) -> Optional[tuple[TreeNode, list[int]]]:
-    """Convert a compressed trie to ``(TreeNode, leaf_to_sample)`` consumed by
-    :func:`verl.utils.prefix_tree.utils.build_layout_from_tree_node`.
+) -> Optional[PrefixSubTrie]:
+    """Convert a compressed trie to a :class:`PrefixSubTrie`.
 
-    The trie root is a virtual placeholder with no tokens. We promote the
-    trie's only child as the TreeNode root so the downstream flex-spec
-    builder sees a non-zero root segment.
-
-    Returns ``None`` when there's no real sharing (single sample, no children,
-    or multi-forest case).
-
-    Returns ``(root, leaf_to_sample)`` where ``leaf_to_sample[i]`` is the
-    original sample index for the i-th leaf in DFS pre-order — matches the
-    contract expected by ``build_layout_from_tree_node``.
+    Returns ``None`` when there's no real sharing (no children or multi-root).
+    Delegates to :func:`prune_trie` with all sequence IDs.
     """
     if not trie.children:
         _logging.getLogger(__name__).warning(
@@ -233,56 +217,19 @@ def convert_trie_to_tree_node(
         return None
     if len(trie.children) > 1:
         _logging.getLogger(__name__).warning(
-            "prefix_tree: convert_trie_to_tree_node: multiple roots (multi-forest, %d roots) — returning None",
+            "prefix_tree: convert_trie_to_tree_node: multiple roots (%d) — returning None",
             len(trie.children),
         )
         return None
-
-    leaf_to_sample: list[int] = []
-
-    def _convert(trie_node: TrieNode) -> TreeNode:
-        segment_len = len(trie_node.tokens)
-        children: list[TreeNode] = [_convert(child) for _tok, child in sorted(trie_node.children.items())]
-        node = TreeNode(segment_len=segment_len, children=children)
-        if not children:
-            if len(trie_node.sequence_ids) != 1:
-                # Create zero-length leaves for ALL duplicate sequences (incl. first)
-                # so leaf_to_sample count matches leaf count in TreeNode DFS walk
-                for sid in trie_node.sequence_ids:
-                    leaf_to_sample.append(sid)
-                    node.children.append(TreeNode(segment_len=0, children=[]))
-            else:
-                leaf_to_sample.append(trie_node.sequence_ids[0])
-        else:
-            # Samples that terminate at this intermediate node need zero-length leaves.
-            child_ids = {sid for c in trie_node.children.values() for sid in c.sequence_ids}
-            for sid in trie_node.sequence_ids:
-                if sid not in child_ids:
-                    leaf_to_sample.append(sid)
-                    # zero-length leaf: sample's tokens are entirely in ancestors
-                    node.children.append(TreeNode(segment_len=0, children=[]))
-        return node
-
-    only_child = next(iter(trie.children.values()))
-    try:
-        root = _convert(only_child)
-    except ValueError:
-        return None  # duplicate sequences — fall back to standard attention
-    if not root.children:
-        return None
-    return root, leaf_to_sample
+    all_seq_ids = {s for child in trie.children.values() for s in _trie_seq_ids(child)}
+    return prune_trie(trie, all_seq_ids)
 
 
-def build_tree_dynamic(samples: list[Tensor]) -> Optional[tuple[TreeNode, list[int]]]:
-    """Token-by-token trie detection. Returns ``(TreeNode, leaf_to_sample)`` or None.
+def build_tree_dynamic(samples: list[Tensor]) -> Optional[PrefixSubTrie]:
+    """Token-by-token trie detection. Returns a :class:`PrefixSubTrie` or None.
 
-    Builds a compressed trie of the input samples, then converts it to the
-    canonical ``TreeNode`` representation consumed by
-    :func:`verl.utils.prefix_tree.utils.build_layout_from_tree_node`.
-
-    ``leaf_to_sample[i]`` gives the original sample index for the i-th leaf in
-    DFS pre-order. Returns ``None`` when there's no shared prefix (empty input,
-    single sample, or multi-forest case).
+    Returns ``None`` when there's no shared prefix (empty input, single sample,
+    or multi-forest case).
     """
     if not samples:
         return None
@@ -291,7 +238,7 @@ def build_tree_dynamic(samples: list[Tensor]) -> Optional[tuple[TreeNode, list[i
     tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=max_tokens_per_tree)
     if not tries or len(tries) > 1:
         _logging.getLogger(__name__).warning(
-            "prefix_tree: build_tree_dynamic: multi-forest or empty tries (len=%d) — no shared prefix, returning None",
+            "prefix_tree: build_tree_dynamic: multi-forest or empty tries (len=%d) — returning None",
             len(tries),
         )
         return None
@@ -315,7 +262,7 @@ def _trie_effective_tokens(node: TrieNode) -> int:
     flat token count that would result from laying this subtree out for
     prefix-tree attention.
     """
-    total = len(node.tokens)
+    total = len(node.input_ids)
     for child in node.children.values():
         total += _trie_effective_tokens(child)
     return total
@@ -339,14 +286,14 @@ def trie_group_flat_tokens(group: list[int], trie: TrieNode) -> int:
 
     def _count(node: TrieNode) -> int:
         if not node.children:
-            return len(node.tokens) if any(s in keep for s in node.sequence_ids) else 0
+            return len(node.input_ids) if any(s in keep for s in node.sequence_ids) else 0
         has_relevant = False
         relevant_total = 0
         for child in node.children.values():
             if any(s in keep for s in child.sequence_ids):
                 has_relevant = True
                 relevant_total += _count(child)
-        return relevant_total + len(node.tokens) if has_relevant else 0
+        return relevant_total + len(node.input_ids) if has_relevant else 0
 
     return sum(_count(c) for c in trie.children.values())
 
@@ -368,10 +315,11 @@ def _leaf_attn_area_inc(node: TrieNode, covered: set[int]) -> tuple[int, list[Tr
     Returns:
         (inc, new_anc): incremental area cost and the newly-covered ancestor nodes.
     """
-    new_anc = [n for n in node.ancestors if id(n) not in covered]
-    shared_anc_len = sum(len(n.tokens) for n in node.ancestors if id(n) in covered)
-    new_anc_len = sum(len(n.tokens) for n in new_anc)
-    leaf_len = len(node.tokens)
+    anc = _ancestors(node)
+    new_anc = [n for n in anc if id(n) not in covered]
+    shared_anc_len = sum(len(n.input_ids) for n in anc if id(n) in covered)
+    new_anc_len = sum(len(n.input_ids) for n in new_anc)
+    leaf_len = len(node.input_ids)
     inc = new_anc_len * new_anc_len + (shared_anc_len + new_anc_len) * leaf_len + leaf_len * leaf_len
     return inc, new_anc
 
@@ -441,7 +389,7 @@ def build_mini_batch_prefix_groups(
         current = trie_root
         while len(current.children) == 1:
             child = next(iter(current.children.values()))
-            shared_len += len(child.tokens)
+            shared_len += len(child.input_ids)
             current = child
 
         if not current.children:
@@ -541,9 +489,9 @@ def dfs_micro_batch_groups(
             nonlocal current_eff
             if not node.children:
                 # Leaf: full path = ancestors (list of TrieNodes) + self
-                path = node.ancestors + [node]
+                path = _ancestors(node) + [node]
                 new_nodes = [n for n in path if id(n) not in covered]  # noqa: B023
-                inc = sum(len(n.tokens) for n in new_nodes)
+                inc = sum(len(n.input_ids) for n in new_nodes)
 
                 if current_group and current_eff + inc > max_token_len:  # noqa: B023
                     # Flush — start a fresh batch with this leaf
@@ -552,7 +500,7 @@ def dfs_micro_batch_groups(
                     covered.clear()  # noqa: B023
                     current_eff = 0
                     new_nodes = path  # all nodes are new in empty batch
-                    inc = sum(len(n.tokens) for n in new_nodes)
+                    inc = sum(len(n.input_ids) for n in new_nodes)
 
                 current_group.extend(node.sequence_ids)  # noqa: B023
                 covered.update(id(n) for n in new_nodes)  # noqa: B023
@@ -666,16 +614,16 @@ def mbs_groups_from_trie(
                     covered.update(id(n) for n in new_anc + [node])  # noqa: B023
                     current_eff += inc
                 else:
-                    path = node.ancestors + [node]
+                    path = _ancestors(node) + [node]
                     new_nodes = [n for n in path if id(n) not in covered]  # noqa: B023
-                    inc = sum(len(n.tokens) for n in new_nodes)
+                    inc = sum(len(n.input_ids) for n in new_nodes)
                     if current_group and current_eff + inc > max_token_len:  # noqa: B023
                         all_groups.append(current_group[:])  # noqa: B023
                         current_group.clear()  # noqa: B023
                         covered.clear()  # noqa: B023
                         current_eff = 0
                         new_nodes = path
-                        inc = sum(len(n.tokens) for n in new_nodes)
+                        inc = sum(len(n.input_ids) for n in new_nodes)
                     # Keep all sequence_ids (including duplicates) in the same group.
                     # Duplicates land in the same group as their originals → prune_trie
                     # returns None for that group → FA3 fallback for that one group.
@@ -703,50 +651,46 @@ def mbs_groups_from_trie(
 def prune_trie(
     trie: TrieNode,
     keep_leaf_ids: set[int],
-) -> Optional[tuple[TreeNode, list[int]]]:  # noqa: F821
+    source: Optional[PrefixTrie] = None,
+) -> Optional[PrefixSubTrie]:
     """Extract a subtree containing only the given leaf sample indices.
 
-    Returns ``(tree_root, leaf_to_sample)`` ready for
-    :func:`build_layout_from_tree_node`, or ``None`` if no leaves match.
+    Returns a :class:`PrefixSubTrie` ready for downstream use, or ``None``
+    if no leaves match.  When ``source`` is provided it is attached as the
+    global-trie back-reference on the returned ``PrefixSubTrie``; otherwise
+    one is constructed automatically from ``trie``.
     """
     if not keep_leaf_ids:
         return None
+    if source is None:
+        source = PrefixTrie(root=trie)
 
-    def _build_subtree(node: TrieNode) -> Optional[TreeNode]:
-        segment_len = len(node.tokens)
-        children: list[TreeNode] = []
-
+    def _collect(node: TrieNode) -> bool:
+        """Walk node, collecting matching leaves. Returns False on duplicate-leaf fallback."""
         if not node.children:
-            # Leaf: keep only the sequence_ids that are in keep_leaf_ids.
             kept = [s for s in node.sequence_ids if s in keep_leaf_ids]
             if not kept:
-                return None
+                return True
             if len(kept) > 1:
-                # Two identical sequences in this micro-batch share the same trie
-                # leaf — can't represent as a single TreeNode.  Fall back.
-                return None
+                return False  # duplicate sequences share a leaf — fall back
             leaf_to_sample.extend(kept)
-            return TreeNode(segment_len=segment_len, children=[])
-
-        # Internal node: keep children that intersect keep_leaf_ids
+            leaf_node_ids.append(node.flat_idx)
+            return True
         for child in node.children.values():
             if keep_leaf_ids.isdisjoint(child.sequence_ids):
                 continue
-            child_tree = _build_subtree(child)
-            if child_tree is not None:
-                children.append(child_tree)
-
-        if segment_len == 0 and len(children) <= 1:
-            # zero-length internal node with ≤1 child → skip (chain compression)
-            if len(children) == 1:
-                return children[0]
-            return None
-
-        return TreeNode(segment_len=segment_len, children=children)
+            if not _collect(child):
+                return False
+        return True
 
     leaf_to_sample: list[int] = []
-    root = _build_subtree(trie)
-    if root is None or not root.children and not root.is_leaf:
+    leaf_node_ids: list[int] = []
+    for child in trie.children.values():
+        if keep_leaf_ids.isdisjoint(child.sequence_ids):
+            continue
+        if not _collect(child):
+            return None
+    if not leaf_to_sample:
         return None
     # Guard: if any keep_leaf_id was dropped (e.g. duplicate sequences sharing a
     # trie leaf), fall back so restore_flat_to_nested never sees missing slots.
@@ -756,10 +700,18 @@ def prune_trie(
         _logging.getLogger(__name__).warning(
             "prefix_tree: prune_trie: %d duplicate sequence(s) share a trie leaf "
             "(%d unique / %d total) — FA3 fallback for this micro-batch",
-            n_dup, len(got), len(keep_leaf_ids),
+            n_dup,
+            len(got),
+            len(keep_leaf_ids),
         )
         return None
-    return root, leaf_to_sample
+    batch_size = max(leaf_to_sample) + 1 if leaf_to_sample else 0
+    return PrefixSubTrie(
+        source=source,
+        leaf_node_ids=leaf_node_ids,
+        leaf_to_sample=leaf_to_sample,
+        batch_size=batch_size,
+    )
 
 
 def compute_prefix_sharing_ratio(input_ids, attention_mask=None) -> float:
@@ -884,7 +836,9 @@ def compute_prefix_tree_metrics(
         if tries:
             trie = tries[0]
             use_n2 = dynbsz_estimator == "area"
-            groups = mbs_groups_from_trie(trie, max_token_len_per_gpu, use_n2_cost=use_n2)
+            groups = mbs_groups_from_trie(
+                trie, max_token_len_per_gpu, use_n2_cost=use_n2
+            )  # TODO: use PrefixSubTrie / PrefixTrie interface
             result["prefix_tree/avg_mbs"] = len(sequences) / len(groups) if groups else 0.0
             # Per-micro-batch sharing ratio using actual dynbsz groups and the global trie.
             ratios = []
@@ -935,7 +889,9 @@ def prepare_prefix_tree_micro_batches(
 
     trie = tu.get_non_tensor_data(data, "prefix_tree", default=None)
     if trie is not None:
-        batch_idx_list = mbs_groups_from_trie(trie, max_token_len, use_n2_cost=use_n2_cost)
+        batch_idx_list = mbs_groups_from_trie(
+            trie, max_token_len, use_n2_cost=use_n2_cost
+        )  # TODO: use PrefixSubTrie / PrefixTrie interface
     else:
         input_ids = data["input_ids"]
         seqs = [t.tolist() for t in input_ids.unbind()]
@@ -963,13 +919,13 @@ def prepare_prefix_tree_micro_batches(
             def _count(node):
                 total = 0
                 if not node.children:
-                    return len(node.tokens) if any(s in keep for s in node.sequence_ids) else 0
+                    return len(node.input_ids) if any(s in keep for s in node.sequence_ids) else 0
                 kept = False
                 for child in node.children.values():
                     if any(s in keep for s in child.sequence_ids):
                         kept = True
                         total += _count(child)
-                return total + len(node.tokens) if kept else total
+                return total + len(node.input_ids) if kept else total
 
             return sum(_count(c) for c in trie.children.values())
 
@@ -980,13 +936,19 @@ def prepare_prefix_tree_micro_batches(
         micro_batches = [tu.index_select_tensor_dict(data, idx) for idx in batch_idx_list]
     # Attach pruned subtree to each micro-batch for downstream trie reuse.
     if trie is not None:
+        pt_global = PrefixTrie(root=trie)
         for idx, mb in zip(batch_idx_list, micro_batches, strict=False):
-            subtree = prune_trie(trie, set(idx))
+            subtree = prune_trie(trie, set(idx), source=pt_global)
             if subtree is not None:
-                tree_root, leaf_to_sample_global = subtree
+                # remap global sample indices to local micro-batch indices
                 global_to_local = {g: loc for loc, g in enumerate(idx)}
-                leaf_to_sample_local = [global_to_local[g] for g in leaf_to_sample_global]
-                tu.assign_non_tensor(mb, prefix_tree_subtree=(tree_root, leaf_to_sample_local))
+                local_subtree = PrefixSubTrie(
+                    source=pt_global,
+                    leaf_node_ids=subtree.leaf_node_ids,
+                    leaf_to_sample=[global_to_local[g] for g in subtree.leaf_to_sample],
+                    batch_size=len(idx),
+                )
+                tu.assign_non_tensor(mb, prefix_tree_subtree=local_subtree)
     return micro_batches, batch_idx_list
 
 
@@ -1121,7 +1083,7 @@ def get_prefix_tree_mbs_dp_partitions(
         return _fallback_equal_split()
 
     trie = tries[0]
-    mbs_groups = mbs_groups_from_trie(trie, max_token_len)
+    mbs_groups = mbs_groups_from_trie(trie, max_token_len)  # TODO: use PrefixSubTrie / PrefixTrie interface
     if len(mbs_groups) < dp_size:
         return _fallback_equal_split()
 

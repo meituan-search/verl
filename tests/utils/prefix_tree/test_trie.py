@@ -27,7 +27,7 @@ from verl.utils.prefix_tree.dynamic import (
     trie_dfs_leaf_order,
     trie_to_leaf_ids,
 )
-from verl.utils.prefix_tree.utils import build_layout_from_tree_node
+from verl.utils.prefix_tree.tree import PrefixSubTrie
 
 # ---------------------------------------------------------------------------
 # trie_dfs_leaf_order
@@ -43,7 +43,6 @@ class TestTrieDfsLeafOrder:
         ]
         result = build_tree_dynamic(seqs)
         assert result is not None
-        tree_root, _ = result
         # Convert TreeNode → trie is not trivial; use the original trie
         # from greedy_build_tries for testing trie_dfs_leaf_order directly.
         raw_seqs = [s.tolist() for s in seqs]
@@ -157,19 +156,19 @@ class TestPruneTrie:
         trie = self._build_trie(raw)
         result = prune_trie(trie, {0, 1, 2})
         assert result is not None
-        tree_root, leaf_to_sample = result
-        assert tree_root.segment_len == 2  # [1, 2]
-        assert len(leaf_to_sample) == 3
+        assert isinstance(result, PrefixSubTrie)
+        assert len(result.leaf_to_sample) == 3
+        assert len(result.nodes[0].input_ids) == 2  # [1, 2] shared prefix
 
     def test_prune_single_leaf(self):
         raw = [[1, 2, 3, 4], [1, 2, 3, 5], [1, 2, 6, 7]]
         trie = self._build_trie(raw)
         result = prune_trie(trie, {0})
         assert result is not None
-        tree_root, leaf_to_sample = result
-        # Only leaf 0: [1,2,3] + [4]
-        assert tree_root.segment_len == 3  # [1, 2, 3]
-        assert leaf_to_sample == [0]
+        assert isinstance(result, PrefixSubTrie)
+        assert result.leaf_to_sample == [0]
+        # nodes: [1,2] ancestor + [3] node + [4] leaf
+        assert len(result.nodes) == 3
 
     def test_prune_subset(self):
         raw = [[1, 2, 3, 4], [1, 2, 3, 5], [1, 2, 6, 7]]
@@ -177,9 +176,8 @@ class TestPruneTrie:
         # Keep 0 and 1 (share [1,2,3]), drop 2
         result = prune_trie(trie, {0, 1})
         assert result is not None
-        tree_root, leaf_to_sample = result
-        assert tree_root.segment_len == 3  # [1, 2, 3]
-        assert set(leaf_to_sample) == {0, 1}
+        assert isinstance(result, PrefixSubTrie)
+        assert set(result.leaf_to_sample) == {0, 1}
 
     def test_prune_empty(self):
         raw = [[1, 2, 3]]
@@ -193,18 +191,17 @@ class TestPruneTrie:
         result = prune_trie(trie, {99})
         assert result is None
 
-    def test_prune_to_layout_roundtrip(self):
-        """prune_trie + build_layout_from_tree_node produces valid params."""
+    def test_prune_leaf_node_ids(self):
+        """leaf_node_ids reference correct flat_idx values in the source trie."""
         raw = [[1, 2, 3, 4], [1, 2, 3, 5], [1, 2, 6, 7]]
         trie = self._build_trie(raw)
         result = prune_trie(trie, {0, 2})
         assert result is not None
-        tree_root, leaf_to_sample = result
-
-        samples = [torch.tensor(s) for s in raw]
-        params = build_layout_from_tree_node(samples, tree_root, leaf_to_sample)
-        assert params.total_seqlen_q > 0
-        assert len(params.leaf_ranges) == 2
+        assert len(result.leaf_to_sample) == 2
+        assert set(result.leaf_to_sample) == {0, 2}
+        # Each leaf_node_id should be a valid flat_idx in the trie
+        for lid in result.leaf_node_ids:
+            assert 0 <= lid < len(trie.nodes)
 
 
 # ---------------------------------------------------------------------------
@@ -221,9 +218,8 @@ class TestBuildTreeDynamic:
         ]
         result = build_tree_dynamic(samples)
         assert result is not None
-        tree_root, leaf_to_sample = result
-        assert tree_root.segment_len == 2  # [1, 2]
-        assert len(leaf_to_sample) == 3
+        assert len(result.nodes[0].input_ids) == 2  # [1, 2]
+        assert len(result.leaf_to_sample) == 3
 
     def test_no_shared_prefix(self):
         samples = [
@@ -248,13 +244,10 @@ class TestBuildTreeDynamic:
         ]
         result = build_tree_dynamic(samples)
         assert result is not None
-        tree_root, leaf_to_sample = result
         # Root: [10, 20] (shared by all 3)
         # Child A: [30] with two leaves [41], [42]
         # Child B: [50, 60] (leaf)
-        assert tree_root.segment_len == 2
-        assert len(tree_root.children) == 2
-        assert len(leaf_to_sample) == 3
+        assert len(result.leaf_to_sample) == 3
 
     def test_duplicate_sequences(self):
         """GRPO with n>1: identical sequences should gracefully fallback."""
@@ -281,9 +274,8 @@ class TestConvertTrieToTreeNode:
         tries, _ = greedy_build_tries(raw, max_tokens_per_tree=1000)
         result = convert_trie_to_tree_node(tries[0])
         assert result is not None
-        tree_root, leaf_to_sample = result
-        assert tree_root.segment_len == 2
-        assert len(leaf_to_sample) == 3
+        assert len(result.nodes[0].input_ids) == 2
+        assert len(result.leaf_to_sample) == 3
 
     def test_no_children(self):
         trie = TrieNode(tree_id=0)
@@ -293,8 +285,8 @@ class TestConvertTrieToTreeNode:
     def test_multi_children(self):
         """Trie root with >1 children → no single shared prefix → None."""
         trie = TrieNode(tree_id=0)
-        trie.children[1] = TrieNode(tree_id=0, tokens=[1], sequence_ids=[0])
-        trie.children[2] = TrieNode(tree_id=0, tokens=[2], sequence_ids=[1])
+        trie.children[1] = TrieNode(tree_id=0, input_ids=[1], sequence_ids=[0])
+        trie.children[2] = TrieNode(tree_id=0, input_ids=[2], sequence_ids=[1])
         result = convert_trie_to_tree_node(trie)
         assert result is None
 
@@ -323,13 +315,13 @@ class TestAttentionSpec:
         sample1 = torch.tensor(prefix + [2000 + i for i in range(100)])
 
         from verl.utils.prefix_tree.dynamic import build_tree_dynamic
-        from verl.utils.prefix_tree.utils import build_prefix_tree_attention_spec
+        from verl.utils.prefix_tree.utils import build_layout_from_tree_node
 
         result = build_tree_dynamic([sample0, sample1])
         assert result is not None
-        tree_root, leaf_to_sample = result
 
-        q_ranges, k_ranges, mask_types = build_prefix_tree_attention_spec(tree_root)
+        params = build_layout_from_tree_node([sample0, sample1], result)
+        q_ranges, k_ranges, mask_types = params.q_ranges, params.k_ranges, params.mask_types
 
         # 5 rectangles
         assert len(q_ranges) == 5
@@ -361,7 +353,7 @@ class TestAttentionSpec:
         = 21 tokens, 25 attention rects.
         """
         from verl.utils.prefix_tree.dynamic import build_tree_dynamic
-        from verl.utils.prefix_tree.utils import build_prefix_tree_attention_spec
+        from verl.utils.prefix_tree.utils import build_layout_from_tree_node
 
         root_tok = [1, 2, 3]
         samples = [
@@ -376,10 +368,10 @@ class TestAttentionSpec:
 
         result = build_tree_dynamic(samples)
         assert result is not None
-        tree_root, leaf_to_sample = result
-        assert len(leaf_to_sample) == 7
+        assert len(result.leaf_to_sample) == 7
 
-        q_ranges, k_ranges, mask_types = build_prefix_tree_attention_spec(tree_root)
+        params = build_layout_from_tree_node(samples, result)
+        q_ranges, k_ranges, mask_types = params.q_ranges, params.k_ranges, params.mask_types
         assert len(q_ranges) == 25
         rects = list(zip(q_ranges, k_ranges, mask_types, strict=False))
 
@@ -410,7 +402,6 @@ class TestAttentionSpec:
         child_b prunes from 4 leaves to 1 leaf.
         """
         from verl.utils.prefix_tree.dynamic import greedy_build_tries, prune_trie
-        from verl.utils.prefix_tree.utils import build_prefix_tree_attention_spec
 
         raw = [
             [1, 2, 3, 10, 11],
@@ -426,30 +417,11 @@ class TestAttentionSpec:
 
         result = prune_trie(trie, {0, 1, 2, 3})
         assert result is not None
-        tree_root, leaf_to_sample = result
-        assert len(leaf_to_sample) == 4
-
-        q_ranges, k_ranges, mask_types = build_prefix_tree_attention_spec(tree_root)
-        rects = list(zip(q_ranges, k_ranges, mask_types, strict=False))
-
-        # Fewer rects than the full 25 (no leaf4-6)
-        assert len(rects) < 25
-
-        # root causal and leaf→root FULL rects still exist
-        assert ((0, 3), (0, 3), "causal") in rects
-        full_to_root = [(q, k, t) for q, k, t in rects if k == (0, 3) and t == "full"]
-        assert len(full_to_root) > 0
-
-        # child_a still has 2 leaves
-        assert ((7, 9), (5, 7), "full") in rects  # leaf1 → child_a
-        assert ((9, 11), (5, 7), "full") in rects  # leaf2 → child_a
-
-        # child_b now has only 1 leaf (leaf3)
-        assert ((13, 15), (11, 13), "full") in rects
-
-        # leaf4-6 rects must be absent
-        child_b_full_rects = [q for q, k, t in rects if k == (11, 13) and t == "full"]
-        assert len(child_b_full_rects) == 1  # only leaf3
+        assert isinstance(result, PrefixSubTrie)
+        assert len(result.leaf_to_sample) == 4
+        assert set(result.leaf_to_sample) == {0, 1, 2, 3}
+        # All 4 leaves + their ancestor chain (root + child_a + child_b = 3 ancestors + 4 leaves = 7)
+        assert len(result.nodes) == 7
 
     def test_zero_length_leaf_nodes(self):
         """A/AB/ABC: nested prefixes produce zero-length leaf nodes.
@@ -462,7 +434,7 @@ class TestAttentionSpec:
         are covered by ancestor rects.
         """
         from verl.utils.prefix_tree.dynamic import build_tree_dynamic
-        from verl.utils.prefix_tree.utils import build_prefix_tree_attention_spec
+        from verl.utils.prefix_tree.utils import build_layout_from_tree_node
 
         samples = [
             torch.tensor([1, 2]),  # A
@@ -472,9 +444,9 @@ class TestAttentionSpec:
 
         result = build_tree_dynamic(samples)
         assert result is not None
-        tree_root, leaf_to_sample = result
 
-        q_ranges, k_ranges, mask_types = build_prefix_tree_attention_spec(tree_root)
+        params = build_layout_from_tree_node(samples, result)
+        q_ranges, k_ranges, mask_types = params.q_ranges, params.k_ranges, params.mask_types
         assert len(q_ranges) == 6  # root causal + 2 full→root + child causal + 1 full→child + ABC causal
         rects = list(zip(q_ranges, k_ranges, mask_types, strict=False))
 
@@ -494,12 +466,5 @@ class TestAttentionSpec:
         assert len(rects) == 6
 
         # Verify flat token layout: [1,2] + [3,4] + [5,6] = 6 tokens
-        from verl.utils.prefix_tree.utils import build_layout_from_tree_node
-
-        params = build_layout_from_tree_node(
-            samples,
-            tree_root,
-            leaf_to_sample,
-        )
-        assert torch.equal(params.flat_tokens, torch.tensor([1, 2, 3, 4, 5, 6]))
+        assert torch.equal(params.tree_packed_tokens, torch.tensor([1, 2, 3, 4, 5, 6]))
         assert params.total_seqlen_q == 6

@@ -21,8 +21,6 @@ TS="${TS:-$(date +%Y%m%d_%H%M%S)}"
 OUTDIR="${OUTDIR:-/tmp/verl_submit/profiles/fa3_baseline/${TS}}"
 mkdir -p "$OUTDIR"
 
-VERL_DIR="${VERL_DIR:-/home/hadoop-djst-algoplat/prefix-tree/verl_prefix_tree}"
-cd "$VERL_DIR"
 
 echo "================================================================"
 echo "FA3 BASELINE — Megatron, no prefix tree"
@@ -63,7 +61,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.megatron.use_megatron_fsdp=True \
     +actor_rollout_ref.actor.megatron.override_transformer_config.gradient_accumulation_fusion=False \
     \
-    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.name=sglang \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \

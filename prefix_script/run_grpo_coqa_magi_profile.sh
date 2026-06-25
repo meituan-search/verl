@@ -24,8 +24,8 @@ export MAGI_DIAG=1
 
 MODEL_PATH="${MODEL_PATH:-/mnt/dolphinfs/ssd_pool/docker/user/hadoop-ai-search/deepsearch_files_ssd/LLMbasemodels/huggingface.co/Qwen/Qwen3-4B-Base}"
 # Dataset: coqa_grpo.parquet prepared from CoQA via prefix_script/data/coqa/prepare_coqa_grpo.py
-TRAIN_FILES="${TRAIN_FILES:-$HOME/prefix-tree/verl_prefix_tree/prefix_script/data/coqa/coqa_grpo.parquet}"
-REWARD_FN="${REWARD_FN:-$HOME/prefix-tree/verl_prefix_tree/prefix_script/data/coqa/coqa_reward.py}"
+TRAIN_FILES="${TRAIN_FILES:-/mnt/dolphinfs/hdd_pool/docker/user/hadoop-djst-algoplat/yumingxuan/prefix_script/data/coqa/coqa_grpo.parquet}"
+REWARD_FN="${REWARD_FN:-/mnt/dolphinfs/hdd_pool/docker/user/hadoop-djst-algoplat/yumingxuan/prefix_script/data/coqa/coqa_reward.py}"
 PROFILE_MODE="${PROFILE_MODE:-timing}"
 
 TS=$(date +%Y%m%d_%H%M%S)
@@ -68,7 +68,8 @@ BASE_ARGS=(
     actor_rollout_ref.actor.megatron.vanilla_mbridge=True
     actor_rollout_ref.actor.megatron.use_megatron_fsdp=True
     +actor_rollout_ref.actor.megatron.override_transformer_config.gradient_accumulation_fusion=False
-    actor_rollout_ref.rollout.name=vllm
+    actor_rollout_ref.rollout.name=sglang
+    actor_rollout_ref.rollout.calculate_log_probs=True
     actor_rollout_ref.rollout.n=8
     actor_rollout_ref.rollout.tensor_model_parallel_size=1
     actor_rollout_ref.rollout.gpu_memory_utilization=0.5

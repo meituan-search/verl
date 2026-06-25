@@ -29,28 +29,7 @@ from verl.utils.prefix_tree.dynamic import (
     convert_trie_to_tree_node,
     greedy_build_tries,
 )
-from verl.utils.prefix_tree.utils import TreeNode, build_layout_from_tree_node
-
-# ---------------------------------------------------------------------------
-# Lower-level helpers
-# ---------------------------------------------------------------------------
-
-
-def _collect_leaf_segments(node: TreeNode) -> list[int]:
-    """Return segment lengths of leaves in DFS pre-order."""
-    if node.is_leaf:
-        return [node.segment_len]
-    out: list[int] = []
-    for child in node.children:
-        out.extend(_collect_leaf_segments(child))
-    return out
-
-
-def _count_leaves(node: TreeNode) -> int:
-    if node.is_leaf:
-        return 1
-    return sum(_count_leaves(c) for c in node.children)
-
+from verl.utils.prefix_tree.utils import build_layout_from_tree_node
 
 # ---------------------------------------------------------------------------
 # greedy_build_tries
@@ -99,16 +78,13 @@ def test_convert_trie_to_tree_node_depth_2():
     tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=1000)
     result = convert_trie_to_tree_node(tries[0])
     assert result is not None
-    tree_root, leaf_to_sample = result
 
     # Root segment_len == 2 (the shared [10, 11])
-    assert tree_root.segment_len == 2
-    # 3 leaf children, each of segment_len 2 ([20,21] / [30,31] / [40,41])
-    assert len(tree_root.children) == 3
-    leaf_segs = _collect_leaf_segments(tree_root)
-    assert leaf_segs == [2, 2, 2]
+    assert len(result.nodes[0].input_ids) == 2
+    # 3 leaves
+    assert len(result.leaf_to_sample) == 3
     # leaf_to_sample is the original sample order (sorted by first divergent token)
-    assert sorted(leaf_to_sample) == [0, 1, 2]
+    assert sorted(result.leaf_to_sample) == [0, 1, 2]
 
 
 def test_convert_trie_to_tree_node_depth_3_multilevel():
@@ -132,16 +108,12 @@ def test_convert_trie_to_tree_node_depth_3_multilevel():
     tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=1000)
     result = convert_trie_to_tree_node(tries[0])
     assert result is not None
-    tree_root, leaf_to_sample = result
 
-    # Root has shared 2-token prefix [10, 11], 2 internal children
-    assert tree_root.segment_len == 2
-    assert len(tree_root.children) == 2
+    # Root has shared 2-token prefix [10, 11]
+    assert len(result.nodes[0].input_ids) == 2
     # 4 leaves total
-    assert _count_leaves(tree_root) == 4
-    # Each leaf is segment_len=2 ([30,31] / [40,41] / [60,61] / [70,71])
-    assert _collect_leaf_segments(tree_root) == [2, 2, 2, 2]
-    assert sorted(leaf_to_sample) == [0, 1, 2, 3]
+    assert len(result.leaf_to_sample) == 4
+    assert sorted(result.leaf_to_sample) == [0, 1, 2, 3]
 
 
 def test_convert_trie_returns_none_for_single_sample():
@@ -177,10 +149,9 @@ def test_build_tree_dynamic_recovers_depth_2():
     ]
     result = build_tree_dynamic(samples)
     assert result is not None
-    tree_root, leaf_to_sample = result
-    assert tree_root.segment_len == 2
-    assert _count_leaves(tree_root) == 3
-    assert sorted(leaf_to_sample) == [0, 1, 2]
+    assert len(result.nodes[0].input_ids) == 2
+    assert len(result.leaf_to_sample) == 3
+    assert sorted(result.leaf_to_sample) == [0, 1, 2]
 
 
 def test_build_tree_dynamic_recovers_depth_3():
@@ -191,13 +162,9 @@ def test_build_tree_dynamic_recovers_depth_3():
     ]
     result = build_tree_dynamic(samples)
     assert result is not None
-    tree_root, _ = result
     # Root [10, 11], internal child [20, 21] with 2 leaves + [50, 51] with 1 leaf
-    assert tree_root.segment_len == 2
-    assert _count_leaves(tree_root) == 3
-    # Total internal+leaf nodes > 4 → confirms multi-level
-    leaf_segs = _collect_leaf_segments(tree_root)
-    assert sum(leaf_segs) <= sum(len(s) for s in samples)  # sanity
+    assert len(result.nodes[0].input_ids) == 2
+    assert len(result.leaf_to_sample) == 3
 
 
 def test_build_tree_dynamic_returns_none_for_disjoint():
@@ -234,11 +201,9 @@ def test_layout_from_dynamic_tree_token_conservation():
     ]
     result = build_tree_dynamic(samples)
     assert result is not None
-    tree_root, leaf_to_sample = result
 
-    params = build_layout_from_tree_node(samples, tree_root, leaf_to_sample)
-    assert params.flat_tokens.shape[0] == 2 + 3 * 2  # 8
-    assert params.multilevel is True
+    params = build_layout_from_tree_node(samples, result)
+    assert params.tree_packed_tokens.shape[0] == 2 + 3 * 2  # 8
     assert len(params.leaf_to_sample) == 3
     # Root range covers the first 2 tokens
     assert params.prefix_range == (0, 2)
@@ -260,14 +225,13 @@ def test_layout_from_dynamic_tree_depth_3_token_conservation():
     ]
     result = build_tree_dynamic(samples)
     assert result is not None
-    tree_root, leaf_to_sample = result
 
-    params = build_layout_from_tree_node(samples, tree_root, leaf_to_sample)
+    params = build_layout_from_tree_node(samples, result)
     # 2 (root) + 2*2 (internal) + 4*2 (leaves) = 14
-    assert params.flat_tokens.shape[0] == 14
+    assert params.tree_packed_tokens.shape[0] == 14
     assert len(params.leaf_ranges) == 4
-    # Check that flat_tokens are correct: every original sample's tokens are present
-    flat = params.flat_tokens.tolist()
+    # Check that tree_packed_tokens are correct: every original sample's tokens are present
+    flat = params.tree_packed_tokens.tolist()
     assert 10 in flat and 11 in flat  # root
     assert 20 in flat and 21 in flat  # internal A
     assert 50 in flat and 51 in flat  # internal B

@@ -43,7 +43,7 @@ def add_meta_info(meta_dict: dict, config_or_data: dict) -> None:
 
 def compute_metrics(
     metrics: dict,
-    input_ids,
+    input_ids,  # TODO: use PrefixTrie / PrefixSubTrie
     config_or_data: dict,
     attention_mask=None,
     max_token_len_per_gpu: int | None = None,
@@ -64,7 +64,7 @@ def compute_metrics(
         else getattr(config_or_data, "prefix_tree_dynbsz_length_estimator", "length")
     )
     metrics.update(
-        compute_prefix_tree_metrics(
+        compute_prefix_tree_metrics(  # TODO: use PrefixTrie / PrefixSubTrie
             input_ids,
             attention_mask=attention_mask,
             max_token_len_per_gpu=max_token_len_per_gpu,
