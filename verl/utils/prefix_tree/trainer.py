@@ -20,6 +20,8 @@ the caller never needs to gate on ``use_prefix_tree``.
 
 from __future__ import annotations
 
+from verl.utils.prefix_tree.dynamic import compute_prefix_tree_metrics
+
 
 def apply_engine_config(engine_config, config_or_data: dict) -> None:
     """Thread prefix-tree flags from config into *engine_config*."""
@@ -43,17 +45,19 @@ def compute_metrics(
     metrics: dict,
     input_ids,
     config_or_data: dict,
+    attention_mask=None,
     max_token_len_per_gpu: int | None = None,
+    micro_batch_size: int = 0,
 ) -> None:
     """Compute prefix-sharing metrics if *use_prefix_tree* is enabled.
 
     Updates *metrics* in-place with keys like ``prefix_tree/sharing_ratio``.
-    Pass *max_token_len_per_gpu* to also log ``prefix_tree/avg_mbs``.
+    Pass *attention_mask* to strip padding from 2-D padded tensors.
+    Pass *max_token_len_per_gpu* for dynbsz (trie-based micro-batch groups).
+    Pass *micro_batch_size* for fixed-mbs (consecutive-slice groups).
     """
     if not _is_prefix_tree_enabled(config_or_data):
         return
-    from verl.utils.prefix_tree.dynamic import compute_prefix_tree_metrics
-
     estimator = (
         config_or_data.get("prefix_tree_dynbsz_length_estimator", "length")
         if isinstance(config_or_data, dict)
@@ -62,8 +66,10 @@ def compute_metrics(
     metrics.update(
         compute_prefix_tree_metrics(
             input_ids,
+            attention_mask=attention_mask,
             max_token_len_per_gpu=max_token_len_per_gpu,
             dynbsz_estimator=estimator,
+            micro_batch_size=micro_batch_size,
         )
     )
 

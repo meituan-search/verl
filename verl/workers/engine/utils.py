@@ -75,17 +75,42 @@ def prepare_micro_batches(
     if use_dynamic_bsz and use_prefix_tree:
         from verl.utils.prefix_tree.dynamic import (
             greedy_build_tries,
+            mbs_groups_from_trie,
             prepare_prefix_tree_micro_batches,
+            trie_group_flat_tokens,
         )
 
         # Build trie once, thread through batch metadata.
         input_ids = data["input_ids"]
         seqs = [t.tolist() for t in input_ids.unbind()]
-        max_tokens = sum(len(s) for s in seqs) * 10
-        tries, _ = greedy_build_tries(seqs, max_tokens_per_tree=max_tokens)
-        if tries:
+        total_raw = sum(len(s) for s in seqs)
+        max_tokens = total_raw * 10
+        tries, num_tokens = greedy_build_tries(seqs, max_tokens_per_tree=max_tokens)
+        if tries and total_raw > 0:
             trie = tries[0]
+            flat = num_tokens[0]
             tu.assign_non_tensor(data, prefix_tree=trie)
+
+            # Compute prefix-tree metrics from the already-built trie — correct
+            # sequence lengths (NestedTensor, no padding) and no trie rebuild.
+            max_token_len_per_gpu = tu.get_non_tensor_data(data, "max_token_len_per_gpu", default=None)
+            estimator = tu.get_non_tensor_data(data, "prefix_tree_dynbsz_length_estimator", default="length")
+            pt_metrics = {
+                "prefix_tree/global_shared_ratio": 1.0 - flat / total_raw,
+                "prefix_tree/flat_tokens": flat,
+                "prefix_tree/raw_tokens": total_raw,
+            }
+            if max_token_len_per_gpu is not None:
+                groups = mbs_groups_from_trie(trie, max_token_len_per_gpu * sp_size, use_n2_cost=(estimator == "area"))
+                pt_metrics["prefix_tree/avg_mbs"] = len(seqs) / len(groups) if groups else 0.0
+                ratios = [
+                    1.0 - trie_group_flat_tokens(g, trie) / sum(len(seqs[i]) for i in g)
+                    for g in groups
+                    if sum(len(seqs[i]) for i in g) > 0
+                ]
+                if ratios:
+                    pt_metrics["prefix_tree/micro_batch_shared_ratio"] = sum(ratios) / len(ratios)
+            tu.assign_non_tensor(data, prefix_tree_metrics=pt_metrics)
 
         micro_batches, batch_idx_list = prepare_prefix_tree_micro_batches(
             data,

@@ -713,6 +713,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             return
 
         set_expandable_segments(False)
+        # Flush PyTorch's CUDA memory cache before sglang resumes physical pages.
+        # Without this, cached-but-freed allocator blocks prevent cuMemCreate from
+        # succeeding even when nominal free memory is sufficient (see verl PR #2253).
+        aggressive_empty_cache(force_sync=True)
         log_gpu_memory_usage("Before resume weights", logger=logger)
 
         # 1. resume rollout memory (weights were released during sleep)
