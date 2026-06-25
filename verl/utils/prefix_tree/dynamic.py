@@ -750,11 +750,13 @@ def prune_trie(
         return None
     # Guard: if any keep_leaf_id was dropped (e.g. duplicate sequences sharing a
     # trie leaf), fall back so restore_flat_to_nested never sees missing slots.
-    if set(leaf_to_sample) != keep_leaf_ids:
+    got = set(leaf_to_sample)
+    if got != keep_leaf_ids:
+        n_dup = len(keep_leaf_ids) - len(got)
         _logging.getLogger(__name__).warning(
-            "prefix_tree: prune_trie: duplicate-leaf mismatch (got %s, expected %s) — returning None",
-            set(leaf_to_sample),
-            keep_leaf_ids,
+            "prefix_tree: prune_trie: %d duplicate sequence(s) share a trie leaf "
+            "(%d unique / %d total) — FA3 fallback for this micro-batch",
+            n_dup, len(got), len(keep_leaf_ids),
         )
         return None
     return root, leaf_to_sample
