@@ -722,12 +722,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps
         )
 
-        log_gpu_memory_usage("After update_weights", logger=logger)
+        print("zs-log:  After update_weights")
+        log_gpu_memory_usage("After update_weights", logger=None, level=logging.INFO)
 
         # 3. offload model to cpu
         if self.actor.engine.is_param_offload_enabled:
             self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
         aggressive_empty_cache(force_sync=True)
+
+        print("zs-log:  After offload megatron parameters")
+        log_gpu_memory_usage("After offload megatron parameters", logger=None, level=logging.INFO)
 
         # 4. resume kv_cache
         if self.config.rollout.free_cache_engine:

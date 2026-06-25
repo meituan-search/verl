@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -x
 
-TRAIN_FILE="/cfs_shtx5_serving_3/mlp/training/docker/user/hadoop-ai-search/zhangshuai122/data/dapo/dapo-math-17k.parquet"
-TEST_FILE="/cfs_shtx5_serving_3/mlp/training/docker/user/hadoop-ai-search/zhangshuai122/data/dapo/aime-2024.parquet"
-MODEL_PATH=/cfs_shtx5_serving_3/mlp/training/docker/user/hadoop-ai-search/deepsearch_files_ssd/LLMbasemodels/huggingface.co/Qwen/Qwen3.5-35B-A3B
+TRAIN_FILE="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/zhangshuai122/data/dapo/dapo-math-17k.parquet"
+TEST_FILE="/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/zhangshuai122/data/dapo/aime-2024.parquet"
+MODEL_PATH=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-xt-ai-search/ai-search/zhangshuai122/models/huggingface.co/Qwen/Qwen3.5-35B-A3B
 
 project_name='GRPO-Qwen35-35b-Base-MATH'
 exp_name='GRPO-Qwen35-35b-Base-MATH-fully-async-1train-1rollout'
@@ -13,7 +13,7 @@ CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 
 mtp_params=(
   actor_rollout_ref.model.mtp.enable=True
-  actor_rollout_ref.model.mtp.enable_train=True
+  actor_rollout_ref.model.mtp.enable_train=False
   actor_rollout_ref.model.mtp.mtp_loss_scaling_factor=0.1
   actor_rollout_ref.model.mtp.detach_encoder=True
   actor_rollout_ref.model.mtp.enable_rollout=True
@@ -27,8 +27,8 @@ mtp_params=(
 rollout_mode="async"
 return_raw_chat="True"
 
-NNODES_ROLLOUT=${NNODES_ROLLOUT:-2}
-NNODES_TRAIN=${NNODES_TRAIN:-2}
+NNODES_ROLLOUT=${NNODES_ROLLOUT:-1}
+NNODES_TRAIN=${NNODES_TRAIN:-3}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
 gen_prompt_bsz=1
@@ -64,7 +64,7 @@ python3 -X faulthandler -m verl.experimental.fully_async_policy.fully_async_main
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=128000 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=70000 \
     actor_rollout_ref.actor.megatron.use_mbridge=True \
     actor_rollout_ref.actor.megatron.use_dist_checkpointing=False \
     actor_rollout_ref.actor.megatron.param_offload=${True} \
@@ -73,8 +73,8 @@ python3 -X faulthandler -m verl.experimental.fully_async_policy.fully_async_main
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=8 \
     actor_rollout_ref.actor.megatron.expert_model_parallel_size=8 \
     actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=1 \
-    actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=2 \
-   +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_last_pipeline_stage=7 \
+    actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=3 \
+   +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_first_pipeline_stage=12 \
    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform \
    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
@@ -119,11 +119,9 @@ python3 -X faulthandler -m verl.experimental.fully_async_policy.fully_async_main
     "${mtp_params[@]}" \
    +actor_rollout_ref.rollout.engine_kwargs.sglang.mamba_scheduler_strategy=no_buffer \
    +actor_rollout_ref.rollout.engine_kwargs.sglang.disable_radix_cache=True \
-   +actor_rollout_ref.rollout.engine_kwargs.sglang.enable_memory_saver=False \
+   +actor_rollout_ref.rollout.engine_kwargs.sglang.enable_memory_saver=True \
    +actor_rollout_ref.rollout.engine_kwargs.sglang.cuda_graph_max_bs=256 \
    +actor_rollout_ref.rollout.engine_kwargs.sglang.max_running_requests=256 \
-   +actor_rollout_ref.rollout.engine_kwargs.sglang.soft_watchdog_timeout=300 \
-   +actor_rollout_ref.rollout.engine_kwargs.sglang.watchdog_timeout=999999 \
    +trainer.worker_env.PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
    +actor_rollout_ref.rollout.engine_kwargs.sglang.disable_cuda_graph=False \
     trainer.total_epochs=1 $@

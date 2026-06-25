@@ -320,13 +320,6 @@ class MegatronEngine(BaseEngine):
         if not self.engine_config.use_fused_kernels:
             return
 
-        if self.is_value_model or self.model_config.mtp.enable:
-            logger.warning_once(
-                "Fused kernels are not supported for value models or when MTP is enabled in Megatron engine; disabling."
-            )
-            self.engine_config.use_fused_kernels = False
-            return
-
         from verl.models.mcore.model_forward_fused import patch_fused_forward
 
         for model in self.module:
