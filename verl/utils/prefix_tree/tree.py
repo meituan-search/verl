@@ -217,6 +217,50 @@ class PrefixSubTrie(PrefixTrie):
                     result.append(n)
         return result
 
+    def __getstate__(self) -> dict:
+        """Pickle without the full trie back-references.
+
+        TrieNode.children dicts point to siblings outside the subtrie, causing
+        pickle to serialise the entire global trie.  Store compact per-node data
+        and reconstruct detached nodes on __setstate__.
+        """
+        nodes_data = [
+            (n.flat_idx, n.input_ids, n.ancestor.flat_idx if n.ancestor else -1, n.sequence_ids)
+            for n in self.nodes
+        ]
+        return {
+            "leaf_node_ids": self.leaf_node_ids,
+            "leaf_to_sample": self.leaf_to_sample,
+            "leaf_ids": self.leaf_ids,
+            "nodes_data": nodes_data,
+            "_zero_len_leaves": getattr(self, "_zero_len_leaves", set()),
+        }
+
+    def __setstate__(self, state: dict) -> None:
+        self.source = None
+        self.root = TrieNode(tree_id=-1)  # dummy root (not used after unpickling)
+        self.leaf_node_ids = state["leaf_node_ids"]
+        self.leaf_to_sample = state["leaf_to_sample"]
+        self.leaf_ids = state["leaf_ids"]
+        if state.get("_zero_len_leaves"):
+            self._zero_len_leaves = state["_zero_len_leaves"]
+
+        # Reconstruct detached TrieNode objects (subtrie-only children links).
+        by_flat_idx: dict[int, TrieNode] = {}
+        for flat_idx, input_ids, _anc, sequence_ids in state["nodes_data"]:
+            node = TrieNode(tree_id=-1, input_ids=list(input_ids),
+                            sequence_ids=list(sequence_ids), flat_idx=flat_idx)
+            by_flat_idx[flat_idx] = node
+
+        for flat_idx, input_ids, ancestor_flat_idx, _seq in state["nodes_data"]:
+            node = by_flat_idx[flat_idx]
+            if ancestor_flat_idx != -1 and ancestor_flat_idx in by_flat_idx:
+                node.ancestor = by_flat_idx[ancestor_flat_idx]
+                first_token = input_ids[0] if input_ids else -1
+                by_flat_idx[ancestor_flat_idx].children[first_token] = node
+
+        self.nodes = [by_flat_idx[fid] for fid, _, _, _ in state["nodes_data"]]
+
     def create_sub_trie(
         self,
         leaf_node_ids: list[int],

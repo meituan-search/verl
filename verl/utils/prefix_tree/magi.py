@@ -590,6 +590,9 @@ def forward_prefix_tree(
 
     strip_prefix_tree_args(logits_processor_args)
 
+    import time as _time
+    _t0 = _time.perf_counter()
+
     if prefix_tree_attention == "magi":
         # Pre-dispatch: each CP rank processes only its local token slice through
         # embedding, FFN, MoE, and layer norms — not the full flat sequence.
@@ -598,6 +601,7 @@ def forward_prefix_tree(
         local_input_ids = pt_batch.tree_packed_input_ids[local_indices].unsqueeze(0)
         local_position_ids = pt_batch.tree_packed_position_ids[local_indices].unsqueeze(0)
 
+        _t_pre_model = _time.perf_counter()
         output_orig = model(
             input_ids=local_input_ids,
             attention_mask=None,
@@ -605,6 +609,12 @@ def forward_prefix_tree(
             packed_seq_params=None,
             magi_attention_key=pt_batch.magi_key,
             **model_kwargs,
+        )
+        _t_post_model = _time.perf_counter()
+        _log.getLogger(__name__).warning(
+            "prefix_tree timing: pre_model=%.3fs  model=%.3fs  flat=%d  local=%d",
+            _t_pre_model - _t0, _t_post_model - _t_pre_model,
+            pt_batch.real_tokens, local_input_ids.shape[1],
         )
 
         if post_process:
