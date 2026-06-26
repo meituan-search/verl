@@ -209,7 +209,11 @@ def build_layout_from_tree_node(
     """
 
     valid_ids: set[int] = {n.flat_idx for n in subtrie.nodes}
-    leaf_node_id_to_sample: dict[int, int] = dict(zip(subtrie.leaf_node_ids, subtrie.leaf_to_sample, strict=False))
+    # Map flat_idx → ordered list of sample_ids (first = representative, rest = zero-len duplicates)
+    leaf_node_id_to_samples: dict[int, list[int]] = {}
+    for nid, sid in zip(subtrie.leaf_node_ids, subtrie.leaf_to_sample, strict=False):
+        leaf_node_id_to_samples.setdefault(nid, []).append(sid)
+    leaf_node_id_to_sample: dict[int, int] = {nid: sids[0] for nid, sids in leaf_node_id_to_samples.items()}
 
     def _subtrie_children(node: TrieNode) -> list[TrieNode]:
         return [c for c in node.children.values() if c.flat_idx in valid_ids]
@@ -326,11 +330,13 @@ def build_layout_from_tree_node(
             torch.cat(default_pid_pieces) if default_pid_pieces else torch.empty(0, dtype=torch.long, device=device)
         )
 
-    leaf_ranges = [(leaf._flat_start, leaf._flat_end) for leaf in leaves_in_dfs]
-    leaf_to_sample_list = list(subtrie.leaf_to_sample)
-    sample_to_leaf_range = {s: r for s, r in zip(leaf_to_sample_list, leaf_ranges, strict=False)}
-
+    # Build leaf ranges and ancestor chains in DFS order, interleaving zero-length
+    # duplicate entries immediately after their representative so the last entry
+    # (the last real leaf) still ends at total_seqlen_q (satisfying PrefixTreeParams).
+    leaf_ranges: list[RangeSpec] = []
+    leaf_to_sample_list: list[int] = []
     leaf_ancestor_ranges: list[list[RangeSpec]] = []
+
     for leaf in leaves_in_dfs:
         chain: list[RangeSpec] = []
         cur = parent_of.get(id(leaf))
@@ -338,7 +344,24 @@ def build_layout_from_tree_node(
             chain.append((cur._flat_start, cur._flat_end))
             cur = parent_of.get(id(cur))
         chain.reverse()  # root first
+
+        rep_range: RangeSpec = (leaf._flat_start, leaf._flat_end)
+        sids = leaf_node_id_to_samples[leaf.flat_idx]
+
+        # Representative entry
+        leaf_ranges.append(rep_range)
+        leaf_to_sample_list.append(sids[0])
         leaf_ancestor_ranges.append(chain)
+
+        # Zero-length entries for duplicates: ancestor chain extended with the rep's
+        # leaf range so restore_flat_to_nested reconstructs the full sequence correctly.
+        zero_range: RangeSpec = (rep_range[1], rep_range[1])
+        for dup_sid in sids[1:]:
+            leaf_ranges.append(zero_range)
+            leaf_to_sample_list.append(dup_sid)
+            leaf_ancestor_ranges.append(chain + [rep_range])
+
+    sample_to_leaf_range = {s: r for s, r in zip(leaf_to_sample_list, leaf_ranges, strict=False)}
 
     # prefix_range: the shared root segment (first root_node for single-prefix trees)
     prefix_range = (root_nodes[0]._flat_start, root_nodes[0]._flat_end)

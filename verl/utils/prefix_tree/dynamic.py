@@ -666,15 +666,18 @@ def prune_trie(
         source = PrefixTrie(root=trie)
 
     def _collect(node: TrieNode) -> bool:
-        """Walk node, collecting matching leaves. Returns False on duplicate-leaf fallback."""
+        """Walk node, collecting matching leaves."""
         if not node.children:
             kept = [s for s in node.sequence_ids if s in keep_leaf_ids]
             if not kept:
                 return True
-            if len(kept) > 1:
-                return False  # duplicate sequences share a leaf — fall back
-            leaf_to_sample.extend(kept)
-            leaf_node_ids.append(node.flat_idx)
+            # First sample gets the real leaf; duplicates share the same node → zero-length
+            # leaves whose tokens are fully covered by the shared ancestor chain.
+            for i, sid in enumerate(kept):
+                leaf_to_sample.append(sid)
+                leaf_node_ids.append(node.flat_idx)
+                if i > 0:
+                    zero_len_leaves.add(len(leaf_to_sample) - 1)  # mark position as zero-length
             return True
         for child in node.children.values():
             if keep_leaf_ids.isdisjoint(child.sequence_ids):
@@ -685,6 +688,7 @@ def prune_trie(
 
     leaf_to_sample: list[int] = []
     leaf_node_ids: list[int] = []
+    zero_len_leaves: set[int] = set()  # indices into leaf_to_sample that are zero-length duplicates
     for child in trie.children.values():
         if keep_leaf_ids.isdisjoint(child.sequence_ids):
             continue
@@ -692,26 +696,21 @@ def prune_trie(
             return None
     if not leaf_to_sample:
         return None
-    # Guard: if any keep_leaf_id was dropped (e.g. duplicate sequences sharing a
-    # trie leaf), fall back so restore_flat_to_nested never sees missing slots.
-    got = set(leaf_to_sample)
-    if got != keep_leaf_ids:
-        n_dup = len(keep_leaf_ids) - len(got)
+    if set(leaf_to_sample) != keep_leaf_ids:
         _logging.getLogger(__name__).warning(
-            "prefix_tree: prune_trie: %d duplicate sequence(s) share a trie leaf "
-            "(%d unique / %d total) — FA3 fallback for this micro-batch",
-            n_dup,
-            len(got),
-            len(keep_leaf_ids),
+            "prefix_tree: prune_trie: unmatched sequences — FA3 fallback"
         )
         return None
     batch_size = max(leaf_to_sample) + 1 if leaf_to_sample else 0
-    return PrefixSubTrie(
+    subtrie = PrefixSubTrie(
         source=source,
         leaf_node_ids=leaf_node_ids,
         leaf_to_sample=leaf_to_sample,
         batch_size=batch_size,
     )
+    if zero_len_leaves:
+        subtrie._zero_len_leaves = zero_len_leaves
+    return subtrie
 
 
 def compute_prefix_sharing_ratio(input_ids, attention_mask=None) -> float:
