@@ -1202,36 +1202,12 @@ class RayPPOTrainer:
 
         old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
         # step 4. No padding to padding
-        # Wrap in try/except: multilevel magi may produce a NestedTensor whose
-        # total token count differs from what no_padding_2_padding expects (rare
-        # edge case with partial groups at micro-batch boundaries).  When this
-        # happens we fall back to a plain forward without prefix tree.
-        try:
-            entropy = no_padding_2_padding(entropy, batch_td)
-            log_probs = no_padding_2_padding(log_probs, batch_td)
-        except AssertionError as _e:
-            import logging as _log
-            import traceback as _tb
-
-            _log.getLogger(__name__).error(
-                "_compute_old_log_prob: no_padding_2_padding assertion failed (%s). "
-                "old_log_prob MUST use MAGI — falling back to static micro-batches "
-                "WITH prefix tree enabled. Fix the root cause.\n%s",
-                _e,
-                _tb.format_exc(),
-            )
-            # Keep prefix tree enabled (use_prefix_tree stays True) so old_log_prob
-            # still uses MAGI. Only switch to static micro-batches to avoid the
-            # token-budget path that creates 1-seq micro-batches at small budgets.
-            tu.assign_non_tensor(
-                batch_td,
-                use_dynamic_bsz=False,
-                micro_batch_size_per_gpu=self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu,
-            )
-            _fb_out = self.actor_rollout_wg.compute_log_prob(batch_td)
-            entropy = no_padding_2_padding(tu.get(_fb_out, "entropy"), batch_td)
-            log_probs = no_padding_2_padding(tu.get(_fb_out, "log_probs"), batch_td)
-            del _fb_out
+        # no_padding_2_padding must succeed for prefix-tree outputs.
+        # If it fails, there's a bug in the prefix-tree expansion or token alignment.
+        # Fail hard to surface the issue — the fallback that re-runs compute_log_prob
+        # would double OLP time and mask the root cause.
+        entropy = no_padding_2_padding(entropy, batch_td)
+        log_probs = no_padding_2_padding(log_probs, batch_td)
         if sum_pi_squared is not None:
             sum_pi_squared = no_padding_2_padding(sum_pi_squared, batch_td)
         # step 5: rebuild a tensordict and convert to dataproto

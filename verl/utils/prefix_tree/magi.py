@@ -565,12 +565,14 @@ def build_prefix_tree_batch(model, input_ids, logits_processor_args, vision_mode
     """
     prefix_tree_attention = (logits_processor_args or {}).get("prefix_tree_attention", "flex")
     loss_mask_nested = (logits_processor_args or {}).get("loss_mask", None)
+    position_ids_nested = (logits_processor_args or {}).get("position_ids", None)
     cached_result = (logits_processor_args or {}).get("prefix_tree_subtree")  # TODO: use PrefixSubTrie
 
     return build_prefix_tree_micro_batch(
         model,
         input_ids,
         loss_mask_nested,
+        position_ids=position_ids_nested,
         attention_type=prefix_tree_attention,
         tp_size=mpu.get_tensor_model_parallel_world_size(),
         cp_size=mpu.get_context_parallel_world_size(),
@@ -593,6 +595,14 @@ def forward_prefix_tree(
     import time as _time
     _t0 = _time.perf_counter()
 
+    # Collect diagnostic counters
+    _diag_real_tokens = pt_batch.real_tokens
+    _diag_packed_tokens = pt_batch.tree_packed_input_ids.shape[0]
+    _diag_magi_key_info = ""
+    if pt_batch.magi_key is not None:
+        _diag_magi_key_info = f" seqlen_q={pt_batch.magi_key.total_seqlen_q} seqlen_k={pt_batch.magi_key.total_seqlen_k}"
+    _diag_rope_max = int(pt_batch.tree_packed_position_ids.max().item()) + 1
+
     if prefix_tree_attention == "magi":
         # Pre-dispatch: each CP rank processes only its local token slice through
         # embedding, FFN, MoE, and layer norms — not the full flat sequence.
@@ -600,6 +610,7 @@ def forward_prefix_tree(
         local_indices = get_position_ids(pt_batch.magi_key)  # (local_tokens,) global positions
         local_input_ids = pt_batch.tree_packed_input_ids[local_indices].unsqueeze(0)
         local_position_ids = pt_batch.tree_packed_position_ids[local_indices].unsqueeze(0)
+        _diag_local_tokens = local_input_ids.shape[1]
 
         _t_pre_model = _time.perf_counter()
         output_orig = model(
@@ -611,16 +622,25 @@ def forward_prefix_tree(
             **model_kwargs,
         )
         _t_post_model = _time.perf_counter()
-        _log.getLogger(__name__).warning(
-            "prefix_tree timing: pre_model=%.3fs  model=%.3fs  flat=%d  local=%d",
-            _t_pre_model - _t0, _t_post_model - _t_pre_model,
-            pt_batch.real_tokens, local_input_ids.shape[1],
-        )
+        _t_model = _t_post_model - _t_pre_model
 
         if post_process:
             # Gather local logit slices → full flat_tokens vocab tensor for loss computation.
+            _t_undispatch_start = _time.perf_counter()
             output_orig = undispatch(output_orig.squeeze(0), pt_batch.magi_key).unsqueeze(0)
+            _t_undispatch_end = _time.perf_counter()
+            _t_undispatch = _t_undispatch_end - _t_undispatch_start
+        else:
+            _t_undispatch = 0.0
+
+        _log.getLogger(__name__).warning(
+            "prefix_tree timing[magi]: pre_model=%.3fs model=%.3fs undispatch=%.3fs "
+            "real_tokens=%d packed=%d local=%d rope_max=%d%s",
+            _t_pre_model - _t0, _t_model, _t_undispatch,
+            _diag_real_tokens, _diag_packed_tokens, _diag_local_tokens, _diag_rope_max, _diag_magi_key_info,
+        )
     else:
+        _t_pre_model = _time.perf_counter()
         output_orig = model(
             input_ids=tree_packed_input_ids,
             attention_mask=None,
@@ -628,6 +648,12 @@ def forward_prefix_tree(
             packed_seq_params=None,
             flex_attention_key=pt_batch.flex_key,
             **model_kwargs,
+        )
+        _t_post_model = _time.perf_counter()
+        _t_model = _t_post_model - _t_pre_model
+        _log.getLogger(__name__).warning(
+            "prefix_tree timing[flex]: model=%.3fs real_tokens=%d packed=%d rope_max=%d",
+            _t_model, _diag_real_tokens, _diag_packed_tokens, _diag_rope_max,
         )
 
     get_torch_device().synchronize()
@@ -657,12 +683,29 @@ def forward_prefix_tree(
         if "temperature" in orig_args:
             t = orig_args["temperature"]
             if isinstance(t, torch.Tensor) and t.is_nested:
-                scalar_t = t.values()[0].item()
+                # Per-sample temperature: expand to match tree-packed structure
+                # t has shape (batch_size,) as nested tensor, need to expand per token
+                temp_by_sample = t.values()  # (batch_size,)
+                # Build per-token temperature using expand_flat_to_per_sample pattern
+                prefix_start, prefix_end = pt_batch.prefix_range
+                prefix_temp = temp_by_sample[0]  # Use first sample's temp for prefix (shared)
+                temp_pieces = []
+                for leaf_idx, sample_idx in enumerate(pt_batch.segment_to_sample):
+                    s, e = pt_batch.segment_ranges[leaf_idx]
+                    leaf_tokens = e - s
+                    temp_pieces.append(torch.full((leaf_tokens, 1), temp_by_sample[sample_idx].item(),
+                                                  dtype=torch.float32, device=tree_packed_label.device))
+                # Prefix temp for all prefix tokens
+                if prefix_end > prefix_start:
+                    temp_pieces.insert(0, torch.full((prefix_end - prefix_start, 1), prefix_temp.item(),
+                                                    dtype=torch.float32, device=tree_packed_label.device))
+                tree_packed_t = torch.cat(temp_pieces, dim=0) if temp_pieces else torch.ones(total_flat, 1, dtype=torch.float32, device=tree_packed_label.device)
             elif isinstance(t, torch.Tensor):
                 scalar_t = t.flatten()[0].item()
+                tree_packed_t = torch.full((total_flat, 1), scalar_t, dtype=torch.float32, device=tree_packed_label.device)
             else:
                 scalar_t = float(t)
-            tree_packed_t = torch.full((total_flat, 1), scalar_t, dtype=torch.float32, device=tree_packed_label.device)
+                tree_packed_t = torch.full((total_flat, 1), scalar_t, dtype=torch.float32, device=tree_packed_label.device)
         else:
             tree_packed_t = torch.ones(total_flat, 1, dtype=torch.float32, device=tree_packed_label.device)
         flat_args = {
@@ -670,14 +713,17 @@ def forward_prefix_tree(
         }
         flat_args["label"] = tree_packed_label
         flat_args["temperature"] = tree_packed_t
-        if pt_batch.tree_packed_loss_mask is not None:
-            flat_args["loss_mask"] = pt_batch.tree_packed_loss_mask[:real_tokens].unsqueeze(1)
+        # Note: loss_mask is not passed to logits_processor - it's handled downstream in sft_loss
+        # after expand_flat_to_per_sample restores per-sample structure.
 
         # logits_processor runs on flat (flat_tokens, 1, vocab).
         # Clone so in-place ops inside the processor don't alias output_orig.
         # This avoids the O(N·P·vocab) expansion before the vocab-dimension ops.
+        _t_logits_start = _time.perf_counter()
         output_dict = logits_processor(logits_flat.clone().unsqueeze(1), **flat_args)
+        _t_logits_end = _time.perf_counter()
 
+        _t_expand_start = _time.perf_counter()
         if isinstance(output_dict, dict):
             # Per-token flat results are expanded after the vocab ops:
             # expand_flat_to_per_sample replicates the prefix slice per sample (1-D, cheap),
@@ -694,6 +740,12 @@ def forward_prefix_tree(
                         val_expanded = expand_flat_to_per_sample(val_1d, pt_batch)
                         tensors = [val_expanded[cu_seqlen[i] : cu_seqlen[i + 1]] for i in range(len(cu_seqlen) - 1)]
                         output_dict[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
+        _t_expand_end = _time.perf_counter()
+
+        _log.getLogger(__name__).warning(
+            "prefix_tree timing[post]: logits_processor=%.3fs expand=%.3fs total_flat=%d",
+            _t_logits_end - _t_logits_start, _t_expand_end - _t_expand_start, total_flat,
+        )
         return output_dict
     else:
         # Intermediate PP stage (post_process=False) or no logits_processor.
