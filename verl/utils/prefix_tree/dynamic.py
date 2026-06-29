@@ -99,16 +99,20 @@ def _insert_sequence(
     sequence: list[int],
     tree_id: int,
     sequence_id: int,
-) -> None:
+) -> int:
+    """Insert sequence into tree. Returns number of NEW nodes created."""
     current = root
+    new_nodes = 0
     for token in sequence:
         if token not in current.children:
             node_id = len(all_nodes)
             current.children[token] = _BuildNode(tree_id, token, node_id)
             all_nodes.append(current.children[token])
+            new_nodes += 1
         current.children[token].sequence_ids.append(sequence_id)
         current = current.children[token]
     current.is_end = True
+    return new_nodes
 
 
 def _ancestors(node: TrieNode) -> list[TrieNode]:
@@ -177,25 +181,39 @@ def greedy_build_tries(
         (tries, num_tokens_list) — list of compressed TrieNode roots + total
         uncompressed nodes per tree.
     """
-    forests: list[dict[str, Any]] = []
-    for seq_id, seq in enumerate(sequences):
-        inserted = False
-        for tree_id, tree in enumerate(forests):
-            additional = _count_additional_nodes(tree["root"], seq)
-            if tree["nodes"] + additional <= max_tokens_per_tree:
-                _insert_sequence(tree["root"], tree["all_nodes"], seq, tree_id, seq_id)
-                tree["nodes"] += additional
-                inserted = True
-                break
-        if inserted:
-            continue
-        if len(seq) > max_tokens_per_tree:
-            raise ValueError(f"Sequence length {len(seq)} exceeds max_tokens_per_tree {max_tokens_per_tree}")
-        new_tree_id = len(forests)
-        new_root = _BuildNode(new_tree_id, -1, -1)
+    # Fast path: when max_tokens_per_tree is huge (e.g., sum*10), build single tree
+    total_tokens = sum(len(s) for s in sequences)
+    if max_tokens_per_tree >= total_tokens and sequences:
+        root = _BuildNode(0, -1, -1)
         all_nodes: list[_BuildNode] = []
-        _insert_sequence(new_root, all_nodes, seq, new_tree_id, seq_id)
-        forests.append({"root": new_root, "all_nodes": all_nodes, "nodes": len(seq)})
+        for seq_id, seq in enumerate(sequences):
+            _insert_sequence(root, all_nodes, seq, 0, seq_id)
+        forests = [{"root": root, "all_nodes": all_nodes, "nodes": len(all_nodes)}]
+    else:
+        # Greedy packing: try to fit sequences into existing trees
+        forests: list[dict[str, Any]] = []
+        for seq_id, seq in enumerate(sequences):
+            inserted = False
+            for tree_id, tree in enumerate(forests):
+                additional = _count_additional_nodes(tree["root"], seq)
+                if tree["nodes"] + additional <= max_tokens_per_tree:
+                    actual_new = _insert_sequence(
+                        tree["root"], tree["all_nodes"], seq, tree_id, seq_id
+                    )
+                    tree["nodes"] += actual_new
+                    inserted = True
+                    break
+            if inserted:
+                continue
+            if len(seq) > max_tokens_per_tree:
+                raise ValueError(
+                    f"Sequence length {len(seq)} exceeds max_tokens_per_tree {max_tokens_per_tree}"
+                )
+            new_tree_id = len(forests)
+            new_root = _BuildNode(new_tree_id, -1, -1)
+            all_nodes: list[_BuildNode] = []
+            _insert_sequence(new_root, all_nodes, seq, new_tree_id, seq_id)
+            forests.append({"root": new_root, "all_nodes": all_nodes, "nodes": len(seq)})
 
     tries = [_compress_trie(f["root"]) for f in forests]
     num_tokens_list = [f["nodes"] for f in forests]
