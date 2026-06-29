@@ -180,6 +180,10 @@ class PrefixSubTrie(PrefixTrie):
     # Computed at construction time in batch input order — ready for non_tensor_data.
     leaf_ids: np.ndarray  # shape (batch_size,), dtype int64
 
+    # MAGI key cache for OLP→actor_update reuse. Populated on first forward,
+    # reused if tree structure and CP group haven't changed.
+    _cached_magi_key: Optional[object] = None
+
     def __init__(
         self,
         source: PrefixTrie,
@@ -225,8 +229,7 @@ class PrefixSubTrie(PrefixTrie):
         and reconstruct detached nodes on __setstate__.
         """
         nodes_data = [
-            (n.flat_idx, n.input_ids, n.ancestor.flat_idx if n.ancestor else -1, n.sequence_ids)
-            for n in self.nodes
+            (n.flat_idx, n.input_ids, n.ancestor.flat_idx if n.ancestor else -1, n.sequence_ids) for n in self.nodes
         ]
         return {
             "leaf_node_ids": self.leaf_node_ids,
@@ -248,8 +251,7 @@ class PrefixSubTrie(PrefixTrie):
         # Reconstruct detached TrieNode objects (subtrie-only children links).
         by_flat_idx: dict[int, TrieNode] = {}
         for flat_idx, input_ids, _anc, sequence_ids in state["nodes_data"]:
-            node = TrieNode(tree_id=-1, input_ids=list(input_ids),
-                            sequence_ids=list(sequence_ids), flat_idx=flat_idx)
+            node = TrieNode(tree_id=-1, input_ids=list(input_ids), sequence_ids=list(sequence_ids), flat_idx=flat_idx)
             by_flat_idx[flat_idx] = node
 
         for flat_idx, input_ids, ancestor_flat_idx, _seq in state["nodes_data"]:
@@ -260,6 +262,7 @@ class PrefixSubTrie(PrefixTrie):
                 by_flat_idx[ancestor_flat_idx].children[first_token] = node
 
         self.nodes = [by_flat_idx[fid] for fid, _, _, _ in state["nodes_data"]]
+        self._cached_magi_key = None
 
     def create_sub_trie(
         self,

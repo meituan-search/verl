@@ -216,6 +216,7 @@ def build_prefix_tree_micro_batch(
             attention_type=attention_type,
             tp_size=tp_size,
             cp_size=cp_size,
+            subtrie=subtrie,
         )
     except (ValueError, AssertionError, RuntimeError) as _e:
         _log.getLogger(__name__).error(
@@ -305,6 +306,7 @@ def _finalize_prefix_tree_batch(
     attention_type: str = "flex",
     tp_size: int = 1,
     cp_size: int = 1,
+    subtrie=None,
 ) -> PrefixTreeMagiBatch:
     """Common downstream step for both detection paths.
 
@@ -332,7 +334,13 @@ def _finalize_prefix_tree_batch(
             params.total_seqlen_k += pad_len
 
     if attention_type == "magi":
-        magi_key = _build_magi_key(model, params)
+        # Reuse cached MAGI key for OLP→actor_update reuse if tree structure unchanged.
+        if subtrie is not None and getattr(subtrie, "_cached_magi_key", None) is not None:
+            magi_key = subtrie._cached_magi_key
+        else:
+            magi_key = _build_magi_key(model, params)
+            if subtrie is not None:
+                subtrie._cached_magi_key = magi_key
         flex_key = None
     else:
         flex_key = _build_flex_key(params, params.tree_packed_tokens.device)
@@ -593,6 +601,7 @@ def forward_prefix_tree(
     strip_prefix_tree_args(logits_processor_args)
 
     import time as _time
+
     _t0 = _time.perf_counter()
 
     # Collect diagnostic counters
@@ -600,7 +609,9 @@ def forward_prefix_tree(
     _diag_packed_tokens = pt_batch.tree_packed_input_ids.shape[0]
     _diag_magi_key_info = ""
     if pt_batch.magi_key is not None:
-        _diag_magi_key_info = f" seqlen_q={pt_batch.magi_key.total_seqlen_q} seqlen_k={pt_batch.magi_key.total_seqlen_k}"
+        _diag_magi_key_info = (
+            f" seqlen_q={pt_batch.magi_key.total_seqlen_q} seqlen_k={pt_batch.magi_key.total_seqlen_k}"
+        )
     _diag_rope_max = int(pt_batch.tree_packed_position_ids.max().item()) + 1
 
     if prefix_tree_attention == "magi":
@@ -636,8 +647,14 @@ def forward_prefix_tree(
         _log.getLogger(__name__).warning(
             "prefix_tree timing[magi]: pre_model=%.3fs model=%.3fs undispatch=%.3fs "
             "real_tokens=%d packed=%d local=%d rope_max=%d%s",
-            _t_pre_model - _t0, _t_model, _t_undispatch,
-            _diag_real_tokens, _diag_packed_tokens, _diag_local_tokens, _diag_rope_max, _diag_magi_key_info,
+            _t_pre_model - _t0,
+            _t_model,
+            _t_undispatch,
+            _diag_real_tokens,
+            _diag_packed_tokens,
+            _diag_local_tokens,
+            _diag_rope_max,
+            _diag_magi_key_info,
         )
     else:
         _t_pre_model = _time.perf_counter()
@@ -653,7 +670,10 @@ def forward_prefix_tree(
         _t_model = _t_post_model - _t_pre_model
         _log.getLogger(__name__).warning(
             "prefix_tree timing[flex]: model=%.3fs real_tokens=%d packed=%d rope_max=%d",
-            _t_model, _diag_real_tokens, _diag_packed_tokens, _diag_rope_max,
+            _t_model,
+            _diag_real_tokens,
+            _diag_packed_tokens,
+            _diag_rope_max,
         )
 
     get_torch_device().synchronize()
@@ -693,19 +713,40 @@ def forward_prefix_tree(
                 for leaf_idx, sample_idx in enumerate(pt_batch.segment_to_sample):
                     s, e = pt_batch.segment_ranges[leaf_idx]
                     leaf_tokens = e - s
-                    temp_pieces.append(torch.full((leaf_tokens, 1), temp_by_sample[sample_idx].item(),
-                                                  dtype=torch.float32, device=tree_packed_label.device))
+                    temp_pieces.append(
+                        torch.full(
+                            (leaf_tokens, 1),
+                            temp_by_sample[sample_idx].item(),
+                            dtype=torch.float32,
+                            device=tree_packed_label.device,
+                        )
+                    )
                 # Prefix temp for all prefix tokens
                 if prefix_end > prefix_start:
-                    temp_pieces.insert(0, torch.full((prefix_end - prefix_start, 1), prefix_temp.item(),
-                                                    dtype=torch.float32, device=tree_packed_label.device))
-                tree_packed_t = torch.cat(temp_pieces, dim=0) if temp_pieces else torch.ones(total_flat, 1, dtype=torch.float32, device=tree_packed_label.device)
+                    temp_pieces.insert(
+                        0,
+                        torch.full(
+                            (prefix_end - prefix_start, 1),
+                            prefix_temp.item(),
+                            dtype=torch.float32,
+                            device=tree_packed_label.device,
+                        ),
+                    )
+                tree_packed_t = (
+                    torch.cat(temp_pieces, dim=0)
+                    if temp_pieces
+                    else torch.ones(total_flat, 1, dtype=torch.float32, device=tree_packed_label.device)
+                )
             elif isinstance(t, torch.Tensor):
                 scalar_t = t.flatten()[0].item()
-                tree_packed_t = torch.full((total_flat, 1), scalar_t, dtype=torch.float32, device=tree_packed_label.device)
+                tree_packed_t = torch.full(
+                    (total_flat, 1), scalar_t, dtype=torch.float32, device=tree_packed_label.device
+                )
             else:
                 scalar_t = float(t)
-                tree_packed_t = torch.full((total_flat, 1), scalar_t, dtype=torch.float32, device=tree_packed_label.device)
+                tree_packed_t = torch.full(
+                    (total_flat, 1), scalar_t, dtype=torch.float32, device=tree_packed_label.device
+                )
         else:
             tree_packed_t = torch.ones(total_flat, 1, dtype=torch.float32, device=tree_packed_label.device)
         flat_args = {
@@ -744,7 +785,9 @@ def forward_prefix_tree(
 
         _log.getLogger(__name__).warning(
             "prefix_tree timing[post]: logits_processor=%.3fs expand=%.3fs total_flat=%d",
-            _t_logits_end - _t_logits_start, _t_expand_end - _t_expand_start, total_flat,
+            _t_logits_end - _t_logits_start,
+            _t_expand_end - _t_expand_start,
+            total_flat,
         )
         return output_dict
     else:
