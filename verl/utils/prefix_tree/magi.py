@@ -150,6 +150,7 @@ def build_prefix_tree_micro_batch(
     tp_size: int = 1,
     cp_size: int = 1,
     cached_result: Optional[PrefixSubTrie] = None,
+    segment_metadata: Optional[dict] = None,
 ) -> Optional[PrefixTreeMagiBatch]:
     """Build a PrefixTreeMagiBatch from a micro-batch of NestedTensor sequences.
 
@@ -158,6 +159,9 @@ def build_prefix_tree_micro_batch(
 
     When ``cached_result`` (a :class:`PrefixSubTrie`) is provided, skips
     trie construction and uses the pre-computed subtrie.
+
+    When ``segment_metadata`` is provided (e.g., from GRPO grouping), uses
+    hash-based tree building instead of token-by-token detection.
 
     Returns None when there is no shared prefix, signalling the caller to
     fall back to the standard attention path.
@@ -171,6 +175,8 @@ def build_prefix_tree_micro_batch(
         attention_type: ``"flex"`` or ``"magi"``.
         tp_size / cp_size: Tensor / context parallel world sizes (for
             SP-divisibility padding).
+        segment_metadata: Optional dict with segment hashes from
+            :func:`create_grpo_segment_metadata` for fast hash-based grouping.
 
     Returns:
         PrefixTreeMagiBatch or None.
@@ -190,16 +196,40 @@ def build_prefix_tree_micro_batch(
 
     if cached_result is not None:
         subtrie = cached_result
-    else:
-        subtrie = build_tree_dynamic(samples)
-        if subtrie is None:
-            _log.getLogger(__name__).error(
-                "build_prefix_tree_micro_batch: no prefix sharing found (n=%d); "
-                "falling back to standard attention — old_log_prob will use FA3, "
-                "causing ppo_kl != 0",
-                len(samples),
+    elif segment_metadata is not None:
+        # Fast path: hash-based tree building from pre-computed segment metadata
+        from verl.utils.prefix_tree.segment_grouper import validate_segment_metadata
+        from verl.utils.prefix_tree.tree import build_tree_from_segments
+        from verl.utils.prefix_tree.dynamic import (
+            _BuildNode,
+            _compress_trie,
+            convert_trie_to_tree_node,
+        )
+
+        if validate_segment_metadata(segment_metadata):
+            subtrie = build_tree_from_segments(
+                samples,
+                segments=segment_metadata["segments"],
+                _BuildNode=_BuildNode,
+                _insert_sequence=_insert_sequence,
+                _compress_trie=_compress_trie,
+                convert_trie_to_tree_node=convert_trie_to_tree_node,
             )
-            return None
+        else:
+            # Fallback to token-by-token detection
+            subtrie = build_tree_dynamic(samples)
+    else:
+        # Default: token-by-token trie detection
+        subtrie = build_tree_dynamic(samples)
+
+    if subtrie is None:
+        _log.getLogger(__name__).error(
+            "build_prefix_tree_micro_batch: no prefix sharing found (n=%d); "
+            "falling back to standard attention — old_log_prob will use FA3, "
+            "causing ppo_kl != 0",
+            len(samples),
+        )
+        return None
 
     try:
         params = build_layout_from_tree_node(

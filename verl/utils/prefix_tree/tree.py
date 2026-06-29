@@ -297,3 +297,64 @@ class PrefixSubTrie(PrefixTrie):
             loss_masks_by_sample=loss_masks_by_sample,
             position_ids_by_sample=position_ids_by_sample,
         )
+
+
+# ---------------------------------------------------------------------------
+# Static tree builders (from known structure, avoiding token-by-token detection)
+# ---------------------------------------------------------------------------
+
+
+def build_tree_from_segments(
+    samples: list,
+    segments: list[list[tuple[int, int]]],
+    _BuildNode=None,
+    _insert_sequence=None,
+    _compress_trie=None,
+    convert_trie_to_tree_node=None,
+) -> Optional["PrefixSubTrie"]:
+    """Build tree from pre-computed segment metadata (fast path).
+
+    Instead of token-by-token comparison, groups samples by their first segment
+    hash. All samples with the same first segment hash share that prefix.
+
+    Args:
+        samples: List of token tensors.
+        segments: List of [(hash, length), ...] per sample from segment_grouper.
+        _BuildNode, _insert_sequence, _compress_trie, convert_trie_to_tree_node:
+            Injected dependencies from dynamic.py to avoid circular imports.
+
+    Returns:
+        PrefixSubTrie or None if no sharing detected.
+    """
+    if not samples or len(samples) < 2:
+        return None
+
+    from verl.utils.prefix_tree.segment_grouper import group_by_segment_hash
+
+    # Group by first segment (the shared prefix)
+    groups = group_by_segment_hash(segments, level=0)
+
+    # Find largest group with shared prefix
+    largest_group = max(groups.values(), key=len, default=[])
+    if len(largest_group) < 2:
+        return None  # No sharing
+
+    # Build tree: shared prefix node + individual response branches
+    root = _BuildNode(0, -1, -1)
+    all_nodes: list = []
+
+    # Get shared prefix tokens from first sample in group
+    first_idx, prefix_len = largest_group[0]
+    prefix_tokens = samples[first_idx][:prefix_len].tolist()
+
+    # Insert shared prefix
+    _insert_sequence(root, all_nodes, prefix_tokens, 0, -1)
+
+    # Insert full sequences for all samples in group
+    for seq_idx, _ in largest_group:
+        seq_tokens = samples[seq_idx].tolist()
+        _insert_sequence(root, all_nodes, seq_tokens, 0, seq_idx)
+
+    # Compress and convert
+    trie = _compress_trie(root)
+    return convert_trie_to_tree_node(trie)
