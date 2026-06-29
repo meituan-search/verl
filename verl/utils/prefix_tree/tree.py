@@ -315,15 +315,19 @@ def build_tree_from_segments(
 ) -> Optional[PrefixSubTrie]:
     """Build tree from pre-computed segment metadata (fast path).
 
-    Instead of token-by-token comparison, groups samples by their first segment
-    hash. All samples with the same first segment hash share that prefix.
+    For GRPO, segment metadata tells us the exact prefix split point.  We build
+    the compressed :class:`TrieNode` tree directly — one prefix node + N leaf
+    nodes — without token-by-token ``_insert_sequence`` / ``_compress_trie`` /
+    ``prune_trie``.  Children are keyed by sample index (not first token) so
+    suffixes that coincidentally start with the same token don't collide.
 
     Args:
         samples: List of token tensors.
         segment_hashes: Array of hash lists per sample (object dtype).
         segment_lengths: Array of length lists per sample (object dtype).
         _BuildNode, _insert_sequence, _compress_trie, convert_trie_to_tree_node:
-            Injected dependencies from dynamic.py to avoid circular imports.
+            Unused — kept for signature compatibility with the caller in
+            ``magi.py``.
 
     Returns:
         PrefixSubTrie or None if no sharing detected.
@@ -341,22 +345,58 @@ def build_tree_from_segments(
     if len(largest_group) < 2:
         return None  # No sharing
 
-    # Build tree: shared prefix node + individual response branches
-    root = _BuildNode(0, -1, -1)
-    all_nodes: list = []
-
-    # Get shared prefix tokens from first sample in group
     first_idx, prefix_len = largest_group[0]
+    all_seq_ids = [sid for sid, _ in largest_group]
+
+    # ── Direct compressed-TrieNode construction ────────────────────────────
+    # Structure: virtual root → prefix_node (shared tokens, all sample IDs)
+    #            → N leaf nodes (one per sample's response suffix).
+    # Children keyed by sample index so same-first-token suffixes don't collide.
+    trie_root = TrieNode(tree_id=0)
+    trie_root.nodes = []  # flat DFS list
+
     prefix_tokens = samples[first_idx][:prefix_len].tolist()
+    prefix_node = TrieNode(
+        tree_id=0,
+        start_idx=0,
+        end_idx=max(prefix_len - 1, 0),
+        input_ids=prefix_tokens,
+        sequence_ids=list(all_seq_ids),
+        ancestor=None,
+        flat_idx=len(trie_root.nodes),
+    )
+    trie_root.nodes.append(prefix_node)
+    # Single child of root — satisfies convert_trie_to_tree_node's single-root check.
+    trie_root.children[0] = prefix_node
 
-    # Insert shared prefix
-    _insert_sequence(root, all_nodes, prefix_tokens, 0, -1)
+    leaf_to_sample: list[int] = []
+    leaf_node_ids: list[int] = []
 
-    # Insert full sequences for all samples in group
     for seq_idx, _ in largest_group:
-        seq_tokens = samples[seq_idx].tolist()
-        _insert_sequence(root, all_nodes, seq_tokens, 0, seq_idx)
+        suffix = samples[seq_idx][prefix_len:].tolist()
+        leaf = TrieNode(
+            tree_id=0,
+            start_idx=0,
+            end_idx=max(len(suffix) - 1, 0),
+            input_ids=suffix,
+            sequence_ids=[seq_idx],
+            ancestor=prefix_node,
+            flat_idx=len(trie_root.nodes),
+        )
+        trie_root.nodes.append(leaf)
+        # Key by sample index — never collides with other leaves regardless of
+        # the suffix's first token.
+        prefix_node.children[seq_idx] = leaf
 
-    # Compress and convert
-    trie = _compress_trie(root)
-    return convert_trie_to_tree_node(trie)
+        leaf_to_sample.append(seq_idx)
+        leaf_node_ids.append(leaf.flat_idx)
+
+    source = PrefixTrie(root=trie_root)
+    batch_size = max(leaf_to_sample) + 1 if leaf_to_sample else 0
+    subtrie = PrefixSubTrie(
+        source=source,
+        leaf_node_ids=leaf_node_ids,
+        leaf_to_sample=leaf_to_sample,
+        batch_size=batch_size,
+    )
+    return subtrie
