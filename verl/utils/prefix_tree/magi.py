@@ -50,9 +50,8 @@ from torch import Tensor
 from torch.nested._internal.nested_tensor import NestedTensor
 from torch.nn.attention.flex_attention import create_block_mask
 
-from verl.utils.device import get_torch_device
 from verl.utils.megatron_utils import unwrap_model
-from verl.utils.prefix_tree.dynamic import build_tree_dynamic
+from verl.utils.prefix_tree.dynamic import _insert_sequence, build_tree_dynamic
 from verl.utils.prefix_tree.tree import PrefixSubTrie
 from verl.utils.prefix_tree.utils import build_layout_from_tree_node
 
@@ -198,13 +197,13 @@ def build_prefix_tree_micro_batch(
         subtrie = cached_result
     elif segment_metadata is not None:
         # Fast path: hash-based tree building from pre-computed segment metadata
-        from verl.utils.prefix_tree.segment_grouper import validate_segment_metadata
-        from verl.utils.prefix_tree.tree import build_tree_from_segments
         from verl.utils.prefix_tree.dynamic import (
             _BuildNode,
             _compress_trie,
             convert_trie_to_tree_node,
         )
+        from verl.utils.prefix_tree.segment_grouper import validate_segment_metadata
+        from verl.utils.prefix_tree.tree import build_tree_from_segments
 
         if validate_segment_metadata(segment_metadata):
             subtrie = build_tree_from_segments(
@@ -705,8 +704,6 @@ def forward_prefix_tree(
             _diag_packed_tokens,
             _diag_rope_max,
         )
-
-    get_torch_device().synchronize()
 
     real_tokens = pt_batch.real_tokens
     if output_orig.shape[0] == 1:
