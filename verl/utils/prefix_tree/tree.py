@@ -306,12 +306,13 @@ class PrefixSubTrie(PrefixTrie):
 
 def build_tree_from_segments(
     samples: list,
-    segments: list[list[tuple[int, int]]],
+    segment_hashes: np.ndarray,
+    segment_lengths: np.ndarray,
     _BuildNode=None,
     _insert_sequence=None,
     _compress_trie=None,
     convert_trie_to_tree_node=None,
-) -> Optional["PrefixSubTrie"]:
+) -> Optional[PrefixSubTrie]:
     """Build tree from pre-computed segment metadata (fast path).
 
     Instead of token-by-token comparison, groups samples by their first segment
@@ -319,7 +320,8 @@ def build_tree_from_segments(
 
     Args:
         samples: List of token tensors.
-        segments: List of [(hash, length), ...] per sample from segment_grouper.
+        segment_hashes: Array of hash lists per sample (object dtype).
+        segment_lengths: Array of length lists per sample (object dtype).
         _BuildNode, _insert_sequence, _compress_trie, convert_trie_to_tree_node:
             Injected dependencies from dynamic.py to avoid circular imports.
 
@@ -332,7 +334,7 @@ def build_tree_from_segments(
     from verl.utils.prefix_tree.segment_grouper import group_by_segment_hash
 
     # Group by first segment (the shared prefix)
-    groups = group_by_segment_hash(segments, level=0)
+    groups = group_by_segment_hash(segment_hashes, segment_lengths, level=0)
 
     # Find largest group with shared prefix
     largest_group = max(groups.values(), key=len, default=[])

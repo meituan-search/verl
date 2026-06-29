@@ -34,6 +34,7 @@ local Q/K/V (pre-dispatch happens in ``forward_prefix_tree`` before the model ca
 from __future__ import annotations
 
 import functools
+import logging
 
 import torch
 from magi_attention.api import calc_attn
@@ -146,10 +147,13 @@ def apply_prefix_tree_patch() -> None:
         **kwargs,
     ):
         if magi_attention_key is not None:
+            logging.getLogger(__name__).warning("prefix_tree_patch: using MAGI attention path")
             return magi_attn_forward(query, key, value, magi_attention_key)
         if flex_attention_key is not None:
+            logging.getLogger(__name__).warning("prefix_tree_patch: using flex attention path")
             return flex_attn_forward(query, key, value, flex_attention_key)
         # FA3 path
+        logging.getLogger(__name__).warning("prefix_tree_patch: using FA3 attention path (fallback)")
         return _orig_te_forward(
             self,
             query,

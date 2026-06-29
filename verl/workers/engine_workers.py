@@ -14,6 +14,7 @@
 import functools
 import logging
 import os
+import time
 from contextlib import nullcontext
 from copy import deepcopy
 from functools import partial
@@ -272,6 +273,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
             mini_batch_size_per_gpu = mini_batch_size // self.engine.get_data_parallel_size()
 
         # make iterator
+        _t0 = time.perf_counter()
         dataloader = tu.make_iterator(
             data,
             mini_batch_size=mini_batch_size_per_gpu,
@@ -279,6 +281,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
             seed=seed + self.engine.get_data_parallel_rank(),
             dataloader_kwargs=dataloader_kwargs,
         )
+        _t1 = time.perf_counter()
+        logger.warning(f"train_mini_batch: make_iterator took {_t1 - _t0:.3f}s")
 
         with (
             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
@@ -288,7 +292,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
             output_lst = []
             total_num_iterations = data.shape[0] // mini_batch_size_per_gpu * epochs
 
+            _loop_start = time.perf_counter()
             for batch_idx, mini_batch_td in enumerate(dataloader):
+                _iter_start = time.perf_counter()
+                if batch_idx == 0:
+                    logger.warning(f"train_mini_batch: first iteration start after {_iter_start - _loop_start:.3f}s")
+
                 # add global token num
                 if "input_ids" in mini_batch_td:
                     global_token_num = mini_batch_td["input_ids"].offsets().diff().tolist()  # (total_nnz,)
@@ -309,7 +318,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     update_lr_scheduler=batch_idx == total_num_iterations - 1,
                     disable_auto_offload=True,
                 )
+                _t_train_start = time.perf_counter()
                 actor_output = self.train_batch(mini_batch_td)
+                _t_train_end = time.perf_counter()
+                logger.warning(f"train_mini_batch: batch_idx={batch_idx} overhead={_t_train_start - _iter_start:.3f}s train={_t_train_end - _t_train_start:.3f}s")
                 output_lst.append(actor_output)
 
             if self.engine.is_mp_src_rank_with_outputs():

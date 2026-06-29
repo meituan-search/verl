@@ -38,9 +38,9 @@ Examples:
         -> Share first two segments, diverge at third
 """
 
-from typing import Any, Callable, Hashable, Optional
+from typing import Hashable
 
-from torch import Tensor
+import numpy as np
 
 
 # Default hash function for string UUIDs
@@ -50,44 +50,46 @@ def _default_uid_hash(uid: str) -> int:
 
 def create_segment_metadata(
     segments: list[list[tuple[Hashable, int]]],
-    metadata: Optional[dict] = None,
-) -> dict:
-    """Create generic segment metadata for prefix-tree building.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Create segment metadata arrays for prefix-tree building.
 
     Args:
         segments: List of segments per sample. Each segment is (hash, length).
             Example: [[("uuid-0", 100), ("resp-0", 50)], [("uuid-0", 100), ("resp-1", 45)]]
-        metadata: Optional additional metadata (e.g., {"rollout_n": 8, "type": "grpo"})
 
     Returns:
-        Dict with segment metadata for non-tensor batch.
+        Tuple of (segment_hashes, segment_lengths) as numpy arrays with object dtype.
+        Supports fancy indexing during reorder.
     """
     # Convert hashes to integers for consistent comparison
-    int_segments = []
+    # Store as separate numpy arrays with object dtype to support fancy indexing
+    segment_hashes = []
+    segment_lengths = []
+
     for sample_segments in segments:
-        int_segs = []
+        hashes = []
+        lengths = []
         for hash_val, length in sample_segments:
             if isinstance(hash_val, str):
                 hash_val = _default_uid_hash(hash_val)
             elif not isinstance(hash_val, int):
                 hash_val = hash(hash_val) & 0xFFFFFFFF
-            int_segs.append((hash_val, length))
-        int_segments.append(int_segs)
+            hashes.append(hash_val)
+            lengths.append(length)
+        segment_hashes.append(hashes)
+        segment_lengths.append(lengths)
 
-    result = {
-        "segments": int_segments,
-        "num_samples": len(segments),
-    }
-    if metadata:
-        result["metadata"] = metadata
-    return result
+    return (
+        np.array(segment_hashes, dtype=object),
+        np.array(segment_lengths, dtype=object),
+    )
 
 
 def create_grpo_segment_metadata(
     prompt_uids: list[str],
     prompt_lengths: list[int],
     rollout_n: int,
-) -> dict:
+) -> tuple[np.ndarray, np.ndarray]:
     """Create segment metadata for GRPO prefix-tree grouping.
 
     In GRPO, each prompt generates `rollout_n` responses. Sequences from the
@@ -100,73 +102,58 @@ def create_grpo_segment_metadata(
         rollout_n: Number of rollouts per prompt.
 
     Returns:
-        Segment metadata dict compatible with build_tree_from_segments().
+        Tuple of (segment_hashes, segment_lengths) arrays compatible with build_tree_from_segments().
     """
     batch_size = len(prompt_uids)
     if batch_size % rollout_n != 0:
         raise ValueError(f"batch_size {batch_size} not divisible by rollout_n {rollout_n}")
 
     segments = []
-    for uid, p_len in zip(prompt_uids, prompt_lengths):
-        # GRPO: two segments - shared prompt + unique response
+    for uid, p_len in zip(prompt_uids, prompt_lengths, strict=False):
+        # GRPO: single segment - shared prompt
         segments.append([(uid, p_len)])
 
-    return create_segment_metadata(
-        segments,
-        metadata={"type": "grpo", "rollout_n": rollout_n},
-    )
+    return create_segment_metadata(segments)
 
 
 def group_by_segment_hash(
-    segments: list[list[tuple[int, int]]],
+    segment_hashes: np.ndarray,
+    segment_lengths: np.ndarray,
     level: int = 0,
 ) -> dict[int, list[tuple[int, int]]]:
     """Group samples by their segment hash at a given level.
 
     Args:
-        segments: List of [(hash, length), ...] per sample.
+        segment_hashes: Array of hash lists per sample (object dtype).
+        segment_lengths: Array of length lists per sample (object dtype).
         level: Which segment level to group by (0 = first segment).
 
     Returns:
         Dict mapping hash -> list of (sample_idx, segment_length).
     """
     groups: dict[int, list[tuple[int, int]]] = {}
-    for sample_idx, sample_segments in enumerate(segments):
-        if level >= len(sample_segments):
+    for sample_idx in range(len(segment_hashes)):
+        sample_hashes = segment_hashes[sample_idx]
+        sample_lengths = segment_lengths[sample_idx]
+        if level >= len(sample_hashes):
             continue
-        hash_val, length = sample_segments[level]
+        hash_val = int(sample_hashes[level])
+        length = int(sample_lengths[level])
         if hash_val not in groups:
             groups[hash_val] = []
         groups[hash_val].append((sample_idx, length))
     return groups
 
 
-def validate_segment_metadata(
-    metadata: dict,
-    expected_type: Optional[str] = None,
-    expected_rollout_n: Optional[int] = None,
-) -> bool:
-    """Validate segment metadata for tree building.
+def has_segment_metadata(batch_non_tensor: dict) -> bool:
+    """Check if segment metadata arrays are present for fast-path tree building.
 
     Args:
-        metadata: Dict from create_segment_metadata.
-        expected_type: Expected metadata type (e.g., "grpo").
-        expected_rollout_n: Expected rollout.n for GRPO.
+        batch_non_tensor: The non_tensor_batch dict from DataProto.
 
     Returns:
-        True if metadata is valid for fast-path tree building.
+        True if segment_hashes and segment_lengths arrays are present.
     """
-    if metadata is None or "segments" not in metadata:
+    if batch_non_tensor is None:
         return False
-
-    if expected_type:
-        meta = metadata.get("metadata", {})
-        if meta.get("type") != expected_type:
-            return False
-
-    if expected_rollout_n:
-        meta = metadata.get("metadata", {})
-        if meta.get("rollout_n") != expected_rollout_n:
-            return False
-
-    return True
+    return "segment_hashes" in batch_non_tensor and "segment_lengths" in batch_non_tensor

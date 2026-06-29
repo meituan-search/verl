@@ -51,7 +51,7 @@ from torch.nested._internal.nested_tensor import NestedTensor
 from torch.nn.attention.flex_attention import create_block_mask
 
 from verl.utils.megatron_utils import unwrap_model
-from verl.utils.prefix_tree.dynamic import _insert_sequence, build_tree_dynamic
+from verl.utils.prefix_tree.dynamic import build_tree_dynamic
 from verl.utils.prefix_tree.tree import PrefixSubTrie
 from verl.utils.prefix_tree.utils import build_layout_from_tree_node
 
@@ -149,7 +149,8 @@ def build_prefix_tree_micro_batch(
     tp_size: int = 1,
     cp_size: int = 1,
     cached_result: Optional[PrefixSubTrie] = None,
-    segment_metadata: Optional[dict] = None,
+    segment_hashes: Optional[np.ndarray] = None,
+    segment_lengths: Optional[np.ndarray] = None,
 ) -> Optional[PrefixTreeMagiBatch]:
     """Build a PrefixTreeMagiBatch from a micro-batch of NestedTensor sequences.
 
@@ -159,8 +160,9 @@ def build_prefix_tree_micro_batch(
     When ``cached_result`` (a :class:`PrefixSubTrie`) is provided, skips
     trie construction and uses the pre-computed subtrie.
 
-    When ``segment_metadata`` is provided (e.g., from GRPO grouping), uses
-    hash-based tree building instead of token-by-token detection.
+    When ``segment_hashes`` and ``segment_lengths`` are provided (e.g., from
+    GRPO grouping), uses hash-based tree building instead of token-by-token
+    detection.
 
     Returns None when there is no shared prefix, signalling the caller to
     fall back to the standard attention path.
@@ -174,8 +176,8 @@ def build_prefix_tree_micro_batch(
         attention_type: ``"flex"`` or ``"magi"``.
         tp_size / cp_size: Tensor / context parallel world sizes (for
             SP-divisibility padding).
-        segment_metadata: Optional dict with segment hashes from
-            :func:`create_grpo_segment_metadata` for fast hash-based grouping.
+        segment_hashes: Optional numpy array with segment hashes per sample.
+        segment_lengths: Optional numpy array with segment lengths per sample.
 
     Returns:
         PrefixTreeMagiBatch or None.
@@ -195,28 +197,25 @@ def build_prefix_tree_micro_batch(
 
     if cached_result is not None:
         subtrie = cached_result
-    elif segment_metadata is not None:
+    elif segment_hashes is not None and segment_lengths is not None:
         # Fast path: hash-based tree building from pre-computed segment metadata
         from verl.utils.prefix_tree.dynamic import (
             _BuildNode,
             _compress_trie,
+            _insert_sequence,
             convert_trie_to_tree_node,
         )
-        from verl.utils.prefix_tree.segment_grouper import validate_segment_metadata
         from verl.utils.prefix_tree.tree import build_tree_from_segments
 
-        if validate_segment_metadata(segment_metadata):
-            subtrie = build_tree_from_segments(
-                samples,
-                segments=segment_metadata["segments"],
-                _BuildNode=_BuildNode,
-                _insert_sequence=_insert_sequence,
-                _compress_trie=_compress_trie,
-                convert_trie_to_tree_node=convert_trie_to_tree_node,
-            )
-        else:
-            # Fallback to token-by-token detection
-            subtrie = build_tree_dynamic(samples)
+        subtrie = build_tree_from_segments(
+            samples,
+            segment_hashes=segment_hashes,
+            segment_lengths=segment_lengths,
+            _BuildNode=_BuildNode,
+            _insert_sequence=_insert_sequence,
+            _compress_trie=_compress_trie,
+            convert_trie_to_tree_node=convert_trie_to_tree_node,
+        )
     else:
         # Default: token-by-token trie detection
         subtrie = build_tree_dynamic(samples)
@@ -468,6 +467,8 @@ _PREFIX_TREE_KEYS = frozenset(
         "prefix_tree_attention",
         "prefix_tree_subtree",
         "prefix_tree_no_expand_middle",
+        "segment_hashes",
+        "segment_lengths",
     }
 )
 
@@ -522,20 +523,27 @@ def read_prefix_tree_batch_config(batch, tu, use_remove_padding: bool = True) ->
 def get_prefix_tree_logits_args(batch, tu) -> dict:
     """Build the prefix-tree fragment for logits_processor_args from a batch.
 
-    Reads use_prefix_tree, prefix_tree_attention, and prefix_tree_subtree
-    from *batch* internally and returns the ready-to-unpack dict.
+    Reads use_prefix_tree, prefix_tree_attention, prefix_tree_subtree,
+    and segment metadata from *batch* internally and returns the ready-to-unpack dict.
     """
     use_prefix_tree = tu.get_non_tensor_data(batch, key="use_prefix_tree", default=False)
     if not use_prefix_tree:
         return {}
     prefix_tree_attention = tu.get_non_tensor_data(batch, key="prefix_tree_attention", default="flex")
-    return {
+    result = {
         "use_prefix_tree": True,
         "prefix_tree_attention": prefix_tree_attention,
         "prefix_tree_subtree": tu.get_non_tensor_data(
             batch, "prefix_tree_subtree", default=None
         ),  # TODO: use PrefixSubTrie
     }
+    # Add segment metadata for fast-path tree building if available
+    segment_hashes = tu.get_non_tensor_data(batch, "segment_hashes", default=None)
+    segment_lengths = tu.get_non_tensor_data(batch, "segment_lengths", default=None)
+    if segment_hashes is not None and segment_lengths is not None:
+        result["segment_hashes"] = segment_hashes
+        result["segment_lengths"] = segment_lengths
+    return result
 
 
 def try_forward_prefix_tree(
@@ -605,6 +613,22 @@ def build_prefix_tree_batch(model, input_ids, logits_processor_args, vision_mode
     position_ids_nested = (logits_processor_args or {}).get("position_ids", None)
     cached_result = (logits_processor_args or {}).get("prefix_tree_subtree")  # TODO: use PrefixSubTrie
 
+    # Extract segment metadata for fast-path tree building
+    # Stored as NonTensorStack (list of lists), convert to numpy object array
+    _segment_hashes = (logits_processor_args or {}).get("segment_hashes", None)
+    _segment_lengths = (logits_processor_args or {}).get("segment_lengths", None)
+    if _segment_hashes is not None:
+        # NonTensorStack needs .tolist() before numpy conversion
+        segment_hashes = np.array(
+            _segment_hashes.tolist() if hasattr(_segment_hashes, "tolist") else _segment_hashes, dtype=object
+        )
+        segment_lengths = np.array(
+            _segment_lengths.tolist() if hasattr(_segment_lengths, "tolist") else _segment_lengths, dtype=object
+        )
+    else:
+        segment_hashes = None
+        segment_lengths = None
+
     return build_prefix_tree_micro_batch(
         model,
         input_ids,
@@ -614,6 +638,8 @@ def build_prefix_tree_batch(model, input_ids, logits_processor_args, vision_mode
         tp_size=mpu.get_tensor_model_parallel_world_size(),
         cp_size=mpu.get_context_parallel_world_size(),
         cached_result=cached_result,
+        segment_hashes=segment_hashes,
+        segment_lengths=segment_lengths,
     )
 
 
