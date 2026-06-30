@@ -44,7 +44,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.use_fused_kernels=False \
     actor_rollout_ref.model.use_prefix_tree=True \
     actor_rollout_ref.model.prefix_tree_attention=magi \
-    actor_rollout_ref.model.prefix_tree_dynbsz_length_estimator=area \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.ppo_mini_batch_size=128 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \

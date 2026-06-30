@@ -43,9 +43,6 @@ use_remove_padding: True
 use_prefix_tree: false
 prefix_tree_attention: magi
 
-# dynbsz budget estimator when use_prefix_tree=true: "length" (flat dedup tokens) or "area" (sqrt of non-masked attention area)
-prefix_tree_dynbsz_length_estimator: length
-
 # Set to positive value to enable LoRA (e.g., 32)
 lora_rank: 0
 

@@ -57,8 +57,6 @@ data:
   # "flex"  — PyTorch flex_attention (no extra deps)
   # "magi"  — MAGI attention (default; requires magi_attention installed, set MAGI_ATTENTION_KERNEL_BACKEND)
   prefix_tree_attention: magi
-  # dynbsz budget estimator: "length" (flat dedup tokens) or "area" (sqrt of non-masked attention area)
-  prefix_tree_dynbsz_length_estimator: length
 
 # Checkpoint configuration
 checkpoint:
