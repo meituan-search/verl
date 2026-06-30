@@ -53,6 +53,7 @@ __all__ = [
     "TrieNode",
     "greedy_build_tries",
     "mbs_groups_from_trie",
+    "mbs_groups_from_uid",
     "trie_group_attn_area",
     "convert_trie_to_tree_node",
     # Load balancing
@@ -197,18 +198,14 @@ def greedy_build_tries(
             for tree_id, tree in enumerate(forests):
                 additional = _count_additional_nodes(tree["root"], seq)
                 if tree["nodes"] + additional <= max_tokens_per_tree:
-                    actual_new = _insert_sequence(
-                        tree["root"], tree["all_nodes"], seq, tree_id, seq_id
-                    )
+                    actual_new = _insert_sequence(tree["root"], tree["all_nodes"], seq, tree_id, seq_id)
                     tree["nodes"] += actual_new
                     inserted = True
                     break
             if inserted:
                 continue
             if len(seq) > max_tokens_per_tree:
-                raise ValueError(
-                    f"Sequence length {len(seq)} exceeds max_tokens_per_tree {max_tokens_per_tree}"
-                )
+                raise ValueError(f"Sequence length {len(seq)} exceeds max_tokens_per_tree {max_tokens_per_tree}")
             new_tree_id = len(forests)
             new_root = _BuildNode(new_tree_id, -1, -1)
             all_nodes: list[_BuildNode] = []
@@ -715,9 +712,7 @@ def prune_trie(
     if not leaf_to_sample:
         return None
     if set(leaf_to_sample) != keep_leaf_ids:
-        _logging.getLogger(__name__).warning(
-            "prefix_tree: prune_trie: unmatched sequences — FA3 fallback"
-        )
+        _logging.getLogger(__name__).warning("prefix_tree: prune_trie: unmatched sequences — FA3 fallback")
         return None
     batch_size = max(leaf_to_sample) + 1 if leaf_to_sample else 0
     subtrie = PrefixSubTrie(
@@ -876,6 +871,76 @@ def compute_prefix_tree_metrics(
     return result
 
 
+def mbs_groups_from_uid(
+    uid_list: list,
+    trie: TrieNode,
+    max_token_len: int,
+) -> list[list[int]]:
+    """Group samples into micro-batches using uid as the atomic unit.
+
+    Same-uid samples (same prompt → shared prefix) stay together so the trie
+    can dedup them.  Unlike :func:`mbs_groups_from_trie` (sequential DFS fill,
+    prefix-locality-first), this partitions uid-groups into a fixed number of
+    micro-batches using Karmarkar-Karp with **balance as the objective** —
+    minimising the max−min flat-token gap across mbs to reduce PP bubble.
+
+    Args:
+        uid_list: Per-sample uids.  Same uid = same prompt.  Samples with the
+            same uid must be contiguous (guaranteed by ``batch.repeat`` +
+            DFS reorder in ``reorder_and_balance_for_prefix_tree``).
+        trie: Root of the compressed trie (``trie.is_root == True``).
+        max_token_len: Flat (deduplicated) token budget per micro-batch.
+
+    Returns:
+        List of micro-batches, each a list of sample indices.  Same-uid
+        samples are guaranteed to be in the same micro-batch.
+    """
+    # 1. Build atomic uid-groups (contiguous same-uid blocks).
+    uid_groups: list[list[int]] = []
+    current_uid = None
+    current_indices: list[int] = []
+    for i, uid in enumerate(uid_list):
+        if uid != current_uid:
+            if current_indices:
+                uid_groups.append(current_indices)
+            current_uid = uid
+            current_indices = [i]
+        else:
+            current_indices.append(i)
+    if current_indices:
+        uid_groups.append(current_indices)
+
+    if not uid_groups:
+        return []
+
+    # 2. Flat (deduplicated) token cost per uid-group.
+    group_flat = [trie_group_flat_tokens(g, trie) for g in uid_groups]
+
+    total_flat = sum(group_flat)
+    n_groups = len(uid_groups)
+
+    # 3. Determine number of micro-batches from the flat-token budget.
+    n_mb = max(1, min(n_groups, -(-total_flat // max_token_len)))  # ceildiv
+
+    # 4. Karmarkar-Karp partition uid-groups into n_mb balanced mbs.
+    from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions
+
+    group_partitions = get_seqlen_balanced_partitions(
+        seqlen_list=group_flat,
+        k_partitions=n_mb,
+        equal_size=False,
+    )
+
+    # 5. Convert group partitions → sample-index lists.
+    mbs: list[list[int]] = []
+    for group_partition in group_partitions:
+        sample_indices: list[int] = []
+        for group_idx in group_partition:
+            sample_indices.extend(uid_groups[group_idx])
+        mbs.append(sample_indices)
+    return mbs
+
+
 def prepare_prefix_tree_micro_batches(
     data,
     sp_size: int,
@@ -905,7 +970,17 @@ def prepare_prefix_tree_micro_batches(
     max_token_len = max_token_len_per_gpu * sp_size
 
     trie = tu.get_non_tensor_data(data, "prefix_tree", default=None)
-    if trie is not None:
+    uid_list = tu.get_non_tensor_data(data, "uid", default=None)
+    if trie is not None and uid_list is not None:
+        # Uid-based grouping: same-prompt samples stay together (atomic), and
+        # uid-groups are balanced across mbs via Karmarkar-Karp on flat tokens.
+        # This replaces DFS-first-fit when uid metadata is available.
+        batch_idx_list = mbs_groups_from_uid(
+            uid_list=list(uid_list),
+            trie=trie,
+            max_token_len=max_token_len,
+        )
+    elif trie is not None:
         batch_idx_list = mbs_groups_from_trie(
             trie, max_token_len, use_n2_cost=use_n2_cost
         )  # TODO: use PrefixSubTrie / PrefixTrie interface
