@@ -850,17 +850,7 @@ def prepare_prefix_tree_micro_batches(
     max_token_len = max_token_len_per_gpu * sp_size
 
     trie = tu.get_non_tensor_data(data, "prefix_tree", default=None)
-    uid_list = tu.get_non_tensor_data(data, "uid", default=None)
-    if trie is not None and uid_list is not None:
-        # Uid-based grouping: same-prompt samples stay together (atomic), and
-        # uid-groups are balanced across mbs via Karmarkar-Karp on flat tokens.
-        # This replaces DFS-first-fit when uid metadata is available.
-        batch_idx_list = mbs_groups_from_uid(
-            uid_list=list(uid_list),
-            trie=trie,
-            max_token_len=max_token_len,
-        )
-    elif trie is not None:
+    if trie is not None:
         batch_idx_list = mbs_groups_from_trie(
             trie, max_token_len
         )  # TODO: use PrefixSubTrie / PrefixTrie interface
