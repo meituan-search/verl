@@ -55,6 +55,7 @@ __all__ = [
     "mbs_groups_from_trie",
     "mbs_groups_from_uid",
     "convert_trie_to_tree_node",
+    "subtrie_view",
     # Load balancing
     "trie_group_flat_tokens",
     "get_prefix_tree_mbs_dp_partitions",
@@ -222,7 +223,7 @@ def convert_trie_to_tree_node(
     """Convert a compressed trie to a :class:`PrefixSubTrie`.
 
     Returns ``None`` when there's no real sharing (no children or multi-root).
-    Delegates to :func:`prune_trie` with all sequence IDs.
+    Delegates to :func:`subtrie_view` with all sequence IDs.
     """
     if not trie.children:
         _logging.getLogger(__name__).warning(
@@ -236,7 +237,7 @@ def convert_trie_to_tree_node(
         )
         return None
     all_seq_ids = {s for child in trie.children.values() for s in _trie_seq_ids(child)}
-    return prune_trie(trie, all_seq_ids)
+    return subtrie_view(trie, all_seq_ids)
 
 
 def build_tree_dynamic(samples: list[Tensor]) -> Optional[PrefixSubTrie]:
@@ -531,7 +532,7 @@ def mbs_groups_from_trie(
 
     Budget is flat (deduplicated) tokens.  When a trie leaf holds multiple
     sequence_ids (identical sequences), all IDs stay in the same DFS group.
-    prune_trie returns None for that group (len(kept)>1), causing FA3 fallback
+    subtrie_view returns None for that group (len(kept)>1), causing FA3 fallback
     for that one group only.  Keeping duplicates in-group avoids an extra
     singleton group that would cause same_micro_num_in_dp to pad the other DP
     rank, double-counting its gradients.
@@ -557,7 +558,7 @@ def mbs_groups_from_trie(
                     new_nodes = path
                     inc = sum(len(n.input_ids) for n in new_nodes)
                 # Keep all sequence_ids (including duplicates) in the same group.
-                # Duplicates land in the same group as their originals → prune_trie
+                # Duplicates land in the same group as their originals → subtrie_view
                 # returns None for that group → FA3 fallback for that one group.
                 # This avoids creating an extra singleton group that would upset
                 # same_micro_num_in_dp and double-count gradients on the other rank.
@@ -580,7 +581,7 @@ def mbs_groups_from_trie(
     return all_groups
 
 
-def prune_trie(
+def subtrie_view(
     trie: TrieNode,
     keep_leaf_ids: set[int],
     source: Optional[PrefixTrie] = None,
@@ -629,7 +630,7 @@ def prune_trie(
     if not leaf_to_sample:
         return None
     if set(leaf_to_sample) != keep_leaf_ids:
-        _logging.getLogger(__name__).warning("prefix_tree: prune_trie: unmatched sequences — FA3 fallback")
+        _logging.getLogger(__name__).warning("prefix_tree: subtrie_view: unmatched sequences — FA3 fallback")
         return None
     batch_size = max(leaf_to_sample) + 1 if leaf_to_sample else 0
     subtrie = PrefixSubTrie(
@@ -787,29 +788,26 @@ def compute_prefix_tree_metrics(
 
 def mbs_groups_from_uid(
     uid_list: list,
-    trie: TrieNode,
-    max_token_len: int,
+    trie: TrieNode = None,
+    max_token_len: int = 0,
 ) -> list[list[int]]:
     """Group samples into micro-batches using uid as the atomic unit.
 
-    Same-uid samples (same prompt → shared prefix) stay together so the trie
-    can dedup them.  Unlike :func:`mbs_groups_from_trie` (sequential DFS fill,
-    prefix-locality-first), this partitions uid-groups into a fixed number of
-    micro-batches using Karmarkar-Karp with **balance as the objective** —
-    minimising the max−min flat-token gap across mbs to reduce PP bubble.
+    Each uid-group (same prompt → shared prefix) becomes exactly one
+    micro-batch.  Different uid-groups are never merged because they don't
+    share a prefix — merging them would create a multi-family flat layout
+    that breaks the prefix-tree MAGI key construction.
 
     Args:
         uid_list: Per-sample uids.  Same uid = same prompt.  Samples with the
             same uid must be contiguous (guaranteed by ``batch.repeat`` +
             DFS reorder in ``reorder_and_balance_for_prefix_tree``).
-        trie: Root of the compressed trie (``trie.is_root == True``).
-        max_token_len: Flat (deduplicated) token budget per micro-batch.
+        trie: Unused — kept for backward compatibility.
+        max_token_len: Unused — kept for backward compatibility.
 
     Returns:
-        List of micro-batches, each a list of sample indices.  Same-uid
-        samples are guaranteed to be in the same micro-batch.
+        List of micro-batches, each containing exactly one uid-group.
     """
-    # 1. Build atomic uid-groups (contiguous same-uid blocks).
     uid_groups: list[list[int]] = []
     current_uid = None
     current_indices: list[int] = []
@@ -824,35 +822,7 @@ def mbs_groups_from_uid(
     if current_indices:
         uid_groups.append(current_indices)
 
-    if not uid_groups:
-        return []
-
-    # 2. Flat (deduplicated) token cost per uid-group.
-    group_flat = [trie_group_flat_tokens(g, trie) for g in uid_groups]
-
-    total_flat = sum(group_flat)
-    n_groups = len(uid_groups)
-
-    # 3. Determine number of micro-batches from the flat-token budget.
-    n_mb = max(1, min(n_groups, -(-total_flat // max_token_len)))  # ceildiv
-
-    # 4. Karmarkar-Karp partition uid-groups into n_mb balanced mbs.
-    from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions
-
-    group_partitions = get_seqlen_balanced_partitions(
-        seqlen_list=group_flat,
-        k_partitions=n_mb,
-        equal_size=False,
-    )
-
-    # 5. Convert group partitions → sample-index lists.
-    mbs: list[list[int]] = []
-    for group_partition in group_partitions:
-        sample_indices: list[int] = []
-        for group_idx in group_partition:
-            sample_indices.extend(uid_groups[group_idx])
-        mbs.append(sample_indices)
-    return mbs
+    return uid_groups
 
 
 def prepare_prefix_tree_micro_batches(
@@ -968,7 +938,7 @@ def prepare_prefix_tree_micro_batches(
     if trie is not None:
         pt_global = PrefixTrie(root=trie)
         for idx, mb in zip(batch_idx_list, micro_batches, strict=False):
-            subtree = prune_trie(trie, set(idx), source=pt_global)
+            subtree = subtrie_view(trie, set(idx), source=pt_global)
             if subtree is not None:
                 # remap global sample indices to local micro-batch indices
                 global_to_local = {g: loc for loc, g in enumerate(idx)}

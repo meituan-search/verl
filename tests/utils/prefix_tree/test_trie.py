@@ -23,7 +23,7 @@ from verl.utils.prefix_tree.dynamic import (
     convert_trie_to_tree_node,
     greedy_build_tries,
     mbs_groups_from_trie,
-    prune_trie,
+    subtrie_view,
     trie_dfs_leaf_order,
     trie_to_leaf_ids,
 )
@@ -142,7 +142,7 @@ class TestMbsGroupsFromTrie:
 
 
 # ---------------------------------------------------------------------------
-# prune_trie
+# subtrie_view
 # ---------------------------------------------------------------------------
 
 
@@ -154,7 +154,7 @@ class TestPruneTrie:
     def test_prune_all_leaves(self):
         raw = [[1, 2, 3, 4], [1, 2, 3, 5], [1, 2, 6, 7]]
         trie = self._build_trie(raw)
-        result = prune_trie(trie, {0, 1, 2})
+        result = subtrie_view(trie, {0, 1, 2})
         assert result is not None
         assert isinstance(result, PrefixSubTrie)
         assert len(result.leaf_to_sample) == 3
@@ -163,7 +163,7 @@ class TestPruneTrie:
     def test_prune_single_leaf(self):
         raw = [[1, 2, 3, 4], [1, 2, 3, 5], [1, 2, 6, 7]]
         trie = self._build_trie(raw)
-        result = prune_trie(trie, {0})
+        result = subtrie_view(trie, {0})
         assert result is not None
         assert isinstance(result, PrefixSubTrie)
         assert result.leaf_to_sample == [0]
@@ -174,7 +174,7 @@ class TestPruneTrie:
         raw = [[1, 2, 3, 4], [1, 2, 3, 5], [1, 2, 6, 7]]
         trie = self._build_trie(raw)
         # Keep 0 and 1 (share [1,2,3]), drop 2
-        result = prune_trie(trie, {0, 1})
+        result = subtrie_view(trie, {0, 1})
         assert result is not None
         assert isinstance(result, PrefixSubTrie)
         assert set(result.leaf_to_sample) == {0, 1}
@@ -182,20 +182,20 @@ class TestPruneTrie:
     def test_prune_empty(self):
         raw = [[1, 2, 3]]
         trie = self._build_trie(raw)
-        result = prune_trie(trie, set())
+        result = subtrie_view(trie, set())
         assert result is None
 
     def test_prune_no_match(self):
         raw = [[1, 2, 3]]
         trie = self._build_trie(raw)
-        result = prune_trie(trie, {99})
+        result = subtrie_view(trie, {99})
         assert result is None
 
     def test_prune_leaf_node_ids(self):
         """leaf_node_ids reference correct flat_idx values in the source trie."""
         raw = [[1, 2, 3, 4], [1, 2, 3, 5], [1, 2, 6, 7]]
         trie = self._build_trie(raw)
-        result = prune_trie(trie, {0, 2})
+        result = subtrie_view(trie, {0, 2})
         assert result is not None
         assert len(result.leaf_to_sample) == 2
         assert set(result.leaf_to_sample) == {0, 2}
@@ -401,7 +401,7 @@ class TestAttentionSpec:
         Keep samples {0, 1, 2, 3}: leaf0, leaf1+leaf2 (under child_a), leaf3 (under child_b).
         child_b prunes from 4 leaves to 1 leaf.
         """
-        from verl.utils.prefix_tree.dynamic import greedy_build_tries, prune_trie
+        from verl.utils.prefix_tree.dynamic import greedy_build_tries, subtrie_view
 
         raw = [
             [1, 2, 3, 10, 11],
@@ -415,7 +415,7 @@ class TestAttentionSpec:
         tries, _ = greedy_build_tries(raw, max_tokens_per_tree=1000)
         trie = tries[0]
 
-        result = prune_trie(trie, {0, 1, 2, 3})
+        result = subtrie_view(trie, {0, 1, 2, 3})
         assert result is not None
         assert isinstance(result, PrefixSubTrie)
         assert len(result.leaf_to_sample) == 4

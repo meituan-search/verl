@@ -3,13 +3,13 @@ import pickle, sys, os
 sys.path.insert(0, os.getcwd())
 
 import torch
-from verl.utils.prefix_tree.dynamic import greedy_build_tries, prune_trie
+from verl.utils.prefix_tree.dynamic import greedy_build_tries, subtrie_view
 from verl.utils.prefix_tree.utils import build_layout_from_tree_node
 
 
 def make_subtrie(raw_seqs, keep_ids):
     tries, _ = greedy_build_tries(raw_seqs, max_tokens_per_tree=10000)
-    subtrie = prune_trie(tries[0], set(keep_ids))
+    subtrie = subtrie_view(tries[0], set(keep_ids))
     assert subtrie is not None
     return subtrie
 
@@ -41,7 +41,7 @@ def test_size():
     raw = [prompt + list(range(5000+i*50, 5000+i*50+200)) for i in range(8)]
     tries, _ = greedy_build_tries(raw, max_tokens_per_tree=1_000_000)
     full_size = len(pickle.dumps(tries[0]))
-    sub = prune_trie(tries[0], {0,1,2,3})
+    sub = subtrie_view(tries[0], {0,1,2,3})
     sub_size = len(pickle.dumps(sub))
     ratio = sub_size / full_size
     print(f"  full trie: {full_size:,} bytes  subtrie(4/8): {sub_size:,} bytes  ratio={ratio:.2f}")

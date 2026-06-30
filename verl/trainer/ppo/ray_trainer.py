@@ -72,32 +72,6 @@ from verl.workers.rollout.llm_server import LLMServerManager
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
-def _attach_segment_metadata(batch: DataProto, rollout_n: int) -> None:
-    """Attach segment metadata for prefix-tree fast path (GRPO).
-
-    Creates segment_hashes and segment_lengths from the batch's prompt UIDs and
-    prompt lengths, storing them in non_tensor_batch as numpy object arrays so
-    they survive reorder()/chunk()/to_tensordict() round-trips.
-    """
-    from verl.utils.prefix_tree.segment_grouper import create_grpo_segment_metadata
-
-    if rollout_n < 2:
-        return
-    prompt_uids = batch.non_tensor_batch.get("prompt_uid", None)
-    if prompt_uids is None:
-        return
-    # Shared prefix length = valid prompt tokens (excludes response).
-    attention_mask = batch.batch["attention_mask"]
-    response_length = batch.batch["responses"].size(1)
-    prompt_lengths = attention_mask[:, :-response_length].sum(dim=-1).cpu().tolist()
-    segment_hashes, segment_lengths = create_grpo_segment_metadata(
-        prompt_uids=list(prompt_uids),
-        prompt_lengths=prompt_lengths,
-        rollout_n=rollout_n,
-    )
-    batch.non_tensor_batch["segment_hashes"] = segment_hashes
-    batch.non_tensor_batch["segment_lengths"] = segment_lengths
-
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
     """Apply KL penalty to the token-level rewards.
@@ -1463,7 +1437,6 @@ class RayPPOTrainer:
                     batch = batch.union(gen_batch_output)
 
                     # Create segment metadata for prefix-tree fast path (GRPO)
-                    _attach_segment_metadata(batch, rollout_n=self.config.actor_rollout_ref.rollout.n)
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.

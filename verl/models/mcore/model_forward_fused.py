@@ -14,8 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections import OrderedDict
 import logging as _log
+from collections import OrderedDict
 from typing import Optional
 
 import megatron.core as mcore
@@ -152,11 +152,14 @@ def fused_forward_model_engine(vision_model: bool = False):
         pre_process = unwrap_model(model).pre_process
         post_process = unwrap_model(model).post_process
 
-        # Prefix-tree (MAGI) fused path: only when post_process (PP=1 or last
-        # stage).  Intermediate PP stages fall through to standard fused.
+        # Prefix-tree (MAGI) fused path: all PP stages use MAGI-dispatched tokens.
+        # - pre_process=True (stage 0): dispatch → embedding → MAGI → raw hidden out
+        # - pre_process=False, post_process=False (intermediate): recv CP-local →
+        #   MAGI → raw hidden out
+        # - post_process=True (last stage): recv CP-local → MAGI → undispatch → LCE
         _pt_args = logits_processor_args or {}
         use_prefix_tree = _pt_args.get("use_prefix_tree", False)
-        if use_prefix_tree and post_process and not vision_model:
+        if use_prefix_tree and not vision_model:
             from verl.utils.prefix_tree.magi import fuse_try_forward_prefix_tree
 
             output = fuse_try_forward_prefix_tree(
@@ -170,8 +173,7 @@ def fused_forward_model_engine(vision_model: bool = False):
             if output is not None:
                 return output
             _log.getLogger(__name__).warning(
-                "prefix_tree: fuse_try_forward_prefix_tree returned None — "
-                "falling back to standard fused path"
+                "prefix_tree: fuse_try_forward_prefix_tree returned None — falling back to standard fused path"
             )
 
         fp8 = unwrap_model(model).config.fp8
@@ -259,20 +261,50 @@ def _fused_GPTModel_forward(
     **kwargs,
 ) -> CausalLMOutputForPPO:
     """
-    Patch self._postprocess in forward for GPT models to enable fused kernel support.
-    https://github.com/NVIDIA/Megatron-LM/blob/core_v0.13.0/megatron/core/models/gpt/gpt_model.py
+    Fused forward: vocab projection via linear_cross_entropy (no logits tensor).
 
-    TODO: Currently we still need to patch `forward` because we need to pass `temperature`
-    explicitly to `self._postprocess` when calling, maybe there can be a better way to handle this?
+    Handles both the standard fused path and the fused prefix-tree path:
+    - Prefix-tree (``magi_attention_key`` + ``pt_batch`` in kwargs): installs
+      the rope override and decoder-key plumbing, then delegates to
+      ``fuse_forward_body`` (magi.py).
+    - Standard fused (no attention key): runs preprocess → decoder → LCE.
     """
 
     inference_context = deprecate_inference_params(inference_context, inference_params)
 
-    # Prefix-tree (MAGI): pull pt_batch out of kwargs before decoder — decoder
-    # doesn't accept it.  magi_attention_key / flex_attention_key stay in kwargs
-    # and flow to the attention layers via **kwargs below.
+    # Prefix-tree fused path: rope override + decoder key + fuse_forward_body.
+    # Pop pt_batch + attention keys before anything else — decoder doesn't
+    # accept them, and prefix_tree_decoder_key_context injects the key so
+    # passing it again via **kwargs would duplicate it.
     pt_batch = kwargs.pop("pt_batch", None)
-    _magi_key = kwargs.get("magi_attention_key", None)
+    _magi_key = kwargs.pop("magi_attention_key", None)
+    _flex_key = kwargs.pop("flex_attention_key", None)
+
+    if (_magi_key is not None or _flex_key is not None) and pt_batch is not None:
+        from verl.utils.prefix_tree.magi import (
+            fuse_forward_body,
+            prefix_tree_decoder_key_context,
+            prefix_tree_rope_context,
+        )
+
+        with prefix_tree_rope_context(model, position_ids), prefix_tree_decoder_key_context(
+            model, _magi_key, _flex_key
+        ):
+            return fuse_forward_body(
+                model,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                temperature=temperature,
+                pt_batch=pt_batch,
+                magi_key=_magi_key,
+                flex_key=_flex_key,
+                decoder_input=decoder_input,
+                packed_seq_params=packed_seq_params,
+                extra_block_kwargs=extra_block_kwargs,
+                inference_context=inference_context,
+            )
 
     preproc_output = model._preprocess(
         input_ids=input_ids,
@@ -309,14 +341,7 @@ def _fused_GPTModel_forward(
         attentions=None,
     )
 
-    # Prefix-tree (MAGI): undispatch local hidden → tree-packed → per-sample
-    # flat order matching labels_flat.  Skip the SP gather — MAGI handles its
-    # own parallelism; the decoder output is already in the right layout.
-    if _magi_key is not None and pt_batch is not None:
-        from verl.utils.prefix_tree.magi import fuse_undispatch_and_expand_hidden
-
-        hidden_states = fuse_undispatch_and_expand_hidden(hidden_states, _magi_key, pt_batch)
-    elif model.config.sequence_parallel:
+    if model.config.sequence_parallel:
         hidden_states = gather_from_sequence_parallel_region(hidden_states)
 
     # Get the output weight - use embedding weight if output_layer is None or weight is shared

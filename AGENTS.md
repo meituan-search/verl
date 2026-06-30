@@ -72,6 +72,80 @@ Review comments from agent bots (e.g., gemini-code-assist) can be outdated or wr
 
 ---
 
+## Profiling with nsys
+
+verl has built-in nsys profiling support via `global_profiler` config. To profile actor updates:
+
+```bash
+# Profile step 2 (skip step 1 warmup), save to ~/nsys_profile/
+python3 -m verl.trainer.main_ppo \
+    +global_profiler.tool=nsys \
+    "+global_profiler.steps=[2]" \
+    ++global_profiler.save_path="$HOME/nsys_profile/magi_profile" \
+    ++global_profiler.global_tool_config.nsys.discrete=true \
+    '++global_profiler.global_tool_config.nsys.worker_nsight_options.trace=cuda,nvtx,cublas,ucx' \
+    '++global_profiler.global_tool_config.nsys.worker_nsight_options.cuda-memory-usage=true' \
+    '++global_profiler.global_tool_config.nsys.worker_nsight_options.cuda-graph-trace=graph' \
+    '++global_profiler.global_tool_config.nsys.worker_nsight_options.capture-range=cudaProfilerApi' \
+    ++actor_rollout_ref.actor.profiler.enable=true \
+    ++actor_rollout_ref.actor.profiler.all_ranks=true \
+    ... # other config
+```
+
+Key requirements:
+- `worker_nsight_options` must be set when using nsys with `profile_steps`
+- `capture-range=cudaProfilerApi` is required for verl's profiler integration
+- Use `discrete=true` for single-step profiling (avoids large files)
+- Skip step 1 (warmup) to avoid initialization overhead in profile
+
+See `prefix_script/run_grpo_longreason_magi_profile.sh` for a complete example.
+
+---
+
+## Prefix-Tree (MAGI) Architecture
+
+### Overview
+The prefix-tree attention system (MAGI) enables prefix-deduplicated training for LLMs. It packs multiple sequences with shared prefixes into a flat layout where shared tokens are processed once.
+
+### Key Components
+
+**Data Structures** (`verl/utils/prefix_tree/tree.py`):
+- `TrieNode` — compressed trie node with `flat_idx`, `input_ids`, `ancestor`, `children`
+- `PrefixTrie` — full batch view with flat `nodes` list indexed by `flat_idx`
+- `PrefixSubTrie` — per-micro-batch view, serializable via `__getstate__`/`__setstate__`
+
+**Layout Building** (`verl/utils/prefix_tree/utils.py`):
+- `build_layout_from_tree_node()` — builds flat token layout and attention ranges
+- `PrefixTreeParams` — holds `q_ranges`, `k_ranges`, `mask_types`, packed tensors
+- Pre-packed labels avoid `torch.roll` cross-boundary issues
+
+**MAGI Integration** (`verl/utils/prefix_tree/magi.py`):
+- Dispatch happens **once per forward** (not per-layer)
+- `get_position_ids(magi_key)` returns local token indices for CP rank
+- Model receives pre-dispatched `local_input_ids` / `local_position_ids`
+- `undispatch()` gathers local logits back to full layout for loss computation
+
+**Attention Patch** (`verl/utils/prefix_tree/prefix_tree_patch_impl.py`):
+- Patches `TEDotProductAttention.forward` to add MAGI/flex branches
+- `magi_attn_forward()` calls `calc_attn()` from `magi_attention` package
+- Fallback to FA3 if neither MAGI nor flex key is provided
+
+### Configuration
+```bash
+# Enable prefix-tree with MAGI attention
+actor_rollout_ref.model.use_prefix_tree=True
+actor_rollout_ref.model.prefix_tree_attention=magi  # or "flex"
+```
+
+### Key Files
+- `verl/utils/prefix_tree/magi.py` — main forward path
+- `verl/utils/prefix_tree/tree.py` — data structures
+- `verl/utils/prefix_tree/utils.py` — layout builder
+- `verl/utils/prefix_tree/prefix_tree_patch_impl.py` — Megatron patches
+- `prefix_script/run_grpo_*_magi*.sh` — example training scripts
+
+---
+
 ## Domain-Specific Guides
 
 Do not modify code in these areas without first reading and following the

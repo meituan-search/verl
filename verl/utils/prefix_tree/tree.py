@@ -119,7 +119,7 @@ class PrefixTrie:
     ) -> PrefixSubTrie:
         """Return a PrefixSubTrie view for the given leaf flat_idx values.
 
-        Replaces ``prune_trie(trie, keep_leaf_ids)``.
+        Replaces ``subtrie_view(trie, keep_leaf_ids)``.
         """
         return PrefixSubTrie(
             source=self,
@@ -258,8 +258,10 @@ class PrefixSubTrie(PrefixTrie):
             node = by_flat_idx[flat_idx]
             if ancestor_flat_idx != -1 and ancestor_flat_idx in by_flat_idx:
                 node.ancestor = by_flat_idx[ancestor_flat_idx]
-                first_token = input_ids[0] if input_ids else -1
-                by_flat_idx[ancestor_flat_idx].children[first_token] = node
+                # Key by flat_idx (always unique) not first_token — keying by first
+                # token causes silent collision when two siblings start with the same
+                # token (e.g. two rollout responses both begin with the same word).
+                by_flat_idx[ancestor_flat_idx].children[flat_idx] = node
 
         self.nodes = [by_flat_idx[fid] for fid, _, _, _ in state["nodes_data"]]
         self._cached_magi_key = None
@@ -298,105 +300,3 @@ class PrefixSubTrie(PrefixTrie):
             position_ids_by_sample=position_ids_by_sample,
         )
 
-
-# ---------------------------------------------------------------------------
-# Static tree builders (from known structure, avoiding token-by-token detection)
-# ---------------------------------------------------------------------------
-
-
-def build_tree_from_segments(
-    samples: list,
-    segment_hashes: np.ndarray,
-    segment_lengths: np.ndarray,
-    _BuildNode=None,
-    _insert_sequence=None,
-    _compress_trie=None,
-    convert_trie_to_tree_node=None,
-) -> Optional[PrefixSubTrie]:
-    """Build tree from pre-computed segment metadata (fast path).
-
-    For GRPO, segment metadata tells us the exact prefix split point.  We build
-    the compressed :class:`TrieNode` tree directly — one prefix node + N leaf
-    nodes — without token-by-token ``_insert_sequence`` / ``_compress_trie`` /
-    ``prune_trie``.  Children are keyed by sample index (not first token) so
-    suffixes that coincidentally start with the same token don't collide.
-
-    Args:
-        samples: List of token tensors.
-        segment_hashes: Array of hash lists per sample (object dtype).
-        segment_lengths: Array of length lists per sample (object dtype).
-        _BuildNode, _insert_sequence, _compress_trie, convert_trie_to_tree_node:
-            Unused — kept for signature compatibility with the caller in
-            ``magi.py``.
-
-    Returns:
-        PrefixSubTrie or None if no sharing detected.
-    """
-    if not samples or len(samples) < 2:
-        return None
-
-    from verl.utils.prefix_tree.segment_grouper import group_by_segment_hash
-
-    # Group by first segment (the shared prefix)
-    groups = group_by_segment_hash(segment_hashes, segment_lengths, level=0)
-
-    # Find largest group with shared prefix
-    largest_group = max(groups.values(), key=len, default=[])
-    if len(largest_group) < 2:
-        return None  # No sharing
-
-    first_idx, prefix_len = largest_group[0]
-    all_seq_ids = [sid for sid, _ in largest_group]
-
-    # ── Direct compressed-TrieNode construction ────────────────────────────
-    # Structure: virtual root → prefix_node (shared tokens, all sample IDs)
-    #            → N leaf nodes (one per sample's response suffix).
-    # Children keyed by sample index so same-first-token suffixes don't collide.
-    trie_root = TrieNode(tree_id=0)
-    trie_root.nodes = []  # flat DFS list
-
-    prefix_tokens = samples[first_idx][:prefix_len].tolist()
-    prefix_node = TrieNode(
-        tree_id=0,
-        start_idx=0,
-        end_idx=max(prefix_len - 1, 0),
-        input_ids=prefix_tokens,
-        sequence_ids=list(all_seq_ids),
-        ancestor=None,
-        flat_idx=len(trie_root.nodes),
-    )
-    trie_root.nodes.append(prefix_node)
-    # Single child of root — satisfies convert_trie_to_tree_node's single-root check.
-    trie_root.children[0] = prefix_node
-
-    leaf_to_sample: list[int] = []
-    leaf_node_ids: list[int] = []
-
-    for seq_idx, _ in largest_group:
-        suffix = samples[seq_idx][prefix_len:].tolist()
-        leaf = TrieNode(
-            tree_id=0,
-            start_idx=0,
-            end_idx=max(len(suffix) - 1, 0),
-            input_ids=suffix,
-            sequence_ids=[seq_idx],
-            ancestor=prefix_node,
-            flat_idx=len(trie_root.nodes),
-        )
-        trie_root.nodes.append(leaf)
-        # Key by sample index — never collides with other leaves regardless of
-        # the suffix's first token.
-        prefix_node.children[seq_idx] = leaf
-
-        leaf_to_sample.append(seq_idx)
-        leaf_node_ids.append(leaf.flat_idx)
-
-    source = PrefixTrie(root=trie_root)
-    batch_size = max(leaf_to_sample) + 1 if leaf_to_sample else 0
-    subtrie = PrefixSubTrie(
-        source=source,
-        leaf_node_ids=leaf_node_ids,
-        leaf_to_sample=leaf_to_sample,
-        batch_size=batch_size,
-    )
-    return subtrie
