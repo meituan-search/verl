@@ -28,7 +28,8 @@ Patch chain (each wrapper accepts ``magi_attention_key``/``flex_attention_key`` 
     → TEDotProductAttention.forward  (early-return MAGI branch)
 
 The ``magi_attn_forward`` helper calls ``calc_attn`` directly on already-dispatched
-local Q/K/V (pre-dispatch happens in ``forward_prefix_tree`` before the model call).
+local Q/K/V (pre-dispatch happens in ``unfuse_forward_prefix_tree`` /
+``fuse_try_forward_prefix_tree`` before the model call).
 """
 
 from __future__ import annotations
@@ -385,7 +386,7 @@ def apply_prefix_tree_patch() -> None:
             def _rope_fwd_with_pids(max_seq_len, offset=0, packed_seq=False, cp_group=None):
                 actual_seq_len = int(pids.max().item()) + 1
                 emb = _orig_rope_fn(rope_mod, actual_seq_len, offset=0, packed_seq=True, cp_group=None)
-                # All PP stages use seq-first Q=(seq,1,H,D) because forward_prefix_tree
+                # All PP stages use seq-first Q=(seq,1,H,D) because unfuse_forward_prefix_tree
                 # returns (seq,1,hidden) for all intermediate stages (not batch-first).
                 # freqs=(seq,1,1,dim) broadcasts correctly: Q×freqs→(seq,1,H,D) ✓
                 indexed = emb[pids.to(emb.device)]

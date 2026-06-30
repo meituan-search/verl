@@ -917,6 +917,13 @@ class MegatronEngineWithLMHead(MegatronEngine):
         if use_fused_kernels:
             from verl.models.mcore import get_mcore_forward_fused_model_engine_fn
 
+            if use_prefix_tree:
+                from verl.utils.prefix_tree.magi import get_prefix_tree_logits_args
+
+                _pt_logits_args = get_prefix_tree_logits_args(batch, tu)
+            else:
+                _pt_logits_args = {}
+
             fused_forward_fn = get_mcore_forward_fused_model_engine_fn(self.model_config.hf_config)
             output = fused_forward_fn(
                 model=model,
@@ -926,6 +933,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 temperature=temperature_value,
                 calculate_entropy=calculate_entropy,
                 pad_token_id=self.model_config.tokenizer.pad_token_id,
+                logits_processor_args=_pt_logits_args,
             )
         else:
             if not isinstance(temperature, torch.Tensor):
