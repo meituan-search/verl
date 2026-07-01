@@ -200,12 +200,10 @@ def build_prefix_tree_micro_batch(
 
     if subtrie is None:
         _log.getLogger(__name__).error(
-            "build_prefix_tree_micro_batch: no prefix sharing found (n=%d); "
-            "falling back to standard attention",
+            "build_prefix_tree_micro_batch: no prefix sharing found (n=%d); falling back to standard attention",
             len(samples),
         )
         return None
-
 
     try:
         params = build_layout_from_tree_node(
@@ -225,14 +223,13 @@ def build_prefix_tree_micro_batch(
             subtrie=subtrie,
         )
     except Exception as _e:
-        _log.getLogger(__name__).error(
+        _log.getLogger(__name__).exception(
             "build_prefix_tree_micro_batch: falling back to standard attention (%s: %s) "
             "subtrie_nodes=%d subtrie_leaves=%d",
             type(_e).__name__,
             _e,
             len(subtrie.nodes) if subtrie is not None else -1,
             len(subtrie.leaf_node_ids) if subtrie is not None else -1,
-            exc_info=True,
         )
         return None
 
@@ -344,12 +341,10 @@ def prefix_tree_rope_context(model, position_ids: Optional[Tensor]):
     if rope_mod is None or position_ids is None:
         yield
         return
-    from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 
     pids = position_ids.reshape(-1)
     _real_rope_fwd = rope_mod.forward
     _orig_rope_fn = RotaryEmbedding.forward.__wrapped__  # bypass lru_cache
-
 
     def _rope_fwd_with_pids(max_seq_len, offset=0, packed_seq=False, cp_group=None):
         actual_seq_len = int(pids.max().item()) + 1
@@ -404,7 +399,7 @@ def fuse_forward_body(
     attention_mask: Optional[Tensor],
     labels: Tensor,
     temperature: float,
-    pt_batch: "PrefixTreeMagiBatch",
+    pt_batch: PrefixTreeMagiBatch,
     magi_key=None,
     flex_key=None,
     **kwargs,
@@ -437,7 +432,6 @@ def fuse_forward_body(
     packed_seq_params = kwargs.pop("packed_seq_params", None)
     extra_block_kwargs = kwargs.pop("extra_block_kwargs", None)
 
-
     preproc_output = model._preprocess(
         input_ids=input_ids,
         position_ids=position_ids,
@@ -446,7 +440,6 @@ def fuse_forward_body(
         packed_seq_params=packed_seq_params,
     )
     (decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset) = preproc_output[:5]
-
 
     hidden_states = model.decoder(
         hidden_states=decoder_input,
@@ -461,30 +454,43 @@ def fuse_forward_body(
         **kwargs,
     )
 
-
     if not model.post_process:
         return hidden_states
-
-    # Undispatch local hidden → tree-packed → per-sample flat order.
-    if magi_key is not None:
-        hidden_states = fuse_undispatch_and_expand_hidden(hidden_states, magi_key, pt_batch)
-    elif model.config.sequence_parallel:
-        from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
-        hidden_states = gather_from_sequence_parallel_region(hidden_states)
 
     if hasattr(model, "output_layer") and model.output_layer is not None and model.output_layer.weight is not None:
         output_weight = model.output_layer.weight
     else:
         output_weight = model.embedding.word_embeddings.weight
 
-    logprobs, entropy = _lce(
-        hidden_states,
-        output_weight,
-        labels,
-        temperature,
-        "none",
-        _ps.get_tensor_model_parallel_group(),
-    )
+    if magi_key is not None:
+        # CP-local LCE: run on local hidden (local_tokens), undispatch 1D outputs (KB-scale).
+        local_indices = get_position_ids(magi_key)
+        flat_padded = pt_batch.tree_packed_input_ids.shape[0]
+        pad = flat_padded - labels.shape[0]
+        labels_full = torch.cat([labels, labels.new_zeros(pad)]) if pad > 0 else labels
+        logprobs, entropy = _lce(
+            hidden_states,
+            output_weight,
+            labels_full[local_indices],
+            temperature,
+            "none",
+            _ps.get_tensor_model_parallel_group(),
+        )
+        logprobs = undispatch(logprobs.reshape(-1), magi_key)[: pt_batch.real_tokens]
+        entropy = undispatch(entropy.reshape(-1), magi_key)[: pt_batch.real_tokens]
+    else:
+        if model.config.sequence_parallel:
+            from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+
+            hidden_states = gather_from_sequence_parallel_region(hidden_states)
+        logprobs, entropy = _lce(
+            hidden_states,
+            output_weight,
+            labels,
+            temperature,
+            "none",
+            _ps.get_tensor_model_parallel_group(),
+        )
 
     if _has_cfg_log(model.config):
         payload = _OrderedDict(
@@ -570,7 +576,6 @@ def _finalize_prefix_tree_batch(
                 )
             params.total_seqlen_q += pad_len
             params.total_seqlen_k += pad_len
-
 
     if attention_type == "magi":
         # Reuse cached MAGI key for OLP→actor_update reuse if tree structure unchanged.
@@ -838,28 +843,8 @@ def unfuse_forward_prefix_tree(
 
     strip_prefix_tree_args(logits_processor_args)
 
-    import time as _time
-
-    _t0 = _time.perf_counter()
-
-    # Collect diagnostic counters
-    _diag_real_tokens = pt_batch.real_tokens
-    _diag_packed_tokens = pt_batch.tree_packed_input_ids.shape[0]
-    _diag_magi_key_info = ""
-    if pt_batch.magi_key is not None:
-        _diag_magi_key_info = (
-            f" seqlen_q={pt_batch.magi_key.total_seqlen_q} seqlen_k={pt_batch.magi_key.total_seqlen_k}"
-        )
-    _diag_rope_max = int(pt_batch.tree_packed_position_ids.max().item()) + 1
-
     if prefix_tree_attention == "magi":
-        # Pre-dispatch: each CP rank processes only its local token slice through
-        # embedding, FFN, MoE, and layer norms — not the full flat sequence.
-        # calc_attn handles cross-rank attention communication internally.
         local_input_ids, local_position_ids = dispatch_pt_batch(pt_batch)
-        _diag_local_tokens = local_input_ids.shape[1]
-
-        _t_pre_model = _time.perf_counter()
         output_orig = model(
             input_ids=local_input_ids,
             attention_mask=None,
@@ -868,32 +853,7 @@ def unfuse_forward_prefix_tree(
             magi_attention_key=pt_batch.magi_key,
             **model_kwargs,
         )
-        _t_post_model = _time.perf_counter()
-        _t_model = _t_post_model - _t_pre_model
-
-        if post_process:
-            # Gather local logit slices → full flat_tokens vocab tensor for loss computation.
-            _t_undispatch_start = _time.perf_counter()
-            output_orig = undispatch(output_orig.squeeze(0), pt_batch.magi_key).unsqueeze(0)
-            _t_undispatch_end = _time.perf_counter()
-            _t_undispatch = _t_undispatch_end - _t_undispatch_start
-        else:
-            _t_undispatch = 0.0
-
-        _log.getLogger(__name__).warning(
-            "prefix_tree timing[magi]: pre_model=%.3fs model=%.3fs undispatch=%.3fs "
-            "real_tokens=%d packed=%d local=%d rope_max=%d%s",
-            _t_pre_model - _t0,
-            _t_model,
-            _t_undispatch,
-            _diag_real_tokens,
-            _diag_packed_tokens,
-            _diag_local_tokens,
-            _diag_rope_max,
-            _diag_magi_key_info,
-        )
     else:
-        _t_pre_model = _time.perf_counter()
         output_orig = model(
             input_ids=tree_packed_input_ids,
             attention_mask=None,
@@ -901,15 +861,6 @@ def unfuse_forward_prefix_tree(
             packed_seq_params=None,
             flex_attention_key=pt_batch.flex_key,
             **model_kwargs,
-        )
-        _t_post_model = _time.perf_counter()
-        _t_model = _t_post_model - _t_pre_model
-        _log.getLogger(__name__).warning(
-            "prefix_tree timing[flex]: model=%.3fs real_tokens=%d packed=%d rope_max=%d",
-            _t_model,
-            _diag_real_tokens,
-            _diag_packed_tokens,
-            _diag_rope_max,
         )
 
     real_tokens = pt_batch.real_tokens
@@ -975,43 +926,40 @@ def unfuse_forward_prefix_tree(
         flat_args = {
             k: v for k, v in orig_args.items() if k not in ("label", "temperature", "loss_mask", "use_prefix_tree")
         }
-        flat_args["label"] = tree_packed_label
-        flat_args["temperature"] = tree_packed_t
-        # Note: loss_mask is not passed to logits_processor - it's handled downstream in sft_loss
-        # after expand_flat_to_per_sample restores per-sample structure.
 
-        # logits_processor runs on flat (flat_tokens, 1, vocab).
-        # Clone so in-place ops inside the processor don't alias output_orig.
-        # This avoids the O(N·P·vocab) expansion before the vocab-dimension ops.
-        _t_logits_start = _time.perf_counter()
+        # For MAGI: logits are CP-local (local_tokens, vocab). Slice label/temp to match.
+        # For flex: logits are full flat (real_tokens, vocab). Use as-is.
+        if prefix_tree_attention == "magi":
+            local_indices = get_position_ids(pt_batch.magi_key)  # (local_tokens,)
+            flat_padded = pt_batch.tree_packed_input_ids.shape[0]
+            pad = flat_padded - real_tokens
+
+            def _pad_to_full(x):
+                return torch.cat([x, x.new_zeros((pad,) + x.shape[1:])]) if pad > 0 else x
+
+            flat_args["label"] = _pad_to_full(tree_packed_label)[local_indices]
+            flat_args["temperature"] = _pad_to_full(tree_packed_t)[local_indices]
+            n_logits = local_indices.shape[0]
+        else:
+            flat_args["label"] = tree_packed_label
+            flat_args["temperature"] = tree_packed_t
+            n_logits = total_flat
+
         output_dict = logits_processor(logits_flat.clone().unsqueeze(1), **flat_args)
-        _t_logits_end = _time.perf_counter()
 
-        _t_expand_start = _time.perf_counter()
         if isinstance(output_dict, dict):
-            # Per-token flat results are expanded after the vocab ops:
-            # expand_flat_to_per_sample replicates the prefix slice per sample (1-D, cheap),
-            # then split into a per-sample NestedTensor using the expanded offsets.
             nested_ids = restore_flat_to_nested(tree_packed_ids, pt_batch)
-            cu_seqlen = nested_ids.offsets()  # cumulative lengths in original sample order
+            cu_seqlen = nested_ids.offsets()
 
             for key, val in output_dict.items():
                 if isinstance(val, torch.Tensor):
-                    # Only per-token tensors (numel == flat_tokens) need expanding.
-                    # Scalars (e.g. sum_pi_squared) are left as-is.
                     val_1d = val.reshape(-1)
-                    if val_1d.shape[0] == total_flat:
+                    if val_1d.shape[0] == n_logits:
+                        if prefix_tree_attention == "magi":
+                            val_1d = undispatch(val_1d, pt_batch.magi_key)[:real_tokens]
                         val_expanded = expand_flat_to_per_sample(val_1d, pt_batch)
                         tensors = [val_expanded[cu_seqlen[i] : cu_seqlen[i + 1]] for i in range(len(cu_seqlen) - 1)]
                         output_dict[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
-        _t_expand_end = _time.perf_counter()
-
-        _log.getLogger(__name__).warning(
-            "prefix_tree timing[post]: logits_processor=%.3fs expand=%.3fs total_flat=%d",
-            _t_logits_end - _t_logits_start,
-            _t_expand_end - _t_expand_start,
-            total_flat,
-        )
         return output_dict
     else:
         # Intermediate PP stage (post_process=False) or no logits_processor.
@@ -1102,41 +1050,37 @@ def fuse_try_forward_prefix_tree(
                 "prefix_tree[fused]: tree_packed_labels is None — falling back to standard fused path"
             )
             return None
-        labels_flat = expand_flat_to_per_sample(pb.tree_packed_labels[:real_tokens], pb)
+        # Pass flat (deduped) labels — LCE runs on real_tokens, not total_expanded.
+        labels_arg = pb.tree_packed_labels[:real_tokens]
     else:
-        labels_flat = None
+        labels_arg = None
 
     output_orig = model(
         input_ids=local_input_ids,
         attention_mask=None,
         position_ids=local_position_ids,
         packed_seq_params=None,
-        labels=labels_flat,
+        labels=labels_arg,
         temperature=temperature,
         pt_batch=pb,
         **attn_kwargs,
     )
 
-    # Non-last PP stages: return raw hidden states for pipeline send to next stage.
     if not post_process:
         return output_orig
 
-    # output_orig.log_probs / .entropy are (total_expanded,) per-sample flat.
-    # Split into NestedTensor using original input_ids offsets (unpadded).
-    cu_seqlens = input_ids.offsets()  # (batch_size + 1,)
+    # output_orig.log_probs / .entropy are (real_tokens,) flat — expand then split.
+    cu_seqlens = input_ids.offsets()
     batch_size = input_ids.shape[0]
 
-    log_probs = output_orig.log_probs
-    if log_probs.dim() == 1:
-        log_probs = log_probs.unsqueeze(0)  # (1, total_expanded)
-    log_probs_tensors = [log_probs[0, cu_seqlens[i] : cu_seqlens[i + 1]] for i in range(batch_size)]
-    log_probs_nested = torch.nested.as_nested_tensor(log_probs_tensors, layout=torch.jagged)
-
+    log_probs = expand_flat_to_per_sample(output_orig.log_probs.reshape(-1), pb)
+    log_probs_nested = torch.nested.as_nested_tensor(
+        [log_probs[cu_seqlens[i] : cu_seqlens[i + 1]] for i in range(batch_size)], layout=torch.jagged
+    )
     output = {"log_probs": log_probs_nested}
     if calculate_entropy:
-        entropy = output_orig.entropy
-        if entropy.dim() == 1:
-            entropy = entropy.unsqueeze(0)
-        entropy_tensors = [entropy[0, cu_seqlens[i] : cu_seqlens[i + 1]] for i in range(batch_size)]
-        output["entropy"] = torch.nested.as_nested_tensor(entropy_tensors, layout=torch.jagged)
+        entropy = expand_flat_to_per_sample(output_orig.entropy.reshape(-1), pb)
+        output["entropy"] = torch.nested.as_nested_tensor(
+            [entropy[cu_seqlens[i] : cu_seqlens[i + 1]] for i in range(batch_size)], layout=torch.jagged
+        )
     return output

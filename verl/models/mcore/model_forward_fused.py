@@ -273,12 +273,16 @@ def _fused_GPTModel_forward(
     inference_context = deprecate_inference_params(inference_context, inference_params)
 
     # Prefix-tree fused path: rope override + decoder key + fuse_forward_body.
-    # Pop pt_batch + attention keys before anything else — decoder doesn't
-    # accept them, and prefix_tree_decoder_key_context injects the key so
-    # passing it again via **kwargs would duplicate it.
+    # Only pop attention keys when pt_batch is also present (fused path).
+    # Unfused path passes magi_attention_key without pt_batch and relies on
+    # the key flowing through **kwargs to the patched TransformerBlock.
     pt_batch = kwargs.pop("pt_batch", None)
-    _magi_key = kwargs.pop("magi_attention_key", None)
-    _flex_key = kwargs.pop("flex_attention_key", None)
+    if pt_batch is not None:
+        _magi_key = kwargs.pop("magi_attention_key", None)
+        _flex_key = kwargs.pop("flex_attention_key", None)
+    else:
+        _magi_key = kwargs.get("magi_attention_key", None)
+        _flex_key = kwargs.get("flex_attention_key", None)
 
     if (_magi_key is not None or _flex_key is not None) and pt_batch is not None:
         from verl.utils.prefix_tree.magi import (
@@ -287,8 +291,9 @@ def _fused_GPTModel_forward(
             prefix_tree_rope_context,
         )
 
-        with prefix_tree_rope_context(model, position_ids), prefix_tree_decoder_key_context(
-            model, _magi_key, _flex_key
+        with (
+            prefix_tree_rope_context(model, position_ids),
+            prefix_tree_decoder_key_context(model, _magi_key, _flex_key),
         ):
             return fuse_forward_body(
                 model,

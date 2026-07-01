@@ -53,7 +53,6 @@ __all__ = [
     "TrieNode",
     "greedy_build_tries",
     "mbs_groups_from_trie",
-    "mbs_groups_from_uid",
     "convert_trie_to_tree_node",
     "subtrie_view",
     # Load balancing
@@ -763,9 +762,7 @@ def compute_prefix_tree_metrics(
         tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=total_raw * 10)
         if tries:
             trie = tries[0]
-            groups = mbs_groups_from_trie(
-                trie, max_token_len_per_gpu
-            )  # TODO: use PrefixSubTrie / PrefixTrie interface
+            groups = mbs_groups_from_trie(trie, max_token_len_per_gpu)  # TODO: use PrefixSubTrie / PrefixTrie interface
             result["prefix_tree/avg_mbs"] = len(sequences) / len(groups) if groups else 0.0
             # Per-micro-batch sharing ratio using actual dynbsz groups and the global trie.
             ratios = []
@@ -784,45 +781,6 @@ def compute_prefix_tree_metrics(
             result["prefix_tree/micro_batch_shared_ratio"] = ratio
 
     return result
-
-
-def mbs_groups_from_uid(
-    uid_list: list,
-    trie: TrieNode = None,
-    max_token_len: int = 0,
-) -> list[list[int]]:
-    """Group samples into micro-batches using uid as the atomic unit.
-
-    Each uid-group (same prompt → shared prefix) becomes exactly one
-    micro-batch.  Different uid-groups are never merged because they don't
-    share a prefix — merging them would create a multi-family flat layout
-    that breaks the prefix-tree MAGI key construction.
-
-    Args:
-        uid_list: Per-sample uids.  Same uid = same prompt.  Samples with the
-            same uid must be contiguous (guaranteed by ``batch.repeat`` +
-            DFS reorder in ``reorder_and_balance_for_prefix_tree``).
-        trie: Unused — kept for backward compatibility.
-        max_token_len: Unused — kept for backward compatibility.
-
-    Returns:
-        List of micro-batches, each containing exactly one uid-group.
-    """
-    uid_groups: list[list[int]] = []
-    current_uid = None
-    current_indices: list[int] = []
-    for i, uid in enumerate(uid_list):
-        if uid != current_uid:
-            if current_indices:
-                uid_groups.append(current_indices)
-            current_uid = uid
-            current_indices = [i]
-        else:
-            current_indices.append(i)
-    if current_indices:
-        uid_groups.append(current_indices)
-
-    return uid_groups
 
 
 def prepare_prefix_tree_micro_batches(
@@ -851,9 +809,7 @@ def prepare_prefix_tree_micro_batches(
 
     trie = tu.get_non_tensor_data(data, "prefix_tree", default=None)
     if trie is not None:
-        batch_idx_list = mbs_groups_from_trie(
-            trie, max_token_len
-        )  # TODO: use PrefixSubTrie / PrefixTrie interface
+        batch_idx_list = mbs_groups_from_trie(trie, max_token_len)  # TODO: use PrefixSubTrie / PrefixTrie interface
     else:
         input_ids = data["input_ids"]
         seqs = [t.tolist() for t in input_ids.unbind()]
