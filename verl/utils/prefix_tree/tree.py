@@ -66,6 +66,9 @@ class TrieNode:
     ancestor: Optional[TrieNode] = None
     # Root-only: flat DFS list; nodes[i].flat_idx == i.
     nodes: list[TrieNode] = field(default_factory=list)
+    # Root-only: leaves[sample_idx] = leaf TrieNode for that sample.
+    # Direct O(1) index → leaf map; populated during tree construction.
+    leaves: list[Optional[TrieNode]] = field(default_factory=list)
     # DFS index in root.nodes — set once by _compress_trie; -1 on root.
     flat_idx: int = -1
 
@@ -173,12 +176,15 @@ class PrefixSubTrie(PrefixTrie):
     re-attach after deserialisation to enable KV-cache lookup.
     """
 
-    leaf_to_sample: list[int]  # leaf i → local sample index (batch order)
+    leaf_to_sample: list[int]  # leaf i → global sample index
     leaf_node_ids: list[int]  # leaf i → flat_idx of its TrieNode in source
     source: Optional[PrefixTrie]  # back-ref to global trie; not serialised
-    # leaf_ids[local_sample_idx] = flat_idx of that sample's leaf; -1 if absent.
-    # Computed at construction time in batch input order — ready for non_tensor_data.
-    leaf_ids: np.ndarray  # shape (batch_size,), dtype int64
+    # leaf_ids[local_pos] = flat_idx of that sample's leaf; -1 if absent.
+    # Indexed by shard-local position (0..len(global_sample_ids)-1).
+    # Use global_sample_ids[local_pos] to recover the global sample index.
+    leaf_ids: np.ndarray  # shape (len(global_sample_ids),), dtype int64
+    # global_sample_ids[i] = global sample index for shard-local position i.
+    global_sample_ids: list[int]
 
     # MAGI key cache for OLP→actor_update reuse. Populated on first forward,
     # reused if tree structure and CP group haven't changed.
@@ -198,10 +204,14 @@ class PrefixSubTrie(PrefixTrie):
         self.leaf_to_sample = leaf_to_sample
         self.root = source.root
         self.nodes = self._collect_nodes(source, leaf_node_ids)
-        # Build batch-ordered leaf id array at creation time.
-        self.leaf_ids = np.full(batch_size, -1, dtype=np.int64)
+        # Build shard-local leaf_ids: indexed by local position (0..shard_size-1).
+        # global_sample_ids[i] is the global sample index for local position i.
+        self.global_sample_ids = sorted(set(leaf_to_sample))
+        _global_to_local: dict[int, int] = {g: i for i, g in enumerate(self.global_sample_ids)}
+        local_batch_size = len(self.global_sample_ids)
+        self.leaf_ids = np.full(local_batch_size, -1, dtype=np.int64)
         for i, sample_idx in enumerate(leaf_to_sample):
-            self.leaf_ids[sample_idx] = leaf_node_ids[i]
+            self.leaf_ids[_global_to_local[sample_idx]] = leaf_node_ids[i]
 
     @staticmethod
     def _collect_nodes(source: PrefixTrie, leaf_node_ids: list[int]) -> list[TrieNode]:
@@ -235,8 +245,8 @@ class PrefixSubTrie(PrefixTrie):
             "leaf_node_ids": self.leaf_node_ids,
             "leaf_to_sample": self.leaf_to_sample,
             "leaf_ids": self.leaf_ids,
+            "global_sample_ids": self.global_sample_ids,
             "nodes_data": nodes_data,
-            "_zero_len_leaves": getattr(self, "_zero_len_leaves", set()),
         }
 
     def __setstate__(self, state: dict) -> None:
@@ -245,9 +255,7 @@ class PrefixSubTrie(PrefixTrie):
         self.leaf_node_ids = state["leaf_node_ids"]
         self.leaf_to_sample = state["leaf_to_sample"]
         self.leaf_ids = state["leaf_ids"]
-        if state.get("_zero_len_leaves"):
-            self._zero_len_leaves = state["_zero_len_leaves"]
-
+        self.global_sample_ids = state.get("global_sample_ids", sorted(set(state["leaf_to_sample"])))
         # Reconstruct detached TrieNode objects (subtrie-only children links).
         by_flat_idx: dict[int, TrieNode] = {}
         for flat_idx, input_ids, _anc, sequence_ids in state["nodes_data"]:
@@ -299,4 +307,93 @@ class PrefixSubTrie(PrefixTrie):
             loss_masks_by_sample=loss_masks_by_sample,
             position_ids_by_sample=position_ids_by_sample,
         )
+
+
+# ---------------------------------------------------------------------------
+# Segment-based global trie construction (O(N) — no token comparison)
+# ---------------------------------------------------------------------------
+
+
+def build_global_tree_from_segments(
+    samples: list,
+    segment_hashes,
+    segment_lengths,
+) -> Optional["TrieNode"]:
+    """Build a global TrieNode from segment metadata for all uid-groups.
+
+    O(N) construction using known prefix structure — no token-by-token
+    comparison.  Returns a TrieNode root compatible with ``mbs_groups_from_trie``
+    and ``subtrie_view``.
+
+    For each uid-group (same first segment hash):
+    - 2+ sequences: prefix_node (shared prompt tokens) + N leaf_nodes (responses)
+    - 1 sequence:   single leaf_node under root (no sharing; still in trie for metrics)
+
+    Children of the root are keyed by uid_hash (deterministic DFS order).
+    Children of prefix nodes are keyed by sample_idx (no first-token collision).
+
+    Args:
+        samples: List of token tensors (one per sequence).
+        segment_hashes: (N,) object-dtype numpy array of hash lists.
+        segment_lengths: (N,) object-dtype numpy array of length lists.
+
+    Returns:
+        TrieNode root, or None if fewer than 2 samples.
+    """
+    if not samples or len(samples) < 2:
+        return None
+
+    from verl.utils.prefix_tree.segment_grouper import group_by_segment_hash
+
+    groups = group_by_segment_hash(segment_hashes, segment_lengths, level=0)
+
+    trie_root = TrieNode(tree_id=0)
+    trie_root.nodes = []
+    trie_root.leaves = [None] * len(samples)
+
+    for uid_hash in sorted(groups.keys()):
+        group = groups[uid_hash]
+        all_seq_ids = [sid for sid, _ in group]
+
+        if len(group) >= 2:
+            first_idx, prefix_len = group[0]
+            prefix_tokens = samples[first_idx][:prefix_len].tolist()
+
+            prefix_node = TrieNode(
+                tree_id=0,
+                input_ids=prefix_tokens,
+                sequence_ids=list(all_seq_ids),
+                ancestor=None,
+                flat_idx=len(trie_root.nodes),
+            )
+            trie_root.nodes.append(prefix_node)
+            trie_root.children[uid_hash] = prefix_node
+
+            for seq_idx, _ in group:
+                suffix = samples[seq_idx][prefix_len:].tolist()
+                leaf = TrieNode(
+                    tree_id=0,
+                    input_ids=suffix,
+                    sequence_ids=[seq_idx],
+                    ancestor=prefix_node,
+                    flat_idx=len(trie_root.nodes),
+                )
+                trie_root.nodes.append(leaf)
+                prefix_node.children[seq_idx] = leaf
+                trie_root.leaves[seq_idx] = leaf
+        else:
+            seq_idx, _ = group[0]
+            all_tokens = samples[seq_idx].tolist()
+            leaf = TrieNode(
+                tree_id=0,
+                input_ids=all_tokens,
+                sequence_ids=[seq_idx],
+                ancestor=None,
+                flat_idx=len(trie_root.nodes),
+            )
+            trie_root.nodes.append(leaf)
+            trie_root.children[uid_hash] = leaf
+            trie_root.leaves[seq_idx] = leaf
+
+    return trie_root if trie_root.nodes else None
 
