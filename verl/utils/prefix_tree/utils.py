@@ -235,7 +235,7 @@ def build_layout_from_tree_node(
         children = _subtrie_children(node)
         node._flat_start = start
         extra_in = 1 if donated_in else 0
-        if children and len(node.input_ids) > 1:
+        if children and len(node.input_ids) >= 1:
             donated_out = True
             node._flat_end = start + extra_in + len(node.input_ids) - 1
         else:
@@ -260,7 +260,9 @@ def build_layout_from_tree_node(
         return result
 
     def _emit_attn(node: TrieNode) -> None:
-        if not node.input_ids:
+        if not node.input_ids or node._flat_start >= node._flat_end:
+            # No tokens or empty range after donation (e.g. single-token node that
+            # donated its only token to children) — skip rects, still recurse.
             for child in _subtrie_children(node):
                 _emit_attn(child)
             return
