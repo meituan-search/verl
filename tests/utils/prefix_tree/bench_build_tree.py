@@ -155,8 +155,17 @@ def subtrie_flat_tokens(subtrie: PrefixSubTrie) -> list[int]:
 
 def layout_flat_tokens(subtrie: PrefixSubTrie, samples: list) -> list[int]:
     """Build the flat packed layout and return its token sequence."""
-    labels_by_sample = [torch.cat([s[1:], torch.zeros(1, dtype=s.dtype)]) for s in samples]
-    params = build_layout_from_tree_node(samples, subtrie, labels_by_sample=labels_by_sample)
+    params = build_layout_from_tree_node(samples, subtrie)
+    # Equivalence: reconstructed per-sample labels must match rolled originals bit-identically.
+    labels_ref = [torch.cat([s[1:], torch.zeros(1, dtype=s.dtype)]) for s in samples]
+    for leaf_idx, sample_idx in enumerate(params.leaf_to_sample):
+        anc = params._leaf_ancestor_ranges[leaf_idx]
+        ls, le = params.leaf_ranges[leaf_idx]
+        parts = [params.tree_packed_labels[a:b] for a, b in anc] + [params.tree_packed_labels[ls:le]]
+        recon = torch.cat(parts) if parts else torch.empty(0, dtype=samples[0].dtype)
+        assert torch.equal(recon, labels_ref[sample_idx]), (
+            f"label mismatch for sample {sample_idx}: {recon.tolist()} != {labels_ref[sample_idx].tolist()}"
+        )
     return params.tree_packed_tokens.tolist()
 
 
@@ -312,8 +321,7 @@ def bench_grpo_scale():
     # Also time the layout build (shared by both paths)
     t0 = time.perf_counter()
     for _ in range(n_iter):
-        labels_by_sample = [torch.cat([s[1:], torch.zeros(1, dtype=s.dtype)]) for s in samples]
-        _ = build_layout_from_tree_node(samples, sub_seg, labels_by_sample=labels_by_sample)
+        _ = build_layout_from_tree_node(samples, sub_seg)
     t_layout = (time.perf_counter() - t0) / n_iter * 1000
     print(f"  layout build:   {t_layout:.1f} ms")
 

@@ -196,16 +196,15 @@ def build_layout_from_tree_node(
     subtrie: PrefixSubTrie,
     loss_masks_by_sample: Optional[Sequence[Tensor]] = None,
     position_ids_by_sample: Optional[Sequence[Tensor]] = None,
-    labels_by_sample: Optional[Sequence[Tensor]] = None,
 ) -> PrefixTreeParams:
     """Build flat layout (PrefixTreeParams) from a PrefixSubTrie.
 
     Walks only the nodes in ``subtrie``, emitting tokens in DFS pre-order.
     Leaf ordering matches ``subtrie.leaf_to_sample``.
 
-    ``labels_by_sample[i]`` should be pre-shifted labels — typically
-    ``concat(samples[i][1:], tensor([0]))`` — computed before packing so
-    that cross-segment boundaries in the flat layout carry no wrong values.
+    Labels are derived from the flat token layout after packing: the donation
+    mechanism ensures ``labels[k] = tokens[k+1]`` is correct everywhere except
+    the last position of each leaf segment, which is zeroed (EOS).
     """
 
     valid_ids: set[int] = {n.flat_idx for n in subtrie.nodes}
@@ -313,7 +312,6 @@ def build_layout_from_tree_node(
     flat_pieces: list[Tensor] = []
     flat_lm_pieces: Optional[list[Tensor]] = [] if loss_masks_by_sample is not None else None
     flat_pid_pieces: Optional[list[Tensor]] = [] if position_ids_by_sample is not None else None
-    flat_label_pieces: Optional[list[Tensor]] = [] if labels_by_sample is not None else None
     default_pid_pieces: list[Tensor] = []
 
     def _emit(node: TrieNode) -> None:
@@ -328,8 +326,8 @@ def build_layout_from_tree_node(
             s_emit = s - 1 if donated_in else s
             e_emit = e - 1 if donated_out else e
             if not children:
-                # Leaf: use THIS leaf's own sample so the boundary label is per-sample
-                # correct (labels_by_sample[leaf][s-1] = r1_leaf, not r1_owner).
+                # Leaf: use its own sample so the donated boundary token comes from
+                # this leaf's sequence (making tokens[k+1] correct for label derivation).
                 leaf_sample = leaf_node_id_to_sample[node.flat_idx]
                 src = leaf_sample
             else:
@@ -342,8 +340,6 @@ def build_layout_from_tree_node(
                 flat_pid_pieces.append(position_ids_by_sample[src][s_emit:e_emit])
             else:
                 default_pid_pieces.append(torch.arange(s_emit, e_emit, device=device, dtype=torch.long))
-            if flat_label_pieces is not None:
-                flat_label_pieces.append(labels_by_sample[src][s_emit:e_emit])
         for child in _subtrie_children(node):
             _emit(child)
 
@@ -354,7 +350,15 @@ def build_layout_from_tree_node(
         torch.cat(flat_pieces) if flat_pieces else torch.empty(0, dtype=samples[0].dtype, device=device)
     )
     tree_packed_loss_mask = torch.cat(flat_lm_pieces) if flat_lm_pieces is not None else None
-    tree_packed_labels_tensor = torch.cat(flat_label_pieces) if flat_label_pieces is not None else None
+    # Labels: tokens[k+1] at every position (donation ensures correctness at prefix/leaf
+    # boundaries); zero out the last position of each leaf segment (EOS crossing guard).
+    tree_packed_labels_tensor = torch.zeros_like(tree_packed_tokens)
+    if tree_packed_tokens.numel() > 1:
+        tree_packed_labels_tensor[:-1] = tree_packed_tokens[1:]
+    for leaf in leaves_in_dfs:
+        end = leaf._flat_end
+        if end > leaf._flat_start and end <= tree_packed_tokens.numel():
+            tree_packed_labels_tensor[end - 1] = 0
     if flat_pid_pieces is not None:
         tree_packed_position_ids = torch.cat(flat_pid_pieces)
     else:
