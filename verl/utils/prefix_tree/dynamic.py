@@ -70,7 +70,13 @@ __all__ = [
 
 # TrieNode is canonical in tree.py — import from there (single definition).
 # Old code using .ancestors (list) will raise AttributeError immediately.
-from verl.utils.prefix_tree.tree import PrefixSubTrie, PrefixTrie, TrieNode  # noqa: E402
+from verl.utils.prefix_tree.tree import (  # noqa: E402
+    PrefixSubTrie,
+    PrefixTrie,
+    TrieNode,
+    _is_prefix_tree_enabled,
+    trie_ancestors,
+)
 
 
 class _BuildNode:
@@ -117,17 +123,6 @@ def _insert_sequence(
         current = current.children[token]
     current.is_end = True
     return new_nodes
-
-
-def _ancestors(node: TrieNode) -> list[TrieNode]:
-    """Return ancestor chain from root-child down to node's parent (exclusive of node)."""
-    chain: list[TrieNode] = []
-    cur = node.ancestor
-    while cur is not None:
-        chain.append(cur)
-        cur = cur.ancestor
-    chain.reverse()
-    return chain
 
 
 def _compress_trie(root: _BuildNode) -> TrieNode:
@@ -388,25 +383,14 @@ def dfs_leaf_order(
     if not sequences:
         return []
 
-    ordered: list[int] = []
-
-    def _walk(node: TrieNode) -> None:
-        if not node.children:
-            ordered.extend(node.sequence_ids)
-        else:
-            for child in node.children.values():
-                _walk(child)
-
     if trie is not None:
-        for child in trie.children.values():
-            _walk(child)
-    else:
-        max_tokens = sum(len(s) for s in sequences) * 10
-        tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=max_tokens)
-        for trie_root in tries:
-            for child in trie_root.children.values():
-                _walk(child)
+        return trie_dfs_leaf_order(trie)
 
+    max_tokens = sum(len(s) for s in sequences) * 10
+    tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=max_tokens)
+    ordered: list[int] = []
+    for trie_root in tries:
+        ordered.extend(trie_dfs_leaf_order(trie_root))
     return ordered
 
 
@@ -455,7 +439,7 @@ def dfs_micro_batch_groups(
             nonlocal current_eff
             if not node.children:
                 # Leaf: full path = ancestors (list of TrieNodes) + self
-                path = _ancestors(node) + [node]
+                path = trie_ancestors(node) + [node]
                 new_nodes = [n for n in path if id(n) not in covered]  # noqa: B023
                 inc = sum(len(n.input_ids) for n in new_nodes)
 
@@ -554,7 +538,7 @@ def mbs_groups_from_trie(
         def _visit(node: TrieNode) -> None:
             nonlocal current_eff
             if not node.children:
-                path = _ancestors(node) + [node]
+                path = trie_ancestors(node) + [node]
                 new_nodes = [n for n in path if id(n) not in covered]  # noqa: B023
                 inc = sum(len(n.input_ids) for n in new_nodes)
                 if current_group and current_eff + inc > max_token_len:  # noqa: B023
@@ -833,24 +817,7 @@ def prepare_prefix_tree_micro_batches(
     # Compute deduplicated (flat) token count per micro-batch — used for PP
     # sort and for imbalance diagnostics.
     if trie is not None:
-
-        def _group_flat_tokens(group: list[int]) -> int:
-            keep = set(group)
-
-            def _count(node):
-                total = 0
-                if not node.children:
-                    return len(node.input_ids) if any(s in keep for s in node.sequence_ids) else 0
-                kept = False
-                for child in node.children.values():
-                    if any(s in keep for s in child.sequence_ids):
-                        kept = True
-                        total += _count(child)
-                return total + len(node.input_ids) if kept else total
-
-            return sum(_count(c) for c in trie.children.values())
-
-        tokens_per_group = [_group_flat_tokens(g) for g in batch_idx_list]
+        tokens_per_group = [trie_group_flat_tokens(g, trie) for g in batch_idx_list]
 
         # Reorder micro-batches in inc-then-dec flat-token pattern to reduce PP bubble.
         # Preserves prefix locality: samples within a group share prefixes and stay together.
@@ -886,12 +853,6 @@ def create_and_attach_subtrie_views(micro_batches, batch_idx_list, trie) -> None
                 batch_size=len(idx),
             )
             tu.assign_non_tensor(mb, prefix_tree_subtree=local_subtree)
-
-
-def _is_prefix_tree_enabled(config_or_data) -> bool:
-    if isinstance(config_or_data, dict):
-        return config_or_data.get("use_prefix_tree", False)
-    return getattr(config_or_data, "use_prefix_tree", False)
 
 
 def get_dfs_balanced_partitions(
