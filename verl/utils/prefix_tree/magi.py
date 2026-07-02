@@ -190,8 +190,11 @@ def build_prefix_tree_micro_batch(
     loss_masks_by_sample = _unpack_nested_to_list(loss_mask)
     position_ids_by_sample = _unpack_nested_to_list(position_ids, mask=loss_mask)
     _unpacked = _unpack_nested_to_list(rolled_labels, mask=loss_mask) if rolled_labels is not None else None
-    labels_by_sample = _unpacked if _unpacked is not None \
+    labels_by_sample = (
+        _unpacked
+        if _unpacked is not None
         else [torch.cat([s[1:], torch.zeros(1, dtype=s.dtype, device=s.device)]) for s in samples]
+    )
 
     if subtrie is None:
         # No pre-built subtrie (e.g. use_dynamic_bsz=False): build locally.
@@ -303,76 +306,6 @@ def expand_flat_to_per_sample(
         "expand_flat_to_per_sample: some sample indices were not covered by segment_to_sample"
     )
     return torch.cat(sample_tensors, dim=0)
-
-
-def _gather_boundary_vector(
-    pt_batch: PrefixTreeMagiBatch,
-    vectors: Tensor,
-    magi_key=None,
-) -> Optional[Tensor]:
-    """Return the vector (logit or hidden) at the last prefix position.
-
-    For MAGI (CP-distributed): the boundary token may live on another rank.
-    We all_reduce-sum across CP (only one rank contributes non-zero values).
-    Returns None when the prefix is empty.
-
-    Args:
-        pt_batch: holds prefix_range for the flat layout.
-        vectors: (local_tokens, D) for MAGI or (flat_tokens, D) for flex.
-        magi_key: MAGI key for CP group; None for flex/SP paths.
-    """
-    boundary_pos = pt_batch.prefix_range[1] - 1
-    if boundary_pos < 0:
-        return None
-    if magi_key is not None:
-        local_indices = get_position_ids(magi_key)
-        mask = (local_indices == boundary_pos)
-        if mask.any():
-            vec = vectors[mask.nonzero(as_tuple=True)[0][0]].clone()
-        else:
-            vec = torch.zeros(vectors.shape[-1], device=vectors.device, dtype=vectors.dtype)
-        torch.distributed.all_reduce(vec, op=torch.distributed.ReduceOp.SUM,
-                                     group=mpu.get_context_parallel_group())
-        return vec
-    return vectors[boundary_pos]
-
-
-def _apply_boundary_logprob_correction(
-    log_probs_expanded: Tensor,
-    pt_batch: PrefixTreeMagiBatch,
-    cu_seqlens: Tensor,
-    boundary_logit: Tensor,
-    temperature: float,
-) -> Tensor:
-    """Fix boundary log_probs for non-owner samples in an expanded 1-D tensor.
-
-    The flat layout stores one label at the last prefix position (the owner's).
-    This replaces each leaf's boundary log_prob with log P(r1_i | prefix)
-    so it matches the FA3 per-sample result.
-
-    Args:
-        log_probs_expanded: 1-D tensor from expand_flat_to_per_sample.
-        pt_batch: for prefix_range, segment_ranges, segment_to_sample, tree_packed_input_ids.
-        cu_seqlens: cumulative offsets from restore_flat_to_nested(…).offsets().
-        boundary_logit: raw vocab logit at the boundary position (vocab,).
-        temperature: scalar temperature for log_softmax.
-    """
-    prefix_len = pt_batch.prefix_range[1] - pt_batch.prefix_range[0]
-    boundary_log_probs = torch.nn.functional.log_softmax(boundary_logit.float() / temperature, dim=-1)
-    # Owner label at flat boundary position — that leaf's correction is a no-op.
-    owner_r1 = pt_batch.tree_packed_labels[pt_batch.prefix_range[1] - 1].item() \
-        if pt_batch.tree_packed_labels is not None else None
-    result = log_probs_expanded.clone()
-    for leaf_idx, sample_idx in enumerate(pt_batch.segment_to_sample):
-        ls, le = pt_batch.segment_ranges[leaf_idx]
-        if ls >= le:
-            continue  # zero-length leaf (duplicate): ancestor_segment_ranges handles it
-        first_response_token = pt_batch.tree_packed_input_ids[ls].item()
-        if first_response_token == owner_r1:
-            continue  # owner: LCE already computed log P(r1_owner | prefix) correctly
-        expanded_boundary_pos = int(cu_seqlens[sample_idx].item()) + prefix_len - 1
-        result[expanded_boundary_pos] = boundary_log_probs[first_response_token]
-    return result
 
 
 def dispatch_pt_batch(pt_batch: PrefixTreeMagiBatch) -> tuple[Tensor, Tensor]:
@@ -590,16 +523,6 @@ def fuse_forward_body(
     )
     output.entropy = entropy
     output.log_probs = logprobs
-    # Boundary is a shared token — one projection gives the full distribution,
-    # then each sample indexes its own r1_i. Reuses _apply_boundary_logprob_correction.
-    # Skipped for TP>1: output_weight is vocab/TP-sharded (partial logit only).
-    output.boundary_logit = None
-    if pt_batch is not None and mpu.get_tensor_model_parallel_world_size() == 1:
-        hs = hidden_states.view(-1, hidden_states.shape[-1])
-        boundary_hidden = _gather_boundary_vector(pt_batch, hs, magi_key)
-        if boundary_hidden is not None:
-            # Project in native dtype — avoid materialising full weight in float32.
-            output.boundary_logit = (boundary_hidden.to(output_weight.dtype) @ output_weight.T).float()
     return output
 
 
@@ -892,8 +815,9 @@ def unfuse_try_forward_prefix_tree(
     return None
 
 
-def build_prefix_tree_batch(model, input_ids, logits_processor_args, vision_model, mtp_enable_train,
-                            rolled_labels=None):
+def build_prefix_tree_batch(
+    model, input_ids, logits_processor_args, vision_model, mtp_enable_train, rolled_labels=None
+):
     """Build prefix-tree micro-batch from *logits_processor_args*.
 
     Returns :class:`PrefixTreeMagiBatch` or ``None`` when the per-mb subtrie
@@ -1034,13 +958,6 @@ def unfuse_forward_prefix_tree(
             flat_args["temperature"] = tree_packed_t
             n_logits = total_flat
 
-        # Gather boundary logit once before logits_processor (shared hidden context).
-        boundary_flat_pos = pt_batch.prefix_range[1] - 1
-        boundary_logit = _gather_boundary_vector(
-            pt_batch, logits_flat, magi_key=pt_batch.magi_key if prefix_tree_attention == "magi" else None
-        )
-        boundary_temperature = tree_packed_t[boundary_flat_pos, 0].item() if boundary_flat_pos >= 0 else 1.0
-
         output_dict = logits_processor(logits_flat.clone().unsqueeze(1), **flat_args)
 
         if isinstance(output_dict, dict):
@@ -1054,10 +971,6 @@ def unfuse_forward_prefix_tree(
                         if prefix_tree_attention == "magi":
                             val_1d = undispatch(val_1d, pt_batch.magi_key)[:real_tokens]
                         val_expanded = expand_flat_to_per_sample(val_1d, pt_batch)
-                        if "log_prob" in key and boundary_logit is not None:
-                            val_expanded = _apply_boundary_logprob_correction(
-                                val_expanded, pt_batch, cu_seqlen, boundary_logit, boundary_temperature
-                            )
                         tensors = [val_expanded[cu_seqlen[i] : cu_seqlen[i + 1]] for i in range(len(cu_seqlen) - 1)]
                         output_dict[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
         return output_dict
@@ -1174,10 +1087,6 @@ def fuse_try_forward_prefix_tree(
     batch_size = input_ids.shape[0]
 
     log_probs = expand_flat_to_per_sample(output_orig.log_probs.reshape(-1), pb)
-    if getattr(output_orig, "boundary_logit", None) is not None:
-        log_probs = _apply_boundary_logprob_correction(
-            log_probs, pb, cu_seqlens, output_orig.boundary_logit, temperature
-        )
     log_probs_nested = torch.nested.as_nested_tensor(
         [log_probs[cu_seqlens[i] : cu_seqlens[i + 1]] for i in range(batch_size)], layout=torch.jagged
     )
