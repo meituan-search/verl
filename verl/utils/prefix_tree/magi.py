@@ -888,13 +888,7 @@ def unfuse_forward_prefix_tree(
 
         # Labels are pre-shifted per sample before packing (labels_by_sample[i] = input_ids[i][1:]+[0]).
         # This avoids cross-segment boundary errors — no torch.roll needed on the flat layout.
-        if pt_batch.tree_packed_labels is not None:
-            tree_packed_label = pt_batch.tree_packed_labels[:real_tokens].unsqueeze(1)
-        else:
-            # Fallback for batches built without labels_by_sample (e.g. cached subtrie).
-            tree_packed_label = torch.roll(tree_packed_ids, shifts=-1, dims=0)
-            tree_packed_label[-1] = 0
-            tree_packed_label = tree_packed_label.unsqueeze(1)
+        tree_packed_label = pt_batch.tree_packed_labels[:real_tokens].unsqueeze(1)
 
         orig_args = logits_processor_args or {}
         total_flat = tree_packed_ids.shape[0]

@@ -262,6 +262,8 @@ def build_layout_from_tree_node(
 
     def _emit_attn(node: TrieNode) -> None:
         if not node.input_ids:
+            for child in _subtrie_children(node):
+                _emit_attn(child)
             return
         node_range: RangeSpec = (node._flat_start, node._flat_end)
         q_ranges.append(node_range)
