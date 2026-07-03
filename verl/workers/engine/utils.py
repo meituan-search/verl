@@ -117,7 +117,7 @@ def prepare_micro_batches(
             tu.assign_non_tensor(data, prefix_tree_metrics=pt_metrics)
 
     # ── Phase 2: split into micro-batches ──────────────────────────────────────
-    if use_dynamic_bsz and use_prefix_tree:
+    if use_prefix_tree:
         from verl.utils.prefix_tree.dynamic import prepare_prefix_tree_micro_batches
         micro_batches, batch_idx_list = prepare_prefix_tree_micro_batches(
             data,
@@ -125,6 +125,7 @@ def prepare_micro_batches(
             dp_group=dp_group,
             same_micro_num_in_dp=same_micro_num_in_dp,
             num_batches_divided_by=num_batches_divided_by,
+            force_group_size=force_group_size,
         )
 
     elif use_dynamic_bsz:
@@ -142,10 +143,6 @@ def prepare_micro_batches(
             force_group_size=force_group_size,
         )
     else:
-        # When use_prefix_tree=True, the batch is already DFS-ordered by the
-        # global _balance_batch step (reorder_and_balance_for_prefix_tree).
-        # Contiguous micro-batch slices then naturally group same-prompt sequences
-        # together so the prefix tree can find shared prefixes.  No local re-sort needed.
         total_data_size = len(data)
         micro_batch_size_per_gpu = data["micro_batch_size_per_gpu"]
         assert total_data_size % (force_group_size * micro_batch_size_per_gpu) == 0, (
@@ -155,11 +152,6 @@ def prepare_micro_batches(
         n_micro = total_data_size // mbs
         micro_batches = tu.chunk_tensordict(data, n_micro)
         batch_idx_list = [list(range(i * mbs, (i + 1) * mbs)) for i in range(n_micro)]
-        # Attach subtries for prefix-tree even with fixed mbs (same helper as dynbsz).
-        if use_prefix_tree:
-            from verl.utils.prefix_tree.dynamic import create_and_attach_subtrie_views
-            trie = tu.get_non_tensor_data(data, "prefix_tree", default=None)
-            create_and_attach_subtrie_views(micro_batches, batch_idx_list, trie)
     return micro_batches, batch_idx_list
 
 

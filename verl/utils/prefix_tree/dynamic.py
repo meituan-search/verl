@@ -776,31 +776,44 @@ def prepare_prefix_tree_micro_batches(
     dp_group=None,
     same_micro_num_in_dp: bool = True,
     num_batches_divided_by: int | None = None,
+    force_group_size: int = 1,
 ):
     """Prepare micro-batches using prefix-tree grouping.
 
+    Works with both dynamic and fixed micro-batch sizes:
+    - ``use_dynamic_bsz=True``: reads ``max_token_len_per_gpu`` and groups by flat token budget.
+    - ``use_dynamic_bsz=False``: reads ``micro_batch_size_per_gpu`` and chunks by sequence count
+      using DFS trie order so same-prefix sequences stay together.
+
     Expects a pre-built trie stored via ``tu.assign_non_tensor(data, prefix_tree=trie)``.
-    If not present, builds one from sequences (backward-compatible fallback).
+    If not present, falls back to token-by-token trie construction (dynbsz) or plain range
+    order (fixed mbs).
     """
-    _logging.getLogger(__name__).warning_once(
-        "prefix_tree is on: max_token_len_per_gpu is interpreted as "
-        "deduplicated (flat trie) token count, not raw sequence length."
-    )
-
-    assert "max_token_len_per_gpu" in data.keys(), "max_token_len_per_gpu must be set when use_dynamic_bsz is True"
-    max_token_len_per_gpu = data["max_token_len_per_gpu"]
-
-    # After pre-dispatch each CP rank processes flat_tokens/CP tokens, so the total
-    # budget across all CP ranks is max_token_len_per_gpu × sp_size.
-    max_token_len = max_token_len_per_gpu * sp_size
-
     trie = tu.get_non_tensor_data(data, "prefix_tree", default=None)
-    if trie is not None:
-        batch_idx_list = mbs_groups_from_trie(trie, max_token_len)  # TODO: use PrefixSubTrie / PrefixTrie interface
+
+    if "max_token_len_per_gpu" in data.keys():
+        # Dynamic bsz: group by flat-token budget.
+        _logging.getLogger(__name__).warning_once(
+            "prefix_tree is on: max_token_len_per_gpu is interpreted as "
+            "deduplicated (flat trie) token count, not raw sequence length."
+        )
+        max_token_len = data["max_token_len_per_gpu"] * sp_size
+        if trie is not None:
+            batch_idx_list = mbs_groups_from_trie(trie, max_token_len)
+        else:
+            input_ids = data["input_ids"]
+            seqs = [t.tolist() for t in input_ids.unbind()]
+            batch_idx_list = dfs_micro_batch_groups(seqs, max_token_len)
     else:
-        input_ids = data["input_ids"]
-        seqs = [t.tolist() for t in input_ids.unbind()]
-        batch_idx_list = dfs_micro_batch_groups(seqs, max_token_len)
+        # Fixed mbs: chunk by sequence count in DFS trie order so same-prefix
+        # sequences land in the same micro-batch.
+        mbs = data["micro_batch_size_per_gpu"] * force_group_size
+        n = len(data)
+        if trie is not None:
+            dfs_order = trie_dfs_leaf_order(trie)
+        else:
+            dfs_order = list(range(n))
+        batch_idx_list = [dfs_order[i : i + mbs] for i in range(0, n, mbs)]
 
     if torch.distributed.is_initialized() and same_micro_num_in_dp and dp_group is not None:
         n_mb = torch.tensor([len(batch_idx_list)], device=get_torch_device().current_device())
