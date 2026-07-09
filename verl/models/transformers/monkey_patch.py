@@ -72,6 +72,104 @@ def apply_prefix_grouper_patch():
     print(f"[PrefixGrouper] Patched: {patched}")
 
 
+# ---------------------------------------------------------------------------
+# FSDP-only: dynamic prefix-tree + Magi backend.
+#
+# Registers ``"Magi_Attention"`` into HF's ``ALL_ATTENTION_FUNCTIONS``. With
+# ``model.config._attn_implementation = "Magi_Attention"``, every attention
+# layer dispatches through the backend, which reads the Magi key off a
+# per-module attribute. Megatron does not use this path — it builds its own
+# Magi/flex key in ``verl/utils/prefix_tree_magi.py`` and calls
+# ``magi_attn_flex_key`` directly.
+# ---------------------------------------------------------------------------
+
+_MAGI_PREFIX_TREE_REGISTERED = False
+
+
+def _is_attention_module(mod) -> bool:
+    cls_name = mod.__class__.__name__.lower()
+    return cls_name.endswith("attention") or cls_name.endswith("self_attn") or cls_name.endswith("selfattention")
+
+
+def set_magi_attention_key_fsdp(model, key) -> None:
+    """FSDP-only. Attach ``key`` to every attention layer as ``_verl_magi_attention_key``.
+
+    Used by the FSDP dynamic-trie path so the HF ``Magi_Attention`` backend
+    (``_magi_prefix_tree_attention_forward_fsdp``) can read the per-step Magi
+    runtime key. Megatron does NOT use this — it threads the key directly via
+    ``magi_attention_key=...`` kwarg into mcore's forward.
+
+    Module attribute (not kwargs / ContextVar): kwargs crash FSDP2 mixed-precision
+    casting on the dataclass key, ContextVar resets before activation-checkpoint
+    backward recompute. Attribute survives both; same pattern as ``cp_group``.
+    """
+    for _, mod in model.named_modules():
+        if _is_attention_module(mod):
+            mod._verl_magi_attention_key = key
+
+
+def _magi_prefix_tree_attention_forward_fsdp(
+    module,
+    query,
+    key,
+    value,
+    attention_mask,
+    scaling=None,
+    dropout: float = 0.0,
+    **kwargs,
+):
+    """FSDP-only. HF-compatible attention forward backed by MagiAttention's FFA kernel.
+
+    Registered into ``ALL_ATTENTION_FUNCTIONS`` under the name ``"Magi_Attention"``
+    by ``apply_magi_prefix_tree_backend_fsdp``. Megatron uses its own attention
+    integration in ``verl/utils/prefix_tree_magi.py`` and does not go through
+    this function.
+
+    Q/K/V are (bsz, num_heads, seq_len, head_dim); bsz must be 1 since the
+    prefix-tree path packs all samples into one sequence. Patterned after
+    https://github.com/SandAI-org/MagiAttention/blob/main/examples/transformers/magi_attention_func.py.
+    """
+    from einops import rearrange
+    from magi_attention.api import calc_attn
+
+    magi_key = getattr(module, "_verl_magi_attention_key", None)
+    assert magi_key is not None, "set_magi_attention_key_fsdp must be called before forward."
+
+    cp_group = getattr(module, "cp_group", None)
+    assert cp_group is not None or not torch.distributed.is_initialized(), (
+        "attention module missing cp_group; did FSDPEngine attach it?"
+    )
+
+    bsz = query.shape[0]
+    assert bsz == 1, f"Magi_Attention backend requires batch_size=1, got {bsz}."
+
+    dtype = query.dtype
+    # (1, nh, s, hd) -> (s, nh, hd); FFA needs fp16/bf16.
+    q, k, v = [rearrange(e, "1 nh s hd -> (1 s) nh hd").to(torch.bfloat16) for e in (query, key, value)]
+
+    o = calc_attn(q, k, v, magi_key)[0]
+
+    o = rearrange(o, "(1 s) nh hd -> 1 s (nh hd)").to(dtype)
+    return o, None
+
+
+def apply_magi_prefix_tree_backend_fsdp():
+    """FSDP-only. Idempotently register ``"Magi_Attention"`` into ALL_ATTENTION_FUNCTIONS.
+
+    Megatron does not register an HF backend — its prefix-tree path runs through
+    mcore's forward in ``verl/models/mcore/model_forward.py``.
+    """
+    global _MAGI_PREFIX_TREE_REGISTERED
+    if _MAGI_PREFIX_TREE_REGISTERED:
+        return
+
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    ALL_ATTENTION_FUNCTIONS.register("Magi_Attention", _magi_prefix_tree_attention_forward_fsdp)
+    _MAGI_PREFIX_TREE_REGISTERED = True
+    print("[PrefixTreeDynamic-FSDP] Registered Magi_Attention backend in ALL_ATTENTION_FUNCTIONS")
+
+
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=2, repeats=n_rep). The hidden states go from (batch,
@@ -295,6 +393,7 @@ def apply_monkey_patch(
     use_fused_kernels: bool = False,
     fused_kernels_backend: str = None,
     use_prefix_grouper: bool = False,
+    use_prefix_tree_dynamic: bool = False,
     use_tiled_mlp: bool = False,
     tiled_mlp_shards: int = 4,
 ):
@@ -323,6 +422,12 @@ def apply_monkey_patch(
     # Apply PrefixGrouper patch if enabled
     if use_prefix_grouper:
         apply_prefix_grouper_patch()
+
+    # FSDP-only: register the Magi_Attention backend if dynamic prefix-tree is on.
+    # FSDPEngine._build_module then walks the model, attaches `cp_group`, and
+    # flips `_attn_implementation`.
+    if use_prefix_tree_dynamic:
+        apply_magi_prefix_tree_backend_fsdp()
 
     """Replace _flash_attention_forward to _ulysses_flash_attention_forward"""
     module = sys.modules[model.__module__]

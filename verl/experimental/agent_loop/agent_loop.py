@@ -410,8 +410,9 @@ class AgentLoopWorker:
             )
 
         # Load tools once per worker; each trajectory just reuses self.tools.
+        # function_tool_path may be absent on older rollout schemas.
         tool_config_path = self.rollout_config.multi_turn.tool_config_path
-        function_tool_path = self.rollout_config.multi_turn.function_tool_path
+        function_tool_path = getattr(self.rollout_config.multi_turn, "function_tool_path", None)
         self.tools = load_all_tools(
             tool_config_path=resolve_config_path(tool_config_path) if tool_config_path else None,
             function_tool_path=resolve_config_path(function_tool_path) if function_tool_path else None,
