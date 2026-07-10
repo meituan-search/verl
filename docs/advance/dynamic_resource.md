@@ -10,7 +10,7 @@ This module provides **hybrid inference resource dynamic scaling** for the fully
 > - Two kinds of inference replicas: **Standalone** (dedicated rollout nodes, always on) + **Hybrid** (share Trainer-node GPUs; activated during training idle time, weights offloaded and memory returned before each training step).
 > - A pluggable **Policy** decides when to activate/deactivate Hybrid replicas; `DynamicResourceController` owns the lifecycle (state machine `STANDALONE_ONLY <-> HYBRID_ACTIVE`).
 > - When Standalone capacity is sufficient, Hybrid skips rollout entirely and stays focused on training, avoiding needless mode-switching; weight sync to Hybrid replicas can also be skipped, saving communication.
-> - Measured (Qwen3.5-35B-A3B / DAPO-Math-17K): ~**12%** faster end-to-end training time, with a reward curve identical to baseline.
+> - Measured (Qwen3.5-35B-A3B / DAPO-Math-17K): ~**15.3%** faster end-to-end training time, with a reward curve identical to baseline.
 
 ---
 
@@ -194,7 +194,7 @@ compute, aggregated over an entire sync cycle.
 
 For each micro fit-step $i = 1, \dots, n$ within the cycle:
 
-- Numerator (compute time): $C_i = \sum_{k \in K} \text{timing\_raw}_i[k]$, where
+- Numerator (compute time): $C_i = \sum_{k \in K} \text{timing\_raw\_i}[k]$, where
   $K = \{\text{reward}, \text{old\_log\_prob}, \text{ref}, \text{values}, \text{adv}, \text{update\_critic}, \text{update\_actor}\}$
   — `ref` is the timing key recorded via `marked_timer(str(Role.RefPolicy), …)` (the enum's
   string value is `"ref"`, not `"RefPolicy"`). Missing keys — e.g. `values`/`update_critic`
@@ -238,7 +238,7 @@ its own $S_k$.
 The capacity for each interval is:
 
 $$
-S_k = \min\!\left(\text{get\_active\_server\_count}_k \times \text{concurrent\_samples\_per\_replica},\ \text{max\_required\_samples}\right)
+S_k = \min\!\left(\text{get\_active\_server\_count\_k} \times \text{concurrent\_samples\_per\_replica},\ \text{max\_required\_samples}\right)
 $$
 
 For each interval $k$, the instantaneous utilization is $u_k = \min(1, A_k / S_k)$ (clamped
@@ -335,7 +335,7 @@ the `dynamic_resource/*` metrics above.
 
 #### Result: 15.3% Faster End-to-End Training Time
 
-Dynamic resource scaling reduces total wall-clock training time by **~15.3%** compared to the 8+24 baseline, and **~17.5** compared to the 16+16 baseline, while producing an **identical reward curve** — confirming that the training quality is not compromised by the time-sliced GPU sharing.
+Dynamic resource scaling reduces total wall-clock training time by **~15.3%** compared to the 8+24 baseline, and **~17.5%** compared to the 16+16 baseline, while producing an **identical reward curve** — confirming that the training quality is not compromised by the time-sliced GPU sharing.
 
 **Reward curve** (dynamic scaling vs baseline):
 
