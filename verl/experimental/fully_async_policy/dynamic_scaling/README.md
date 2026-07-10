@@ -185,6 +185,10 @@ formal definition of each metric.
 |--------|---------|
 | $a$ | `hybrid_gpus` = `trainer.nnodes × trainer.n_gpus_per_node` (Trainer-node GPUs that can switch between rollout/train) |
 | $b$ | `standalone_gpus` = `rollout.nnodes × rollout.n_gpus_per_node` (dedicated rollout-node GPUs) |
+| $\text{compute}_i$ | Training-GPU compute time of micro fit-step $i$ (sum of `timing_raw` keys: `reward`, `old_log_prob`, `ref`, `values`, `adv`, `update_critic`, `update_actor`) |
+| $\text{alloc}_i$ | Allocated wall-clock time of micro fit-step $i$ (from `_fit_generate()` through `_fit_dump_data()`, including `param_sync` and activation overhead) |
+| $\text{cap}_k$ | Concurrency capacity of rollout interval $k$ = $\min(\text{servers}_k \times s,\ \text{maxReq})$ |
+| $\text{active}_k$ | Active task count during rollout interval $k$ |
 | sync cycle | The window between two consecutive parameter-sync events (i.e. between two `reset_staleness()` calls / every `trigger_parameter_sync_step` collections), possibly spanning multiple Trainer micro fit-steps (including partial-rollout resumption) |
 
 ### 4.1 `dynamic_resource/train_resource_utilization`
@@ -194,12 +198,12 @@ compute, aggregated over an entire sync cycle.
 
 For each micro fit-step $i = 1, \dots, n$ within the cycle:
 
-- Numerator (compute time): $C_i = \sum_{k \in K} \text{timing\_raw\_i}[k]$, where
-  $K = \{\text{reward}, \text{old\_log\_prob}, \text{ref}, \text{values}, \text{adv}, \text{update\_critic}, \text{update\_actor}\}$
+- **Numerator** ($\text{compute}_i$): sum of the `timing_raw` training-compute keys
+  (`reward`, `old_log_prob`, `ref`, `values`, `adv`, `update_critic`, `update_actor`).
   — `ref` is the timing key recorded via `marked_timer(str(Role.RefPolicy), …)` (the enum's
   string value is `"ref"`, not `"RefPolicy"`). Missing keys — e.g. `values`/`update_critic`
   when `use_critic=False` — default to 0.
-- Denominator (allocated time): $A_i$ = wall-clock time from `_fit_generate()` through
+- **Denominator** ($\text{alloc}_i$): wall-clock time from `_fit_generate()` through
   `_fit_update_weights()` and `_fit_dump_data()` (includes `timing_s/param_sync` and any hybrid
   activation time; these are intentionally **not** subtracted)
 
@@ -207,7 +211,7 @@ Both quantities are summed across all micro-steps in the cycle first, and the ra
 once from the summed totals (not averaged per micro-step):
 
 $$
-\text{train\_resource\_utilization} = \frac{\sum_{i=1}^{n} C_i}{\sum_{i=1}^{n} A_i}
+U_{\text{train}} = \frac{\sum_{i=1}^{n} \text{compute}_i}{\sum_{i=1}^{n} \text{alloc}_i}
 $$
 
 The un-ratioed numerator and denominator are also emitted directly as the raw metrics
@@ -225,32 +229,35 @@ tuples — appended every time a sample is submitted, completes, or is drained d
 **and** whenever `max_concurrent_samples` itself changes (i.e. a replica is
 activated/deactivated under dynamic resource scaling). This gives timestamps
 $t_0 < t_1 < \dots < t_m$ with two quantities held constant over each interval $[t_k, t_{k+1})$:
-the active-task count $A_k$ and the concurrency capacity $S_k$ ($t_0$ is the previous step's end
-/ this step's start; $t_m$ is "now", appended when `reset_staleness()` is called, closing out the
-window including any trailing drain/idle time).
+the active-task count $\text{active}_k$ and the concurrency capacity $\text{cap}_k$
+($t_0$ is the previous step's end / this step's start; $t_m$ is "now", appended when
+`reset_staleness()` is called, closing out the window including any trailing drain/idle time).
 
 Recording the capacity alongside the active count per interval is essential because under dynamic
-resource scaling $S_k$ is **not** constant over a step window — replicas can be
+resource scaling $\text{cap}_k$ is **not** constant over a step window — replicas can be
 activated/deactivated mid-window. Using a single end-of-window capacity for the whole window
 would misattribute utilization for intervals that had a different capacity, so each interval uses
-its own $S_k$.
+its own $\text{cap}_k$.
 
-The capacity for each interval is:
-
-$$
-S_k = \min\!\left(\text{get\_active\_server\_count\_k} \times \text{concurrent\_samples\_per\_replica},\ \text{max\_required\_samples}\right)
-$$
-
-For each interval $k$, the instantaneous utilization is $u_k = \min(1, A_k / S_k)$ (clamped
-because concurrency can transiently exceed capacity under dynamic resource scaling). Weighting
-each interval by its capacity-time (so a higher-capacity interval counts proportionally more):
+The capacity for each interval is $\text{cap}_k = \min(\text{servers}_k \times s,\ \text{maxReq})$,
+where $\text{servers}_k$ is `get_active_server_count()` at interval $k$, $s$ is
+`concurrent_samples_per_replica`, and $\text{maxReq}$ is `max_required_samples`:
 
 $$
-\text{rollout\_resource\_utilization} = \frac{\sum_k (t_{k+1} - t_k) \cdot S_k \cdot u_k}{\sum_k (t_{k+1} - t_k) \cdot S_k} = \frac{\sum_k (t_{k+1} - t_k) \cdot \min(S_k, A_k)}{\sum_k (t_{k+1} - t_k) \cdot S_k}
+\text{cap}_k = \min(\text{servers}_k \times s,\ \text{maxReq})
+$$
+
+Each interval's effective load is $\min(\text{cap}_k, \text{active}_k)$ (the capacity
+$\text{cap}_k$ is already clamped, so the actual served concurrency is the smaller of capacity
+and active tasks). Weighting each interval by its capacity-time (so a higher-capacity interval
+counts proportionally more):
+
+$$
+U_{\text{rollout}} = \frac{\sum_k (t_{k+1} - t_k) \cdot \min(\text{cap}_k, \text{active}_k)}{\sum_k (t_{k+1} - t_k) \cdot \text{cap}_k}
 $$
 
 Returns `0.0` if there is no time span to integrate over (e.g. total capacity-time weight is 0;
-intervals with $S_k = 0$ contribute zero weight and are skipped).
+intervals with $\text{cap}_k = 0$ contribute zero weight and are skipped).
 
 ### 4.3 `dynamic_resource/resource_utilization`
 
@@ -263,31 +270,30 @@ rollout (the rest, $1-x$, they spent training), estimated as the ratio of summed
 resource scaling deactivates Hybrid replicas this cycle) over the summed step time:
 
 $$
-x = \text{clip}\!\left(\frac{\texttt{timing\_s/wait\_for\_enough\_samples}}{\texttt{timing\_s/step}},\ 0,\ 1\right)
+x = \mathrm{clip}\!\left(\frac{\text{wait}}{\text{step}},\ 0,\ 1\right)
 $$
 
-When dynamic resource scaling never switches Hybrid GPUs into rollout mode this cycle (e.g.
-disabled, or `wait_for_enough_samples` was skipped), $x = 0$ (100% of Hybrid time is training).
+where $\text{wait}$ is the summed `timing_s/wait_for_enough_samples` and $\text{step}$ is the
+summed `timing_s/step`. When dynamic resource scaling never switches Hybrid GPUs into rollout
+mode this cycle (e.g. disabled, or `wait_for_enough_samples` was skipped), $x = 0$ (100% of
+Hybrid time is training).
 
 Weighting each utilization by the GPU-seconds it was measured over — Hybrid GPUs spend
-$(1-x) \cdot a$ GPU-time training at `train_resource_utilization` and $x \cdot a$ GPU-time doing
-rollout at `rollout_resource_utilization`; Standalone GPUs ($b$ of them) spend all their time doing
-rollout at `rollout_resource_utilization`:
+$(1-x) \cdot a$ GPU-time training at $U_{\text{train}}$ and $x \cdot a$ GPU-time doing
+rollout at $U_{\text{rollout}}$; Standalone GPUs ($b$ of them) spend all their time doing
+rollout at $U_{\text{rollout}}$:
 
 $$
-\text{resource\_utilization} = \frac{(1-x) \cdot a \cdot \text{train\_util} + (x \cdot a + b) \cdot \text{rollout\_util}}{a + b}
+U_{\text{cluster}} = \frac{(1-x) \cdot a \cdot U_{\text{train}} + (x \cdot a + b) \cdot U_{\text{rollout}}}{a + b}
 $$
 
 ### 4.4 `dynamic_resource/mq_size`
 
 A snapshot (not an average) of the number of samples remaining in the MessageQueue for subsequent
-steps, taken right after a Trainer `fit_step()` (including any partial-rollout resumption) finishes:
-
-$$
-\text{mq\_size} = \text{message\_queue\_client.get\_queue\_size\_sync()}
-$$
-
-Reported as the last value observed in the cycle rather than an average across the cycle's
+steps, taken right after a Trainer `fit_step()` (including any partial-rollout resumption) finishes.
+If we denote this snapshot as $Q$, then $Q$ equals the value returned by
+`message_queue_client.get_queue_size_sync()`. Reported as the last value observed in the cycle
+rather than an average across the cycle's
 micro-steps.
 
 ### 4.5 Related rollouter-side metric: `fully_async/rollouter/step_generated_samples`
