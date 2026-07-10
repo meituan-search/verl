@@ -270,7 +270,7 @@ rollout (the rest, $1-x$, they spent training), estimated as the ratio of summed
 resource scaling deactivates Hybrid replicas this cycle) over the summed step time:
 
 $$
-x = \mathrm{clip}\!\left(\frac{\text{wait}}{\text{step}},\ 0,\ 1\right)
+x = \mathrm{clip}\left(\frac{\text{wait}}{\text{step}},\ 0,\ 1\right)
 $$
 
 where $\text{wait}$ is the summed `timing_s/wait_for_enough_samples` and $\text{step}$ is the
