@@ -1,12 +1,14 @@
 # Fully-Async 训练的动态资源伸缩
 
+> 完整文档已迁移至 [`docs/advance/dynamic_resource.md`](../../../../docs/advance/dynamic_resource.md)，本文件为中文翻译。
+
 本模块为 fully-async 训练框架提供**混合推理资源的动态伸缩**能力：让 Trainer 节点的 GPU 在训练空闲期参与 rollout 生成，从而提升整体 GPU 利用率。
 
 > **速览**
 > - 两种推理副本：**Standalone**（专用 rollout 节点，常驻在线）+ **Hybrid**（与 Trainer 节点 GPU 共享，训练空闲时激活，训练前 offload 权重并归还显存）。
 > - 由可插拔的 **Policy** 决定何时激活/停用 Hybrid 副本；`DynamicResourceController` 管理生命周期（状态机 `STANDALONE_ONLY <-> HYBRID_ACTIVE`）。
 > - 当 Standalone 产能充足时，Hybrid 直接跳过 rollout 专心训练，避免无谓的模式切换；权重同步也可按需跳过 Hybrid，节省通信。
-> - 实测（Qwen3.5-35B-A3B / DAPO-Math-17K）：端到端训练时间快约 **12%**，reward 曲线与 baseline 一致。
+> - 实测（Qwen3.5-35B-A3B / DAPO-Math-17K）：端到端训练时间快约 **15.3%**，reward 曲线与 baseline 一致。
 
 ---
 
@@ -186,8 +188,8 @@ Deactivate（顺序至关重要）：
 对 cycle 内每个 micro fit-step $i = 1, \dots, n$：
 
 - 分子（计算时间）：$C_i = \sum_{k \in K} \text{timing\_raw}_i[k]$，其中
-  $K = \{\text{reward}, \text{old\_log\_prob}, \text{RefPolicy}, \text{values}, \text{adv}, \text{update\_critic}, \text{update\_actor}\}$
-  （缺失的 key——如 `use_critic=False` 时的 `values`/`update_critic`——按 0 计）
+  $K = \{\text{reward}, \text{old\_log\_prob}, \text{ref}, \text{values}, \text{adv}, \text{update\_critic}, \text{update\_actor}\}$
+  ——`ref` 是通过 `marked_timer(str(Role.RefPolicy), …)` 记录的 timing key（枚举的字符串值为 `"ref"`，而非 `"RefPolicy"`）。缺失的 key——如 `use_critic=False` 时的 `values`/`update_critic`——按 0 计。
 - 分母（分配时间）：$A_i$ = 从 `_fit_generate()` 到 `_fit_update_weights()`、`_fit_dump_data()` 的 wall-clock（含 `timing_s/param_sync` 与 hybrid 激活开销，这些**故意不减**）
 
 两者先对 cycle 内所有 micro-step 求和，再由总和求比（而非按 micro-step 平均）：
@@ -196,25 +198,29 @@ $$
 \text{train\_resource\_utilization} = \frac{\sum_{i=1}^{n} C_i}{\sum_{i=1}^{n} A_i}
 $$
 
+未取比的原始分子/分母也直接作为 `dynamic_resource/train_compute_time_s` 和 `dynamic_resource/train_allocated_time_s` 上报（按 cycle 内 micro-step **求和**聚合），比值由 `MetricsAggregator` 从总和一次性计算，而非按 micro-step 平均。
+
 ### 4.2 `dynamic_resource/rollout_resource_utilization`
 
 Rollouter 一步内（上一次到本次 `reset_staleness()` 之间的窗口）rollout 并发容量的实际使用占比。
 
-Rollouter 记录 `len(active_tasks)` 的事件驱动历史——每次提交样本、完成、暂停时 drain 时追加——得到时间戳 $t_0 < t_1 < \dots < t_m$，各区间 $[t_k, t_{k+1})$ 内活跃任务数为 $A_k$（$t_0$ 为上一步结束/本步开始；$t_m$ 为「现在」，在 `reset_staleness()` 时追加，闭合窗口并包含尾部 drain/空闲时间）。
+Rollouter 记录 `(len(active_tasks), max_concurrent_samples)` 的事件驱动历史——每次提交样本、完成、暂停时 drain 时追加，**且**每当 `max_concurrent_samples` 本身变化（即动态伸缩下副本增减）时也追加——得到时间戳 $t_0 < t_1 < \dots < t_m$，每个区间 $[t_k, t_{k+1})$ 内有两个量保持恒定：活跃任务数 $A_k$ 和并发容量 $S_k$（$t_0$ 为上一步结束/本步开始；$t_m$ 为「现在」，在 `reset_staleness()` 时追加，闭合窗口并包含尾部 drain/空闲时间）。
 
-最大并发容量用**窗口末值**近似（有意的近似，不逐子区间重算）：
+逐区间记录容量是因为动态伸缩下 $S_k$ 在一个 step 窗口内**并非恒定**——副本可能中途激活/停用。若用窗口末尾单一容量近似整窗，会带偏容量不同的早期区间利用率，因此每个区间用各自的 $S_k$。
 
-$$
-S = \text{get\_active\_server\_count}() \times \text{concurrent\_samples\_per\_replica}
-$$
-
-对每个区间 $k$，瞬时利用率为 $u_k = \min(1, A_k / S)$（做 clamp 是因为动态伸缩下并发可能瞬时超过容量）。按区间时长加权：
+每个区间的容量为：
 
 $$
-\text{rollout\_resource\_utilization} = \frac{\sum_k (t_{k+1} - t_k) \cdot u_k}{\sum_k (t_{k+1} - t_k)}
+S_k = \min\!\left(\text{get\_active\_server\_count}_k \times \text{concurrent\_samples\_per\_replica},\ \text{max\_required\_samples}\right)
 $$
 
-无可积分时间跨度时（如 $S = 0$）返回 `0.0`。
+对每个区间 $k$，瞬时利用率为 $u_k = \min(1, A_k / S_k)$（做 clamp 是因为动态伸缩下并发可能瞬时超过容量）。按**容量时间**加权（容量大的区间权重更高）：
+
+$$
+\text{rollout\_resource\_utilization} = \frac{\sum_k (t_{k+1} - t_k) \cdot S_k \cdot u_k}{\sum_k (t_{k+1} - t_k) \cdot S_k} = \frac{\sum_k (t_{k+1} - t_k) \cdot \min(S_k, A_k)}{\sum_k (t_{k+1} - t_k) \cdot S_k}
+$$
+
+无可积分时间跨度时（如总容量时间权重为 0；$S_k = 0$ 的区间权重为 0 且被跳过）返回 `0.0`。
 
 ### 4.3 `dynamic_resource/resource_utilization`
 
@@ -244,9 +250,13 @@ $$
 
 按 cycle 内最后一次观测值上报，而非跨 micro-step 平均。
 
+### 4.5 相关 Rollouter 侧指标：`fully_async/rollouter/step_generated_samples`
+
+当前 param version 内 Rollouter 完整生成的样本数（每次 `reset_staleness()` 时重置为 0）。它与 `dynamic_resource/rollout_resource_utilization` 一起在 rollouter 的 `timing_raw` 中返回，是 Rollouter 追踪每步吞吐量的底层信号；因其与上述 `dynamic_resource/*` 指标在同一代码路径中计算，故在此一并说明。
+
 ### 注意事项
 
-- **`rollout_resource_utilization` 的容量近似**：$S$ 取窗口末值，若一个 cycle 内 Hybrid 副本多次激活/停用（导致 $S$ 中途显著变化），早期区间的利用率会被带偏。
+- **`rollout_resource_utilization` 的逐区间容量**：动态伸缩下容量 $S_k$ 可能因副本激活/停用而中途变化；每个区间使用各自的 $S_k$ 而非窗口末尾单一值，容量变化可被忠实反映。`max_concurrent_samples` 首次已知前记录的初始种子点（占位容量 0）会在真实容量可用后被修正。
 - **`resource_utilization` 假设 `should_deactivate() == is_hybrid_active`**：$x$ 的估计依赖 `timing_s/wait_for_enough_samples` 忠实反映「本 cycle Hybrid GPU 处于 rollout 模式」，这对内置 `default`/`static_fully_async` 策略成立，但对激活语义不同的自定义策略未必成立。
 - **`train_resource_utilization` 与 `rollout_resource_utilization` 不完全可比**：前者分母含 `param_sync`/激活开销（未减），后者分母是纯 rollout 窗口时间——解读合并后的 `resource_utilization` 时需注意。
 
@@ -260,29 +270,84 @@ $$
 |------|--------|
 | 模型 | Qwen3.5-35B-A3B |
 | 数据集 | DAPO-Math-17k (train) / AIME-2024 (val) |
-| 后端 | Megatron（TP=4, PP=3, EP=8） |
+| 后端 | Megatron（TP=4, PP=2, EP=8） |
 | 硬件 | H20（8 GPUs/node） |
 | 脚本 | `verl/experimental/fully_async_policy/shell/run_qwen35_35b_a3b_math_dynamic_megatron.sh` |
 | 关键超参 | `dynamic_scaling_policy="default"`, `dynamic_scaling_deactivate_ratio=0.6`, `dynamic_scaling_enable_rebalance=True`, `staleness_threshold=0.5`, `trigger_parameter_sync_step=4`；hybrid `gpu_memory_utilization=0.45`，standalone `standalone_gpu_memory_utilization=0.7` |
 
-**Baseline**：16 GPU 训练 + 16 GPU rollout（2 个训练节点 + 2 个 rollout 节点）。
-**动态伸缩**：24 GPU 训练（3 节点）+ 8 GPU rollout（1 节点），Trainer GPU 上跑 Hybrid 副本。
+**Baseline 1**：16 GPU 训练 + 16 GPU rollout（2 个训练节点 + 2 个 rollout 节点）。
+**Baseline 2**：8 GPU 训练 + 24 GPU rollout（1 个训练节点 + 3 个 rollout 节点）。
+**动态伸缩**：16 GPU 训练（2 节点）+ 16 GPU rollout（2 节点），Trainer GPU 上跑 Hybrid 副本。
 
-#### 结果：端到端训练时间快约 12%
+#### 结果：端到端训练时间快约 15.3%
 
-动态资源伸缩相比 16+16 baseline，总 wall-clock 训练时间降低约 **12%**，且 reward 曲线**完全一致**——证明分时共享 GPU 不损害训练质量。
+动态资源伸缩相比 8+24 baseline，总 wall-clock 训练时间降低约 **15.3%**，相比 16+16 baseline 降低约 **17.5%**，且 reward 曲线**完全一致**——证明分时共享 GPU 不损害训练质量。
 
 **Reward 曲线**（动态伸缩 vs baseline）：
 
-![Reward 曲线](https://github.com/zpltys/Blob/blob/main/dynamic_resource_exp_reward.png?raw=true)
+<div align="center">
+<img src="https://github.com/zpltys/Blob/blob/main/dynamic_resource_exp_reward.png?raw=true" width="600" />
+</div>
 
 两条曲线全程高度重合，说明动态伸缩不引入模型质量回归。
 
 **每步运行时对比**：
 
-![每步运行时](https://github.com/zpltys/Blob/blob/main/dynamic_resource_exp_time.png?raw=true)
+<div align="center">
+<img src="https://github.com/zpltys/Blob/blob/main/dynamic_resource_exp_time.png?raw=true" width="600" />
+</div>
 
 每步运行时图显示，动态伸缩利用 Trainer GPU 在 rollout 空闲窗参与生成以降低 step 延迟，且随训练推进、policy 自适应 `deactivate_ratio`，差距逐渐拉大。
+
+#### 资源利用率分解
+
+三种 static 配置的差异在于**训练/推理负载配比**，下面的指标可以清楚地体现这一点。关键直觉：`dynamic_resource/mq_size`（每次 `fit_step()` 后 MessageQueue 中缓冲的样本数）直接反映瓶颈在生产端（rollout）还是消费端（trainer）。
+
+- **16-16-static**（16 GPU 训练 + 16 GPU rollout）：trainer 消费样本的速度快于 16 GPU rollout 的生产速度，**瓶颈在生产端**——队列被持续抽到接近 0，trainer 一直等样本。
+- **24-8-static**（8 GPU 训练 + 24 GPU rollout）：24 GPU rollout 的生产速度快于 8 GPU trainer 的消费速度，**瓶颈在消费（训练）端**——样本堆积，队列顶到容量上限。
+- **dynamic**：根据实时队列深度在 rollout 和训练之间动态调配 Trainer 节点 GPU，使生产和消费匹配——队列保持适中水平，既避免了 16-16 的 trainer 空等，也避免了 24-8 的样本积压。
+
+**MessageQueue 大小**（`dynamic_resource/mq_size`）：
+
+<div align="center">
+<img src="https://github.com/zpltys/Blob/blob/main/dynamic_resource_exp_mq_size.png?raw=true" width="600" />
+</div>
+
+16-16-static 曲线贴近 0（生产瓶颈，trainer 空等）；24-8-static 曲线顶在容量上限（消费瓶颈，样本积压）；dynamic 曲线居中，维持生成/消费平衡。
+
+**集群级 GPU 利用率**（`dynamic_resource/resource_utilization`）：
+
+<div align="center">
+<img src="https://github.com/zpltys/Blob/blob/main/dynamic_resource_resource_utilization.png?raw=true" width="600" />
+</div>
+
+16-16-static 浪费训练侧 GPU 时间等样本；24-8-static 浪费 rollout 侧 GPU 时间过度生产未被消费的样本。动态伸缩让两侧 GPU 时间都落在有效计算上，集群级利用率最高。
+
+**Rollout 侧利用率**（`dynamic_resource/rollout_resource_utilization`）：
+
+<div align="center">
+<img src="https://github.com/zpltys/Blob/blob/main/dynamic_resource_rollout_resource_utilization.png?raw=true" width="600" />
+</div>
+
+16-16-static（生产瓶颈）的 16 个 rollout GPU 长期压满产能；24-8-static（产能过剩）的 24 GPU rollout 容量大量闲置，因为 trainer 消费不动。动态伸缩将 rollout 利用率维持在较高且稳定的水平——既不像 16-16 那样被压满到瓶颈，也不像 24-8 那样闲置。
+
+**训练侧利用率**（`dynamic_resource/train_resource_utilization`）：
+
+<div align="center">
+<img src="https://github.com/zpltys/Blob/blob/main/dynamic_resource_train_resource_utilization.png?raw=true" width="600" />
+</div>
+
+24-8-static 样本充足，trainer 从不等样本，训练侧利用率最高。16-16-static 的 trainer 大量时间花在等样本上（等待时间在该指标分母内，拉低了比值）。动态伸缩在样本充足时接近 24-8 的高水平，同时避免了 16-16 的空等浪费。
+
+**负载配比权衡汇总**：
+
+| 配置 | 瓶颈 | MQ 积压 | Rollout 利用率 | Train 利用率 |
+|------|------|---------|---------------|-------------|
+| 16-16-static | 生产端（rollout） | 贴近 0（trainer 空等） | 压满产能 | 低（等样本） |
+| 24-8-static | 消费端（trainer） | 顶到上限 | 容量闲置 | 高（不等样本） |
+| dynamic | 动态匹配 | 适中 | 高且稳定 | 接近 24-8 |
+
+动态伸缩的价值：通过在训练和 rollout 之间动态调配 GPU 以匹配实际负载，同时避免 16-16 的 trainer 空等和 24-8 的样本积压，在不增加总 GPU 数的前提下获得更高的端到端吞吐。
 
 ---
 
@@ -386,5 +451,6 @@ dynamic_scaling/
 ├── static_fully_async_policy.py       # StaticFullyAsyncPolicy（原始 fully-async / colocated 回退）
 ├── fixed_ratio_policy.py              # FixedRatioDynamicScalingPolicy（固定比例，无自适应）
 ├── dynamic_resource_controller.py     # DynamicResourceController（状态机 + 生命周期）
-└── README.md / README_zh.md           # 英文 / 中文文档
+├── README.md                          # 指向 docs/advance/dynamic_resource.md 的指针
+└── README_zh.md                       # 中文文档（本文件）
 ```
