@@ -59,7 +59,7 @@ class GlobalRequestLoadBalancer:
       among equally-loaded servers uses ``hash(request_id)`` so the same
       request always routes to the same server across runs.
     - **Dynamic Server Management**: Supports add/remove servers at runtime
-      for hybrid scheduling.
+      for hybrid scaling.
     """
 
     def __init__(
@@ -68,7 +68,7 @@ class GlobalRequestLoadBalancer:
         max_cache_size: int = DEFAULT_ROUTING_CACHE_SIZE,
         full_determinism: bool = False,
     ):
-        # Allow empty initial servers: in dynamic-resource-scaling mode all
+        # Allow empty initial servers: in dynamic-resource-scheduling mode all
         # replicas are hybrid and will be registered later via add_servers().
 
         self._servers: dict[str, ray.actor.ActorHandle] = dict(servers)
