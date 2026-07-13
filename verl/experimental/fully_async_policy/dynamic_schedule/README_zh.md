@@ -82,7 +82,7 @@ Deactivate（顺序至关重要）：
 | `use_dynamic_resource_scheduling` | bool | `False` | 总开关。为 `True` 时，启动即在 Trainer 节点 GPU 上初始化 hybrid rollout 副本（sleeping，显存已归还训练引擎）。 |
 | `dynamic_schedule_policy` | str | `"default"` | 策略名（`"default"` / `"static_fully_async"` / `"fixed_ratio"` / 自定义注册名）。 |
 | `dynamic_schedule_deactivate_ratio` | float | `0.3` | 样本收集比例阈值。控制器等到 `deactivate_ratio × required_samples × trigger_parameter_sync_step` 个样本缓冲好再停用。越小越早停用；`1.0` 表示等满一个 batch。 |
-| `dynamic_schedule_enable_rebalance` | bool | `False` | hybrid 激活后是否对在途请求做 rebalance（abort + 清 sticky cache + resume），按 least-loaded 路由。 |
+| `dynamic_schedule_enable_rebalance` | bool | `True` | hybrid 激活后是否对在途请求做 rebalance（abort + 清 sticky cache + resume），按 least-loaded 路由。 |
 
 ### 复用的已有 async-training 参数
 

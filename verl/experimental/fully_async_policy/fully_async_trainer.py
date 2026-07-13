@@ -196,7 +196,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # Whether to enable request rebalancing (abort + clear sticky cache +
         # resume) after hybrid replica activation. Default False.
         self._dynamic_schedule_enable_rebalance: bool = config.async_training.get(
-            "dynamic_schedule_enable_rebalance", False
+            "dynamic_schedule_enable_rebalance", True
         )
         self.staleness_threshold: float = config.async_training.get("staleness_threshold", 1)
 

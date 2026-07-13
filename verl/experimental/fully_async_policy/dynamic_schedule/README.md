@@ -87,7 +87,7 @@ All dynamic scheduling parameters live under the `async_training` section of you
 | `use_dynamic_resource_scheduling` | bool | `False` | Master switch. When `True`, hybrid rollout replicas are initialised on Trainer-node GPUs at startup (sleeping, memory returned to the training engine). |
 | `dynamic_schedule_policy` | str | `"default"` | Name of the scheduling policy (`"default"`, `"static_fully_async"`, `"fixed_ratio"`, or a custom registered name). |
 | `dynamic_schedule_deactivate_ratio` | float | `0.3` | Sample-collection ratio threshold. The controller waits until `deactivate_ratio × required_samples × trigger_parameter_sync_step` samples are buffered before deactivating. Lower → earlier deactivation; `1.0` → wait for a full batch. |
-| `dynamic_schedule_enable_rebalance` | bool | `False` | Whether to rebalance (abort + clear sticky cache + resume) in-flight requests across all active replicas after hybrid activation, via least-loaded routing. |
+| `dynamic_schedule_enable_rebalance` | bool | `True` | Whether to rebalance (abort + clear sticky cache + resume) in-flight requests across all active replicas after hybrid activation, via least-loaded routing. |
 
 ### Existing Async-Training Parameters (used by dynamic scheduling)
 
