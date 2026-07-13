@@ -92,11 +92,6 @@ Deactivate（顺序至关重要）：
 | `trigger_parameter_sync_step` | int | `4` | 两次 weight-sync 之间的 collection 数；用于上面的 deactivate wait 公式。 |
 | `require_batches` | int | `1` | 每次 collection 的 ppo_mini_batch 数；决定 `required_samples`。 |
 
-### FSDP 专属参数
-
-| 参数 | 类型 | 默认 | 说明 |
-|------|------|------|------|
-| `concurrent_samples_per_replica` | int | `16` | 每副本最大并发生成请求数，用于计算 `max_concurrent_samples = num_active_replicas × concurrent_samples_per_replica`。（仅 FSDP config。） |
 
 ### Rollout 资源配置（`actor_rollout_ref.rollout` 下）
 

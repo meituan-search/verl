@@ -45,6 +45,9 @@ async_training:
   # across newly activated hybrid replicas via least-loaded routing.
   dynamic_schedule_enable_rebalance: False
 
+  # Maximum number of concurrent generation requests per replica.
+  concurrent_samples_per_replica: 16
+
 # Rollout config
 rollout:
 

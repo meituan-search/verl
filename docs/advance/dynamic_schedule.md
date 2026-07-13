@@ -97,11 +97,6 @@ All dynamic scheduling parameters live under the `async_training` section of you
 | `trigger_parameter_sync_step` | int | `4` | Number of collections per weight-sync step; used in the deactivate wait formula above. |
 | `require_batches` | int | `1` | Number of ppo_mini_batches per collection; determines `required_samples`. |
 
-### FSDP-Specific Parameter
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `concurrent_samples_per_replica` | int | `16` | Maximum concurrent generation requests per replica. Used to compute `max_concurrent_samples = num_active_replicas × concurrent_samples_per_replica`. (FSDP config only.) |
 
 ### Rollout Resource Config (under `actor_rollout_ref.rollout`)
 
