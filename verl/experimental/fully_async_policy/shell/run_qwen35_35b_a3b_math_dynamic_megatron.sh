@@ -119,9 +119,9 @@ python3 -X faulthandler -m verl.experimental.fully_async_policy.fully_async_main
     rollout.total_rollout_steps="${total_rollout_steps}" \
     async_training.staleness_threshold="${staleness_threshold}" \
     async_training.use_dynamic_resource_scaling=True \
-    async_training.dynamic_scaling_policy="default" \
-    async_training.dynamic_scaling_deactivate_ratio=0.6 \
-    async_training.dynamic_scaling_enable_rebalance=True \
+    async_training.dynamic_schedule_policy="default" \
+    async_training.dynamic_schedule_deactivate_ratio=0.6 \
+    async_training.dynamic_schedule_enable_rebalance=True \
     async_training.trigger_parameter_sync_step="${trigger_parameter_sync_step}" \
     async_training.require_batches="${require_batches}" \
     async_training.partial_rollout="${partial_rollout}" \

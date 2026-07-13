@@ -16,14 +16,14 @@
 
 import ray
 
-from .base import DynamicScaleContext, DynamicScalingPolicyBase, register_policy
+from .base import DynamicScaleContext, DynamicSchedulePolicyBase, register_policy
 
 
 @register_policy("fixed_ratio")
-class FixedRatioDynamicScalingPolicy(DynamicScalingPolicyBase):
+class FixedRatioDynamicSchedulePolicy(DynamicSchedulePolicyBase):
     """Fixed-ratio policy: same as default but deactivate_ratio is never updated.
 
-    Identical to :class:`DefaultDynamicScalingPolicy` except that
+    Identical to :class:`DefaultDynamicSchedulePolicy` except that
     ``update_after_step`` is a no-op — the ratio stays at its initial value
     throughout training regardless of trainer wait time or sample-buffer state.
 
@@ -39,7 +39,7 @@ class FixedRatioDynamicScalingPolicy(DynamicScalingPolicyBase):
         self.deactivate_ratio = deactivate_ratio
         self.only_hybrid = only_hybrid
         if only_hybrid:
-            print("[FixedRatioDynamicScalingPolicy] only_hybrid=True: forcing deactivate_ratio=1.0")
+            print("[FixedRatioDynamicSchedulePolicy] only_hybrid=True: forcing deactivate_ratio=1.0")
             self.deactivate_ratio = 1.0
 
     def should_deactivate(self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScaleContext) -> bool:
@@ -51,7 +51,7 @@ class FixedRatioDynamicScalingPolicy(DynamicScalingPolicyBase):
     def update_after_step(self, global_steps: int, ctx: DynamicScaleContext) -> None:
         """No-op: deactivate_ratio is fixed and never updated."""
         print(
-            f"[FixedRatioDynamicScalingPolicy] step={global_steps} "
+            f"[FixedRatioDynamicSchedulePolicy] step={global_steps} "
             f"deactivate_ratio={self.deactivate_ratio:.3f} (fixed, no update) "
             f"(generated={ctx.total_generated_samples}, expected={ctx.expected_samples}, "
             f"activate_dur={ctx.last_activate_duration_s:.2f}s, deactivate_dur={ctx.last_deactivate_duration_s:.2f}s)"
@@ -73,15 +73,15 @@ class FixedRatioDynamicScalingPolicy(DynamicScalingPolicyBase):
     def request_rebalance(self, global_steps: int, ctx: DynamicScaleContext) -> None:
         """Redistribute requests across all active replicas after activation."""
         if not hasattr(self, "_rollouter") or self._rollouter is None:
-            print("[FixedRatioDynamicScalingPolicy] request_rebalance skipped: no rollouter reference available")
+            print("[FixedRatioDynamicSchedulePolicy] request_rebalance skipped: no rollouter reference available")
             return
 
         try:
             result = ray.get(self._rollouter.rebalance_requests.remote())
             print(
-                f"[FixedRatioDynamicScalingPolicy] request_rebalance done at step {global_steps}: "
+                f"[FixedRatioDynamicSchedulePolicy] request_rebalance done at step {global_steps}: "
                 f"cleared {result.get('cleared_entries', 0)} sticky entries, "
                 f"server loads: {result.get('server_loads', {})}"
             )
         except Exception as e:
-            print(f"[FixedRatioDynamicScalingPolicy] request_rebalance failed at step {global_steps}: {e}")
+            print(f"[FixedRatioDynamicSchedulePolicy] request_rebalance failed at step {global_steps}: {e}")

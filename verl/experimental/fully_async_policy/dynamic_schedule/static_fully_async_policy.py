@@ -14,11 +14,11 @@
 
 """Built-in "static_fully_async" dynamic scaling policy."""
 
-from .base import DynamicScaleContext, DynamicScalingPolicyBase, register_policy
+from .base import DynamicScaleContext, DynamicSchedulePolicyBase, register_policy
 
 
 @register_policy("static_fully_async")
-class StaticFullyAsyncPolicy(DynamicScalingPolicyBase):
+class StaticFullyAsyncPolicy(DynamicSchedulePolicyBase):
     """Static fully-async policy: deactivate whenever hybrid is active, with adaptive ratio.
 
     Wait threshold: deactivate_ratio × required_samples × trigger_parameter_sync_step.

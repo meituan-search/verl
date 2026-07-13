@@ -16,7 +16,7 @@
 
 import ray
 
-from .base import DynamicScaleContext, DynamicScalingPolicyBase, register_policy
+from .base import DynamicScaleContext, DynamicSchedulePolicyBase, register_policy
 
 DEFAULT_SWITCH_THRESHOLD_S = 10.0
 SWITCH_OVERHEAD_WINDOW_SIZE = 3
@@ -34,7 +34,7 @@ INITIAL_PER_SAMPLE_TIME_S = 1000.0
 
 
 @register_policy("default")
-class DefaultDynamicScalingPolicy(DynamicScalingPolicyBase):
+class DefaultDynamicSchedulePolicy(DynamicSchedulePolicyBase):
     """Default policy: deactivate whenever hybrid is active, with adaptive ratio.
 
     Wait threshold: deactivate_ratio × step_required_samples
@@ -74,7 +74,7 @@ class DefaultDynamicScalingPolicy(DynamicScalingPolicyBase):
         # a cycle actually observed real waiting for newly-generated samples.
         self._last_per_sample_time: float = INITIAL_PER_SAMPLE_TIME_S
         if only_hybrid:
-            print("[DefaultDynamicScalingPolicy] only_hybrid=True: forcing deactivate_ratio=1.0")
+            print("[DefaultDynamicSchedulePolicy] only_hybrid=True: forcing deactivate_ratio=1.0")
             self.deactivate_ratio = 1.0
 
     def should_deactivate(self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScaleContext) -> bool:
@@ -117,7 +117,7 @@ class DefaultDynamicScalingPolicy(DynamicScalingPolicyBase):
             self.deactivate_ratio += ratio_delta
 
         print(
-            f"[DefaultDynamicScalingPolicy] step={global_steps} "
+            f"[DefaultDynamicSchedulePolicy] step={global_steps} "
             f"deactivate_ratio={self.deactivate_ratio:.3f} (delta={ratio_delta:+.3f}) "
             f"(wait={total_wait:.1f}s, wait_samples={total_wait_samples}, "
             f"switch_samples={len(self._recent_switch_overheads)}/{SWITCH_OVERHEAD_WINDOW_SIZE}, "
@@ -125,7 +125,7 @@ class DefaultDynamicScalingPolicy(DynamicScalingPolicyBase):
             f"activate_dur={ctx.last_activate_duration_s:.2f}s, deactivate_dur={ctx.last_deactivate_duration_s:.2f}s)"
         )
         print(
-            f"[DefaultDynamicScalingPolicy] step={global_steps} "
+            f"[DefaultDynamicSchedulePolicy] step={global_steps} "
             f"switch_overheads_history(tail10)={self._recent_switch_overheads[-10:]}"
         )
 
@@ -181,7 +181,7 @@ class DefaultDynamicScalingPolicy(DynamicScalingPolicyBase):
         net_benefit = expected_benefit_s - switch_cost
 
         print(
-            f"[DefaultDynamicScalingPolicy] step={global_steps} cost/benefit check: "
+            f"[DefaultDynamicSchedulePolicy] step={global_steps} cost/benefit check: "
             f"gap={gap}, per_sample_time={per_sample_time:.2f}s, "
             f"expected_benefit={expected_benefit_s:.2f}s, switch_cost={switch_cost:.2f}s, "
             f"net_benefit={net_benefit:.2f}s -> {'activate' if net_benefit > 0 else 'skip'}"
@@ -219,15 +219,15 @@ class DefaultDynamicScalingPolicy(DynamicScalingPolicyBase):
            activated hybrid replicas (which start with 0 in-flight requests).
         """
         if not hasattr(self, "_rollouter") or self._rollouter is None:
-            print("[DefaultDynamicScalingPolicy] request_rebalance skipped: no rollouter reference available")
+            print("[DefaultDynamicSchedulePolicy] request_rebalance skipped: no rollouter reference available")
             return
 
         try:
             result = ray.get(self._rollouter.rebalance_requests.remote())
             print(
-                f"[DefaultDynamicScalingPolicy] request_rebalance done at step {global_steps}: "
+                f"[DefaultDynamicSchedulePolicy] request_rebalance done at step {global_steps}: "
                 f"cleared {result.get('cleared_entries', 0)} sticky entries, "
                 f"server loads: {result.get('server_loads', {})}"
             )
         except Exception as e:
-            print(f"[DefaultDynamicScalingPolicy] request_rebalance failed at step {global_steps}: {e}")
+            print(f"[DefaultDynamicSchedulePolicy] request_rebalance failed at step {global_steps}: {e}")

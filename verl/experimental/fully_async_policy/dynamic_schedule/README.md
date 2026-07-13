@@ -39,12 +39,12 @@ The horizontal axis shows three steps with distinct Hybrid behaviours:
 - **Step 1 & 2**: At the start of each step, the MessageQueue does not yet have enough samples. Hybrid resources activate into *Rollout* mode to help generate samples alongside Standalone resources, then switch back to *Trainer* once sufficient samples are buffered.
 - **Step 3**: Before this step begins, the MessageQueue **already contains enough samples** (buffered from previous steps). Hybrid resources skip Rollout entirely and go directly into *Trainer* mode — this is the key optimisation: when Standalone capacity is sufficient, Trainer GPUs stay focused on training without unnecessary context-switching overhead.
 
-The transition threshold is controlled by `dynamic_scaling_deactivate_ratio`: the controller deactivates Hybrid replicas once `deactivate_ratio × required_samples × trigger_parameter_sync_step` samples have been collected. A central *Rollout LoadBalancer* dispatches generation requests from the *MessageQueue* across all active replicas.
+The transition threshold is controlled by `dynamic_schedule_deactivate_ratio`: the controller deactivates Hybrid replicas once `deactivate_ratio × required_samples × trigger_parameter_sync_step` samples have been collected. A central *Rollout LoadBalancer* dispatches generation requests from the *MessageQueue* across all active replicas.
 
 Two request-handling mechanisms ensure smooth transitions between modes:
 
 - **Hybrid → Trainer (deactivation)**: When Hybrid resources switch from Rollout back to Trainer, any **in-flight requests** running on them are aborted and automatically **redistributed by the LoadBalancer to Standalone resources**, which continue the rollout. This is transparent to upper layers thanks to the retry mechanism in `FullyAsyncLLMServerClient`.
-- **Trainer → Hybrid (activation)**: After a training step ends, if Hybrid resources switch back into Rollout mode, the `dynamic_scaling_enable_rebalance` parameter controls whether to perform a **reshuffle**: when enabled, the controller clears the LoadBalancer's sticky-session cache and aborts in-flight requests across all active replicas, then resumes them so requests are redistributed via least-loaded routing — naturally balancing load toward the newly activated Hybrid replicas (which start with 0 in-flight requests).
+- **Trainer → Hybrid (activation)**: After a training step ends, if Hybrid resources switch back into Rollout mode, the `dynamic_schedule_enable_rebalance` parameter controls whether to perform a **reshuffle**: when enabled, the controller clears the LoadBalancer's sticky-session cache and aborts in-flight requests across all active replicas, then resumes them so requests are redistributed via least-loaded routing — naturally balancing load toward the newly activated Hybrid replicas (which start with 0 in-flight requests).
 
 - **Weight Sync (parameter synchronisation)**: During the *Weight Sync* phase, weights are first broadcast from Trainer to all **Standalone** rollout replicas (always required). The policy's `should_activate_after_step()` is then evaluated to decide whether Hybrid resources should enter Rollout mode for the next step. If activation is needed, weights are **additionally synced to Hybrid replicas**; otherwise this second sync is **skipped entirely**, saving significant communication overhead — this is exactly what happens in Step 3 of the figure above.
 
@@ -85,9 +85,9 @@ All dynamic scaling parameters live under the `async_training` section of your t
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `use_dynamic_resource_scaling` | bool | `False` | Master switch. When `True`, hybrid rollout replicas are initialised on Trainer-node GPUs at startup (sleeping, memory returned to the training engine). |
-| `dynamic_scaling_policy` | str | `"default"` | Name of the scaling policy (`"default"`, `"static_fully_async"`, `"fixed_ratio"`, or a custom registered name). |
-| `dynamic_scaling_deactivate_ratio` | float | `0.3` | Sample-collection ratio threshold. The controller waits until `deactivate_ratio × required_samples × trigger_parameter_sync_step` samples are buffered before deactivating. Lower → earlier deactivation; `1.0` → wait for a full batch. |
-| `dynamic_scaling_enable_rebalance` | bool | `False` | Whether to rebalance (abort + clear sticky cache + resume) in-flight requests across all active replicas after hybrid activation, via least-loaded routing. |
+| `dynamic_schedule_policy` | str | `"default"` | Name of the scaling policy (`"default"`, `"static_fully_async"`, `"fixed_ratio"`, or a custom registered name). |
+| `dynamic_schedule_deactivate_ratio` | float | `0.3` | Sample-collection ratio threshold. The controller waits until `deactivate_ratio × required_samples × trigger_parameter_sync_step` samples are buffered before deactivating. Lower → earlier deactivation; `1.0` → wait for a full batch. |
+| `dynamic_schedule_enable_rebalance` | bool | `False` | Whether to rebalance (abort + clear sticky cache + resume) in-flight requests across all active replicas after hybrid activation, via least-loaded routing. |
 
 ### Existing Async-Training Parameters (used by dynamic scaling)
 
@@ -120,9 +120,9 @@ All dynamic scaling parameters live under the `async_training` section of your t
 
 ## 3. Built-in Policies
 
-### 3.1 `default` — DefaultDynamicScalingPolicy
+### 3.1 `default` — DefaultDynamicSchedulePolicy
 
-**File:** `verl/experimental/fully_async_policy/dynamic_scaling/default_policy.py`
+**File:** `verl/experimental/fully_async_policy/dynamic_schedule/default_policy.py`
 
 The recommended policy with **adaptive deactivate_ratio** and a **cost/benefit activation gate**:
 
@@ -145,7 +145,7 @@ The recommended policy with **adaptive deactivate_ratio** and a **cost/benefit a
 
 ### 3.2 `static_fully_async` — StaticFullyAsyncPolicy
 
-**File:** `verl/experimental/fully_async_policy/dynamic_scaling/static_fully_async_policy.py`
+**File:** `verl/experimental/fully_async_policy/dynamic_schedule/static_fully_async_policy.py`
 
 Equivalent to the original fully-async strategy, designed for baseline comparisons or colocated fallback:
 
@@ -162,13 +162,13 @@ Equivalent to the original fully-async strategy, designed for baseline compariso
 1. **Equivalent to standard Fully-Async**: Hybrid replicas are deactivated immediately at each training step start and never re-activated. Trainer GPUs are always 100% returned to training — same behaviour as running without `use_dynamic_resource_scaling`.
 2. **Colocated fallback**: When `rollout.nnodes=0`, `only_hybrid=True` and the system runs in classic colocated mode (training + inference share the same GPUs, no separate rollout nodes).
 
-### 3.3 `fixed_ratio` — FixedRatioDynamicScalingPolicy
+### 3.3 `fixed_ratio` — FixedRatioDynamicSchedulePolicy
 
-**File:** `verl/experimental/fully_async_policy/dynamic_scaling/fixed_ratio_policy.py`
+**File:** `verl/experimental/fully_async_policy/dynamic_schedule/fixed_ratio_policy.py`
 
 Identical to `default` except that `update_after_step()` is a no-op — `deactivate_ratio` stays at its initial value throughout training, with no adaptation. `should_activate_after_step()` is also simplified to a pure gap check (no cost/benefit gate). Useful for fixed-ratio ablation experiments.
 
-> **Registration note:** `fixed_ratio` is **not** imported in `__init__.py`, so `@register_policy` does not fire on a default import. Add `from .fixed_ratio_policy import FixedRatioDynamicScalingPolicy` to `verl/experimental/fully_async_policy/dynamic_scaling/__init__.py`, or import it manually in your entry script, before referencing it in config.
+> **Registration note:** `fixed_ratio` is **not** imported in `__init__.py`, so `@register_policy` does not fire on a default import. Add `from .fixed_ratio_policy import FixedRatioDynamicSchedulePolicy` to `verl/experimental/fully_async_policy/dynamic_schedule/__init__.py`, or import it manually in your entry script, before referencing it in config.
 
 ---
 
@@ -333,7 +333,7 @@ the `dynamic_resource/*` metrics above.
 | Backend | Megatron (TP=4, PP=2, EP=8) |
 | Hardware | H20 (8 GPUs/node) |
 | Script | `verl/experimental/fully_async_policy/shell/run_qwen35_35b_a3b_math_dynamic_megatron.sh` |
-| Key hyperparams | `dynamic_scaling_policy="default"`, `dynamic_scaling_deactivate_ratio=0.6`, `dynamic_scaling_enable_rebalance=True`, `staleness_threshold=0.5`, `trigger_parameter_sync_step=4`; hybrid `gpu_memory_utilization=0.45`, standalone `standalone_gpu_memory_utilization=0.7` |
+| Key hyperparams | `dynamic_schedule_policy="default"`, `dynamic_schedule_deactivate_ratio=0.6`, `dynamic_schedule_enable_rebalance=True`, `staleness_threshold=0.5`, `trigger_parameter_sync_step=4`; hybrid `gpu_memory_utilization=0.45`, standalone `standalone_gpu_memory_utilization=0.7` |
 
 **Baseline 1**: 16 GPU training + 16 GPU rollout (2 dedicated trainer nodes + 2 rollout nodes).  
 **Baseline 2**: 8 GPU training + 24 GPU rollout (1 dedicated trainer nodes + 3 rollout nodes).  
@@ -418,14 +418,14 @@ Four steps to support a new policy:
 ### Step 1: Subclass the base class
 
 ```python
-from verl.experimental.fully_async_policy.dynamic_scaling import (
-    DynamicScalingPolicyBase,
+from verl.experimental.fully_async_policy.dynamic_schedule import (
+    DynamicSchedulePolicyBase,
     DynamicScaleContext,
     register_policy,
 )
 
 @register_policy("my_policy")
-class MyDynamicScalingPolicy(DynamicScalingPolicyBase):
+class MyDynamicSchedulePolicy(DynamicSchedulePolicyBase):
 
     def __init__(self, deactivate_ratio: float = 0.5, only_hybrid: bool = False):
         self.deactivate_ratio = deactivate_ratio
@@ -464,11 +464,11 @@ class MyDynamicScalingPolicy(DynamicScalingPolicyBase):
 
 ### Step 2: Register the import
 
-Place the file inside `verl/experimental/fully_async_policy/dynamic_scaling/` and add an import in `__init__.py`:
+Place the file inside `verl/experimental/fully_async_policy/dynamic_schedule/` and add an import in `__init__.py`:
 
 ```python
-# verl/experimental/fully_async_policy/dynamic_scaling/__init__.py
-from .my_policy import MyDynamicScalingPolicy
+# verl/experimental/fully_async_policy/dynamic_schedule/__init__.py
+from .my_policy import MyDynamicSchedulePolicy
 ```
 
 Or import it manually in your entry script to trigger `@register_policy`.
@@ -478,9 +478,9 @@ Or import it manually in your entry script to trigger `@register_policy`.
 ```yaml
 async_training:
   use_dynamic_resource_scaling: True
-  dynamic_scaling_policy: "my_policy"
-  dynamic_scaling_deactivate_ratio: 0.5
-  dynamic_scaling_enable_rebalance: True
+  dynamic_schedule_policy: "my_policy"
+  dynamic_schedule_deactivate_ratio: 0.5
+  dynamic_schedule_enable_rebalance: True
 ```
 
 ### Step 4: Use `DynamicScaleContext` fields
@@ -504,11 +504,11 @@ async_training:
 ## 7. File Structure
 
 ```
-verl/experimental/fully_async_policy/dynamic_scaling/
+verl/experimental/fully_async_policy/dynamic_schedule/
 ├── __init__.py                        # Public exports + policy registry
-├── base.py                            # DynamicScalingPolicyBase ABC, DynamicScaleContext, registry
-├── default_policy.py                  # DefaultDynamicScalingPolicy (adaptive dynamic scaling)
+├── base.py                            # DynamicSchedulePolicyBase ABC, DynamicScaleContext, registry
+├── default_policy.py                  # DefaultDynamicSchedulePolicy (adaptive dynamic scaling)
 ├── static_fully_async_policy.py       # StaticFullyAsyncPolicy (original fully-async / colocated fallback)
-├── fixed_ratio_policy.py              # FixedRatioDynamicScalingPolicy (fixed ratio, no adaptation)
+├── fixed_ratio_policy.py              # FixedRatioDynamicSchedulePolicy (fixed ratio, no adaptation)
 └── dynamic_resource_controller.py     # DynamicResourceController (state machine + lifecycle)
 ```

@@ -30,18 +30,18 @@ import time
 
 import ray
 
-from verl.experimental.fully_async_policy.dynamic_scaling.base import (
-    DynamicScalingPolicyBase,
+from verl.experimental.fully_async_policy.dynamic_schedule.base import (
+    DynamicSchedulePolicyBase,
     build_policy,
     register_policy,
 )
-from verl.experimental.fully_async_policy.dynamic_scaling.default_policy import DefaultDynamicScalingPolicy
-from verl.experimental.fully_async_policy.dynamic_scaling.static_fully_async_policy import StaticFullyAsyncPolicy
+from verl.experimental.fully_async_policy.dynamic_schedule.default_policy import DefaultDynamicSchedulePolicy
+from verl.experimental.fully_async_policy.dynamic_schedule.static_fully_async_policy import StaticFullyAsyncPolicy
 
 __all__ = [
     "DynamicResourceController",
-    "DynamicScalingPolicyBase",
-    "DefaultDynamicScalingPolicy",
+    "DynamicSchedulePolicyBase",
+    "DefaultDynamicSchedulePolicy",
     "StaticFullyAsyncPolicy",
     "build_policy",
     "register_policy",
@@ -53,14 +53,14 @@ class DynamicResourceController:
 
     FullyAsyncTrainer drives transitions via activate_hybrid_replicas /
     deactivate_hybrid_replicas after each weight-sync step.  The *policy*
-    (DynamicScalingPolicyBase) decides when to deactivate.
+    (DynamicSchedulePolicyBase) decides when to deactivate.
 
     Args:
         rollouter: Ray actor handle for FullyAsyncRollouter.
         hybrid_checkpoint_manager: CheckpointEngineManager with naive backend.
         num_standalone_replicas: Number of standalone replicas (for logging).
         num_hybrid_replicas: Number of hybrid replicas (for logging).
-        policy: Scheduling policy; defaults to DefaultDynamicScalingPolicy.
+        policy: Scheduling policy; defaults to DefaultDynamicSchedulePolicy.
     """
 
     def __init__(
@@ -69,7 +69,7 @@ class DynamicResourceController:
         hybrid_checkpoint_manager,
         num_standalone_replicas: int,
         num_hybrid_replicas: int,
-        policy: DynamicScalingPolicyBase | None = None,
+        policy: DynamicSchedulePolicyBase | None = None,
     ):
         self.rollouter = rollouter
         self.hybrid_checkpoint_manager = hybrid_checkpoint_manager
@@ -79,8 +79,8 @@ class DynamicResourceController:
         self._only_hybrid: bool = num_standalone_replicas == 0
         self.activate_count: int = 0
         self.deactivate_count: int = 0
-        self.policy: DynamicScalingPolicyBase = (
-            policy if policy is not None else DefaultDynamicScalingPolicy(only_hybrid=self._only_hybrid)
+        self.policy: DynamicSchedulePolicyBase = (
+            policy if policy is not None else DefaultDynamicSchedulePolicy(only_hybrid=self._only_hybrid)
         )
         # Inject rollouter reference so the policy can perform request rebalancing.
         self.policy._rollouter = rollouter

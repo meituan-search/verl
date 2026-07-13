@@ -16,37 +16,37 @@
 
 Custom policy example::
 
-    from verl.experimental.fully_async_policy.dynamic_scaling import (
-        DynamicScalingPolicyBase, DynamicScaleContext, register_policy,
+    from verl.experimental.fully_async_policy.dynamic_schedule import (
+        DynamicSchedulePolicyBase, DynamicScaleContext, register_policy,
     )
 
     @register_policy("my_policy")
-    class MyPolicy(DynamicScalingPolicyBase):
+    class MyPolicy(DynamicSchedulePolicyBase):
         def should_deactivate(self, global_steps, is_hybrid_active, ctx): ...
         def deactivate_wait_samples(self, ctx): ...
         def should_activate_after_step(self, global_steps, is_hybrid_active, ctx): ...
         def request_rebalance(self, global_steps, ctx): ...
 
-Then set ``async_training.dynamic_scaling_policy: "my_policy"`` in the training config.
+Then set ``async_training.dynamic_schedule_policy: "my_policy"`` in the training config.
 """
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
-_policy_registry: dict[str, type["DynamicScalingPolicyBase"]] = {}
+_policy_registry: dict[str, type["DynamicSchedulePolicyBase"]] = {}
 
 
 def register_policy(name: str):
-    """Decorator: register a DynamicScalingPolicyBase subclass under *name*."""
+    """Decorator: register a DynamicSchedulePolicyBase subclass under *name*."""
 
-    def decorator(cls: type["DynamicScalingPolicyBase"]) -> type["DynamicScalingPolicyBase"]:
+    def decorator(cls: type["DynamicSchedulePolicyBase"]) -> type["DynamicSchedulePolicyBase"]:
         _policy_registry[name] = cls
         return cls
 
     return decorator
 
 
-def build_policy(name: str, **kwargs) -> "DynamicScalingPolicyBase":
+def build_policy(name: str, **kwargs) -> "DynamicSchedulePolicyBase":
     """Instantiate a registered policy by name, forwarding **kwargs to its __init__."""
     if name not in _policy_registry:
         raise KeyError(f"Unknown dynamic scaling policy '{name}'. Registered: {list(_policy_registry.keys())}")
@@ -61,7 +61,7 @@ class DynamicScaleContext:
     per-step runtime state and activation/deactivation timing metrics.
 
     Built by :class:`FullyAsyncTrainer` before each policy call and passed to
-    all :class:`DynamicScalingPolicyBase` methods as the single context entry point.
+    all :class:`DynamicSchedulePolicyBase` methods as the single context entry point.
 
     Attributes:
         required_samples: Minimum samples per collection (ppo_mini_batch_size × require_batches).
@@ -106,7 +106,7 @@ class DynamicScaleContext:
         self.step_required_samples = self.required_samples * self.trigger_parameter_sync_step
 
 
-class DynamicScalingPolicyBase(ABC):
+class DynamicSchedulePolicyBase(ABC):
     """Abstract base class for dynamic resource scaling policies.
 
     Subclasses must implement :meth:`should_deactivate` and

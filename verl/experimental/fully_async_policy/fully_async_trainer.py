@@ -29,7 +29,7 @@ from verl.experimental.fully_async_policy.detach_utils import (
     MetricsAggregator,
     assemble_batch_from_rollout_samples,
 )
-from verl.experimental.fully_async_policy.dynamic_scaling import DynamicScaleContext
+from verl.experimental.fully_async_policy.dynamic_schedule import DynamicScaleContext
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
@@ -186,26 +186,26 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         # Dynamic resource controller — activated when use_dynamic_resource_scaling=True.
         self.dynamic_resource_controller = None
-        self.dynamic_scaling_enabled: bool = config.async_training.get("use_dynamic_resource_scaling", False)
+        self.dynamic_schedule_enabled: bool = config.async_training.get("use_dynamic_resource_scaling", False)
         # Name of the scheduling policy (resolved in _setup_dynamic_resource_controller).
-        self._dynamic_scaling_policy_name: str = config.async_training.get("dynamic_scaling_policy", "default")
+        self._dynamic_schedule_policy_name: str = config.async_training.get("dynamic_schedule_policy", "default")
         # Initial deactivate_ratio forwarded to the policy constructor.
-        self._dynamic_scaling_deactivate_ratio_init: float = config.async_training.get(
-            "dynamic_scaling_deactivate_ratio", 0.3
+        self._dynamic_schedule_deactivate_ratio_init: float = config.async_training.get(
+            "dynamic_schedule_deactivate_ratio", 0.3
         )
         # Whether to enable request rebalancing (abort + clear sticky cache +
         # resume) after hybrid replica activation. Default False.
-        self._dynamic_scaling_enable_rebalance: bool = config.async_training.get(
-            "dynamic_scaling_enable_rebalance", False
+        self._dynamic_schedule_enable_rebalance: bool = config.async_training.get(
+            "dynamic_schedule_enable_rebalance", False
         )
         self.staleness_threshold: float = config.async_training.get("staleness_threshold", 1)
 
         # When standalone rollout resources are 0 (rollout.nnodes == 0), there are no
         # standalone replicas: all rollout happens on hybrid (trainer-side) GPUs.
-        self._standalone_rollout_only_hybrid: bool = self.dynamic_scaling_enabled and config.rollout.nnodes == 0
+        self._standalone_rollout_only_hybrid: bool = self.dynamic_schedule_enabled and config.rollout.nnodes == 0
 
         # Per-step dynamic scaling context — built once at init, mutable fields updated each step.
-        self.dynamic_scale_ctx = DynamicScaleContext(
+        self.dynamic_schedule_ctx = DynamicScaleContext(
             required_samples=self.required_samples,
             trigger_parameter_sync_step=self.trigger_parameter_sync_step,
             total_generated_samples=0,
@@ -302,7 +302,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
     async def _setup_dynamic_resource_controller(self) -> None:
         """Initialise :class:`DynamicResourceController` with the configured policy.
 
-        The policy is selected by ``async_training.dynamic_scaling_policy`` (a
+        The policy is selected by ``async_training.dynamic_schedule_policy`` (a
         registered name string) or can be overridden by subclasses.  The
         ``only_hybrid`` flag is derived from the number of standalone replicas
         so the policy can adjust its behaviour accordingly.
@@ -311,7 +311,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
           - ``self.hybrid_checkpoint_manager`` already set up.
           - ``self.rollouter`` is set.
         """
-        from verl.experimental.fully_async_policy.dynamic_scaling import (
+        from verl.experimental.fully_async_policy.dynamic_schedule import (
             DynamicResourceController,
             build_policy,
         )
@@ -321,13 +321,13 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         only_hybrid = num_standalone == 0
 
         policy = build_policy(
-            self._dynamic_scaling_policy_name,
-            deactivate_ratio=self._dynamic_scaling_deactivate_ratio_init,
+            self._dynamic_schedule_policy_name,
+            deactivate_ratio=self._dynamic_schedule_deactivate_ratio_init,
             only_hybrid=only_hybrid,
         )
         print(
-            f"[FullyAsyncTrainer] Dynamic scaling policy '{self._dynamic_scaling_policy_name}' "
-            f"instantiated (deactivate_ratio={self._dynamic_scaling_deactivate_ratio_init}, "
+            f"[FullyAsyncTrainer] Dynamic scaling policy '{self._dynamic_schedule_policy_name}' "
+            f"instantiated (deactivate_ratio={self._dynamic_schedule_deactivate_ratio_init}, "
             f"only_hybrid={only_hybrid})"
         )
 
@@ -350,7 +350,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         await self._setup_checkpoint_manager()
         await self._setup_hybrid_checkpoint_manager()
         # Setup dynamic resource controller if enabled
-        if self.dynamic_scaling_enabled:
+        if self.dynamic_schedule_enabled:
             await self._setup_dynamic_resource_controller()
 
     def set_total_train_steps(self, total_training_steps):
@@ -392,7 +392,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # rate, so they must be excluded from the wait-time-per-sample estimate.
         # Only queried when dynamic scaling is enabled, since it's the sole consumer
         # of this signal and the extra RPC would otherwise be pure overhead.
-        if self.dynamic_scaling_enabled:
+        if self.dynamic_schedule_enabled:
             queue_size_at_start = await self.message_queue_client.get_queue_size()
             pending_wait_samples = max(0, self.required_samples - queue_size_at_start)
         else:
@@ -558,25 +558,25 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         with marked_timer("step", self.timing_raw):
             ctrl = self.dynamic_resource_controller
-            if self.dynamic_scaling_enabled and ctrl.policy.should_deactivate(
+            if self.dynamic_schedule_enabled and ctrl.policy.should_deactivate(
                 global_steps=self.current_param_version,
                 is_hybrid_active=ctrl.is_hybrid_active,
-                ctx=self.dynamic_scale_ctx,
+                ctx=self.dynamic_schedule_ctx,
             ):
-                threshold_samples = ctrl.policy.deactivate_wait_samples(self.dynamic_scale_ctx)
+                threshold_samples = ctrl.policy.deactivate_wait_samples(self.dynamic_schedule_ctx)
                 with marked_timer("wait_for_enough_samples", self.timing_raw):
                     _ = ray.get(self.rollouter.wait_for_enough_samples.remote(threshold_samples))
                 _deact_start = time.time()
                 await ctrl.deactivate_hybrid_replicas(self.current_param_version)
                 deactivate_duration = time.time() - _deact_start
-                self.dynamic_scale_ctx.last_deactivate_duration_s += deactivate_duration
+                self.dynamic_schedule_ctx.last_deactivate_duration_s += deactivate_duration
                 print(
                     f"[FullyAsyncTrainer] step={self.current_param_version} "
                     f"deactivation took {deactivate_duration:.2f}s "
-                    f"(accumulated this cycle: {self.dynamic_scale_ctx.last_deactivate_duration_s:.2f}s)",
+                    f"(accumulated this cycle: {self.dynamic_schedule_ctx.last_deactivate_duration_s:.2f}s)",
                     flush=True,
                 )
-            elif self.dynamic_scaling_enabled:
+            elif self.dynamic_schedule_enabled:
                 # Not deactivating this step: still emit the metric as 0 so the
                 # timing_s/wait_for_enough_samples curve stays continuous.
                 self.timing_raw["wait_for_enough_samples"] = 0.0
@@ -708,13 +708,13 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         _total_generated_samples, _completed_steps = ray.get(
             [self.rollouter.get_total_produced_samples.remote(), self.rollouter.get_completed_steps.remote()]
         )
-        _expect_samples = self.dynamic_scale_ctx.step_required_samples * _completed_steps
-        _buffer_sampels = self.dynamic_scale_ctx.step_required_samples * self.staleness_threshold
+        _expect_samples = self.dynamic_schedule_ctx.step_required_samples * _completed_steps
+        _buffer_sampels = self.dynamic_schedule_ctx.step_required_samples * self.staleness_threshold
 
-        if self.dynamic_scaling_enabled:
+        if self.dynamic_schedule_enabled:
             ctrl = self.dynamic_resource_controller
             # Update per-step mutable fields on the persistent context.
-            ctx = self.dynamic_scale_ctx
+            ctx = self.dynamic_schedule_ctx
             ctx.total_generated_samples = _total_generated_samples
             ctx.expected_samples = _expect_samples
             ctx.buffer_samples = _buffer_sampels
@@ -734,7 +734,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             # Step 2: When dynamic resource scaling is enabled, the Trainer GPUs
             # also co-host hybrid rollout replicas.  Push weights to them via
             # a separate naive sync (same mechanism as colocated training).
-            if self.dynamic_scaling_enabled and should_activate:
+            if self.dynamic_schedule_enabled and should_activate:
                 _act_start = time.time()
                 await self.hybrid_checkpoint_manager.update_weights(
                     global_steps=self.current_param_version,
@@ -742,13 +742,13 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 await self.dynamic_resource_controller.activate_hybrid_replicas(self.current_param_version)
 
                 # Allow policy to redistribute requests across newly activated replicas.
-                if self._dynamic_scaling_enable_rebalance:
+                if self._dynamic_schedule_enable_rebalance:
                     self.dynamic_resource_controller.policy.request_rebalance(
                         global_steps=self.current_param_version,
                         ctx=ctx,
                     )
 
-                self.dynamic_scale_ctx.last_activate_duration_s += time.time() - _act_start
+                self.dynamic_schedule_ctx.last_activate_duration_s += time.time() - _act_start
 
         timing_raw = await asyncio.wrap_future(self.rollouter.reset_staleness.remote().future())
 
@@ -763,7 +763,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         if steps is not None and profiler_step in steps:
             await asyncio.wrap_future(self.rollouter._start_profiling.remote().future())
 
-        if self.dynamic_scaling_enabled:
+        if self.dynamic_schedule_enabled:
             # Let the policy update its internal state (e.g. adapt deactivate_ratio).
             self.dynamic_resource_controller.policy.update_after_step(
                 global_steps=self.current_param_version,
@@ -771,8 +771,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             )
             # Now that update_after_step() has consumed this cycle's switch timing,
             # reset it so it doesn't leak into the next sync cycle.
-            self.dynamic_scale_ctx.last_deactivate_duration_s = 0.0
-            self.dynamic_scale_ctx.last_activate_duration_s = 0.0
+            self.dynamic_schedule_ctx.last_deactivate_duration_s = 0.0
+            self.dynamic_schedule_ctx.last_activate_duration_s = 0.0
 
         self._step_wait_times = []  # reset for next step
         self._step_wait_samples = []  # reset for next step

@@ -35,12 +35,12 @@
 - **Step 1 & 2**：step 开始时 MessageQueue 还没攒够样本，Hybrid 资源进入 *Rollout* 模式，与 Standalone 一起生成样本；攒够后切回 *Trainer*。
 - **Step 3**：step 开始前 MessageQueue **已有足够样本**（来自前面 step 的缓冲），Hybrid 直接进入 *Trainer* 模式、**跳过 rollout**——这是关键优化：当 Standalone 产能充足时，Trainer GPU 专心训练，避免无谓的模式切换开销。
 
-切换阈值由 `dynamic_scaling_deactivate_ratio` 控制：当收集到的样本数达到 `deactivate_ratio × required_samples × trigger_parameter_sync_step` 时，控制器停用 Hybrid 副本。中心化的 *Rollout LoadBalancer* 把 MessageQueue 的生成请求分发到所有 active 副本。
+切换阈值由 `dynamic_schedule_deactivate_ratio` 控制：当收集到的样本数达到 `deactivate_ratio × required_samples × trigger_parameter_sync_step` 时，控制器停用 Hybrid 副本。中心化的 *Rollout LoadBalancer* 把 MessageQueue 的生成请求分发到所有 active 副本。
 
 两个请求处理机制保证模式切换平滑：
 
 - **Hybrid → Trainer（停用）**：Hybrid 从 Rollout 切回 Trainer 时，其上**在途请求（in-flight）被 abort**，并由 LoadBalancer **自动重分发到 Standalone** 继续完成 rollout。依赖 `FullyAsyncLLMServerClient` 的重试机制，对上层透明。
-- **Trainer → Hybrid（激活）**：训练 step 结束后若 Hybrid 重新进入 Rollout 模式，`dynamic_scaling_enable_rebalance` 控制是否做一次 **reshuffle**：开启时清空 LoadBalancer 的 sticky-session 缓存、abort 所有 active 副本上的在途请求再 resume，请求按 least-loaded 重新路由，自然地把负载压向刚激活、在途为 0 的 Hybrid 副本。
+- **Trainer → Hybrid（激活）**：训练 step 结束后若 Hybrid 重新进入 Rollout 模式，`dynamic_schedule_enable_rebalance` 控制是否做一次 **reshuffle**：开启时清空 LoadBalancer 的 sticky-session 缓存、abort 所有 active 副本上的在途请求再 resume，请求按 least-loaded 重新路由，自然地把负载压向刚激活、在途为 0 的 Hybrid 副本。
 
 - **Weight Sync（权重同步）**：Weight Sync 阶段先把权重从 Trainer 广播给所有 **Standalone** 副本（始终需要）；随后评估 policy 的 `should_activate_after_step()` 决定下一步是否激活 Hybrid。需要激活时**额外**把权重同步给 Hybrid 副本；否则**跳过**这第二次同步以节省通信开销——上图 Step 3 正是这种情况。
 
@@ -80,9 +80,9 @@ Deactivate（顺序至关重要）：
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
 | `use_dynamic_resource_scaling` | bool | `False` | 总开关。为 `True` 时，启动即在 Trainer 节点 GPU 上初始化 hybrid rollout 副本（sleeping，显存已归还训练引擎）。 |
-| `dynamic_scaling_policy` | str | `"default"` | 策略名（`"default"` / `"static_fully_async"` / `"fixed_ratio"` / 自定义注册名）。 |
-| `dynamic_scaling_deactivate_ratio` | float | `0.3` | 样本收集比例阈值。控制器等到 `deactivate_ratio × required_samples × trigger_parameter_sync_step` 个样本缓冲好再停用。越小越早停用；`1.0` 表示等满一个 batch。 |
-| `dynamic_scaling_enable_rebalance` | bool | `False` | hybrid 激活后是否对在途请求做 rebalance（abort + 清 sticky cache + resume），按 least-loaded 路由。 |
+| `dynamic_schedule_policy` | str | `"default"` | 策略名（`"default"` / `"static_fully_async"` / `"fixed_ratio"` / 自定义注册名）。 |
+| `dynamic_schedule_deactivate_ratio` | float | `0.3` | 样本收集比例阈值。控制器等到 `deactivate_ratio × required_samples × trigger_parameter_sync_step` 个样本缓冲好再停用。越小越早停用；`1.0` 表示等满一个 batch。 |
+| `dynamic_schedule_enable_rebalance` | bool | `False` | hybrid 激活后是否对在途请求做 rebalance（abort + 清 sticky cache + resume），按 least-loaded 路由。 |
 
 ### 复用的已有 async-training 参数
 
@@ -115,7 +115,7 @@ Deactivate（顺序至关重要）：
 
 ## 3. 内置策略
 
-### 3.1 `default` — DefaultDynamicScalingPolicy
+### 3.1 `default` — DefaultDynamicSchedulePolicy
 
 **文件：** `default_policy.py`
 
@@ -157,13 +157,13 @@ Deactivate（顺序至关重要）：
 1. **等价于标准 Fully-Async**：每个 step 开始立即停用 hybrid、永不重新激活，Trainer GPU 始终 100% 用于训练——与不开 `use_dynamic_resource_scaling` 行为一致。
 2. **Colocated 回退**：`rollout.nnodes=0` 时 `only_hybrid=True`，退化为经典 colocated 模式（训练 + 推理共享同一批 GPU，无独立 rollout 节点）。
 
-### 3.3 `fixed_ratio` — FixedRatioDynamicScalingPolicy
+### 3.3 `fixed_ratio` — FixedRatioDynamicSchedulePolicy
 
 **文件：** `fixed_ratio_policy.py`
 
 与 `default` 一致，但 `update_after_step()` 为 no-op——`deactivate_ratio` 全程保持初始值，不做自适应。`should_activate_after_step()` 也简化为纯缺口判断（不做成本/收益门控）。适合固定比例的对比实验。
 
-> **注册提示：** `fixed_ratio` 目前未在 `__init__.py` 中导入，`@register_policy` 不会在默认 import 时触发。使用前需在 `__init__.py` 加一行 `from .fixed_ratio_policy import FixedRatioDynamicScalingPolicy`，或在入口脚本手动 import。
+> **注册提示：** `fixed_ratio` 目前未在 `__init__.py` 中导入，`@register_policy` 不会在默认 import 时触发。使用前需在 `__init__.py` 加一行 `from .fixed_ratio_policy import FixedRatioDynamicSchedulePolicy`，或在入口脚本手动 import。
 
 ---
 
@@ -269,7 +269,7 @@ Trainer `fit_step()`（含 partial-rollout 恢复）结束后，MessageQueue 中
 | 后端 | Megatron（TP=4, PP=2, EP=8） |
 | 硬件 | H20（8 GPUs/node） |
 | 脚本 | `verl/experimental/fully_async_policy/shell/run_qwen35_35b_a3b_math_dynamic_megatron.sh` |
-| 关键超参 | `dynamic_scaling_policy="default"`, `dynamic_scaling_deactivate_ratio=0.6`, `dynamic_scaling_enable_rebalance=True`, `staleness_threshold=0.5`, `trigger_parameter_sync_step=4`；hybrid `gpu_memory_utilization=0.45`，standalone `standalone_gpu_memory_utilization=0.7` |
+| 关键超参 | `dynamic_schedule_policy="default"`, `dynamic_schedule_deactivate_ratio=0.6`, `dynamic_schedule_enable_rebalance=True`, `staleness_threshold=0.5`, `trigger_parameter_sync_step=4`；hybrid `gpu_memory_utilization=0.45`，standalone `standalone_gpu_memory_utilization=0.7` |
 
 **Baseline 1**：16 GPU 训练 + 16 GPU rollout（2 个训练节点 + 2 个 rollout 节点）。
 **Baseline 2**：8 GPU 训练 + 24 GPU rollout（1 个训练节点 + 3 个 rollout 节点）。
@@ -354,14 +354,14 @@ Trainer `fit_step()`（含 partial-rollout 恢复）结束后，MessageQueue 中
 ### Step 1：继承基类
 
 ```python
-from verl.experimental.fully_async_policy.dynamic_scaling import (
-    DynamicScalingPolicyBase,
+from verl.experimental.fully_async_policy.dynamic_schedule import (
+    DynamicSchedulePolicyBase,
     DynamicScaleContext,
     register_policy,
 )
 
 @register_policy("my_policy")
-class MyDynamicScalingPolicy(DynamicScalingPolicyBase):
+class MyDynamicSchedulePolicy(DynamicSchedulePolicyBase):
 
     def __init__(self, deactivate_ratio: float = 0.5, only_hybrid: bool = False):
         self.deactivate_ratio = deactivate_ratio
@@ -400,11 +400,11 @@ class MyDynamicScalingPolicy(DynamicScalingPolicyBase):
 
 ### Step 2：注册导入
 
-把文件放进 `dynamic_scaling/`，并在 `__init__.py` 加一行导入：
+把文件放进 `dynamic_schedule/`，并在 `__init__.py` 加一行导入：
 
 ```python
-# dynamic_scaling/__init__.py
-from .my_policy import MyDynamicScalingPolicy
+# dynamic_schedule/__init__.py
+from .my_policy import MyDynamicSchedulePolicy
 ```
 
 或在入口脚本手动 import 以触发 `@register_policy`。
@@ -414,9 +414,9 @@ from .my_policy import MyDynamicScalingPolicy
 ```yaml
 async_training:
   use_dynamic_resource_scaling: True
-  dynamic_scaling_policy: "my_policy"
-  dynamic_scaling_deactivate_ratio: 0.5
-  dynamic_scaling_enable_rebalance: True
+  dynamic_schedule_policy: "my_policy"
+  dynamic_schedule_deactivate_ratio: 0.5
+  dynamic_schedule_enable_rebalance: True
 ```
 
 ### Step 4：使用 `DynamicScaleContext` 字段
@@ -440,12 +440,12 @@ async_training:
 ## 7. 文件结构
 
 ```
-dynamic_scaling/
+dynamic_schedule/
 ├── __init__.py                        # 公开导出 + policy 注册表
-├── base.py                            # DynamicScalingPolicyBase ABC, DynamicScaleContext, registry
-├── default_policy.py                  # DefaultDynamicScalingPolicy（自适应动态伸缩）
+├── base.py                            # DynamicSchedulePolicyBase ABC, DynamicScaleContext, registry
+├── default_policy.py                  # DefaultDynamicSchedulePolicy（自适应动态伸缩）
 ├── static_fully_async_policy.py       # StaticFullyAsyncPolicy（原始 fully-async / colocated 回退）
-├── fixed_ratio_policy.py              # FixedRatioDynamicScalingPolicy（固定比例，无自适应）
+├── fixed_ratio_policy.py              # FixedRatioDynamicSchedulePolicy（固定比例，无自适应）
 ├── dynamic_resource_controller.py     # DynamicResourceController（状态机 + 生命周期）
 ├── README.md                          # 指向 docs/advance/dynamic_resource.md 的指针
 └── README_zh.md                       # 中文文档（本文件）
