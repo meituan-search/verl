@@ -25,13 +25,13 @@ async_training:
   # whether to use trainer do_validate
   use_trainer_do_validate: False
 
-  # Whether to enable dynamic resource scaling.
+  # Whether to enable dynamic resource scheduling.
   # When True, hybrid rollout replicas are initialised on Trainer-node GPUs at
   # startup (sleeping, memory returned to the training engine), and are kept
   # active so that Trainer GPUs participate in rollout alongside standalone GPUs.
-  use_dynamic_resource_scaling: False
+  use_dynamic_resource_scheduling: False
 
-  # Name of the dynamic scaling policy ("default" or custom registered name).
+  # Name of the dynamic scheduling policy ("default" or custom registered name).
   dynamic_schedule_policy: "default"
 
   # Sample-collection ratio threshold for deactivating hybrid replicas.
@@ -70,7 +70,7 @@ actor_rollout_ref:
     # Must be enabled! Otherwise, log_probs cannot be calculated.
     calculate_log_probs: True
 
-    # When use_dynamic_resource_scaling is enabled, hybrid replicas share the GPU with
+    # When use_dynamic_resource_scheduling is enabled, hybrid replicas share the GPU with
     # the training engine, so gpu_memory_utilization should be kept low (e.g. 0.3-0.5).
     # standalone_gpu_memory_utilization applies only to standalone replicas (dedicated
     # rollout GPUs); null means fall back to gpu_memory_utilization.

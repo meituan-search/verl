@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Qwen3.5-35B-A3B GRPO with Megatron backend + MTP + Fully Async Policy + Dynamic Resource Scaling
+# Qwen3.5-35B-A3B GRPO with Megatron backend + MTP + Fully Async Policy + Dynamic Resource Scheduling
 #
 # MTP (Multi-Token Prediction) notes:
 #   - actor_rollout_ref.model.mtp.enable=True        enables MTP module
@@ -118,7 +118,7 @@ python3 -X faulthandler -m verl.experimental.fully_async_policy.fully_async_main
     rollout.n_gpus_per_node="${NGPUS_PER_NODE}" \
     rollout.total_rollout_steps="${total_rollout_steps}" \
     async_training.staleness_threshold="${staleness_threshold}" \
-    async_training.use_dynamic_resource_scaling=True \
+    async_training.use_dynamic_resource_scheduling=True \
     async_training.dynamic_schedule_policy="default" \
     async_training.dynamic_schedule_deactivate_ratio=0.6 \
     async_training.dynamic_schedule_enable_rebalance=True \

@@ -79,7 +79,7 @@ def create_role_worker_mapping(config):
     train_role = Role.Actor
     async_training = config.get("async_training", {})
     if async_training.get("use_trainer_do_validate", False) or async_training.get(
-        "use_dynamic_resource_scaling", False
+        "use_dynamic_resource_scheduling", False
     ):
         train_role = Role.ActorRollout
 

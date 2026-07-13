@@ -52,7 +52,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class FullyAsyncLLMServerManager(LLMServerManager):
-    """Extension of :class:`LLMServerManager` for fully async training with hybrid scaling."""
+    """Extension of :class:`LLMServerManager` for fully async training with hybrid scheduling."""
 
     def __init__(
         self,
@@ -467,7 +467,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Each entry is (timestamp, active_count_after_change, max_concurrent_at_that_time),
         # appended whenever active_tasks' size changes (a sample is submitted, completes, or is
         # drained during a pause) OR when max_concurrent_samples itself changes (replicas
-        # added/removed under dynamic resource scaling). Recording the capacity alongside the
+        # added/removed under dynamic resource scheduling). Recording the capacity alongside the
         # active count is required because max_concurrent_samples is NOT constant over a step
         # window when rollout resources are dynamically (de)activated — using a single
         # end-of-window capacity for the whole window would misattribute utilization for
@@ -546,7 +546,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         S_k be the max-concurrency capacity (max_concurrent_samples) recorded at t_k; both hold
         for the whole interval [t_k, t_{k+1}).
 
-        Under dynamic resource scaling, replicas can be activated/deactivated mid-window, so the
+        Under dynamic resource scheduling, replicas can be activated/deactivated mid-window, so the
         capacity S_k is NOT constant across the window — each interval must use its own S_k
         (the capacity that was actually in effect during that interval), rather than a single
         end-of-window value. _record_active_count() is called both when active_tasks changes
@@ -554,7 +554,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         every interval boundary reflects a change in at least one of A_k or S_k.
 
         For each interval k: u_k = min(1, A_k / S_k) (utilization can exceed 1 transiently
-        under dynamic resource scaling, so it is clamped). Intervals with S_k == 0 (no capacity
+        under dynamic resource scheduling, so it is clamped). Intervals with S_k == 0 (no capacity
         available yet) contribute zero weight and are skipped.
 
         utilization = sum_k[(t_{k+1} - t_k) * S_k * u_k] / sum_k[(t_{k+1} - t_k) * S_k]

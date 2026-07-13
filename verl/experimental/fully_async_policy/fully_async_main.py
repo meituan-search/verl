@@ -161,14 +161,14 @@ class FullyAsyncTaskRunner:
 
         Hybrid replicas are needed when *either*:
         - ``use_trainer_do_validate`` is enabled (trainer-side validation), or
-        - ``use_dynamic_resource_scaling`` is enabled (dynamic resource scheduling).
+        - ``use_dynamic_resource_scheduling`` is enabled (dynamic resource scheduling).
 
         The extracted worker group is stored in ``self.components["hybrid_worker_group"]``
         and injected into the rollouter before ``init_workers()`` is called.
         """
         trainer = self.components["trainer"]
         needs_hybrid = config.async_training.use_trainer_do_validate or config.async_training.get(
-            "use_dynamic_resource_scaling", False
+            "use_dynamic_resource_scheduling", False
         )
         if needs_hybrid:
             trainer_wg = ray.get(trainer.get_actor_wg.remote())
@@ -179,7 +179,7 @@ class FullyAsyncTaskRunner:
             )
         else:
             print(
-                "[ASYNC MAIN] Neither use_trainer_do_validate nor use_dynamic_resource_scaling enabled, "
+                "[ASYNC MAIN] Neither use_trainer_do_validate nor use_dynamic_resource_scheduling enabled, "
                 "skipping hybrid worker group setup"
             )
 

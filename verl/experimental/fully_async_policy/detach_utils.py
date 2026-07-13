@@ -191,7 +191,7 @@ class MetricsAggregator:
         # total num gpus used
         self.total_gpus = total_gpus
         # Number of GPUs that switch between rollout/train (hybrid, i.e. trainer-node GPUs
-        # co-hosting rollout replicas under dynamic resource scaling) and the number of
+        # co-hosting rollout replicas under dynamic resource scheduling) and the number of
         # GPUs dedicated exclusively to rollout (standalone). Used to combine
         # dynamic_resource/{train,rollout}_resource_utilization into a single
         # dynamic_resource/resource_utilization metric — see
@@ -379,7 +379,7 @@ class MetricsAggregator:
         #
         #   x = timing_s/wait_for_enough_samples / timing_s/step
         #
-        # "timing_s/wait_for_enough_samples" is only recorded when dynamic resource scaling
+        # "timing_s/wait_for_enough_samples" is only recorded when dynamic resource scheduling
         # is enabled (see FullyAsyncTrainer.fit_step()). When it's disabled, hybrid GPUs
         # never switch into rollout mode, i.e. x == 0 (100% of hybrid time is training) —
         # so it's treated as 0.0 rather than skipping the metric entirely.

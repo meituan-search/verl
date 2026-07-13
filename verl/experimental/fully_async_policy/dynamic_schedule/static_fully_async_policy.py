@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Built-in "static_fully_async" dynamic scaling policy."""
+"""Built-in "static_fully_async" dynamic scheduling policy."""
 
-from .base import DynamicScaleContext, DynamicSchedulePolicyBase, register_policy
+from .base import DynamicScheduleContext, DynamicSchedulePolicyBase, register_policy
 
 
 @register_policy("static_fully_async")
@@ -39,14 +39,16 @@ class StaticFullyAsyncPolicy(DynamicSchedulePolicyBase):
             print("[StaticFullyAsyncPolicy] only_hybrid=True: forcing deactivate_ratio=1.0")
             self.deactivate_ratio = 1.0
 
-    def should_deactivate(self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScaleContext) -> bool:
+    def should_deactivate(self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScheduleContext) -> bool:
         return is_hybrid_active
 
-    def deactivate_wait_samples(self, ctx: DynamicScaleContext) -> int:
+    def deactivate_wait_samples(self, ctx: DynamicScheduleContext) -> int:
         return 0
 
-    def update_after_step(self, global_steps: int, ctx: DynamicScaleContext) -> None:
+    def update_after_step(self, global_steps: int, ctx: DynamicScheduleContext) -> None:
         return
 
-    def should_activate_after_step(self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScaleContext) -> bool:
+    def should_activate_after_step(
+        self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScheduleContext
+    ) -> bool:
         return False

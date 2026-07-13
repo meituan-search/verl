@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Built-in "default" dynamic scaling policy."""
+"""Built-in "default" dynamic scheduling policy."""
 
 import ray
 
-from .base import DynamicScaleContext, DynamicSchedulePolicyBase, register_policy
+from .base import DynamicScheduleContext, DynamicSchedulePolicyBase, register_policy
 
 DEFAULT_SWITCH_THRESHOLD_S = 10.0
 SWITCH_OVERHEAD_WINDOW_SIZE = 3
@@ -77,10 +77,10 @@ class DefaultDynamicSchedulePolicy(DynamicSchedulePolicyBase):
             print("[DefaultDynamicSchedulePolicy] only_hybrid=True: forcing deactivate_ratio=1.0")
             self.deactivate_ratio = 1.0
 
-    def should_deactivate(self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScaleContext) -> bool:
+    def should_deactivate(self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScheduleContext) -> bool:
         return is_hybrid_active
 
-    def deactivate_wait_samples(self, ctx: DynamicScaleContext) -> int:
+    def deactivate_wait_samples(self, ctx: DynamicScheduleContext) -> int:
         return int(ctx.step_required_samples * self.deactivate_ratio)
 
     def _switch_cost(self) -> float:
@@ -89,7 +89,7 @@ class DefaultDynamicSchedulePolicy(DynamicSchedulePolicyBase):
             return sum(recent) / len(recent)
         return DEFAULT_SWITCH_THRESHOLD_S
 
-    def update_after_step(self, global_steps: int, ctx: DynamicScaleContext) -> None:
+    def update_after_step(self, global_steps: int, ctx: DynamicScheduleContext) -> None:
         if global_steps <= 0 or self.only_hybrid:
             return
 
@@ -129,7 +129,7 @@ class DefaultDynamicSchedulePolicy(DynamicSchedulePolicyBase):
             f"switch_overheads_history(tail10)={self._recent_switch_overheads[-10:]}"
         )
 
-    def _deactivate_gap(self, ctx: DynamicScaleContext) -> float:
+    def _deactivate_gap(self, ctx: DynamicScheduleContext) -> float:
         """How many more samples are needed to reach the deactivate-wait threshold.
 
         Shared by :meth:`should_activate_after_step` and
@@ -139,7 +139,7 @@ class DefaultDynamicSchedulePolicy(DynamicSchedulePolicyBase):
         surplus = ctx.total_generated_samples - ctx.expected_samples
         return deactivate_threshold - surplus
 
-    def _estimate_per_sample_time(self, ctx: DynamicScaleContext) -> float:
+    def _estimate_per_sample_time(self, ctx: DynamicScheduleContext) -> float:
         """Estimate standalone-only wall-clock time to produce one sample.
 
         Divides this cycle's total wait time by ``step_wait_samples`` — the
@@ -160,7 +160,7 @@ class DefaultDynamicSchedulePolicy(DynamicSchedulePolicyBase):
             self._last_per_sample_time = total_wait / total_wait_samples
         return self._last_per_sample_time
 
-    def _has_positive_net_benefit(self, global_steps: int, ctx: DynamicScaleContext) -> bool:
+    def _has_positive_net_benefit(self, global_steps: int, ctx: DynamicScheduleContext) -> bool:
         """Cost/benefit gate: is activating hybrid worth its switch overhead?
 
         Converts the outstanding sample gap into an estimated wall-clock cost
@@ -188,7 +188,9 @@ class DefaultDynamicSchedulePolicy(DynamicSchedulePolicyBase):
         )
         return net_benefit > 0
 
-    def should_activate_after_step(self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScaleContext) -> bool:
+    def should_activate_after_step(
+        self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScheduleContext
+    ) -> bool:
         if self.only_hybrid:
             return True
 
@@ -198,7 +200,7 @@ class DefaultDynamicSchedulePolicy(DynamicSchedulePolicyBase):
             f" self.deactivate_ratio:{self.deactivate_ratio},"
             f" ctx.buffer_samples:{ctx.buffer_samples}"
         )
-        print(f"DynamicScaleContext:{ctx}")
+        print(f"DynamicScheduleContext:{ctx}")
 
         has_gap = self._deactivate_gap(ctx) > 0
         if not has_gap:
@@ -206,7 +208,7 @@ class DefaultDynamicSchedulePolicy(DynamicSchedulePolicyBase):
 
         return self._has_positive_net_benefit(global_steps, ctx)
 
-    def request_rebalance(self, global_steps: int, ctx: DynamicScaleContext) -> None:
+    def request_rebalance(self, global_steps: int, ctx: DynamicScheduleContext) -> None:
         """Redistribute requests across all active replicas after activation.
 
         Performs a full rebalance via the rollouter:

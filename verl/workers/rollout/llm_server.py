@@ -59,7 +59,7 @@ class GlobalRequestLoadBalancer:
       among equally-loaded servers uses ``hash(request_id)`` so the same
       request always routes to the same server across runs.
     - **Dynamic Server Management**: Supports add/remove servers at runtime
-      for hybrid scaling.
+      for hybrid scheduling.
     """
 
     def __init__(

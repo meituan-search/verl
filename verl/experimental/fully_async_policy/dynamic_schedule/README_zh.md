@@ -79,7 +79,7 @@ Deactivate（顺序至关重要）：
 
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
-| `use_dynamic_resource_scaling` | bool | `False` | 总开关。为 `True` 时，启动即在 Trainer 节点 GPU 上初始化 hybrid rollout 副本（sleeping，显存已归还训练引擎）。 |
+| `use_dynamic_resource_scheduling` | bool | `False` | 总开关。为 `True` 时，启动即在 Trainer 节点 GPU 上初始化 hybrid rollout 副本（sleeping，显存已归还训练引擎）。 |
 | `dynamic_schedule_policy` | str | `"default"` | 策略名（`"default"` / `"static_fully_async"` / `"fixed_ratio"` / 自定义注册名）。 |
 | `dynamic_schedule_deactivate_ratio` | float | `0.3` | 样本收集比例阈值。控制器等到 `deactivate_ratio × required_samples × trigger_parameter_sync_step` 个样本缓冲好再停用。越小越早停用；`1.0` 表示等满一个 batch。 |
 | `dynamic_schedule_enable_rebalance` | bool | `False` | hybrid 激活后是否对在途请求做 rebalance（abort + 清 sticky cache + resume），按 least-loaded 路由。 |
@@ -154,7 +154,7 @@ Deactivate（顺序至关重要）：
 
 **关键性质：**
 
-1. **等价于标准 Fully-Async**：每个 step 开始立即停用 hybrid、永不重新激活，Trainer GPU 始终 100% 用于训练——与不开 `use_dynamic_resource_scaling` 行为一致。
+1. **等价于标准 Fully-Async**：每个 step 开始立即停用 hybrid、永不重新激活，Trainer GPU 始终 100% 用于训练——与不开 `use_dynamic_resource_scheduling` 行为一致。
 2. **Colocated 回退**：`rollout.nnodes=0` 时 `only_hybrid=True`，退化为经典 colocated 模式（训练 + 推理共享同一批 GPU，无独立 rollout 节点）。
 
 ### 3.3 `fixed_ratio` — FixedRatioDynamicSchedulePolicy
@@ -356,7 +356,7 @@ Trainer `fit_step()`（含 partial-rollout 恢复）结束后，MessageQueue 中
 ```python
 from verl.experimental.fully_async_policy.dynamic_schedule import (
     DynamicSchedulePolicyBase,
-    DynamicScaleContext,
+    DynamicScheduleContext,
     register_policy,
 )
 
@@ -371,12 +371,12 @@ class MyDynamicSchedulePolicy(DynamicSchedulePolicyBase):
         self,
         global_steps: int,
         is_hybrid_active: bool,
-        ctx: DynamicScaleContext,
+        ctx: DynamicScheduleContext,
     ) -> bool:
         """返回 True 则本步停用 hybrid 副本。"""
         return is_hybrid_active
 
-    def deactivate_wait_samples(self, ctx: DynamicScaleContext) -> int:
+    def deactivate_wait_samples(self, ctx: DynamicScheduleContext) -> int:
         """返回停用前需缓冲的最小样本数。"""
         return int(ctx.required_samples * ctx.trigger_parameter_sync_step * self.deactivate_ratio)
 
@@ -384,17 +384,17 @@ class MyDynamicSchedulePolicy(DynamicSchedulePolicyBase):
         self,
         global_steps: int,
         is_hybrid_active: bool,
-        ctx: DynamicScaleContext,
+        ctx: DynamicScheduleContext,
     ) -> bool:
         """返回 True 则 weight sync 后重新激活。"""
         return ctx.total_generated_samples < ctx.expected_samples + ctx.buffer_samples
 
     # 可选：覆盖以在每步后更新内部状态
-    def update_after_step(self, global_steps: int, ctx: DynamicScaleContext) -> None:
+    def update_after_step(self, global_steps: int, ctx: DynamicScheduleContext) -> None:
         pass
 
     # 可选：覆盖以自定义激活后的请求重分发
-    def request_rebalance(self, global_steps: int, ctx: DynamicScaleContext) -> None:
+    def request_rebalance(self, global_steps: int, ctx: DynamicScheduleContext) -> None:
         pass
 ```
 
@@ -413,13 +413,13 @@ from .my_policy import MyDynamicSchedulePolicy
 
 ```yaml
 async_training:
-  use_dynamic_resource_scaling: True
+  use_dynamic_resource_scheduling: True
   dynamic_schedule_policy: "my_policy"
   dynamic_schedule_deactivate_ratio: 0.5
   dynamic_schedule_enable_rebalance: True
 ```
 
-### Step 4：使用 `DynamicScaleContext` 字段
+### Step 4：使用 `DynamicScheduleContext` 字段
 
 | 字段 | 类型 | 说明 |
 |-------|------|------|
@@ -442,7 +442,7 @@ async_training:
 ```
 dynamic_schedule/
 ├── __init__.py                        # 公开导出 + policy 注册表
-├── base.py                            # DynamicSchedulePolicyBase ABC, DynamicScaleContext, registry
+├── base.py                            # DynamicSchedulePolicyBase ABC, DynamicScheduleContext, registry
 ├── default_policy.py                  # DefaultDynamicSchedulePolicy（自适应动态伸缩）
 ├── static_fully_async_policy.py       # StaticFullyAsyncPolicy（原始 fully-async / colocated 回退）
 ├── fixed_ratio_policy.py              # FixedRatioDynamicSchedulePolicy（固定比例，无自适应）

@@ -29,7 +29,7 @@ from verl.experimental.fully_async_policy.detach_utils import (
     MetricsAggregator,
     assemble_batch_from_rollout_samples,
 )
-from verl.experimental.fully_async_policy.dynamic_schedule import DynamicScaleContext
+from verl.experimental.fully_async_policy.dynamic_schedule import DynamicScheduleContext
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
@@ -145,12 +145,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.progress_bar = None
         self.trigger_parameter_sync_step = config.async_training.trigger_parameter_sync_step
         self.last_ckpt_version = 0
-        # When use_trainer_do_validate OR use_dynamic_resource_scaling is enabled, trainer
+        # When use_trainer_do_validate OR use_dynamic_resource_scheduling is enabled, trainer
         # workers must carry a rollout engine (Role.ActorRollout) so that the master rank
         # can push weight updates directly to the colocated hybrid rollout instance via the
         # naive path (hybrid_checkpoint_manager).
         needs_hybrid_rollout = config.async_training.use_trainer_do_validate or config.async_training.get(
-            "use_dynamic_resource_scaling", False
+            "use_dynamic_resource_scheduling", False
         )
         self.train_role = Role.ActorRollout if needs_hybrid_rollout else Role.Actor
 
@@ -163,7 +163,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # _step_wait_times; see _get_samples_from_queue().
         self._step_wait_samples: list[int] = []
         # Hybrid GPUs (trainer-node GPUs that switch between rollout/train under dynamic
-        # resource scaling) and standalone GPUs (dedicated rollout-node GPUs, always
+        # resource scheduling) and standalone GPUs (dedicated rollout-node GPUs, always
         # doing rollout). Used both for the existing throughput metric and to combine
         # dynamic_resource/{train,rollout}_resource_utilization into a single
         # dynamic_resource/resource_utilization metric (see MetricsAggregator).
@@ -179,14 +179,14 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.checkpoint_manager = None
 
         # Hybrid checkpoint manager for trainer-side validation (use_trainer_do_validate)
-        # and/or dynamic resource scaling (use_dynamic_resource_scaling).
+        # and/or dynamic resource scheduling (use_dynamic_resource_scheduling).
         # Uses naive backend to sync weights from trainer to hybrid rollout replicas.
         # Initialized in _setup_hybrid_checkpoint_manager() via set_rollouter().
         self.hybrid_checkpoint_manager = None
 
-        # Dynamic resource controller — activated when use_dynamic_resource_scaling=True.
+        # Dynamic resource controller — activated when use_dynamic_resource_scheduling=True.
         self.dynamic_resource_controller = None
-        self.dynamic_schedule_enabled: bool = config.async_training.get("use_dynamic_resource_scaling", False)
+        self.dynamic_schedule_enabled: bool = config.async_training.get("use_dynamic_resource_scheduling", False)
         # Name of the scheduling policy (resolved in _setup_dynamic_resource_controller).
         self._dynamic_schedule_policy_name: str = config.async_training.get("dynamic_schedule_policy", "default")
         # Initial deactivate_ratio forwarded to the policy constructor.
@@ -204,8 +204,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # standalone replicas: all rollout happens on hybrid (trainer-side) GPUs.
         self._standalone_rollout_only_hybrid: bool = self.dynamic_schedule_enabled and config.rollout.nnodes == 0
 
-        # Per-step dynamic scaling context — built once at init, mutable fields updated each step.
-        self.dynamic_schedule_ctx = DynamicScaleContext(
+        # Per-step dynamic scheduling context — built once at init, mutable fields updated each step.
+        self.dynamic_schedule_ctx = DynamicScheduleContext(
             required_samples=self.required_samples,
             trigger_parameter_sync_step=self.trigger_parameter_sync_step,
             total_generated_samples=0,
@@ -240,7 +240,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         replicas from the rollouter's ALM via RPC since they live on the rollout side.
         """
         needs_hybrid = self.config.async_training.use_trainer_do_validate or self.config.async_training.get(
-            "use_dynamic_resource_scaling", False
+            "use_dynamic_resource_scheduling", False
         )
         if not needs_hybrid:
             return
@@ -326,7 +326,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             only_hybrid=only_hybrid,
         )
         print(
-            f"[FullyAsyncTrainer] Dynamic scaling policy '{self._dynamic_schedule_policy_name}' "
+            f"[FullyAsyncTrainer] Dynamic scheduling policy '{self._dynamic_schedule_policy_name}' "
             f"instantiated (deactivate_ratio={self._dynamic_schedule_deactivate_ratio_init}, "
             f"only_hybrid={only_hybrid})"
         )
@@ -390,7 +390,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # Snapshot the queue backlog at collection start: samples already sitting
         # in the queue are served instantly and don't reflect actual generation
         # rate, so they must be excluded from the wait-time-per-sample estimate.
-        # Only queried when dynamic scaling is enabled, since it's the sole consumer
+        # Only queried when dynamic scheduling is enabled, since it's the sole consumer
         # of this signal and the extra RPC would otherwise be pure overhead.
         if self.dynamic_schedule_enabled:
             queue_size_at_start = await self.message_queue_client.get_queue_size()
@@ -453,7 +453,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
     def _create_actor_rollout_classes(self):
         # create actor — the role is Role.ActorRollout when use_trainer_do_validate or
-        # use_dynamic_resource_scaling is enabled (so the trainer worker also hosts a
+        # use_dynamic_resource_scheduling is enabled (so the trainer worker also hosts a
         # local rollout engine for naive weight sync via hybrid_checkpoint_manager).
         # Otherwise it is Role.Actor.  Rollout capability is managed by ElasticAgentLoopManager's
         # hybrid replicas.
@@ -731,7 +731,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             await self.checkpoint_manager.update_weights(
                 global_steps=self.current_param_version,
             )
-            # Step 2: When dynamic resource scaling is enabled, the Trainer GPUs
+            # Step 2: When dynamic resource scheduling is enabled, the Trainer GPUs
             # also co-host hybrid rollout replicas.  Push weights to them via
             # a separate naive sync (same mechanism as colocated training).
             if self.dynamic_schedule_enabled and should_activate:

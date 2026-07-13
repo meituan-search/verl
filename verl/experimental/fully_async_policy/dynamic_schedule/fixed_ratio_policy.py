@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Built-in "fixed_ratio" dynamic scaling policy (no adaptive ratio update)."""
+"""Built-in "fixed_ratio" dynamic scheduling policy (no adaptive ratio update)."""
 
 import ray
 
-from .base import DynamicScaleContext, DynamicSchedulePolicyBase, register_policy
+from .base import DynamicScheduleContext, DynamicSchedulePolicyBase, register_policy
 
 
 @register_policy("fixed_ratio")
@@ -42,13 +42,13 @@ class FixedRatioDynamicSchedulePolicy(DynamicSchedulePolicyBase):
             print("[FixedRatioDynamicSchedulePolicy] only_hybrid=True: forcing deactivate_ratio=1.0")
             self.deactivate_ratio = 1.0
 
-    def should_deactivate(self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScaleContext) -> bool:
+    def should_deactivate(self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScheduleContext) -> bool:
         return is_hybrid_active
 
-    def deactivate_wait_samples(self, ctx: DynamicScaleContext) -> int:
+    def deactivate_wait_samples(self, ctx: DynamicScheduleContext) -> int:
         return int(ctx.step_required_samples * self.deactivate_ratio)
 
-    def update_after_step(self, global_steps: int, ctx: DynamicScaleContext) -> None:
+    def update_after_step(self, global_steps: int, ctx: DynamicScheduleContext) -> None:
         """No-op: deactivate_ratio is fixed and never updated."""
         print(
             f"[FixedRatioDynamicSchedulePolicy] step={global_steps} "
@@ -57,7 +57,9 @@ class FixedRatioDynamicSchedulePolicy(DynamicSchedulePolicyBase):
             f"activate_dur={ctx.last_activate_duration_s:.2f}s, deactivate_dur={ctx.last_deactivate_duration_s:.2f}s)"
         )
 
-    def should_activate_after_step(self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScaleContext) -> bool:
+    def should_activate_after_step(
+        self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScheduleContext
+    ) -> bool:
         if self.only_hybrid:
             return True
 
@@ -66,11 +68,11 @@ class FixedRatioDynamicSchedulePolicy(DynamicSchedulePolicyBase):
             f"ctx.expected_samples:{ctx.expected_samples}, self.deactivate_ratio:{self.deactivate_ratio},"
             f" ctx.buffer_samples:{ctx.buffer_samples}"
         )
-        print(f"DynamicScaleContext:{ctx}")
+        print(f"DynamicScheduleContext:{ctx}")
 
         return ctx.total_generated_samples - ctx.expected_samples < self.deactivate_ratio * ctx.step_required_samples
 
-    def request_rebalance(self, global_steps: int, ctx: DynamicScaleContext) -> None:
+    def request_rebalance(self, global_steps: int, ctx: DynamicScheduleContext) -> None:
         """Redistribute requests across all active replicas after activation."""
         if not hasattr(self, "_rollouter") or self._rollouter is None:
             print("[FixedRatioDynamicSchedulePolicy] request_rebalance skipped: no rollouter reference available")

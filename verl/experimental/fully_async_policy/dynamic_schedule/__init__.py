@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .base import DynamicScaleContext, DynamicSchedulePolicyBase, build_policy, register_policy
+from .base import DynamicScheduleContext, DynamicSchedulePolicyBase, build_policy, register_policy
 from .default_policy import DefaultDynamicSchedulePolicy
 from .dynamic_resource_controller import DynamicResourceController
 from .static_fully_async_policy import StaticFullyAsyncPolicy
@@ -20,7 +20,7 @@ from .static_fully_async_policy import StaticFullyAsyncPolicy
 __all__ = [
     "DynamicResourceController",
     "DynamicSchedulePolicyBase",
-    "DynamicScaleContext",
+    "DynamicScheduleContext",
     "build_policy",
     "register_policy",
     "DefaultDynamicSchedulePolicy",

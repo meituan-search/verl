@@ -17,7 +17,7 @@
 Custom policy example::
 
     from verl.experimental.fully_async_policy.dynamic_schedule import (
-        DynamicSchedulePolicyBase, DynamicScaleContext, register_policy,
+        DynamicSchedulePolicyBase, DynamicScheduleContext, register_policy,
     )
 
     @register_policy("my_policy")
@@ -49,13 +49,13 @@ def register_policy(name: str):
 def build_policy(name: str, **kwargs) -> "DynamicSchedulePolicyBase":
     """Instantiate a registered policy by name, forwarding **kwargs to its __init__."""
     if name not in _policy_registry:
-        raise KeyError(f"Unknown dynamic scaling policy '{name}'. Registered: {list(_policy_registry.keys())}")
+        raise KeyError(f"Unknown dynamic scheduling policy '{name}'. Registered: {list(_policy_registry.keys())}")
     return _policy_registry[name](**kwargs)
 
 
 @dataclass
-class DynamicScaleContext:
-    """Unified context for all dynamic scaling policy decisions and state updates.
+class DynamicScheduleContext:
+    """Unified context for all dynamic scheduling policy decisions and state updates.
 
     Combines static training-run configuration (constant across a run) with
     per-step runtime state and activation/deactivation timing metrics.
@@ -107,7 +107,7 @@ class DynamicScaleContext:
 
 
 class DynamicSchedulePolicyBase(ABC):
-    """Abstract base class for dynamic resource scaling policies.
+    """Abstract base class for dynamic resource scheduling policies.
 
     Subclasses must implement :meth:`should_deactivate` and
     :meth:`deactivate_wait_samples` and :meth:`should_activate_after_step`,
@@ -122,7 +122,7 @@ class DynamicSchedulePolicyBase(ABC):
     """
 
     @abstractmethod
-    def should_deactivate(self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScaleContext) -> bool:
+    def should_deactivate(self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScheduleContext) -> bool:
         """Return True to trigger deactivation this step, False to keep hybrid active.
 
         Args:
@@ -132,14 +132,14 @@ class DynamicSchedulePolicyBase(ABC):
         """
 
     @abstractmethod
-    def deactivate_wait_samples(self, ctx: DynamicScaleContext) -> int:
+    def deactivate_wait_samples(self, ctx: DynamicScheduleContext) -> int:
         """Return the minimum buffered-sample count before deactivation proceeds.
 
         Args:
             ctx: Unified policy context (static config + per-step state + timing).
         """
 
-    def update_after_step(self, global_steps: int, ctx: DynamicScaleContext) -> None:  # noqa: B027
+    def update_after_step(self, global_steps: int, ctx: DynamicScheduleContext) -> None:  # noqa: B027
         """Update policy state after weight sync. Override to adapt parameters.
 
         Args:
@@ -148,7 +148,9 @@ class DynamicSchedulePolicyBase(ABC):
         """
 
     @abstractmethod
-    def should_activate_after_step(self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScaleContext) -> bool:
+    def should_activate_after_step(
+        self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScheduleContext
+    ) -> bool:
         """Return True to trigger activation after this step, False to keep hybrid deactivated.
 
         Args:
@@ -157,7 +159,7 @@ class DynamicSchedulePolicyBase(ABC):
             ctx: Unified policy context (static config + per-step state + timing).
         """
 
-    def request_rebalance(self, global_steps: int, ctx: DynamicScaleContext) -> None:  # noqa: B027
+    def request_rebalance(self, global_steps: int, ctx: DynamicScheduleContext) -> None:  # noqa: B027
         """Redistribute requests across inference replicas after activation.
 
         Called immediately after hybrid replicas are activated and registered

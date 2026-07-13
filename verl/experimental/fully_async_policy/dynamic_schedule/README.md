@@ -1,10 +1,10 @@
-# Dynamic Resource Scaling for Fully-Async Training
+# Dynamic Resource Scheduling for Fully-Async Training
 
 **Author:** `https://github.com/meituan-search`
 
 Last updated: 07/10/2026.
 
-This module provides **hybrid inference resource dynamic scaling** for the fully-async training framework, enabling Trainer-node GPUs to participate in rollout generation during idle periods and thus improving overall GPU utilization.
+This module provides **hybrid inference resource dynamic scheduling** for the fully-async training framework, enabling Trainer-node GPUs to participate in rollout generation during idle periods and thus improving overall GPU utilization.
 
 > **At a glance**
 > - Two kinds of inference replicas: **Standalone** (dedicated rollout nodes, always on) + **Hybrid** (share Trainer-node GPUs; activated during training idle time, weights offloaded and memory returned before each training step).
@@ -29,7 +29,7 @@ A **Hybrid + Standalone dual-mode inference resource** design:
 
 ![Dynamic Resource Architecture](https://github.com/zpltys/Blob/blob/main/dynamic_resource.png?raw=true)
 
-The figure above illustrates the **resource-time layout** of the dynamic scaling system across three consecutive training steps. The vertical axis shows GPU resources split into two pools:
+The figure above illustrates the **resource-time layout** of the dynamic scheduling system across three consecutive training steps. The vertical axis shows GPU resources split into two pools:
 
 - **Standalone Resource** (top, GPU 0–n): Dedicated rollout GPUs that **continuously perform rollout** across all steps — they are always active during the *Rollout* phase (blue) and idle during *Trainer* / *Weight Sync*.
 - **Hybrid Resource** (bottom, GPU n+1–n+m): Trainer-node GPUs that **switch between rollout and training**. When in *Rollout* mode they join the Rollout LoadBalancer to generate samples (blue); when in *Trainer* mode they run PPO mini-batch updates (yellow); at each *Weight Sync* boundary the latest weights are broadcast to all replicas.
@@ -77,19 +77,19 @@ Deactivate (order is critical):
 
 ## 2. Configuration Parameters
 
-All dynamic scaling parameters live under the `async_training` section of your training config
+All dynamic scheduling parameters live under the `async_training` section of your training config
 (`fully_async_ppo_trainer.yaml` or `fully_async_ppo_megatron_trainer.yaml`):
 
 ### Core Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `use_dynamic_resource_scaling` | bool | `False` | Master switch. When `True`, hybrid rollout replicas are initialised on Trainer-node GPUs at startup (sleeping, memory returned to the training engine). |
-| `dynamic_schedule_policy` | str | `"default"` | Name of the scaling policy (`"default"`, `"static_fully_async"`, `"fixed_ratio"`, or a custom registered name). |
+| `use_dynamic_resource_scheduling` | bool | `False` | Master switch. When `True`, hybrid rollout replicas are initialised on Trainer-node GPUs at startup (sleeping, memory returned to the training engine). |
+| `dynamic_schedule_policy` | str | `"default"` | Name of the scheduling policy (`"default"`, `"static_fully_async"`, `"fixed_ratio"`, or a custom registered name). |
 | `dynamic_schedule_deactivate_ratio` | float | `0.3` | Sample-collection ratio threshold. The controller waits until `deactivate_ratio × required_samples × trigger_parameter_sync_step` samples are buffered before deactivating. Lower → earlier deactivation; `1.0` → wait for a full batch. |
 | `dynamic_schedule_enable_rebalance` | bool | `False` | Whether to rebalance (abort + clear sticky cache + resume) in-flight requests across all active replicas after hybrid activation, via least-loaded routing. |
 
-### Existing Async-Training Parameters (used by dynamic scaling)
+### Existing Async-Training Parameters (used by dynamic scheduling)
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -159,7 +159,7 @@ Equivalent to the original fully-async strategy, designed for baseline compariso
 
 **Key properties:**
 
-1. **Equivalent to standard Fully-Async**: Hybrid replicas are deactivated immediately at each training step start and never re-activated. Trainer GPUs are always 100% returned to training — same behaviour as running without `use_dynamic_resource_scaling`.
+1. **Equivalent to standard Fully-Async**: Hybrid replicas are deactivated immediately at each training step start and never re-activated. Trainer GPUs are always 100% returned to training — same behaviour as running without `use_dynamic_resource_scheduling`.
 2. **Colocated fallback**: When `rollout.nnodes=0`, `only_hybrid=True` and the system runs in classic colocated mode (training + inference share the same GPUs, no separate rollout nodes).
 
 ### 3.3 `fixed_ratio` — FixedRatioDynamicSchedulePolicy
@@ -174,7 +174,7 @@ Identical to `default` except that `update_after_step()` is a no-op — `deactiv
 
 ## 4. Monitoring Metrics
 
-Dynamic resource scaling emits a set of `dynamic_resource/*` metrics (in addition to the general
+Dynamic resource scheduling emits a set of `dynamic_resource/*` metrics (in addition to the general
 `fully_async/*` metrics documented in [`fully_async.md`](./fully_async.md))
 to help quantify how effectively Hybrid and Standalone GPUs are utilized. This section gives the
 formal definition of each metric.
@@ -227,14 +227,14 @@ between the previous and current `reset_staleness()` call).
 The Rollouter records an event-driven history of `(len(active_tasks), max_concurrent_samples)`
 tuples — appended every time a sample is submitted, completes, or is drained during a pause,
 **and** whenever `max_concurrent_samples` itself changes (i.e. a replica is
-activated/deactivated under dynamic resource scaling). This gives timestamps
+activated/deactivated under dynamic resource scheduling). This gives timestamps
 $t_0 < t_1 < \dots < t_m$ with two quantities held constant over each interval $[t_k, t_{k+1})$:
 the active-task count $\text{active}_k$ and the concurrency capacity $\text{cap}_k$
 ($t_0$ is the previous step's end / this step's start; $t_m$ is "now", appended when
 `reset_staleness()` is called, closing out the window including any trailing drain/idle time).
 
 Recording the capacity alongside the active count per interval is essential because under dynamic
-resource scaling $\text{cap}_k$ is **not** constant over a step window — replicas can be
+resource scheduling $\text{cap}_k$ is **not** constant over a step window — replicas can be
 activated/deactivated mid-window. Using a single end-of-window capacity for the whole window
 would misattribute utilization for intervals that had a different capacity, so each interval uses
 its own $\text{cap}_k$.
@@ -267,14 +267,14 @@ rollout and train with the Standalone GPUs (which spend 100% of their time on ro
 Let $x \in [0, 1]$ be the fraction of the cycle's wall-clock time that Hybrid GPUs spent doing
 rollout (the rest, $1-x$, they spent training), estimated as the ratio of summed
 "wait for enough samples" time (Hybrid-rollout wall-clock time, only recorded when dynamic
-resource scaling deactivates Hybrid replicas this cycle) over the summed step time:
+resource scheduling deactivates Hybrid replicas this cycle) over the summed step time:
 
 $$
 x = \mathrm{clip}\left(\frac{\text{wait}}{\text{step}},\ 0,\ 1\right)
 $$
 
 where $\text{wait}$ is the summed `timing_s/wait_for_enough_samples` and $\text{step}$ is the
-summed `timing_s/step`. When dynamic resource scaling never switches Hybrid GPUs into rollout
+summed `timing_s/step`. When dynamic resource scheduling never switches Hybrid GPUs into rollout
 mode this cycle (e.g. disabled, or `wait_for_enough_samples` was skipped), $x = 0$ (100% of
 Hybrid time is training).
 
@@ -306,7 +306,7 @@ the `dynamic_resource/*` metrics above.
 
 ### Caveats
 
-- **`rollout_resource_utilization` per-interval capacity**: under dynamic resource scaling the
+- **`rollout_resource_utilization` per-interval capacity**: under dynamic resource scheduling the
   capacity $S_k$ can change mid-window as replicas are activated/deactivated; each interval uses
   its own $S_k$ rather than a single end-of-window value, so capacity changes are reflected
   faithfully. Intervals recorded before `max_concurrent_samples` is first known (a single seed
@@ -337,19 +337,19 @@ the `dynamic_resource/*` metrics above.
 
 **Baseline 1**: 16 GPU training + 16 GPU rollout (2 dedicated trainer nodes + 2 rollout nodes).  
 **Baseline 2**: 8 GPU training + 24 GPU rollout (1 dedicated trainer nodes + 3 rollout nodes).  
-**Dynamic scaling**: 16 GPU training (2 nodes) + 16 GPU rollout (2 node), with Hybrid replicas on Trainer GPUs.
+**Dynamic scheduling**: 16 GPU training (2 nodes) + 16 GPU rollout (2 node), with Hybrid replicas on Trainer GPUs.
 
 #### Result: 15.3% Faster End-to-End Training Time
 
-Dynamic resource scaling reduces total wall-clock training time by **~15.3%** compared to the 8+24 baseline, and **~17.5%** compared to the 16+16 baseline, while producing an **identical reward curve** — confirming that the training quality is not compromised by the time-sliced GPU sharing.
+Dynamic resource scheduling reduces total wall-clock training time by **~15.3%** compared to the 8+24 baseline, and **~17.5%** compared to the 16+16 baseline, while producing an **identical reward curve** — confirming that the training quality is not compromised by the time-sliced GPU sharing.
 
-**Reward curve** (dynamic scaling vs baseline):
+**Reward curve** (dynamic scheduling vs baseline):
 
 <div align="center">
 <img src="https://github.com/zpltys/Blob/blob/main/dynamic_resource_exp_reward.png?raw=true" width="600" />
 </div>
 
-Both curves overlap closely throughout training, demonstrating that dynamic scaling introduces no regression in model quality.
+Both curves overlap closely throughout training, demonstrating that dynamic scheduling introduces no regression in model quality.
 
 **Per-step runtime comparison**:
 
@@ -357,7 +357,7 @@ Both curves overlap closely throughout training, demonstrating that dynamic scal
 <img src="https://github.com/zpltys/Blob/blob/main/dynamic_resource_exp_time.png?raw=true" width="600" />
 </div>
 
-The per-step runtime plot shows that dynamic scaling reduces step latency by leveraging Trainer GPUs during rollout idle windows, with the gap widening as training progresses and the policy adapts the `deactivate_ratio`.
+The per-step runtime plot shows that dynamic scheduling reduces step latency by leveraging Trainer GPUs during rollout idle windows, with the gap widening as training progresses and the policy adapts the `deactivate_ratio`.
 
 #### Resource Utilization Breakdown
 
@@ -381,7 +381,7 @@ The 16-16-static curve hugs zero (production-bound, trainer starves); the 24-8-s
 <img src="https://github.com/zpltys/Blob/blob/main/dynamic_resource_resource_utilization.png?raw=true" width="600" />
 </div>
 
-16-16-static wastes training-side GPU time waiting for samples; 24-8-static wastes rollout-side GPU time over-producing unconsumed samples. Dynamic scaling keeps both sides' GPU time on useful work, yielding the highest cluster-wide utilization.
+16-16-static wastes training-side GPU time waiting for samples; 24-8-static wastes rollout-side GPU time over-producing unconsumed samples. Dynamic scheduling keeps both sides' GPU time on useful work, yielding the highest cluster-wide utilization.
 
 **Rollout-side utilization** (`dynamic_resource/rollout_resource_utilization`):
 
@@ -389,7 +389,7 @@ The 16-16-static curve hugs zero (production-bound, trainer starves); the 24-8-s
 <img src="https://github.com/zpltys/Blob/blob/main/dynamic_resource_rollout_resource_utilization.png?raw=true" width="600" />
 </div>
 
-16-16-static (production-bound) keeps its 16 rollout GPUs pinned near capacity; 24-8-static (production-rich) leaves much of its 24-GPU rollout capacity idle since the trainer cannot keep up. Dynamic scaling holds rollout utilization at a high, stable level — neither bottlenecked like 16-16 nor idle like 24-8.
+16-16-static (production-bound) keeps its 16 rollout GPUs pinned near capacity; 24-8-static (production-rich) leaves much of its 24-GPU rollout capacity idle since the trainer cannot keep up. Dynamic scheduling holds rollout utilization at a high, stable level — neither bottlenecked like 16-16 nor idle like 24-8.
 
 **Train-side utilization** (`dynamic_resource/train_resource_utilization`):
 
@@ -397,7 +397,7 @@ The 16-16-static curve hugs zero (production-bound, trainer starves); the 24-8-s
 <img src="https://github.com/zpltys/Blob/blob/main/dynamic_resource_train_resource_utilization.png?raw=true" width="600" />
 </div>
 
-24-8-static has samples in abundance, so the trainer never waits and achieves the highest train-side utilization. 16-16-static's trainer spends much of its turn waiting for samples (the wait is inside the metric's denominator, lowering the ratio). Dynamic scaling approaches the 24-8 level when samples are sufficient, while avoiding the 16-16 wait waste.
+24-8-static has samples in abundance, so the trainer never waits and achieves the highest train-side utilization. 16-16-static's trainer spends much of its turn waiting for samples (the wait is inside the metric's denominator, lowering the ratio). Dynamic scheduling approaches the 24-8 level when samples are sufficient, while avoiding the 16-16 wait waste.
 
 **Summary of load-balance trade-offs**:
 
@@ -407,7 +407,7 @@ The 16-16-static curve hugs zero (production-bound, trainer starves); the 24-8-s
 | 24-8-static | Consumption (trainer) | At capacity limit | Idle capacity | High (never waits) |
 | dynamic | Matched dynamically | Moderate | High & stable | Near 24-8 |
 
-Dynamic scaling's value: by shifting GPUs between training and rollout to match the actual load, it simultaneously avoids the 16-16 trainer starvation and the 24-8 sample buildup, achieving higher end-to-end throughput without adding more total GPUs.
+Dynamic scheduling's value: by shifting GPUs between training and rollout to match the actual load, it simultaneously avoids the 16-16 trainer starvation and the 24-8 sample buildup, achieving higher end-to-end throughput without adding more total GPUs.
 
 ---
 
@@ -420,7 +420,7 @@ Four steps to support a new policy:
 ```python
 from verl.experimental.fully_async_policy.dynamic_schedule import (
     DynamicSchedulePolicyBase,
-    DynamicScaleContext,
+    DynamicScheduleContext,
     register_policy,
 )
 
@@ -435,12 +435,12 @@ class MyDynamicSchedulePolicy(DynamicSchedulePolicyBase):
         self,
         global_steps: int,
         is_hybrid_active: bool,
-        ctx: DynamicScaleContext,
+        ctx: DynamicScheduleContext,
     ) -> bool:
         """Return True to deactivate hybrid replicas this step."""
         return is_hybrid_active
 
-    def deactivate_wait_samples(self, ctx: DynamicScaleContext) -> int:
+    def deactivate_wait_samples(self, ctx: DynamicScheduleContext) -> int:
         """Return minimum buffered-sample count before deactivation proceeds."""
         return int(ctx.required_samples * ctx.trigger_parameter_sync_step * self.deactivate_ratio)
 
@@ -448,17 +448,17 @@ class MyDynamicSchedulePolicy(DynamicSchedulePolicyBase):
         self,
         global_steps: int,
         is_hybrid_active: bool,
-        ctx: DynamicScaleContext,
+        ctx: DynamicScheduleContext,
     ) -> bool:
         """Return True to re-activate after weight sync."""
         return ctx.total_generated_samples < ctx.expected_samples + ctx.buffer_samples
 
     # Optional: override to update internal state after each step
-    def update_after_step(self, global_steps: int, ctx: DynamicScaleContext) -> None:
+    def update_after_step(self, global_steps: int, ctx: DynamicScheduleContext) -> None:
         pass
 
     # Optional: override to customise request redistribution after activation
-    def request_rebalance(self, global_steps: int, ctx: DynamicScaleContext) -> None:
+    def request_rebalance(self, global_steps: int, ctx: DynamicScheduleContext) -> None:
         pass
 ```
 
@@ -477,13 +477,13 @@ Or import it manually in your entry script to trigger `@register_policy`.
 
 ```yaml
 async_training:
-  use_dynamic_resource_scaling: True
+  use_dynamic_resource_scheduling: True
   dynamic_schedule_policy: "my_policy"
   dynamic_schedule_deactivate_ratio: 0.5
   dynamic_schedule_enable_rebalance: True
 ```
 
-### Step 4: Use `DynamicScaleContext` fields
+### Step 4: Use `DynamicScheduleContext` fields
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -506,8 +506,8 @@ async_training:
 ```
 verl/experimental/fully_async_policy/dynamic_schedule/
 ├── __init__.py                        # Public exports + policy registry
-├── base.py                            # DynamicSchedulePolicyBase ABC, DynamicScaleContext, registry
-├── default_policy.py                  # DefaultDynamicSchedulePolicy (adaptive dynamic scaling)
+├── base.py                            # DynamicSchedulePolicyBase ABC, DynamicScheduleContext, registry
+├── default_policy.py                  # DefaultDynamicSchedulePolicy (adaptive dynamic scheduling)
 ├── static_fully_async_policy.py       # StaticFullyAsyncPolicy (original fully-async / colocated fallback)
 ├── fixed_ratio_policy.py              # FixedRatioDynamicSchedulePolicy (fixed ratio, no adaptation)
 └── dynamic_resource_controller.py     # DynamicResourceController (state machine + lifecycle)
