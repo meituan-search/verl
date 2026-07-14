@@ -202,7 +202,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         # When standalone rollout resources are 0 (rollout.nnodes == 0), there are no
         # standalone replicas: all rollout happens on hybrid (trainer-side) GPUs.
-        self._standalone_rollout_only_hybrid: bool = self.dynamic_schedule_enabled and config.rollout.nnodes == 0
+        self.only_hybrid: bool = self.dynamic_schedule_enabled and config.rollout.nnodes == 0
 
         # Per-step dynamic scheduling context — built once at init, mutable fields updated each step.
         self.dynamic_schedule_ctx = DynamicScheduleContext(
@@ -211,7 +211,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             total_generated_samples=0,
             expected_samples=0,
             buffer_samples=0,
-            only_hybrid=self._standalone_rollout_only_hybrid,
+            only_hybrid=self.only_hybrid,
         )
 
     async def _setup_checkpoint_manager(self):
@@ -316,7 +316,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             build_policy,
         )
 
-        num_standalone = len(ray.get(self.rollouter.get_num_standalone_replicas.remote()))
+        num_standalone = len(ray.get(self.rollouter.get_standalone_replicas.remote()))
         num_hybrid = len(ray.get(self.rollouter.get_all_hybrid_replicas.remote()))
         only_hybrid = num_standalone == 0
 
@@ -728,15 +728,18 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         with marked_timer("timing_s/param_sync", self.timing_raw):
             # Step 1: NCCL broadcast from trainer to standalone rollout replicas.
-            await self.checkpoint_manager.update_weights(
-                global_steps=self.current_param_version,
-            )
+            # Skipped when there are no standalone replicas (e.g. rollout.nnodes=0,
+            # all rollout is hybrid) -- there is nothing to sync weights to.
+            if not self.only_hybrid:
+                await self.checkpoint_manager.update_weights(
+                    global_steps=self.current_param_version,
+                )
             # Step 2: When dynamic resource scheduling is enabled, the Trainer GPUs
             # also co-host hybrid rollout replicas.  Push weights to them via
             # a separate naive sync (same mechanism as colocated training).
             if self.dynamic_schedule_enabled and should_activate:
                 _act_start = time.time()
-                await self.hybrid_checkpoint_manager.update_weights(
+                await self.dynamic_resource_controller.sync_hybrid_weights(
                     global_steps=self.current_param_version,
                 )
                 await self.dynamic_resource_controller.activate_hybrid_replicas(self.current_param_version)

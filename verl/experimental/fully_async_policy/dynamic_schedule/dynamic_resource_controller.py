@@ -89,6 +89,31 @@ class DynamicResourceController:
     def is_hybrid_active(self) -> bool:
         return self._hybrid_active
 
+    @property
+    def has_hybrid_replicas(self) -> bool:
+        """Whether any hybrid replica has been registered with the hybrid checkpoint manager."""
+        return bool(self.hybrid_checkpoint_manager.replicas)
+
+    async def sync_hybrid_weights(self, global_steps: int) -> None:
+        """Push the latest trainer weights to hybrid rollout replicas (naive backend).
+
+        Wraps the weight sync with abort/resume of in-flight requests so that
+        hybrid replicas never receive weight updates while serving a request,
+        mirroring the guard that CheckpointEngineManager.update_weights() applies
+        for the non-naive (standalone) path. No-ops when no hybrid replicas have
+        been registered yet (e.g. still initializing, or purely standalone setup).
+
+        Args:
+            global_steps: Current global step (parameter version) to tag the sync with.
+        """
+        if not self.has_hybrid_replicas:
+            print("[DynamicResourceController] No hybrid replicas registered, skipping weight sync")
+            return
+
+        await self.hybrid_checkpoint_manager.abort_replicas()
+        await self.hybrid_checkpoint_manager.update_weights(global_steps=global_steps)
+        await self.hybrid_checkpoint_manager.resume_generation_replicas()
+
     async def activate_hybrid_replicas(self, global_steps: int) -> None:
         """Add hybrid replicas to the LB and resume generation (weight sync must be done first)."""
         print(f"[DynamicResourceController] Activating hybrid replicas at step {global_steps}")

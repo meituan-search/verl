@@ -281,23 +281,22 @@ class FullyAsyncLLMServerManager(LLMServerManager):
         """Total active rollout servers (standalone + hybrid)."""
         return len(self.rollout_replicas) + len(self.alive_replicas)
 
-    def get_num_standalone_replicas(self) -> int:
-        """Number of standalone-only replicas (hybrid replicas excluded).
+    def get_standalone_replicas(self) -> list:
+        """Return standalone-only replicas (hybrid replicas excluded).
 
-        At init time ``alive_replicas`` is empty, so ``rollout_replicas``
-        contains only standalone replicas.  Once some hybrid replicas are
-        activated they are appended to ``rollout_replicas``, so subtracting
-        ``alive_replicas`` recovers the standalone-only count.
+        ``rollout_replicas`` only ever holds standalone replicas; hybrid
+        replicas live separately in ``alive_replicas``/``hybrid_replicas``.
         """
         return self.rollout_replicas
 
-    def get_client(self, client_cls=LLMServerClient, **kwargs) -> LLMServerClient:
+    def get_client(self, client_cls=FullyAsyncLLMServerClient, **kwargs) -> LLMServerClient:
         """Override to automatically inject ``only_hybrid`` into the client.
 
         When there are no standalone replicas, hybrid replicas are the sole
         rollout resource.  During weight-sync windows the load balancer is
         temporarily empty, so the client should keep retrying instead of
-        raising immediately.
+        raising immediately. Defaults to :class:`FullyAsyncLLMServerClient` since
+        ``only_hybrid`` retry support is only implemented there.
         """
         only_hybrid = len(self.rollout_replicas) == 0
         return super().get_client(client_cls=client_cls, only_hybrid=only_hybrid, **kwargs)
@@ -1315,9 +1314,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         """Total active rollout replicas (standalone + active hybrid)."""
         return self.llm_server_manager.get_active_server_count()
 
-    def get_num_standalone_replicas(self) -> int:
-        """Number of standalone-only replicas (hybrid replicas excluded)."""
-        return self.llm_server_manager.get_num_standalone_replicas()
+    def get_standalone_replicas(self) -> list:
+        """Return standalone-only replicas (hybrid replicas excluded)."""
+        return self.llm_server_manager.get_standalone_replicas()
 
     def get_hybrid_replicas_info(self) -> list[dict]:
         """Metadata for all active hybrid replicas."""
