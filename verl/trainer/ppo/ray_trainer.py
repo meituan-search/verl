@@ -1246,15 +1246,6 @@ class RayPPOTrainer:
         old_log_prob = tu.get_tensordict(result)
         old_log_prob = DataProto.from_tensordict(old_log_prob)
 
-        from verl.utils.prefix_tree.rope import cmp_magi_vs_fa3
-
-        cmp_magi_vs_fa3(
-            log_probs,
-            batch,
-            config=self.config.actor_rollout_ref.model,
-            compute_log_prob_fn=self.actor_rollout_wg.compute_log_prob,
-        )
-
         return old_log_prob, old_log_prob_mfu
 
     def _update_actor(self, batch: DataProto) -> DataProto:
