@@ -42,7 +42,6 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
-from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from torch import Tensor
 from torch.nested._internal.nested_tensor import NestedTensor
 
@@ -271,14 +270,25 @@ def expand_flat_to_per_sample(
 
 @contextlib.contextmanager
 def prefix_tree_rope_context(model, position_ids: Optional[Tensor]):
-    """Override ``rotary_pos_emb.forward`` to index by per-token *position_ids*.
+    """Override ``rotary_pos_emb.forward`` to use per-token *position_ids*.
 
     Shared by both fused and unfused prefix-tree paths.  Megatron's default
     RoPE slicing assumes each CP rank holds sequential positions
     ``[r·T/CP .. (r+1)·T/CP]``; after MAGI dispatch each rank holds
-    non-sequential tokens whose ``position_ids`` are arbitrary.  This context
-    builds the full RoPE table (``cp_group=None``) and indexes it directly by
-    the actual local ``position_ids``.
+    non-sequential tokens whose ``position_ids`` are arbitrary.
+
+    Two RoPE families are handled:
+
+    - **Standard ``RotaryEmbedding``** (``forward(max_seq_len, ...)``): builds
+      a sequential table ``[0..max_seq_len-1]``.  The override builds the full
+      table (``cp_group=None``) and indexes it by ``position_ids``.
+    - **M-RoPE** (``Qwen3VLMultimodalRotaryEmbedding`` /
+      ``MultimodalRotaryEmbedding`` — ``forward(position_ids, mrope_section)``):
+      builds freqs directly from ``position_ids``, so each token's RoPE is
+      whatever ``position_ids`` says.  The override broadcasts the 1D per-token
+      positions to 3D ``[3, 1, T]`` (text-only: all three dims identical) and
+      passes them to the original forward with ``cp_group=None`` (MAGI already
+      dispatched — no internal CP slicing).  No table indexing needed.
 
     No-op when ``model`` has no ``rotary_pos_emb`` or ``position_ids`` is None.
     """
@@ -289,15 +299,31 @@ def prefix_tree_rope_context(model, position_ids: Optional[Tensor]):
 
     pids = position_ids.reshape(-1)
     _real_rope_fwd = rope_mod.forward
-    _orig_rope_fn = RotaryEmbedding.forward.__wrapped__  # bypass lru_cache
 
-    def _rope_fwd_with_pids(max_seq_len, offset=0, packed_seq=False, cp_group=None):
-        actual_seq_len = int(pids.max().item()) + 1
-        emb = _orig_rope_fn(rope_mod, actual_seq_len, offset=0, packed_seq=True, cp_group=None)
-        # All PP stages use seq-first Q=(seq,1,H,D) — freqs=(seq,1,1,dim)
-        # broadcasts correctly: Q×freqs → (seq,1,H,D).
-        indexed = emb[pids.to(emb.device)]
-        return indexed
+    # M-RoPE modules don't have get_emb; their forward takes position_ids (3D)
+    # instead of max_seq_len (int).  Qwen3.5 text-only uses this path.
+    _is_mrope = not hasattr(rope_mod, "get_emb")
+
+    if _is_mrope:
+        _mrope_section = getattr(model, "mrope_section", None)
+
+        def _rope_fwd_with_pids(*args, **kwargs):
+            # Broadcast 1D per-token positions to [3, 1, T] — text-only: all
+            # three M-RoPE dims (temporal/height/width) are identical.
+            pids_3d = pids.view(1, 1, -1).expand(3, 1, -1).contiguous()
+            return _real_rope_fwd(pids_3d, _mrope_section, cp_group=None)
+    else:
+        from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+
+        _orig_rope_fn = RotaryEmbedding.forward.__wrapped__  # bypass lru_cache
+
+        def _rope_fwd_with_pids(max_seq_len, offset=0, packed_seq=False, cp_group=None):
+            actual_seq_len = int(pids.max().item()) + 1
+            emb = _orig_rope_fn(rope_mod, actual_seq_len, offset=0, packed_seq=True, cp_group=None)
+            # All PP stages use seq-first Q=(seq,1,H,D) — freqs=(seq,1,1,dim)
+            # broadcasts correctly: Q×freqs → (seq,1,H,D).
+            indexed = emb[pids.to(emb.device)]
+            return indexed
 
     rope_mod.forward = _rope_fwd_with_pids
     try:

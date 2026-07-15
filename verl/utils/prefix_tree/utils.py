@@ -316,11 +316,11 @@ def build_layout_from_tree_node(
     default_pid_pieces: list[Tensor] = []
 
     def _emit(node: TrieNode) -> None:
-        if node.input_ids:
+        donated_in = getattr(node, "_donated_in", False)
+        if node.input_ids or donated_in:
             children = _subtrie_children(node)
             s = node._owner_offset
             e = s + len(node.input_ids)
-            donated_in = getattr(node, "_donated_in", False)
             donated_out = getattr(node, "_donated_out", False)
             # Slice into sample sequence: include donated boundary from parent (-1 on s),
             # exclude token donated to children (-1 on e).
@@ -329,18 +329,19 @@ def build_layout_from_tree_node(
             if not children:
                 # Leaf: use its own sample so the donated boundary token comes from
                 # this leaf's sequence (making tokens[k+1] correct for label derivation).
-                leaf_sample = leaf_node_id_to_sample[node.flat_idx]
-                src = leaf_sample
+                leaf_sample = leaf_node_id_to_sample.get(node.flat_idx)
+                src = leaf_sample if leaf_sample is not None else node._owner_sample
             else:
                 # Non-leaf: use owner's tokens (shared prefix/ancestor tokens).
                 src = node._owner_sample
-            flat_pieces.append(samples[src][s_emit:e_emit])
-            if flat_lm_pieces is not None:
-                flat_lm_pieces.append(loss_masks_by_sample[src][s_emit:e_emit])
-            if flat_pid_pieces is not None:
-                flat_pid_pieces.append(position_ids_by_sample[src][s_emit:e_emit])
-            else:
-                default_pid_pieces.append(torch.arange(s_emit, e_emit, device=device, dtype=torch.long))
+            if s_emit < e_emit:
+                flat_pieces.append(samples[src][s_emit:e_emit])
+                if flat_lm_pieces is not None:
+                    flat_lm_pieces.append(loss_masks_by_sample[src][s_emit:e_emit])
+                if flat_pid_pieces is not None:
+                    flat_pid_pieces.append(position_ids_by_sample[src][s_emit:e_emit])
+                else:
+                    default_pid_pieces.append(torch.arange(s_emit, e_emit, device=device, dtype=torch.long))
         for child in _subtrie_children(node):
             _emit(child)
 

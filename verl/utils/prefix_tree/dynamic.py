@@ -487,6 +487,27 @@ def trie_dfs_leaf_order(trie: TrieNode) -> list[int]:
     return ordered
 
 
+def trie_dfs_leaf_order_from_leaf_idx(leaf_idx: np.ndarray, trie: TrieNode) -> list[int]:
+    """Return batch positions in DFS leaf order, reading from ``leaf_idx``.
+
+    Counterpart of :func:`trie_dfs_leaf_order` that reads from ``leaf_idx``
+    (reorder-aware) instead of the trie's ``sequence_ids`` (stale after
+    reorder).
+    """
+    leaf_to_positions: dict[int, list[int]] = {}
+    for new_pos, leaf_fid in enumerate(leaf_idx.tolist()):
+        if leaf_fid < 0:
+            raise ValueError(f"leaf_idx[{new_pos}]={leaf_fid} — sample has no leaf assigned.")
+        leaf_to_positions.setdefault(int(leaf_fid), []).append(new_pos)
+
+    ordered: list[int] = []
+    for node in trie.nodes:
+        if node.children:
+            continue
+        ordered.extend(leaf_to_positions.get(node.flat_idx, []))
+    return ordered
+
+
 def trie_to_leaf_ids(trie: TrieNode) -> np.ndarray:  # noqa: F821
     """Return np.array mapping sample_idx → leaf_id (DFS order)."""
     leaf_id = [-1]  # counter
@@ -569,6 +590,61 @@ def mbs_groups_from_trie(
         if current_group:
             all_groups.append(current_group)
 
+    return all_groups
+
+
+def mbs_groups_from_leaf_idx(
+    leaf_idx: np.ndarray,
+    trie: TrieNode,
+    max_token_len: int,
+) -> list[list[int]]:
+    """Group reordered-batch positions into micro-batches using ``leaf_idx``.
+
+    Counterpart of :func:`mbs_groups_from_trie` that reads from ``leaf_idx``
+    (a numpy array in ``non_tensor_batch``, automatically reordered by
+    ``DataProto.reorder``) instead of the trie's ``sequence_ids`` (which go
+    stale after reorder).
+    """
+    leaf_to_positions: dict[int, list[int]] = {}
+    for new_pos, leaf_fid in enumerate(leaf_idx.tolist()):
+        if leaf_fid < 0:
+            raise ValueError(
+                f"leaf_idx[{new_pos}]={leaf_fid} — sample has no leaf assigned. "
+                f"_build_global_trie must populate leaf_idx for every sample."
+            )
+        leaf_to_positions.setdefault(int(leaf_fid), []).append(new_pos)
+
+    for node in trie.nodes:
+        if not node.children and node.flat_idx not in leaf_to_positions:
+            raise ValueError(
+                f"trie leaf flat_idx={node.flat_idx} has no sample in leaf_idx — "
+                f"trie and leaf_idx are out of sync."
+            )
+
+    all_groups: list[list[int]] = []
+    current_group: list[int] = []
+    covered: set[int] = set()
+    current_eff = 0
+
+    for node in trie.nodes:
+        if node.children:
+            continue
+        positions = leaf_to_positions[node.flat_idx]
+        path = trie_ancestors(node) + [node]
+        new_nodes = [n for n in path if n.flat_idx not in covered]
+        inc = sum(len(n.input_ids) for n in new_nodes)
+        if current_group and current_eff + inc > max_token_len:
+            all_groups.append(current_group[:])
+            current_group.clear()
+            covered.clear()
+            current_eff = 0
+            new_nodes = path
+            inc = sum(len(n.input_ids) for n in new_nodes)
+        current_group.extend(positions)
+        covered.update(n.flat_idx for n in new_nodes)
+        current_eff += inc
+    if current_group:
+        all_groups.append(current_group[:])
     return all_groups
 
 
@@ -680,6 +756,7 @@ def compute_prefix_tree_metrics(
     attention_mask=None,
     max_token_len_per_gpu: int | None = None,
     micro_batch_size: int = 0,
+    trie: Optional[TrieNode] = None,
 ) -> dict:
     """Compute prefix-tree metrics as a ``prefix_tree/`` namespace dict.
 
@@ -697,6 +774,9 @@ def compute_prefix_tree_metrics(
         attention_mask: Optional mask for padded 2-D case.
         max_token_len_per_gpu: dynbsz budget; if set, computes trie-based micro-batch groups.
         micro_batch_size: fixed micro-batch size (sequences per micro-batch) for non-dynbsz mode.
+        trie: Pre-built compressed TrieNode root. When provided, skips
+            ``greedy_build_tries`` entirely (the caller already built it).
+            ``input_ids`` is still needed for sequence lengths and grouping.
 
     Returns:
         dict of float metrics, all zero if no sequences.
@@ -727,8 +807,14 @@ def compute_prefix_tree_metrics(
             "prefix_tree/raw_tokens": 0,
         }
 
-    _, num_tokens = greedy_build_tries(sequences, max_tokens_per_tree=total_raw * 10)
-    flat = sum(num_tokens)
+    # Build the trie once (or reuse the caller-provided one).
+    if trie is None:
+        tries, num_tokens = greedy_build_tries(sequences, max_tokens_per_tree=total_raw * 10)
+        flat = sum(num_tokens)
+        trie = tries[0] if tries else None
+    else:
+        flat = sum(len(n.input_ids) for n in trie.nodes) if trie else 0
+
     result = {
         "prefix_tree/global_shared_ratio": 1.0 - flat / total_raw,
         "prefix_tree/packed_tokens": flat,
@@ -745,21 +831,18 @@ def compute_prefix_tree_metrics(
             ratios.append(1.0 - sum(gnum) / group_raw)
         return sum(ratios) / len(ratios) if ratios else None
 
-    if max_token_len_per_gpu is not None:
-        tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=total_raw * 10)
-        if tries:
-            trie = tries[0]
-            groups = mbs_groups_from_trie(trie, max_token_len_per_gpu)  # TODO: use PrefixSubTrie / PrefixTrie interface
-            result["prefix_tree/avg_mbs"] = len(sequences) / len(groups) if groups else 0.0
-            # Per-micro-batch sharing ratio using actual dynbsz groups and the global trie.
-            ratios = []
-            for group in groups:
-                group_raw = sum(len(sequences[i]) for i in group)
-                if group_raw == 0:
-                    continue
-                ratios.append(1.0 - trie_group_flat_tokens(group, trie) / group_raw)
-            if ratios:
-                result["prefix_tree/micro_batch_shared_ratio"] = sum(ratios) / len(ratios)
+    if max_token_len_per_gpu is not None and trie is not None:
+        groups = mbs_groups_from_trie(trie, max_token_len_per_gpu)
+        result["prefix_tree/avg_mbs"] = len(sequences) / len(groups) if groups else 0.0
+        # Per-micro-batch sharing ratio using actual dynbsz groups and the global trie.
+        ratios = []
+        for group in groups:
+            group_raw = sum(len(sequences[i]) for i in group)
+            if group_raw == 0:
+                continue
+            ratios.append(1.0 - trie_group_flat_tokens(group, trie) / group_raw)
+        if ratios:
+            result["prefix_tree/micro_batch_shared_ratio"] = sum(ratios) / len(ratios)
     elif micro_batch_size > 0 and len(sequences) >= micro_batch_size:
         # Fixed micro-batch size: consecutive slices.
         groups_iter = (sequences[i : i + micro_batch_size] for i in range(0, len(sequences), micro_batch_size))
@@ -790,6 +873,12 @@ def prepare_prefix_tree_micro_batches(
     order (fixed mbs).
     """
     trie = tu.get_non_tensor_data(data, "prefix_tree", default=None)
+    leaf_idx = tu.get_non_tensor_data(data, "leaf_idx", default=None)
+    if trie is not None and leaf_idx is None:
+        raise ValueError(
+            "prepare_prefix_tree_micro_batches: trie is attached but leaf_idx is "
+            "missing from non_tensor_batch.  _build_global_trie must attach both."
+        )
 
     if "max_token_len_per_gpu" in data.keys():
         # Dynamic bsz: group by flat-token budget.
@@ -799,7 +888,7 @@ def prepare_prefix_tree_micro_batches(
         )
         max_token_len = data["max_token_len_per_gpu"] * sp_size
         if trie is not None:
-            batch_idx_list = mbs_groups_from_trie(trie, max_token_len)
+            batch_idx_list = mbs_groups_from_leaf_idx(leaf_idx, trie, max_token_len)
         else:
             input_ids = data["input_ids"]
             seqs = [t.tolist() for t in input_ids.unbind()]
@@ -810,7 +899,7 @@ def prepare_prefix_tree_micro_batches(
         mbs = data["micro_batch_size_per_gpu"] * force_group_size
         n = len(data)
         if trie is not None:
-            dfs_order = trie_dfs_leaf_order(trie)
+            dfs_order = trie_dfs_leaf_order_from_leaf_idx(leaf_idx, trie)
         else:
             dfs_order = list(range(n))
         batch_idx_list = [dfs_order[i : i + mbs] for i in range(0, n, mbs)]
@@ -849,23 +938,42 @@ def prepare_prefix_tree_micro_batches(
 def create_and_attach_subtrie_views(micro_batches, batch_idx_list, trie) -> None:
     """Create a subtrie view per micro-batch and attach it (shared by dynbsz and fixed-mbs).
 
-    Remaps global sample indices to local micro-batch indices so downstream
-    code (build_prefix_tree_micro_batch) can index into the mb's local samples.
+    Reads ``leaf_idx`` from each microbatch's ``non_tensor_batch`` (which
+    survives ``DataProto.reorder`` automatically) to determine which leaf
+    each local sample belongs to — no dependence on the trie's
+    ``sequence_ids`` (which go stale after reorder).
     """
     if trie is None or batch_idx_list is None:
         return
     pt_global = PrefixTrie(root=trie)
     for idx, mb in zip(batch_idx_list, micro_batches, strict=False):
-        subtree = subtrie_view(trie, set(idx), source=pt_global)
-        if subtree is not None:
-            global_to_local = {g: loc for loc, g in enumerate(idx)}
-            local_subtree = PrefixSubTrie(
-                source=pt_global,
-                leaf_node_ids=subtree.leaf_node_ids,
-                leaf_to_sample=[global_to_local[g] for g in subtree.leaf_to_sample],
-                batch_size=len(idx),
+        mb_leaf_idx = tu.get_non_tensor_data(mb, "leaf_idx", default=None)
+        if mb_leaf_idx is None:
+            raise ValueError(
+                "create_and_attach_subtrie_views: microbatch has no leaf_idx in "
+                "non_tensor_batch.  _build_global_trie must attach leaf_idx and it "
+                "must survive reorder/chunk — this is a bug."
             )
-            tu.assign_non_tensor(mb, prefix_tree_subtree=local_subtree)
+        leaf_to_local: dict[int, int] = {}
+        leaf_node_ids: list[int] = []
+        leaf_to_sample: list[int] = []
+        for local_pos, leaf_fid in enumerate(mb_leaf_idx.tolist()):
+            if leaf_fid < 0:
+                raise ValueError(
+                    f"microbatch leaf_idx[{local_pos}]={leaf_fid} — no leaf assigned "
+                    f"(bug in _build_global_trie)."
+                )
+            if leaf_fid not in leaf_to_local:
+                leaf_to_local[leaf_fid] = len(leaf_node_ids)
+            leaf_node_ids.append(leaf_fid)
+            leaf_to_sample.append(local_pos)
+        local_subtree = PrefixSubTrie(
+            source=pt_global,
+            leaf_node_ids=leaf_node_ids,
+            leaf_to_sample=leaf_to_sample,
+            batch_size=len(idx),
+        )
+        tu.assign_non_tensor(mb, prefix_tree_subtree=local_subtree)
 
 
 def get_dfs_balanced_partitions(

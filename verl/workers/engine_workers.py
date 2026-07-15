@@ -352,6 +352,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
             if key not in data.keys():
                 tu.assign_non_tensor(data, **{key: val})
 
+        if getattr(self.engine_config, "use_prefix_tree", False):
+            from verl.utils.prefix_tree.prefix_tree_patch_impl import reset_prefix_tree_attn_counters
+
+            reset_prefix_tree_attn_counters()
+
         with (
             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
             Timer(name="train_batch", logger=None) as timer,
@@ -360,6 +365,13 @@ class TrainingWorker(Worker, DistProfilerExtension):
             # containing loss, model_output and metrics
             # for training, we only care about loss and metrics
         delta_time = timer.last
+
+        if getattr(self.engine_config, "use_prefix_tree", False):
+            from verl.utils.prefix_tree.prefix_tree_patch_impl import get_prefix_tree_attn_metrics
+
+            attn_metrics = get_prefix_tree_attn_metrics()
+            if attn_metrics and self.engine.is_mp_src_rank_with_outputs():
+                output.setdefault("metrics", {}).update(attn_metrics)
 
         update_lr_scheduler = tu.get(data, key="update_lr_scheduler", default=False)
         # update lr scheduler
@@ -408,6 +420,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
             if key not in data.keys():
                 tu.assign_non_tensor(data, **{key: val})
 
+        if getattr(self.engine_config, "use_prefix_tree", False):
+            from verl.utils.prefix_tree.prefix_tree_patch_impl import reset_prefix_tree_attn_counters
+
+            reset_prefix_tree_attn_counters()
+
         # for sft training, we need to compute loss in eval
         loss_function = self.loss_fn if compute_loss else None
 
@@ -419,6 +436,13 @@ class TrainingWorker(Worker, DistProfilerExtension):
             with adapter_ctx:
                 output = self.engine.infer_batch(data, loss_function=loss_function)
         delta_time = timer.last
+
+        if getattr(self.engine_config, "use_prefix_tree", False):
+            from verl.utils.prefix_tree.prefix_tree_patch_impl import get_prefix_tree_attn_metrics
+
+            attn_metrics = get_prefix_tree_attn_metrics()
+            if attn_metrics and self.engine.is_mp_src_rank_with_outputs():
+                output.setdefault("metrics", {}).update(attn_metrics)
 
         if self.engine.is_mp_src_rank_with_outputs():
             final_output = self._postprocess_output(

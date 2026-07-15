@@ -99,7 +99,7 @@ def _attach_segment_metadata(batch: DataProto, rollout_n: int) -> None:
     batch.non_tensor_batch["segment_lengths"] = segment_lengths
 
 
-def _build_global_trie(batch: DataProto) -> None:
+def _build_global_trie(batch: DataProto) -> float:
     """Build global prefix trie from segment metadata (or token-by-token fallback)
     and attach to batch. Mutates batch in-place.
 
@@ -108,7 +108,13 @@ def _build_global_trie(batch: DataProto) -> None:
 
     Both survive DataProto.reorder/chunk/slice/concat/repeat natively:
     non_tensor_batch propagates via numpy indexing; meta_info wraps as NonTensorData.
+
+    Returns:
+        Wall-clock seconds spent building the trie (segment fast path or greedy
+        fallback), excluding input prep and leaf_idx assignment.
     """
+    import time as _time
+
     import numpy as np
 
     from verl.utils.prefix_tree.dynamic import greedy_build_tries
@@ -124,6 +130,7 @@ def _build_global_trie(batch: DataProto) -> None:
 
     seg_hashes = batch.non_tensor_batch.get("segment_hashes", None)
     seg_lengths = batch.non_tensor_batch.get("segment_lengths", None)
+    _t0 = _time.perf_counter()
     trie = None
     if seg_hashes is not None and seg_lengths is not None:
         trie = build_global_tree_from_segments(seqs, seg_hashes, seg_lengths)
@@ -131,8 +138,9 @@ def _build_global_trie(batch: DataProto) -> None:
         tries, _ = greedy_build_tries(seqs, max_tokens_per_tree=total_raw * 10)
         if tries and total_raw > 0:
             trie = tries[0]
+    _t1 = _time.perf_counter()
     if trie is None:
-        return
+        return 0.0
 
     leaf_idx = np.full(len(seqs), -1, dtype=np.int64)
     for flat_idx, node in enumerate(trie.nodes):
@@ -142,6 +150,7 @@ def _build_global_trie(batch: DataProto) -> None:
 
     batch.meta_info["prefix_tree"] = trie
     batch.non_tensor_batch["leaf_idx"] = leaf_idx
+    return _t1 - _t0
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -1478,15 +1487,6 @@ class RayPPOTrainer:
                     if "__do_sample__" in gen_batch_output.non_tensor_batch:
                         gen_batch_output.pop(non_tensor_batch_keys=["__do_sample__"])
 
-                    pt_metrics(
-                        metrics,
-                        gen_batch_output.batch["input_ids"],
-                        self.config.actor_rollout_ref.model,
-                        max_token_len_per_gpu=getattr(
-                            self.config.actor_rollout_ref.actor, "ppo_max_token_len_per_gpu", None
-                        ),
-                    )
-
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         gen_baseline_output = combined_gen_output.slice(num_sampled_prompts, None)
                         if "__do_sample__" in gen_baseline_output.non_tensor_batch:
@@ -1510,7 +1510,18 @@ class RayPPOTrainer:
                     # Attaches trie to batch.meta_info and leaf_idx to non_tensor_batch.
                     if self.config.actor_rollout_ref.model.get("use_prefix_tree", False):
                         _attach_segment_metadata(batch, self.config.actor_rollout_ref.rollout.n)
-                        _build_global_trie(batch)
+                        _trie_build_s = _build_global_trie(batch)
+                        metrics["prefix_tree/timing_s"] = _trie_build_s
+
+                    pt_metrics(
+                        metrics,
+                        batch.batch["input_ids"],
+                        self.config.actor_rollout_ref.model,
+                        max_token_len_per_gpu=getattr(
+                            self.config.actor_rollout_ref.actor, "ppo_max_token_len_per_gpu", None
+                        ),
+                        trie=batch.meta_info.get("prefix_tree"),
+                    )
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.

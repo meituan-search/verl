@@ -315,7 +315,7 @@ def build_global_tree_from_segments(
     Children of intermediate nodes are keyed by ``flat_idx`` (unique).
 
     Args:
-        samples: List of token tensors (one per sequence).
+        samples: List of 1-D token tensors or lists (one per sequence).
         segment_hashes: (N,) object-dtype numpy array of hash lists.
         segment_lengths: (N,) object-dtype numpy array of length lists.
 
@@ -326,6 +326,10 @@ def build_global_tree_from_segments(
         return None
 
     from verl.utils.prefix_tree.segment_grouper import group_by_segment_hash
+
+    # Normalize samples to list[list[int]] — production caller passes lists,
+    # tests may pass tensors.
+    samples = [s.tolist() if hasattr(s, "tolist") else list(s) for s in samples]
 
     groups = group_by_segment_hash(segment_hashes, segment_lengths, level=0)
 
@@ -339,7 +343,7 @@ def build_global_tree_from_segments(
 
         if len(group) >= 2:
             first_idx, prefix_len = group[0]
-            prefix_tokens = samples[first_idx][:prefix_len].tolist()
+            prefix_tokens = samples[first_idx][:prefix_len]
 
             prefix_node = TrieNode(
                 tree_id=0,
@@ -363,7 +367,7 @@ def build_global_tree_from_segments(
             )
         else:
             seq_idx = group[0][0]
-            all_tokens = samples[seq_idx].tolist()
+            all_tokens = samples[seq_idx]
             leaf = TrieNode(
                 tree_id=0,
                 input_ids=all_tokens,
@@ -397,7 +401,7 @@ def _build_segment_subtree(
     # Samples whose segment list ended before this level → leaves with remaining tokens.
     for sid in group_sids:
         if level >= len(segment_hashes[sid]):
-            remaining = samples[sid][accumulated_len:].tolist()
+            remaining = samples[sid][accumulated_len:]
             leaf = TrieNode(
                 tree_id=0,
                 input_ids=remaining,
@@ -420,7 +424,7 @@ def _build_segment_subtree(
         subgroup = subgroups[hash_val]
         if len(subgroup) >= 2:
             seg_len = int(segment_lengths[subgroup[0]][level])
-            seg_tokens = samples[subgroup[0]][accumulated_len : accumulated_len + seg_len].tolist()
+            seg_tokens = samples[subgroup[0]][accumulated_len : accumulated_len + seg_len]
             node = TrieNode(
                 tree_id=0,
                 input_ids=seg_tokens,
@@ -442,7 +446,7 @@ def _build_segment_subtree(
             )
         else:
             sid = subgroup[0]
-            remaining = samples[sid][accumulated_len:].tolist()
+            remaining = samples[sid][accumulated_len:]
             leaf = TrieNode(
                 tree_id=0,
                 input_ids=remaining,

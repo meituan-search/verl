@@ -43,6 +43,7 @@ def pt_metrics(
     attention_mask=None,
     max_token_len_per_gpu: int | None = None,
     micro_batch_size: int = 0,
+    trie=None,
 ) -> None:
     """Compute prefix-sharing metrics if *use_prefix_tree* is enabled.
 
@@ -50,14 +51,17 @@ def pt_metrics(
     Pass *attention_mask* to strip padding from 2-D padded tensors.
     Pass *max_token_len_per_gpu* for dynbsz (trie-based micro-batch groups).
     Pass *micro_batch_size* for fixed-mbs (consecutive-slice groups).
+    Pass *trie* to skip the internal ``greedy_build_tries`` when the caller
+    already built one (e.g. attached to ``batch.meta_info["prefix_tree"]``).
     """
     if not _is_prefix_tree_enabled(config_or_data):
         return
     metrics.update(
-        compute_prefix_tree_metrics(  # TODO: use PrefixTrie / PrefixSubTrie
+        compute_prefix_tree_metrics(
             input_ids,
             attention_mask=attention_mask,
             max_token_len_per_gpu=max_token_len_per_gpu,
             micro_batch_size=micro_batch_size,
+            trie=trie,
         )
     )

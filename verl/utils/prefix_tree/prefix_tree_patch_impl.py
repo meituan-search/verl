@@ -113,6 +113,55 @@ def magi_attn_forward(
 
 
 # ---------------------------------------------------------------------------
+# Per-batch attention-path counters (magi / flex / fa3-fallback)
+# ---------------------------------------------------------------------------
+
+
+def _make_attn_counters():
+    """Return (reset, inc_fa3, inc_non_fa3, get_metrics) closures sharing one state dict."""
+    state = {"fa3": 0, "total": 0}
+
+    def reset():
+        state["fa3"] = 0
+        state["total"] = 0
+
+    def inc_fa3():
+        state["fa3"] += 1
+        state["total"] += 1
+
+    def inc_non_fa3():
+        state["total"] += 1
+
+    def get_metrics():
+        from verl.utils.metric import AggregationType, Metric
+
+        fa, total = state["fa3"], state["total"]
+        return {
+            "prefix_tree/attn_fa3_fallback_ratio": Metric(
+                value=(fa / total) if total > 0 else 0.0, aggregation=AggregationType.MEAN
+            ),
+        }
+
+    return reset, inc_fa3, inc_non_fa3, get_metrics
+
+
+_reset_attn_counters, _inc_fa3, _inc_non_fa3, _get_attn_metrics = _make_attn_counters()
+
+
+def reset_prefix_tree_attn_counters() -> None:
+    """Reset per-batch attention-path counters. Call at batch start."""
+    _reset_attn_counters()
+
+
+def get_prefix_tree_attn_metrics() -> dict:
+    """Return per-batch attention-path call counts and fallback ratio.
+
+    Call at batch end (after forward/backward) to log to tensorboard.
+    """
+    return _get_attn_metrics()
+
+
+# ---------------------------------------------------------------------------
 # Patch application
 # ---------------------------------------------------------------------------
 
@@ -148,10 +197,13 @@ def apply_prefix_tree_patch() -> None:
         **kwargs,
     ):
         if magi_attention_key is not None:
+            _inc_non_fa3()
             return magi_attn_forward(query, key, value, magi_attention_key)
         if flex_attention_key is not None:
+            _inc_non_fa3()
             return flex_attn_forward(query, key, value, flex_attention_key)
         # FA3 fallback — logged once per occurrence so it shows up in monitoring
+        _inc_fa3()
         logging.getLogger(__name__).warning_once("prefix_tree_patch: using FA3 attention path (fallback)")
         return _orig_te_forward(
             self,
