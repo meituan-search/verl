@@ -664,10 +664,16 @@ class MegatronEngine(BaseEngine):
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
         # batch should be a list of batches inside micro-batches
+        _t_gen_start = logging.time.perf_counter()
         batch_generator = make_batch_generator(micro_batches, vpp_size=len(self.module))
+        _t_gen_end = logging.time.perf_counter()
+        logger.warning(f"forward_backward_batch: make_batch_generator took {_t_gen_end - _t_gen_start:.3f}s")
 
         # TODO: we may use the new schedule instead
         # for flash-attn: (seq_len, batch_size, hidden_size) = (mbs*seq_len, 1, hidden_size)
+        import time as _time
+
+        _t_fb_start = _time.perf_counter()
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step,
             data_iterator=batch_generator,
@@ -676,6 +682,10 @@ class MegatronEngine(BaseEngine):
             seq_length=1,  # the communication shape is obtained via p2p comm
             micro_batch_size=1,  # the communication shape is obtained via p2p comm
             forward_only=forward_only,
+        )
+        _t_fb_end = _time.perf_counter()
+        logger.warning(
+            f"forward_backward_batch: forward_backward_func took {_t_fb_end - _t_fb_start:.3f}s for {n_micro_batch} microbatches"
         )
 
         if losses_reduced and self.is_mp_src_rank_with_outputs():
@@ -838,8 +848,9 @@ class MegatronEngineWithLMHead(MegatronEngine):
         calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
         distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
 
-        _pt_subtree = tu.pop(batch, key="prefix_tree_subtree", default=None) \
-            if self.engine_config.use_prefix_tree else None
+        _pt_subtree = (
+            tu.pop(batch, key="prefix_tree_subtree", default=None) if self.engine_config.use_prefix_tree else None
+        )
 
         batch = batch.to(get_device_id())
 
@@ -848,9 +859,8 @@ class MegatronEngineWithLMHead(MegatronEngine):
 
         if self.engine_config.use_prefix_tree:
             from verl.utils.prefix_tree.magi import read_prefix_tree_batch_config
-            use_prefix_tree, _ = read_prefix_tree_batch_config(
-                batch, tu, self.engine_config.use_remove_padding
-            )
+
+            use_prefix_tree, _ = read_prefix_tree_batch_config(batch, tu, self.engine_config.use_remove_padding)
         else:
             use_prefix_tree = False
 
@@ -907,6 +917,13 @@ class MegatronEngineWithLMHead(MegatronEngine):
         if use_fused_kernels:
             from verl.models.mcore import get_mcore_forward_fused_model_engine_fn
 
+            if use_prefix_tree:
+                from verl.utils.prefix_tree.magi import get_prefix_tree_logits_args
+
+                _pt_logits_args = get_prefix_tree_logits_args(batch, tu)
+            else:
+                _pt_logits_args = {}
+
             fused_forward_fn = get_mcore_forward_fused_model_engine_fn(self.model_config.hf_config)
             output = fused_forward_fn(
                 model=model,
@@ -916,6 +933,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 temperature=temperature_value,
                 calculate_entropy=calculate_entropy,
                 pad_token_id=self.model_config.tokenizer.pad_token_id,
+                logits_processor_args=_pt_logits_args,
             )
         else:
             if not isinstance(temperature, torch.Tensor):
@@ -962,6 +980,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
 
             if use_prefix_tree:
                 from verl.utils.prefix_tree.magi import get_prefix_tree_logits_args
+
                 _pt_logits_args = get_prefix_tree_logits_args(batch, tu)
             else:
                 _pt_logits_args = {}

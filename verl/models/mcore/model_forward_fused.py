@@ -15,6 +15,7 @@
 # limitations under the License.
 
 from collections import OrderedDict
+import logging as _log
 from typing import Optional
 
 import megatron.core as mcore
@@ -146,9 +147,32 @@ def fused_forward_model_engine(vision_model: bool = False):
         temperature: float,
         calculate_entropy: bool,
         pad_token_id: int,
+        logits_processor_args: Optional[dict] = None,
     ):
         pre_process = unwrap_model(model).pre_process
         post_process = unwrap_model(model).post_process
+
+        # Prefix-tree (MAGI) fused path: only when post_process (PP=1 or last
+        # stage).  Intermediate PP stages fall through to standard fused.
+        _pt_args = logits_processor_args or {}
+        use_prefix_tree = _pt_args.get("use_prefix_tree", False)
+        if use_prefix_tree and post_process and not vision_model:
+            from verl.utils.prefix_tree.magi import fuse_try_forward_prefix_tree
+
+            output = fuse_try_forward_prefix_tree(
+                model=model,
+                input_ids=input_ids,
+                labels=labels,
+                temperature=temperature,
+                logits_processor_args=_pt_args,
+                calculate_entropy=calculate_entropy,
+            )
+            if output is not None:
+                return output
+            _log.getLogger(__name__).warning(
+                "prefix_tree: fuse_try_forward_prefix_tree returned None — "
+                "falling back to standard fused path"
+            )
 
         fp8 = unwrap_model(model).config.fp8
         use_fp8_padding = fp8 in ["e4m3", "hybrid"]
@@ -244,6 +268,12 @@ def _fused_GPTModel_forward(
 
     inference_context = deprecate_inference_params(inference_context, inference_params)
 
+    # Prefix-tree (MAGI): pull pt_batch out of kwargs before decoder — decoder
+    # doesn't accept it.  magi_attention_key / flex_attention_key stay in kwargs
+    # and flow to the attention layers via **kwargs below.
+    pt_batch = kwargs.pop("pt_batch", None)
+    _magi_key = kwargs.get("magi_attention_key", None)
+
     preproc_output = model._preprocess(
         input_ids=input_ids,
         position_ids=position_ids,
@@ -279,7 +309,14 @@ def _fused_GPTModel_forward(
         attentions=None,
     )
 
-    if model.config.sequence_parallel:
+    # Prefix-tree (MAGI): undispatch local hidden → tree-packed → per-sample
+    # flat order matching labels_flat.  Skip the SP gather — MAGI handles its
+    # own parallelism; the decoder output is already in the right layout.
+    if _magi_key is not None and pt_batch is not None:
+        from verl.utils.prefix_tree.magi import fuse_undispatch_and_expand_hidden
+
+        hidden_states = fuse_undispatch_and_expand_hidden(hidden_states, _magi_key, pt_batch)
+    elif model.config.sequence_parallel:
         hidden_states = gather_from_sequence_parallel_region(hidden_states)
 
     # Get the output weight - use embedding weight if output_layer is None or weight is shared

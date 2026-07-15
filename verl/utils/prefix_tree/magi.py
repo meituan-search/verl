@@ -39,6 +39,7 @@ import logging as _log
 from dataclasses import dataclass
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.distributed as _dist
 from magi_attention.api import DistAttnConfig, get_position_ids, magi_attn_flex_key, undispatch
@@ -51,7 +52,7 @@ from torch.nested._internal.nested_tensor import NestedTensor
 from torch.nn.attention.flex_attention import create_block_mask
 
 from verl.utils.megatron_utils import unwrap_model
-from verl.utils.prefix_tree.dynamic import _insert_sequence, build_tree_dynamic
+from verl.utils.prefix_tree.dynamic import build_tree_dynamic
 from verl.utils.prefix_tree.tree import PrefixSubTrie
 from verl.utils.prefix_tree.utils import build_layout_from_tree_node
 
@@ -149,7 +150,8 @@ def build_prefix_tree_micro_batch(
     tp_size: int = 1,
     cp_size: int = 1,
     cached_result: Optional[PrefixSubTrie] = None,
-    segment_metadata: Optional[dict] = None,
+    segment_hashes: Optional[np.ndarray] = None,
+    segment_lengths: Optional[np.ndarray] = None,
 ) -> Optional[PrefixTreeMagiBatch]:
     """Build a PrefixTreeMagiBatch from a micro-batch of NestedTensor sequences.
 
@@ -159,8 +161,9 @@ def build_prefix_tree_micro_batch(
     When ``cached_result`` (a :class:`PrefixSubTrie`) is provided, skips
     trie construction and uses the pre-computed subtrie.
 
-    When ``segment_metadata`` is provided (e.g., from GRPO grouping), uses
-    hash-based tree building instead of token-by-token detection.
+    When ``segment_hashes`` and ``segment_lengths`` are provided (e.g., from
+    GRPO grouping), uses hash-based tree building instead of token-by-token
+    detection.
 
     Returns None when there is no shared prefix, signalling the caller to
     fall back to the standard attention path.
@@ -174,8 +177,8 @@ def build_prefix_tree_micro_batch(
         attention_type: ``"flex"`` or ``"magi"``.
         tp_size / cp_size: Tensor / context parallel world sizes (for
             SP-divisibility padding).
-        segment_metadata: Optional dict with segment hashes from
-            :func:`create_grpo_segment_metadata` for fast hash-based grouping.
+        segment_hashes: Optional numpy array with segment hashes per sample.
+        segment_lengths: Optional numpy array with segment lengths per sample.
 
     Returns:
         PrefixTreeMagiBatch or None.
@@ -195,28 +198,25 @@ def build_prefix_tree_micro_batch(
 
     if cached_result is not None:
         subtrie = cached_result
-    elif segment_metadata is not None:
+    elif segment_hashes is not None and segment_lengths is not None:
         # Fast path: hash-based tree building from pre-computed segment metadata
         from verl.utils.prefix_tree.dynamic import (
             _BuildNode,
             _compress_trie,
+            _insert_sequence,
             convert_trie_to_tree_node,
         )
-        from verl.utils.prefix_tree.segment_grouper import validate_segment_metadata
         from verl.utils.prefix_tree.tree import build_tree_from_segments
 
-        if validate_segment_metadata(segment_metadata):
-            subtrie = build_tree_from_segments(
-                samples,
-                segments=segment_metadata["segments"],
-                _BuildNode=_BuildNode,
-                _insert_sequence=_insert_sequence,
-                _compress_trie=_compress_trie,
-                convert_trie_to_tree_node=convert_trie_to_tree_node,
-            )
-        else:
-            # Fallback to token-by-token detection
-            subtrie = build_tree_dynamic(samples)
+        subtrie = build_tree_from_segments(
+            samples,
+            segment_hashes=segment_hashes,
+            segment_lengths=segment_lengths,
+            _BuildNode=_BuildNode,
+            _insert_sequence=_insert_sequence,
+            _compress_trie=_compress_trie,
+            convert_trie_to_tree_node=convert_trie_to_tree_node,
+        )
     else:
         # Default: token-by-token trie detection
         subtrie = build_tree_dynamic(samples)
@@ -326,6 +326,52 @@ def expand_flat_to_per_sample(
         "expand_flat_to_per_sample: some sample indices were not covered by segment_to_sample"
     )
     return torch.cat(sample_tensors, dim=0)
+
+
+def dispatch_pt_batch(pt_batch: PrefixTreeMagiBatch) -> tuple[Tensor, Tensor]:
+    """Slice local_input_ids / local_position_ids from tree-packed tensors via magi dispatch.
+
+    Shared by both fused and unfused paths.  Each CP rank processes only its
+    assigned token slice through embedding / FFN / layer norms; cross-rank
+    attention is handled by ``calc_attn`` inside the patched attention layer.
+    When CP=1, ``local_indices`` covers all tokens.
+
+    Args:
+        pt_batch: PrefixTreeMagiBatch with a non-None ``magi_key``.
+
+    Returns:
+        (local_input_ids (1, local_tokens), local_position_ids (1, local_tokens)).
+    """
+    local_indices = get_position_ids(pt_batch.magi_key)
+    local_input_ids = pt_batch.tree_packed_input_ids[local_indices].unsqueeze(0)
+    local_position_ids = pt_batch.tree_packed_position_ids[local_indices].unsqueeze(0)
+    return local_input_ids, local_position_ids
+
+
+def fuse_undispatch_and_expand_hidden(
+    hidden: Tensor,
+    magi_key,
+    pt_batch: PrefixTreeMagiBatch,
+) -> Tensor:
+    """Fused-path: convert per-rank local hidden states → per-sample flat order.
+
+    Used inside ``_fused_GPTModel_forward`` to prepare hidden states for
+    ``linear_cross_entropy``.  The output is in per-sample flat order (prefix
+    replicated per sample, leaves concatenated in sample-index order), matching
+    ``labels_rmpad`` from ``preprocess_thd_engine(labels, need_roll=True)``.
+
+    Args:
+        hidden: (1, local_tokens, hidden_dim) local hidden states from decoder.
+        magi_key: MAGI key for ``undispatch``.
+        pt_batch: PrefixTreeMagiBatch.
+
+    Returns:
+        (1, total_expanded, hidden_dim) per-sample flat hidden states.
+    """
+    hidden = undispatch(hidden.squeeze(0), magi_key)  # (flat_padded, hidden)
+    hidden = hidden[: pt_batch.real_tokens]  # (real_tokens, hidden)
+    hidden = expand_flat_to_per_sample(hidden, pt_batch)  # (total_expanded, hidden)
+    return hidden.unsqueeze(0)
 
 
 def _finalize_prefix_tree_batch(
@@ -468,6 +514,8 @@ _PREFIX_TREE_KEYS = frozenset(
         "prefix_tree_attention",
         "prefix_tree_subtree",
         "prefix_tree_no_expand_middle",
+        "segment_hashes",
+        "segment_lengths",
     }
 )
 
@@ -522,23 +570,37 @@ def read_prefix_tree_batch_config(batch, tu, use_remove_padding: bool = True) ->
 def get_prefix_tree_logits_args(batch, tu) -> dict:
     """Build the prefix-tree fragment for logits_processor_args from a batch.
 
-    Reads use_prefix_tree, prefix_tree_attention, and prefix_tree_subtree
-    from *batch* internally and returns the ready-to-unpack dict.
+    Reads use_prefix_tree, prefix_tree_attention, prefix_tree_subtree,
+    and segment metadata from *batch* internally and returns the ready-to-unpack dict.
     """
     use_prefix_tree = tu.get_non_tensor_data(batch, key="use_prefix_tree", default=False)
     if not use_prefix_tree:
         return {}
     prefix_tree_attention = tu.get_non_tensor_data(batch, key="prefix_tree_attention", default="flex")
-    return {
+    result = {
         "use_prefix_tree": True,
         "prefix_tree_attention": prefix_tree_attention,
         "prefix_tree_subtree": tu.get_non_tensor_data(
             batch, "prefix_tree_subtree", default=None
         ),  # TODO: use PrefixSubTrie
     }
+    # Add segment metadata for fast-path tree building if available
+    segment_hashes = tu.get_non_tensor_data(batch, "segment_hashes", default=None)
+    segment_lengths = tu.get_non_tensor_data(batch, "segment_lengths", default=None)
+    if segment_hashes is not None and segment_lengths is not None:
+        result["segment_hashes"] = segment_hashes
+        result["segment_lengths"] = segment_lengths
+        _log.getLogger(__name__).warning(
+            "prefix_tree DEBUG[segment_args]: hashes type=%s len=%s lengths type=%s len=%s",
+            type(segment_hashes).__name__,
+            len(segment_hashes) if hasattr(segment_hashes, "__len__") else "?",
+            type(segment_lengths).__name__,
+            len(segment_lengths) if hasattr(segment_lengths, "__len__") else "?",
+        )
+    return result
 
 
-def try_forward_prefix_tree(
+def unfuse_try_forward_prefix_tree(
     model,
     input_ids,
     logits_processor_args,
@@ -549,7 +611,7 @@ def try_forward_prefix_tree(
     vision_model=False,
     mtp_enable_train=False,
 ):
-    """Try to build + forward a prefix-tree batch; returns output dict or None.
+    """Unfused-path: try to build + forward a prefix-tree batch; returns output dict or None.
 
     Consolidates build/forward/strip into one call.  Returns None when no
     prefix sharing is detected, in which case prefix-tree keys are stripped
@@ -574,7 +636,7 @@ def try_forward_prefix_tree(
         mtp_enable_train,
     )
     if pb is not None:
-        return forward_prefix_tree(
+        return unfuse_forward_prefix_tree(
             model,
             pb,
             prefix_tree_attention,
@@ -605,6 +667,29 @@ def build_prefix_tree_batch(model, input_ids, logits_processor_args, vision_mode
     position_ids_nested = (logits_processor_args or {}).get("position_ids", None)
     cached_result = (logits_processor_args or {}).get("prefix_tree_subtree")  # TODO: use PrefixSubTrie
 
+    # Extract segment metadata for fast-path tree building
+    # Stored as NonTensorStack (list of lists), convert to numpy object array
+    _segment_hashes = (logits_processor_args or {}).get("segment_hashes", None)
+    _segment_lengths = (logits_processor_args or {}).get("segment_lengths", None)
+    if _segment_hashes is not None:
+        # NonTensorStack needs .tolist() before numpy conversion
+        segment_hashes = np.array(
+            _segment_hashes.tolist() if hasattr(_segment_hashes, "tolist") else _segment_hashes, dtype=object
+        )
+        segment_lengths = np.array(
+            _segment_lengths.tolist() if hasattr(_segment_lengths, "tolist") else _segment_lengths, dtype=object
+        )
+        _log.getLogger(__name__).warning(
+            "prefix_tree DEBUG[segment_build]: n_samples=%d hashes_shape=%s lengths_shape=%s input_ids_batch=%d",
+            len(segment_hashes),
+            np.shape(segment_hashes),
+            np.shape(segment_lengths),
+            input_ids.shape[0] if hasattr(input_ids, "shape") else -1,
+        )
+    else:
+        segment_hashes = None
+        segment_lengths = None
+
     return build_prefix_tree_micro_batch(
         model,
         input_ids,
@@ -614,13 +699,15 @@ def build_prefix_tree_batch(model, input_ids, logits_processor_args, vision_mode
         tp_size=mpu.get_tensor_model_parallel_world_size(),
         cp_size=mpu.get_context_parallel_world_size(),
         cached_result=cached_result,
+        segment_hashes=segment_hashes,
+        segment_lengths=segment_lengths,
     )
 
 
-def forward_prefix_tree(
+def unfuse_forward_prefix_tree(
     model, pt_batch, prefix_tree_attention, logits_processor, logits_processor_args, post_process, model_kwargs
 ):
-    """Forward pass for prefix-tree batches using magi or flex attention."""
+    """Unfused-path: forward pass for prefix-tree batches using magi or flex attention."""
     tree_packed_input_ids = pt_batch.local_tree_packed_input_ids.unsqueeze(0)
     # Use the layout builder's per-sample position IDs (resets within each sample,
     # stays within max_position_embeddings).  torch.arange(flat_tokens) would produce
@@ -647,9 +734,7 @@ def forward_prefix_tree(
         # Pre-dispatch: each CP rank processes only its local token slice through
         # embedding, FFN, MoE, and layer norms — not the full flat sequence.
         # calc_attn handles cross-rank attention communication internally.
-        local_indices = get_position_ids(pt_batch.magi_key)  # (local_tokens,) global positions
-        local_input_ids = pt_batch.tree_packed_input_ids[local_indices].unsqueeze(0)
-        local_position_ids = pt_batch.tree_packed_position_ids[local_indices].unsqueeze(0)
+        local_input_ids, local_position_ids = dispatch_pt_batch(pt_batch)
         _diag_local_tokens = local_input_ids.shape[1]
 
         _t_pre_model = _time.perf_counter()
@@ -714,6 +799,17 @@ def forward_prefix_tree(
     if post_process and logits_processor is not None:
         logits_flat = output_orig.squeeze(0)  # (flat_tokens, vocab)
         tree_packed_ids = pt_batch.tree_packed_input_ids[:real_tokens]  # (flat_tokens,)
+        _log.getLogger(__name__).warning(
+            "prefix_tree DEBUG[logits]: real_tokens=%d output_orig=%s logits_flat=%s "
+            "packed_ids=%s packed_tokens(full)=%d prefix_range=%s n_leaves=%d",
+            real_tokens,
+            tuple(output_orig.shape),
+            tuple(logits_flat.shape),
+            tuple(tree_packed_ids.shape),
+            pt_batch.tree_packed_input_ids.shape[0],
+            pt_batch.prefix_range,
+            len(pt_batch.segment_ranges),
+        )
 
         # Labels are pre-shifted per sample before packing (labels_by_sample[i] = input_ids[i][1:]+[0]).
         # This avoids cross-segment boundary errors — no torch.roll needed on the flat layout.
@@ -730,40 +826,31 @@ def forward_prefix_tree(
         if "temperature" in orig_args:
             t = orig_args["temperature"]
             if isinstance(t, torch.Tensor) and t.is_nested:
-                # Per-sample temperature: expand to match tree-packed structure
-                # t has shape (batch_size,) as nested tensor, need to expand per token
+                # Per-sample temperature: expand to match tree-packed structure.
+                # t has shape (batch_size,) as nested tensor; we need a per-token
+                # tensor over the full flat layout (total_flat). The flat layout
+                # contains prefix root + internal ancestor nodes + leaf nodes, so
+                # we must fill every token — covering prefix, each leaf, and each
+                # leaf's ancestor chain (ancestor_segment_ranges). Missing the
+                # internal ancestor tokens shrinks the cat below total_flat.
                 temp_by_sample = t.values()  # (batch_size,)
-                # Build per-token temperature using expand_flat_to_per_sample pattern
-                prefix_start, prefix_end = pt_batch.prefix_range
-                prefix_temp = temp_by_sample[0]  # Use first sample's temp for prefix (shared)
-                temp_pieces = []
-                for leaf_idx, sample_idx in enumerate(pt_batch.segment_to_sample):
-                    s, e = pt_batch.segment_ranges[leaf_idx]
-                    leaf_tokens = e - s
-                    temp_pieces.append(
-                        torch.full(
-                            (leaf_tokens, 1),
-                            temp_by_sample[sample_idx].item(),
-                            dtype=torch.float32,
-                            device=tree_packed_label.device,
-                        )
-                    )
-                # Prefix temp for all prefix tokens
-                if prefix_end > prefix_start:
-                    temp_pieces.insert(
-                        0,
-                        torch.full(
-                            (prefix_end - prefix_start, 1),
-                            prefix_temp.item(),
-                            dtype=torch.float32,
-                            device=tree_packed_label.device,
-                        ),
-                    )
-                tree_packed_t = (
-                    torch.cat(temp_pieces, dim=0)
-                    if temp_pieces
-                    else torch.ones(total_flat, 1, dtype=torch.float32, device=tree_packed_label.device)
+                tree_packed_t = torch.ones(
+                    total_flat, 1, dtype=torch.float32, device=tree_packed_label.device
                 )
+                for leaf_idx, sample_idx in enumerate(pt_batch.segment_to_sample):
+                    t_val = temp_by_sample[sample_idx].item()
+                    if pt_batch.ancestor_segment_ranges is not None:
+                        for a, b in pt_batch.ancestor_segment_ranges[leaf_idx]:
+                            if b > a:
+                                tree_packed_t[a:b] = t_val
+                    s, e = pt_batch.segment_ranges[leaf_idx]
+                    if e > s:
+                        tree_packed_t[s:e] = t_val
+                # Shared prefix keeps sample[0]'s temp (prior convention); refill
+                # last so ancestor writes from other leaves don't override it.
+                prefix_start, prefix_end = pt_batch.prefix_range
+                if prefix_end > prefix_start:
+                    tree_packed_t[prefix_start:prefix_end] = temp_by_sample[0].item()
             elif isinstance(t, torch.Tensor):
                 scalar_t = t.flatten()[0].item()
                 tree_packed_t = torch.full(
@@ -783,6 +870,14 @@ def forward_prefix_tree(
         flat_args["temperature"] = tree_packed_t
         # Note: loss_mask is not passed to logits_processor - it's handled downstream in sft_loss
         # after expand_flat_to_per_sample restores per-sample structure.
+
+        _log.getLogger(__name__).warning(
+            "prefix_tree DEBUG[logits_processor]: logits=%s label=%s temperature=%s total_flat=%d",
+            tuple(logits_flat.shape),
+            tuple(tree_packed_label.shape),
+            tuple(tree_packed_t.shape),
+            total_flat,
+        )
 
         # logits_processor runs on flat (flat_tokens, 1, vocab).
         # Clone so in-place ops inside the processor don't alias output_orig.
@@ -824,3 +919,125 @@ def forward_prefix_tree(
         # We must send the same seq-first format (seq, 1, hidden) so all downstream
         # stages also get seq-first Q — no per-stage conditional needed, PP=N safe.
         return output_orig.permute(1, 0, 2)  # (1,seq,hid) → (seq,1,hid)
+
+
+def fuse_try_forward_prefix_tree(
+    model,
+    input_ids,
+    labels,
+    temperature: float,
+    logits_processor_args: dict,
+    calculate_entropy: bool,
+):
+    """Fused-path: try to build + forward a prefix-tree batch with fused vocab projection.
+
+    Counterpart of :func:`unfuse_try_forward_prefix_tree` for the
+    ``use_fused_kernels=True`` path.  The vocab projection + log-prob
+    computation stays fused inside ``_fused_GPTModel_forward`` via
+    :func:`linear_cross_entropy` — the unfused path materialises
+    ``(flat_tokens, vocab)`` logits and runs ``logits_processor`` outside the
+    model, but the fused path never materialises the full vocab tensor.
+
+    Limitations vs unfused path:
+      - **Scalar temperature only.**  ``linear_cross_entropy`` asserts
+        ``isinstance(temperature, float)``.  Per-sample temperature must use
+        the unfused path.
+      - **PP=1 only.**  Intermediate PP stages (``not post_process``) return
+        ``None`` so the caller falls through to the standard fused path.
+        Prefix-tree attention on intermediate PP stages is not supported via
+        the fused path — use the unfused path for PP > 1.
+
+    Args:
+        model: Megatron GPTModel (forward patched to ``_fused_GPTModel_forward``).
+        input_ids: NestedTensor of shape (batch_size, variable_seqlen).
+        labels: NestedTensor — used for per-sample offsets only; actual labels
+            come from ``pt_batch.tree_packed_labels`` (pre-shifted per sample).
+        temperature: scalar float.
+        logits_processor_args: dict containing ``use_prefix_tree``,
+            ``prefix_tree_attention``, ``segment_hashes``, ``segment_lengths``,
+            ``prefix_tree_subtree``.  Prefix-tree keys are stripped on return.
+        calculate_entropy: whether to return ``entropy`` alongside ``log_probs``.
+
+    Returns:
+        ``{"log_probs": NestedTensor, "entropy": NestedTensor}`` (entropy only
+        when ``calculate_entropy=True``), or ``None`` when no prefix sharing is
+        detected — caller falls through to the standard fused path.
+    """
+    from verl.models.mcore.util import preprocess_thd_engine
+
+    prefix_tree_attention = (logits_processor_args or {}).get("prefix_tree_attention", "flex")
+
+    pb = build_prefix_tree_batch(
+        model,
+        input_ids,
+        logits_processor_args,
+        vision_model=False,
+        mtp_enable_train=False,
+    )
+    if pb is None:
+        _log.getLogger(__name__).warning(
+            "prefix_tree: build_prefix_tree_batch returned None — falling back to standard fused path"
+        )
+        strip_prefix_tree_args(logits_processor_args)
+        return None
+
+    if prefix_tree_attention == "magi":
+        local_input_ids, local_position_ids = dispatch_pt_batch(pb)
+        attn_kwargs = {"magi_attention_key": pb.magi_key}
+    else:
+        local_input_ids = pb.local_tree_packed_input_ids.unsqueeze(0)
+        local_position_ids = pb.local_tree_packed_position_ids.unsqueeze(0)
+        attn_kwargs = {"flex_attention_key": pb.flex_key}
+
+    strip_prefix_tree_args(logits_processor_args)
+
+    # Build per-sample flat labels from tree_packed_labels (pre-shifted per sample).
+    # expand_flat_to_per_sample replicates prefix per sample and concatenates in
+    # sample-index order — matching the expanded hidden states from
+    # fuse_undispatch_and_expand_hidden inside _fused_GPTModel_forward.
+    real_tokens = pb.real_tokens
+    if pb.tree_packed_labels is None:
+        _log.getLogger(__name__).warning(
+            "prefix_tree[fused]: tree_packed_labels is None — falling back to standard fused path"
+        )
+        return None
+    labels_flat = expand_flat_to_per_sample(pb.tree_packed_labels[:real_tokens], pb)  # (total_expanded,)
+
+    # packed_seq_params from labels — used only for postprocess offsets.
+    # We pass labels=labels_flat into the model; _fused_GPTModel_forward feeds
+    # it to linear_cross_entropy.  pt_batch flows via kwargs to the patched
+    # forward, which pulls it out before calling model.decoder.
+    output_orig = model(
+        input_ids=local_input_ids,
+        attention_mask=None,
+        position_ids=local_position_ids,
+        packed_seq_params=None,
+        labels=labels_flat,
+        temperature=temperature,
+        pt_batch=pb,
+        **attn_kwargs,
+    )
+
+    # output_orig.log_probs / .entropy are (total_expanded,) per-sample flat.
+    # Split into NestedTensor using original input_ids offsets (unpadded).
+    cu_seqlens = input_ids.offsets()  # (batch_size + 1,)
+    batch_size = input_ids.shape[0]
+
+    log_probs = output_orig.log_probs
+    if log_probs.dim() == 1:
+        log_probs = log_probs.unsqueeze(0)  # (1, total_expanded)
+    log_probs_tensors = [
+        log_probs[0, cu_seqlens[i] : cu_seqlens[i + 1]] for i in range(batch_size)
+    ]
+    log_probs_nested = torch.nested.as_nested_tensor(log_probs_tensors, layout=torch.jagged)
+
+    output = {"log_probs": log_probs_nested}
+    if calculate_entropy:
+        entropy = output_orig.entropy
+        if entropy.dim() == 1:
+            entropy = entropy.unsqueeze(0)
+        entropy_tensors = [
+            entropy[0, cu_seqlens[i] : cu_seqlens[i + 1]] for i in range(batch_size)
+        ]
+        output["entropy"] = torch.nested.as_nested_tensor(entropy_tensors, layout=torch.jagged)
+    return output

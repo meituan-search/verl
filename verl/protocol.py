@@ -966,7 +966,16 @@ class DataProto:
         """
         indices_np = indices.detach().numpy()
         self.batch = self.batch[indices]
-        self.non_tensor_batch = {key: val[indices_np] for key, val in self.non_tensor_batch.items()}
+        # Handle both numpy arrays (fancy indexing) and lists (element-wise selection)
+        reordered = {}
+        for key, val in self.non_tensor_batch.items():
+            if isinstance(val, list):
+                # List needs element-wise selection, not numpy fancy indexing
+                reordered[key] = [val[i] for i in indices_np]
+            else:
+                # numpy array supports fancy indexing
+                reordered[key] = val[indices_np]
+        self.non_tensor_batch = reordered
 
     def repeat(self, repeat_times=2, interleave=True):
         """

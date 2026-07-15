@@ -926,9 +926,9 @@ def prepare_prefix_tree_micro_batches(
             batch_idx_list.append(batch_idx_list[-1])
 
     micro_batches = [tu.index_select_tensor_dict(data, idx) for idx in batch_idx_list]
-    # Reorder micro-batches in inc-then-dec flat-token pattern to reduce PP bubble.
-    # Preserves prefix locality: samples within a group share prefixes and stay together.
-    if trie is not None and len(batch_idx_list) > 1:
+    # Compute deduplicated (flat) token count per micro-batch — used for PP
+    # sort and for imbalance diagnostics.
+    if trie is not None:
 
         def _group_flat_tokens(group: list[int]) -> int:
             keep = set(group)
@@ -947,10 +947,38 @@ def prepare_prefix_tree_micro_batches(
             return sum(_count(c) for c in trie.children.values())
 
         tokens_per_group = [_group_flat_tokens(g) for g in batch_idx_list]
-        sorted_groups = sorted(zip(tokens_per_group, batch_idx_list, range(len(batch_idx_list)), strict=False))
-        ordered = [g for _, g, _ in sorted_groups]
-        batch_idx_list = ordered[::2] + ordered[1::2][::-1]
-        micro_batches = [tu.index_select_tensor_dict(data, idx) for idx in batch_idx_list]
+
+        # Reorder micro-batches in inc-then-dec flat-token pattern to reduce PP bubble.
+        # Preserves prefix locality: samples within a group share prefixes and stay together.
+        if len(batch_idx_list) > 1:
+            sorted_groups = sorted(zip(tokens_per_group, batch_idx_list, range(len(batch_idx_list)), strict=False))
+            ordered_tokens = [t for t, _, _ in sorted_groups]
+            ordered_groups = [g for _, g, _ in sorted_groups]
+            batch_idx_list = ordered_groups[::2] + ordered_groups[1::2][::-1]
+            tokens_per_group = ordered_tokens[::2] + ordered_tokens[1::2][::-1]
+            micro_batches = [tu.index_select_tensor_dict(data, idx) for idx in batch_idx_list]
+
+        # Log per-mb deduped (flat) token counts + raw tokens for PP imbalance diagnosis.
+        _input_ids = data["input_ids"]
+        if _input_ids.is_nested:
+            _lens = _input_ids.offsets().diff().tolist()
+            _raw_per_mb = [sum(_lens[i] for i in g) for g in batch_idx_list]
+        else:
+            _raw_per_mb = [0] * len(batch_idx_list)
+        _total_flat = sum(tokens_per_group)
+        _total_raw = sum(_raw_per_mb)
+        _max_f = max(tokens_per_group) if tokens_per_group else 0
+        _min_f = min(tokens_per_group) if tokens_per_group else 0
+        _logging.getLogger(__name__).warning(
+            "prefix_tree mbs: n_mb=%d flat=%s raw=%s dedup_ratio=%.3f max_flat=%d min_flat=%d imb=%.2f",
+            len(tokens_per_group),
+            tokens_per_group,
+            _raw_per_mb,
+            1.0 - _total_flat / _total_raw if _total_raw > 0 else 0.0,
+            _max_f,
+            _min_f,
+            (_max_f - _min_f) / _max_f if _max_f > 0 else 0.0,
+        )
     # Attach pruned subtree to each micro-batch for downstream trie reuse.
     if trie is not None:
         pt_global = PrefixTrie(root=trie)

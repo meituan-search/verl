@@ -250,9 +250,9 @@ def gptmodel_forward_model_engine(
         prefix_tree_attention = (logits_processor_args or {}).get("prefix_tree_attention", "flex")
 
         if use_prefix_tree:
-            from verl.utils.prefix_tree.magi import try_forward_prefix_tree
+            from verl.utils.prefix_tree.magi import unfuse_try_forward_prefix_tree
 
-            output = try_forward_prefix_tree(
+            output = unfuse_try_forward_prefix_tree(
                 model,
                 input_ids,
                 logits_processor_args,
@@ -266,7 +266,7 @@ def gptmodel_forward_model_engine(
             if output is not None:
                 return output
             _log.getLogger(__name__).warning(
-                "prefix_tree: try_forward_prefix_tree returned None — falling back to standard THD path"
+                "prefix_tree: unfuse_try_forward_prefix_tree returned None — falling back to standard THD path"
             )
 
         input_ids_rmpad, packed_seq_params, position_ids_rmpad = preprocess_thd_engine(
