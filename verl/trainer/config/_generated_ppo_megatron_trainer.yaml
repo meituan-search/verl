@@ -413,7 +413,7 @@ actor_rollout_ref:
     use_remove_padding: true
     use_prefix_tree: false
     prefix_tree_attention: magi
-prefix_tree_dynbsz_length_estimator: length
+    prefix_tree_dynbsz_length_estimator: length
     lora_rank: 0
     lora_alpha: 16
     target_modules: all-linear
@@ -645,7 +645,7 @@ critic:
     use_remove_padding: true
     use_prefix_tree: false
     prefix_tree_attention: magi
-prefix_tree_dynbsz_length_estimator: length
+    prefix_tree_dynbsz_length_estimator: length
     lora_rank: 0
     lora_alpha: 16
     target_modules: all-linear

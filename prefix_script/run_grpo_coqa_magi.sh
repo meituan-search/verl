@@ -20,8 +20,6 @@ TS="${TS:-$(date +%Y%m%d_%H%M%S)}"
 OUTDIR="${OUTDIR:-/tmp/claude/grpo_coqa_4b/magi/${TS}}"
 mkdir -p "$OUTDIR"
 
-VERL_DIR="${VERL_DIR:-/home/hadoop-djst-algoplat/prefix-tree/verl_prefix_tree}"
-cd "$VERL_DIR"
 
 echo "================================================================"
 echo "GRPO CoQA — Megatron actor + MAGI prefix tree"
@@ -65,7 +63,7 @@ TENSORBOARD_DIR="$OUTDIR/tb" python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.megatron.use_megatron_fsdp=True \
     +actor_rollout_ref.actor.megatron.override_transformer_config.gradient_accumulation_fusion=False \
     \
-    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.name=sglang \
     actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \

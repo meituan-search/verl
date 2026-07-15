@@ -87,9 +87,19 @@ def prepare_micro_batches(
         max_tokens = total_raw * 10
         tries, num_tokens = greedy_build_tries(seqs, max_tokens_per_tree=max_tokens)
         if tries and total_raw > 0:
-            trie = tries[0]
+            trie = tries[0]  # TODO: use PrefixTrie
             flat = num_tokens[0]
-            tu.assign_non_tensor(data, prefix_tree=trie)
+            tu.assign_non_tensor(data, prefix_tree=trie)  # TODO: use PrefixTrie
+
+            # Build leaf_ids: sample_idx → flat position of that sample's leaf node.
+            # TODO: move into PrefixTrie constructor once TrieNode gets flat_idx.
+            import numpy as np
+            _leaf_ids = np.full(len(seqs), -1, dtype=np.int64)
+            for _flat_idx, _node in enumerate(trie.nodes):
+                if not _node.children:  # leaf node
+                    for _seq_id in _node.sequence_ids:
+                        _leaf_ids[_seq_id] = _flat_idx
+            tu.assign_non_tensor(data, prefix_tree_leaf_ids=_leaf_ids)
 
             # Compute prefix-tree metrics from the already-built trie — correct
             # sequence lengths (NestedTensor, no padding) and no trie rebuild.
@@ -101,10 +111,10 @@ def prepare_micro_batches(
                 "prefix_tree/raw_tokens": total_raw,
             }
             if max_token_len_per_gpu is not None:
-                groups = mbs_groups_from_trie(trie, max_token_len_per_gpu * sp_size, use_n2_cost=(estimator == "area"))
+                groups = mbs_groups_from_trie(trie, max_token_len_per_gpu * sp_size, use_n2_cost=(estimator == "area"))  # TODO: use PrefixTrie
                 pt_metrics["prefix_tree/avg_mbs"] = len(seqs) / len(groups) if groups else 0.0
                 ratios = [
-                    1.0 - trie_group_flat_tokens(g, trie) / sum(len(seqs[i]) for i in g)
+                    1.0 - trie_group_flat_tokens(g, trie) / sum(len(seqs[i]) for i in g)  # TODO: use PrefixTrie
                     for g in groups
                     if sum(len(seqs[i]) for i in g) > 0
                 ]

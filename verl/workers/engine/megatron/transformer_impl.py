@@ -833,19 +833,21 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 dp_rank=mpu.get_data_parallel_rank(),
             )
 
-        if self.engine_config.use_prefix_tree:
-            from verl.utils.prefix_tree.magi import read_prefix_tree_batch_config
-            _pt_subtree = tu.pop(batch, key="prefix_tree_subtree", default=None)
-            batch = batch.to(get_device_id())
-            if _pt_subtree is not None:
-                tu.assign_non_tensor(batch, prefix_tree_subtree=_pt_subtree)
-        else:
-            batch = batch.to(get_device_id())
         use_fused_kernels = tu.get_non_tensor_data(batch, key="use_fused_kernels", default=False)
         calculate_entropy = tu.get_non_tensor_data(batch, key="calculate_entropy", default=False)
         calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
         distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
+
+        _pt_subtree = tu.pop(batch, key="prefix_tree_subtree", default=None) \
+            if self.engine_config.use_prefix_tree else None
+
+        batch = batch.to(get_device_id())
+
+        if _pt_subtree is not None:
+            tu.assign_non_tensor(batch, prefix_tree_subtree=_pt_subtree)
+
         if self.engine_config.use_prefix_tree:
+            from verl.utils.prefix_tree.magi import read_prefix_tree_batch_config
             use_prefix_tree, _ = read_prefix_tree_batch_config(
                 batch, tu, self.engine_config.use_remove_padding
             )

@@ -45,7 +45,6 @@ from .magi import (
 from .utils import (
     PrefixTreeParams,
     RangeSpec,
-    TreeNode,
     build_layout_from_tree_node,
     longest_common_prefix_length,
 )
@@ -81,7 +80,6 @@ __all__ = [
     # utils
     "PrefixTreeParams",
     "RangeSpec",
-    "TreeNode",
     "build_layout_from_tree_node",
     "longest_common_prefix_length",
 ]

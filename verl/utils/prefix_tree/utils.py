@@ -15,11 +15,13 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 from torch import Tensor
+
+from verl.utils.prefix_tree.tree import PrefixSubTrie, TrieNode
 
 RangeSpec = tuple[int, int]
 
@@ -106,7 +108,6 @@ class PrefixTreeParams:
 __all__ = [
     "RangeSpec",
     "PrefixTreeParams",
-    "TreeNode",
     "build_prefix_tree_dense_mask",
     "build_prefix_tree_attention_spec",
     "build_layout_from_tree_node",
@@ -116,36 +117,8 @@ __all__ = [
 ]
 
 
-@dataclass
-class TreeNode:
-    """A node in a multi-level prefix tree.
-
-    ``segment_len`` is the number of tokens *owned by this node* (i.e. the
-    tokens that are new relative to its parent).  Leaf nodes have no children.
-
-    Example — 3 samples each of length 1000 with 20% prefix at every level::
-
-        root = TreeNode(200, [          # shared root prefix: tokens [0..200)
-            TreeNode(200, [             # sub-prefix A:        tokens [200..400)
-                TreeNode(600),          # leaf A1:             tokens [400..1000)
-                TreeNode(600),          # leaf A2:             tokens [1000..1600)
-            ]),
-            TreeNode(200, [             # sub-prefix B:        tokens [1600..1800)
-                TreeNode(600),          # leaf B1:             tokens [1800..2400)
-            ]),
-        ])
-    """
-
-    segment_len: int
-    children: list[TreeNode] = field(default_factory=list)
-
-    @property
-    def is_leaf(self) -> bool:
-        return not self.children
-
-
 def build_prefix_tree_attention_spec(
-    root: TreeNode,
+    root: TrieNode,
 ) -> tuple[list[RangeSpec], list[RangeSpec], list[str]]:
     """Encode a prefix tree as attention rectangle specs.
 
@@ -158,9 +131,8 @@ def build_prefix_tree_attention_spec(
       to this node's tokens (the leaf attends fully to every ancestor).
 
     Args:
-        root: Root ``TreeNode`` of the tree.  ``segment_len`` must be > 0 for
-            internal nodes; leaves may have ``segment_len`` == 0 (they are
-            skipped).
+        root: Root ``TrieNode`` of the subtrie.  Nodes with empty ``input_ids``
+            are skipped.
 
     Returns:
         ``(q_ranges, k_ranges, mask_types)`` ready to pass to
@@ -171,28 +143,28 @@ def build_prefix_tree_attention_spec(
     mask_types: list[str] = []
 
     # Assign flat token offsets with a DFS pre-order walk.
-    def _assign_offsets(node: TreeNode, start: int) -> int:
+    def _assign_offsets(node: TrieNode, start: int) -> int:
         node._flat_start = start
-        node._flat_end = start + node.segment_len
+        node._flat_end = start + len(node.input_ids)
         cur = node._flat_end
-        for child in node.children:
+        for child in node.children.values():
             cur = _assign_offsets(child, cur)
         return cur
 
     _assign_offsets(root, 0)
 
     # Collect all descendant nodes (non-root) in DFS order.
-    def _collect_descendants(node: TreeNode) -> list[TreeNode]:
-        result: list[TreeNode] = []
-        for child in node.children:
+    def _collect_descendants(node: TrieNode) -> list[TrieNode]:
+        result: list[TrieNode] = []
+        for child in node.children.values():
             result.append(child)
             result.extend(_collect_descendants(child))
         return result
 
     # For each node: emit its own CAUSAL self-rect, then one FULL rect per
     # descendant that attends to this node's tokens.
-    def _emit_node(node: TreeNode) -> None:
-        if node.segment_len == 0:
+    def _emit_node(node: TrieNode) -> None:
+        if not node.input_ids:
             return
         node_range: RangeSpec = (node._flat_start, node._flat_end)
 
@@ -200,18 +172,18 @@ def build_prefix_tree_attention_spec(
         k_ranges.append(node_range)
         mask_types.append("causal")
 
-        if node.is_leaf:
+        if not node.children:
             return
 
         for desc in _collect_descendants(node):
-            if desc.segment_len == 0:
+            if not desc.input_ids:
                 continue
             desc_range: RangeSpec = (desc._flat_start, desc._flat_end)
             q_ranges.append(desc_range)
             k_ranges.append(node_range)
             mask_types.append("full")
 
-        for child in node.children:
+        for child in node.children.values():
             _emit_node(child)
 
     _emit_node(root)
@@ -221,63 +193,94 @@ def build_prefix_tree_attention_spec(
 
 def build_layout_from_tree_node(
     samples: Sequence[Tensor],
-    tree_root: TreeNode,
-    leaf_to_sample: Sequence[int],
+    subtrie: PrefixSubTrie,
     loss_masks_by_sample: Optional[Sequence[Tensor]] = None,
     position_ids_by_sample: Optional[Sequence[Tensor]] = None,
+    labels_by_sample: Optional[Sequence[Tensor]] = None,
 ) -> PrefixTreeParams:
-    """Build flat layout (PrefixTreeParams) from a TreeNode spec.
+    """Build flat layout (PrefixTreeParams) from a PrefixSubTrie.
 
-    Consumed by the dynamic-trie detection path: ``build_tree_dynamic`` produces
-    a ``(TreeNode, leaf_to_sample)`` pair describing the LOGICAL shared-prefix
-    structure, and this function realises it as a PHYSICAL flat token layout
-    plus q/k attention rectangles.
+    Walks only the nodes in ``subtrie``, emitting tokens in DFS pre-order.
+    Leaf ordering matches ``subtrie.leaf_to_sample``.
 
-    For each node we track an "owner" sample (the first leaf descendant) and an
-    "owner offset" (the cumulative segment_len of all ancestors). The owner's
-    token slice at ``[offset, offset+segment_len)`` is what gets emitted into
-    the flat tensor for that node.
-
-    Args:
-        samples: Per-sample 1-D token tensors. ``samples[i]`` is the original
-            sequence for sample ``i``.
-        tree_root: Root of the prefix tree. Its ``segment_len`` is the length
-            of the shared root prefix.
-        leaf_to_sample: For each leaf in DFS pre-order, the original sample
-            index this leaf corresponds to. Length must equal the number of
-            leaves in ``tree_root``.
-        loss_masks_by_sample / position_ids_by_sample: optional per-sample
-            auxiliary tensors. When None, position ids default to
-            ``arange(owner_offset, owner_offset + segment_len)`` so each
-            sample's RoPE positions match the original layout.
-
-    Returns:
-        PrefixTreeParams. Also stashes
-        ``_leaf_ancestor_ranges`` on the params instance for downstream
-        ``restore_flat_to_nested``.
+    ``labels_by_sample[i]`` should be pre-shifted labels — typically
+    ``concat(samples[i][1:], tensor([0]))`` — computed before packing so
+    that cross-segment boundaries in the flat layout carry no wrong values.
     """
-    # build_prefix_tree_attention_spec assigns _flat_start/_flat_end to every node
-    # as a side effect — we rely on that for leaf_ranges + ancestor ranges below.
-    q_ranges, k_ranges, mask_types = build_prefix_tree_attention_spec(tree_root)
 
-    # Walk top-down: assign each node its owner sample (first leaf descendant)
-    # and owner offset (= sum of ancestor segment_lens). Also collect leaves in
-    # DFS order and a parent_of map for restoring ancestor chains.
-    leaves_in_dfs: list[TreeNode] = []
-    parent_of: dict[int, TreeNode] = {}
-    leaf_cursor = [0]  # mutable closure cell
+    valid_ids: set[int] = {n.flat_idx for n in subtrie.nodes}
+    # Map flat_idx → ordered list of sample_ids (first = representative, rest = zero-len duplicates)
+    leaf_node_id_to_samples: dict[int, list[int]] = {}
+    for nid, sid in zip(subtrie.leaf_node_ids, subtrie.leaf_to_sample, strict=False):
+        leaf_node_id_to_samples.setdefault(nid, []).append(sid)
+    leaf_node_id_to_sample: dict[int, int] = {nid: sids[0] for nid, sids in leaf_node_id_to_samples.items()}
 
-    def _annotate(node: TreeNode, owner_offset: int) -> int:
+    def _subtrie_children(node: TrieNode) -> list[TrieNode]:
+        return [c for c in node.children.values() if c.flat_idx in valid_ids]
+
+    root_nodes = [n for n in subtrie.nodes if n.ancestor is None or n.ancestor.flat_idx not in valid_ids]
+
+    # Assign flat positions, build attention spec rectangles.
+    q_ranges: list[RangeSpec] = []
+    k_ranges: list[RangeSpec] = []
+    mask_types: list[str] = []
+
+    def _assign_offsets(node: TrieNode, start: int) -> int:
+        node._flat_start = start
+        node._flat_end = start + len(node.input_ids)
+        cur = node._flat_end
+        for child in _subtrie_children(node):
+            cur = _assign_offsets(child, cur)
+        return cur
+
+    pos = 0
+    for root in root_nodes:
+        pos = _assign_offsets(root, pos)
+
+    def _collect_descendants(node: TrieNode) -> list[TrieNode]:
+        result: list[TrieNode] = []
+        for child in _subtrie_children(node):
+            result.append(child)
+            result.extend(_collect_descendants(child))
+        return result
+
+    def _emit_attn(node: TrieNode) -> None:
+        if not node.input_ids:
+            return
+        node_range: RangeSpec = (node._flat_start, node._flat_end)
+        q_ranges.append(node_range)
+        k_ranges.append(node_range)
+        mask_types.append("causal")
+        children = _subtrie_children(node)
+        if not children:
+            return
+        for desc in _collect_descendants(node):
+            if not desc.input_ids:
+                continue
+            q_ranges.append((desc._flat_start, desc._flat_end))
+            k_ranges.append(node_range)
+            mask_types.append("full")
+        for child in children:
+            _emit_attn(child)
+
+    for root in root_nodes:
+        _emit_attn(root)
+
+    # Build flat token layout.
+    leaves_in_dfs: list[TrieNode] = []
+    parent_of: dict[int, TrieNode] = {}
+
+    def _annotate(node: TrieNode, owner_offset: int) -> int:
         node._owner_offset = owner_offset
-        if node.is_leaf:
-            sample_idx = int(leaf_to_sample[leaf_cursor[0]])
-            leaf_cursor[0] += 1
+        children = _subtrie_children(node)
+        if not children:
+            sample_idx = leaf_node_id_to_sample[node.flat_idx]
             node._owner_sample = sample_idx
             leaves_in_dfs.append(node)
             return sample_idx
-        child_offset = owner_offset + node.segment_len
+        child_offset = owner_offset + len(node.input_ids)
         first_owner: Optional[int] = None
-        for i, child in enumerate(node.children):
+        for i, child in enumerate(children):
             parent_of[id(child)] = node
             owner = _annotate(child, child_offset)
             if i == 0:
@@ -285,19 +288,21 @@ def build_layout_from_tree_node(
         node._owner_sample = first_owner
         return first_owner
 
-    _annotate(tree_root, 0)
+    for root in root_nodes:
+        _annotate(root, 0)
 
     device = samples[0].device
     flat_pieces: list[Tensor] = []
     flat_lm_pieces: Optional[list[Tensor]] = [] if loss_masks_by_sample is not None else None
     flat_pid_pieces: Optional[list[Tensor]] = [] if position_ids_by_sample is not None else None
+    flat_label_pieces: Optional[list[Tensor]] = [] if labels_by_sample is not None else None
     default_pid_pieces: list[Tensor] = []
 
-    def _emit(node: TreeNode) -> None:
-        if node.segment_len > 0:
+    def _emit(node: TrieNode) -> None:
+        if node.input_ids:
             owner = node._owner_sample
             s = node._owner_offset
-            e = s + node.segment_len
+            e = s + len(node.input_ids)
             flat_pieces.append(samples[owner][s:e])
             if flat_lm_pieces is not None:
                 flat_lm_pieces.append(loss_masks_by_sample[owner][s:e])
@@ -305,15 +310,19 @@ def build_layout_from_tree_node(
                 flat_pid_pieces.append(position_ids_by_sample[owner][s:e])
             else:
                 default_pid_pieces.append(torch.arange(s, e, device=device, dtype=torch.long))
-        for child in node.children:
+            if flat_label_pieces is not None:
+                flat_label_pieces.append(labels_by_sample[owner][s:e])
+        for child in _subtrie_children(node):
             _emit(child)
 
-    _emit(tree_root)
+    for root in root_nodes:
+        _emit(root)
 
     tree_packed_tokens = (
         torch.cat(flat_pieces) if flat_pieces else torch.empty(0, dtype=samples[0].dtype, device=device)
     )
     tree_packed_loss_mask = torch.cat(flat_lm_pieces) if flat_lm_pieces is not None else None
+    tree_packed_labels_tensor = torch.cat(flat_label_pieces) if flat_label_pieces is not None else None
     if flat_pid_pieces is not None:
         tree_packed_position_ids = torch.cat(flat_pid_pieces)
     else:
@@ -321,11 +330,13 @@ def build_layout_from_tree_node(
             torch.cat(default_pid_pieces) if default_pid_pieces else torch.empty(0, dtype=torch.long, device=device)
         )
 
-    leaf_ranges = [(leaf._flat_start, leaf._flat_end) for leaf in leaves_in_dfs]
-    leaf_to_sample_list = [int(s) for s in leaf_to_sample]
-    sample_to_leaf_range = {s: r for s, r in zip(leaf_to_sample_list, leaf_ranges, strict=False)}
-
+    # Build leaf ranges and ancestor chains in DFS order, interleaving zero-length
+    # duplicate entries immediately after their representative so the last entry
+    # (the last real leaf) still ends at total_seqlen_q (satisfying PrefixTreeParams).
+    leaf_ranges: list[RangeSpec] = []
+    leaf_to_sample_list: list[int] = []
     leaf_ancestor_ranges: list[list[RangeSpec]] = []
+
     for leaf in leaves_in_dfs:
         chain: list[RangeSpec] = []
         cur = parent_of.get(id(leaf))
@@ -333,9 +344,27 @@ def build_layout_from_tree_node(
             chain.append((cur._flat_start, cur._flat_end))
             cur = parent_of.get(id(cur))
         chain.reverse()  # root first
+
+        rep_range: RangeSpec = (leaf._flat_start, leaf._flat_end)
+        sids = leaf_node_id_to_samples[leaf.flat_idx]
+
+        # Representative entry
+        leaf_ranges.append(rep_range)
+        leaf_to_sample_list.append(sids[0])
         leaf_ancestor_ranges.append(chain)
 
-    prefix_range = (tree_root._flat_start, tree_root._flat_end)
+        # Zero-length entries for duplicates: ancestor chain extended with the rep's
+        # leaf range so restore_flat_to_nested reconstructs the full sequence correctly.
+        zero_range: RangeSpec = (rep_range[1], rep_range[1])
+        for dup_sid in sids[1:]:
+            leaf_ranges.append(zero_range)
+            leaf_to_sample_list.append(dup_sid)
+            leaf_ancestor_ranges.append(chain + [rep_range])
+
+    sample_to_leaf_range = {s: r for s, r in zip(leaf_to_sample_list, leaf_ranges, strict=False)}
+
+    # prefix_range: the shared root segment (first root_node for single-prefix trees)
+    prefix_range = (root_nodes[0]._flat_start, root_nodes[0]._flat_end)
 
     params = PrefixTreeParams(
         prefix_range=prefix_range,
@@ -350,7 +379,7 @@ def build_layout_from_tree_node(
         total_seqlen_q=tree_packed_tokens.numel(),
         total_seqlen_k=tree_packed_tokens.numel(),
         tree_packed_tokens=tree_packed_tokens,
-        tree_packed_labels=None,
+        tree_packed_labels=tree_packed_labels_tensor,
         tree_packed_loss_mask=tree_packed_loss_mask,
         tree_packed_position_ids=tree_packed_position_ids,
     )

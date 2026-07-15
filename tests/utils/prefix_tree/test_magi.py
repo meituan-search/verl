@@ -57,8 +57,7 @@ class TestBuildPrefixTreeLayout:
 
         result = build_tree_dynamic(tokens)
         assert result is not None, "Expected shared prefix trie"
-        tree_root, leaf_to_sample = result
-        return build_layout_from_tree_node(tokens, tree_root, leaf_to_sample)
+        return build_layout_from_tree_node(tokens, result)
 
     def test_basic_shared_prefix(self):
         from verl.utils.prefix_tree.utils import longest_common_prefix_length
@@ -74,7 +73,7 @@ class TestBuildPrefixTreeLayout:
         params = self._build_params_from_tokens(tokens)
 
         # flat layout: [10,20,30] + [41,42] + [51] + [61,62,63]
-        assert torch.equal(params.flat_tokens, torch.tensor([10, 20, 30, 41, 42, 51, 61, 62, 63]))
+        assert torch.equal(params.tree_packed_tokens, torch.tensor([10, 20, 30, 41, 42, 51, 61, 62, 63]))
         assert params.prefix_range == (0, 3)
         assert params.leaf_ranges == [(3, 5), (5, 6), (6, 9)]
         assert params.total_seqlen_q == 9
@@ -127,16 +126,15 @@ class TestRestoreFlatToNested:
 
         result = build_tree_dynamic(tokens)
         assert result is not None
-        tree_root, leaf_to_sample = result
-        params = build_layout_from_tree_node(tokens, tree_root, leaf_to_sample)
+        params = build_layout_from_tree_node(tokens, result)
         return PrefixTreeMagiBatch(
-            flat_input_ids=params.flat_tokens,
-            flat_position_ids=params.flat_position_ids,
-            flat_loss_mask=None,
+            tree_packed_input_ids=params.tree_packed_tokens,
+            tree_packed_position_ids=params.tree_packed_position_ids,
+            tree_packed_loss_mask=None,
             magi_key=None,
             flex_key=None,
-            leaf_to_sample=params.leaf_to_sample,
-            leaf_ranges=params.leaf_ranges,
+            segment_to_sample=params.leaf_to_sample,
+            segment_ranges=params.leaf_ranges,
             prefix_range=params.prefix_range,
             original_batch_size=params.num_samples,
         )
@@ -150,7 +148,7 @@ class TestRestoreFlatToNested:
             torch.tensor([10, 20, 30, 61, 62, 63]),
         ]
         pt_batch = self._build_pt_batch(tokens)
-        flat = pt_batch.flat_input_ids  # (9,)
+        flat = pt_batch.tree_packed_input_ids  # (9,)
 
         restored = restore_flat_to_nested(flat, pt_batch)
 
@@ -193,7 +191,7 @@ class TestRestoreFlatToNested:
             torch.tensor([10, 20, 30, 51, 52]),
         ]
         pt_batch = self._build_pt_batch(tokens)
-        flat = pt_batch.flat_input_ids
+        flat = pt_batch.tree_packed_input_ids
 
         restored = restore_flat_to_nested(flat, pt_batch)
         vals = restored.values()
@@ -248,9 +246,9 @@ class TestNestedTensorUnpack:
 
         assert result is not None
         assert result.original_batch_size == 3
-        assert torch.equal(result.flat_input_ids, torch.tensor([10, 20, 30, 41, 42, 51, 61, 62, 63]))
+        assert torch.equal(result.tree_packed_input_ids, torch.tensor([10, 20, 30, 41, 42, 51, 61, 62, 63]))
         assert result.prefix_range == (0, 3)
-        assert result.leaf_ranges == [(3, 5), (5, 6), (6, 9)]
+        assert result.segment_ranges == [(3, 5), (5, 6), (6, 9)]
 
     def test_no_shared_prefix_returns_none(self, monkeypatch):
         import verl.utils.prefix_tree.magi as ptm
@@ -297,10 +295,10 @@ class TestNestedTensorUnpack:
 
         result = ptm.build_prefix_tree_micro_batch(FakeModel(), input_ids, loss_mask=loss_mask)
         assert result is not None
-        assert result.flat_loss_mask is not None
+        assert result.tree_packed_loss_mask is not None
         # flat: [prefix_loss(3)] + [leaf_0_loss(2)] + [leaf_1_loss(1)]
         # prefix loss taken from sample 0: [0,0,1], leaf_0: [1,1], leaf_1: [1]
         assert torch.equal(
-            result.flat_loss_mask,
+            result.tree_packed_loss_mask,
             torch.tensor([0.0, 0.0, 1.0, 1.0, 1.0, 1.0]),
         )
