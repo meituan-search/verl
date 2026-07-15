@@ -1193,9 +1193,6 @@ class RayPPOTrainer:
             calculate_sum_pi_squared=calculate_sum_pi_squared,
             compute_loss=False,
         )
-        from verl.utils.prefix_tree.trainer import configure_olb_backend
-
-        configure_olb_backend(batch_td, self.config.actor_rollout_ref.model)
         output = self.actor_rollout_wg.compute_log_prob(batch_td)
         # gather output
         entropy = tu.get(output, "entropy")
@@ -1435,7 +1432,14 @@ class RayPPOTrainer:
 
                     from verl.utils.prefix_tree.trainer import compute_metrics
 
-                    compute_metrics(metrics, gen_batch_output.batch["input_ids"], self.config.actor_rollout_ref.model)
+                    compute_metrics(
+                        metrics,
+                        gen_batch_output.batch["input_ids"],
+                        self.config.actor_rollout_ref.model,
+                        max_token_len_per_gpu=getattr(
+                            self.config.actor_rollout_ref.actor, "ppo_max_token_len_per_gpu", None
+                        ),
+                    )
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         gen_baseline_output = combined_gen_output.slice(num_sampled_prompts, None)

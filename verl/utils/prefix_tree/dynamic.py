@@ -27,12 +27,23 @@ Algorithm originally derived from AReaL
 
 from __future__ import annotations
 
+import logging as _logging
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+import numpy as np
+import torch
 from torch import Tensor
 
+from verl.utils import tensordict_utils as tu
+from verl.utils.device import get_torch_device
 from verl.utils.prefix_tree.utils import TreeNode
+from verl.utils.seqlen_balancing import (
+    calculate_workload,
+    get_seqlen_balanced_partitions,
+    log_seqlen_unbalance,
+    roundup_divisible,
+)
 
 __all__ = [
     "build_tree_dynamic",
@@ -44,6 +55,7 @@ __all__ = [
     "TrieNode",
     "greedy_build_tries",
     "mbs_groups_from_trie",
+    "trie_group_attn_area",
     "convert_trie_to_tree_node",
     # Load balancing
     "trie_group_flat_tokens",
@@ -215,8 +227,15 @@ def convert_trie_to_tree_node(
     contract expected by ``build_layout_from_tree_node``.
     """
     if not trie.children:
+        _logging.getLogger(__name__).warning(
+            "prefix_tree: convert_trie_to_tree_node: trie has no children — no sharing, returning None"
+        )
         return None
     if len(trie.children) > 1:
+        _logging.getLogger(__name__).warning(
+            "prefix_tree: convert_trie_to_tree_node: multiple roots (multi-forest, %d roots) — returning None",
+            len(trie.children),
+        )
         return None
 
     leaf_to_sample: list[int] = []
@@ -227,10 +246,13 @@ def convert_trie_to_tree_node(
         node = TreeNode(segment_len=segment_len, children=children)
         if not children:
             if len(trie_node.sequence_ids) != 1:
-                raise ValueError(
-                    f"Trie leaf has duplicate sequences {trie_node.sequence_ids}; falling back to standard attention."
-                )
-            leaf_to_sample.append(trie_node.sequence_ids[0])
+                # Create zero-length leaves for ALL duplicate sequences (incl. first)
+                # so leaf_to_sample count matches leaf count in TreeNode DFS walk
+                for sid in trie_node.sequence_ids:
+                    leaf_to_sample.append(sid)
+                    node.children.append(TreeNode(segment_len=0, children=[]))
+            else:
+                leaf_to_sample.append(trie_node.sequence_ids[0])
         else:
             # Samples that terminate at this intermediate node need zero-length leaves.
             child_ids = {sid for c in trie_node.children.values() for sid in c.sequence_ids}
@@ -268,6 +290,10 @@ def build_tree_dynamic(samples: list[Tensor]) -> Optional[tuple[TreeNode, list[i
     max_tokens_per_tree = sum(len(s) for s in sequences) * 10  # one forest
     tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=max_tokens_per_tree)
     if not tries or len(tries) > 1:
+        _logging.getLogger(__name__).warning(
+            "prefix_tree: build_tree_dynamic: multi-forest or empty tries (len=%d) — no shared prefix, returning None",
+            len(tries),
+        )
         return None
     return convert_trie_to_tree_node(tries[0])
 
@@ -323,6 +349,60 @@ def trie_group_flat_tokens(group: list[int], trie: TrieNode) -> int:
         return relevant_total + len(node.tokens) if has_relevant else 0
 
     return sum(_count(c) for c in trie.children.values())
+
+
+def _leaf_attn_area_inc(node: TrieNode, covered: set[int]) -> tuple[int, list[TrieNode]]:
+    """Incremental non-masked attention area for adding *node* (a leaf) to a group.
+
+    Derived from the prefix-tree block mask (same three block types as
+    ``_build_flex_key``):
+        - new ancestor self-attention  (paid once when first seen)
+        - leaf attending to all its ancestors
+        - leaf self-attention
+
+        inc = new_anc_len²  +  (shared_anc_len + new_anc_len) × leaf_len  +  leaf_len²
+
+    Works correctly for single-level and multi-level trees, and for groups that
+    mix multiple prefix families (different subtrees of the same trie root).
+
+    Returns:
+        (inc, new_anc): incremental area cost and the newly-covered ancestor nodes.
+    """
+    new_anc = [n for n in node.ancestors if id(n) not in covered]
+    shared_anc_len = sum(len(n.tokens) for n in node.ancestors if id(n) in covered)
+    new_anc_len = sum(len(n.tokens) for n in new_anc)
+    leaf_len = len(node.tokens)
+    inc = new_anc_len * new_anc_len + (shared_anc_len + new_anc_len) * leaf_len + leaf_len * leaf_len
+    return inc, new_anc
+
+
+def trie_group_attn_area(group: list[int], trie: TrieNode) -> int:
+    """Total non-masked attention area for a subset of sequences within a trie.
+
+    Mirrors :func:`trie_group_flat_tokens` but returns the attention area instead
+    of flat token count.  The area equals ``sqrt(area)`` effective tokens — the
+    budget unit used by :func:`mbs_groups_from_trie` when ``use_n2_cost=True``.
+    """
+    keep = frozenset(group)
+    covered: set[int] = set()
+    total = 0
+
+    def _visit(node: TrieNode) -> None:
+        nonlocal total
+        if not node.children:
+            if any(s in keep for s in node.sequence_ids):
+                inc, new_anc = _leaf_attn_area_inc(node, covered)
+                total += inc
+                covered.update(id(n) for n in new_anc + [node])
+        else:
+            for child in node.children.values():
+                if any(s in keep for s in child.sequence_ids):
+                    _visit(child)
+
+    for child in trie.children.values():
+        if any(s in keep for s in child.sequence_ids):
+            _visit(child)
+    return total
 
 
 def build_mini_batch_prefix_groups(
@@ -511,8 +591,6 @@ def trie_dfs_leaf_order(trie: TrieNode) -> list[int]:
 
 def trie_to_leaf_ids(trie: TrieNode) -> np.ndarray:  # noqa: F821
     """Return np.array mapping sample_idx → leaf_id (DFS order)."""
-    import numpy as np
-
     leaf_id = [-1]  # counter
     mapping: dict[int, int] = {}
 
@@ -541,11 +619,23 @@ def trie_to_leaf_ids(trie: TrieNode) -> np.ndarray:  # noqa: F821
 def mbs_groups_from_trie(
     trie: TrieNode,
     max_token_len: int,
+    use_n2_cost: bool = False,
 ) -> list[list[int]]:
     """Group sequences into micro-batches from an existing trie.
 
-    Same algorithm as :func:`dfs_micro_batch_groups` but accepts a pre-built
-    trie instead of rebuilding from sequences.
+    When ``use_n2_cost=False`` (default): budget is flat (deduplicated) tokens.
+
+    When ``use_n2_cost=True``: budget is the *effective attention length*
+    ``sqrt(non_masked_area)`` where the non-masked area matches the prefix-tree
+    block mask exactly — prefix self-attention + each leaf attending to all its
+    ancestors + leaf self-attention.  For each new leaf the incremental area is:
+
+        inc = new_anc_len²  +  (shared_anc_len + new_anc_len) × leaf_len  +  leaf_len²
+
+    where ``new_anc_len`` are ancestor tokens not yet in ``covered`` (paid once,
+    like the mask's prefix block) and ``shared_anc_len`` are already covered.
+    Budget check: ``total_area + inc > max_token_len²`` (avoids sqrt in hot path).
+    This handles arbitrary tree depth and multi-family groups correctly.
 
     When a trie leaf holds multiple sequence_ids (identical sequences), all IDs
     stay in the same DFS group.  prune_trie returns None for that group
@@ -554,35 +644,46 @@ def mbs_groups_from_trie(
     same_micro_num_in_dp to pad the other DP rank, double-counting its gradients.
     """
     all_groups: list[list[int]] = []
+    budget_sq = max_token_len * max_token_len  # used only when use_n2_cost=True
 
     for trie_root in [trie]:
         current_group: list[int] = []
         covered: set[int] = set()
-        current_eff = 0
+        current_eff = 0  # flat tokens (use_n2_cost=False) or accumulated area (True)
 
         def _visit(node: TrieNode) -> None:
             nonlocal current_eff
             if not node.children:
-                path = node.ancestors + [node]
-                new_nodes = [n for n in path if id(n) not in covered]  # noqa: B023
-                inc = sum(len(n.tokens) for n in new_nodes)
-
-                if current_group and current_eff + inc > max_token_len:  # noqa: B023
-                    all_groups.append(current_group[:])  # noqa: B023
-                    current_group.clear()  # noqa: B023
-                    covered.clear()  # noqa: B023
-                    current_eff = 0
-                    new_nodes = path
+                if use_n2_cost:  # noqa: B023
+                    inc, new_anc = _leaf_attn_area_inc(node, covered)  # noqa: B023
+                    if current_group and current_eff + inc > budget_sq:  # noqa: B023
+                        all_groups.append(current_group[:])  # noqa: B023
+                        current_group.clear()  # noqa: B023
+                        covered.clear()  # noqa: B023
+                        current_eff = 0
+                        inc, new_anc = _leaf_attn_area_inc(node, covered)  # recompute after flush  # noqa: B023
+                    current_group.extend(node.sequence_ids)  # noqa: B023
+                    covered.update(id(n) for n in new_anc + [node])  # noqa: B023
+                    current_eff += inc
+                else:
+                    path = node.ancestors + [node]
+                    new_nodes = [n for n in path if id(n) not in covered]  # noqa: B023
                     inc = sum(len(n.tokens) for n in new_nodes)
-
-                # Keep all sequence_ids (including duplicates) in the same group.
-                # Duplicates land in the same group as their originals → prune_trie
-                # returns None for that group → FA3 fallback for that one group.
-                # This avoids creating an extra singleton group that would upset
-                # same_micro_num_in_dp and double-count gradients on the other rank.
-                current_group.extend(node.sequence_ids)  # noqa: B023
-                covered.update(id(n) for n in new_nodes)  # noqa: B023
-                current_eff += inc
+                    if current_group and current_eff + inc > max_token_len:  # noqa: B023
+                        all_groups.append(current_group[:])  # noqa: B023
+                        current_group.clear()  # noqa: B023
+                        covered.clear()  # noqa: B023
+                        current_eff = 0
+                        new_nodes = path
+                        inc = sum(len(n.tokens) for n in new_nodes)
+                    # Keep all sequence_ids (including duplicates) in the same group.
+                    # Duplicates land in the same group as their originals → prune_trie
+                    # returns None for that group → FA3 fallback for that one group.
+                    # This avoids creating an extra singleton group that would upset
+                    # same_micro_num_in_dp and double-count gradients on the other rank.
+                    current_group.extend(node.sequence_ids)  # noqa: B023
+                    covered.update(id(n) for n in new_nodes)  # noqa: B023
+                    current_eff += inc
             else:
                 for child in node.children.values():
                     _visit(child)
@@ -608,8 +709,6 @@ def prune_trie(
     Returns ``(tree_root, leaf_to_sample)`` ready for
     :func:`build_layout_from_tree_node`, or ``None`` if no leaves match.
     """
-    from verl.utils.prefix_tree.utils import TreeNode
-
     if not keep_leaf_ids:
         return None
 
@@ -651,7 +750,14 @@ def prune_trie(
         return None
     # Guard: if any keep_leaf_id was dropped (e.g. duplicate sequences sharing a
     # trie leaf), fall back so restore_flat_to_nested never sees missing slots.
-    if set(leaf_to_sample) != keep_leaf_ids:
+    got = set(leaf_to_sample)
+    if got != keep_leaf_ids:
+        n_dup = len(keep_leaf_ids) - len(got)
+        _logging.getLogger(__name__).warning(
+            "prefix_tree: prune_trie: %d duplicate sequence(s) share a trie leaf "
+            "(%d unique / %d total) — FA3 fallback for this micro-batch",
+            n_dup, len(got), len(keep_leaf_ids),
+        )
         return None
     return root, leaf_to_sample
 
@@ -678,8 +784,6 @@ def compute_prefix_sharing_ratio(input_ids, attention_mask=None) -> float:
         ``float`` in ``[0, 1]``.  Returns ``0.0`` for empty or single-sequence
         input, or when no prefix is shared.
     """
-    from torch import Tensor
-
     if isinstance(input_ids, Tensor) and input_ids.is_nested:
         sequences = [t.tolist() for t in input_ids.unbind()]
     elif isinstance(input_ids, Tensor) and input_ids.dim() == 2:
@@ -703,23 +807,34 @@ def compute_prefix_sharing_ratio(input_ids, attention_mask=None) -> float:
     return 1.0 - sum(num_tokens) / total_raw
 
 
-def compute_prefix_tree_metrics(input_ids, attention_mask=None) -> dict:
+def compute_prefix_tree_metrics(
+    input_ids,
+    attention_mask=None,
+    max_token_len_per_gpu: int | None = None,
+    dynbsz_estimator: str = "length",
+    micro_batch_size: int = 0,
+) -> dict:
     """Compute prefix-tree metrics as a ``prefix_tree/`` namespace dict.
 
     Returns a dict with keys:
-        ``prefix_tree/sharing_ratio``  — fraction of tokens saved by deduplication
-        ``prefix_tree/flat_tokens``    — deduplicated flat trie token count
-        ``prefix_tree/raw_tokens``     — total raw token count across all sequences
+        ``prefix_tree/global_shared_ratio``      — fraction of tokens saved by deduplication
+        ``prefix_tree/micro_batch_shared_ratio`` — mean per-micro-batch sharing ratio;
+                                                   computed from trie groups (dynbsz) or
+                                                   consecutive slices of ``micro_batch_size`` (fixed mbs)
+        ``prefix_tree/flat_tokens``              — deduplicated flat trie token count
+        ``prefix_tree/raw_tokens``               — total raw token count across all sequences
+        ``prefix_tree/avg_mbs``                  — avg sequences per micro-batch (dynbsz only)
 
     Args:
         input_ids: NestedTensor, padded 2-D Tensor, or list[list[int]].
         attention_mask: Optional mask for padded 2-D case.
+        max_token_len_per_gpu: dynbsz budget; if set, computes trie-based micro-batch groups.
+        dynbsz_estimator: ``"length"`` (flat tokens) or ``"area"`` (sqrt of attention area).
+        micro_batch_size: fixed micro-batch size (sequences per micro-batch) for non-dynbsz mode.
 
     Returns:
         dict of float metrics, all zero if no sequences.
     """
-    from torch import Tensor
-
     if isinstance(input_ids, Tensor) and input_ids.is_nested:
         sequences = [t.tolist() for t in input_ids.unbind()]
     elif isinstance(input_ids, Tensor) and input_ids.dim() == 2:
@@ -732,19 +847,62 @@ def compute_prefix_tree_metrics(input_ids, attention_mask=None) -> dict:
     elif isinstance(input_ids, list):
         sequences = input_ids
     else:
-        return {"prefix_tree/sharing_ratio": 0.0, "prefix_tree/flat_tokens": 0, "prefix_tree/raw_tokens": 0}
+        return {
+            "prefix_tree/global_shared_ratio": 0.0,
+            "prefix_tree/flat_tokens": 0,
+            "prefix_tree/raw_tokens": 0,
+        }
 
     total_raw = sum(len(s) for s in sequences)
     if total_raw == 0:
-        return {"prefix_tree/sharing_ratio": 0.0, "prefix_tree/flat_tokens": 0, "prefix_tree/raw_tokens": 0}
+        return {
+            "prefix_tree/global_shared_ratio": 0.0,
+            "prefix_tree/flat_tokens": 0,
+            "prefix_tree/raw_tokens": 0,
+        }
 
     _, num_tokens = greedy_build_tries(sequences, max_tokens_per_tree=total_raw * 10)
     flat = sum(num_tokens)
-    return {
-        "prefix_tree/sharing_ratio": 1.0 - flat / total_raw,
+    result = {
+        "prefix_tree/global_shared_ratio": 1.0 - flat / total_raw,
         "prefix_tree/flat_tokens": flat,
         "prefix_tree/raw_tokens": total_raw,
     }
+
+    def _micro_batch_ratio(groups_iter) -> float | None:
+        ratios = []
+        for group_seqs in groups_iter:
+            group_raw = sum(len(s) for s in group_seqs)
+            if group_raw == 0:
+                continue
+            _, gnum = greedy_build_tries(group_seqs, max_tokens_per_tree=group_raw * 10)
+            ratios.append(1.0 - sum(gnum) / group_raw)
+        return sum(ratios) / len(ratios) if ratios else None
+
+    if max_token_len_per_gpu is not None:
+        tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=total_raw * 10)
+        if tries:
+            trie = tries[0]
+            use_n2 = dynbsz_estimator == "area"
+            groups = mbs_groups_from_trie(trie, max_token_len_per_gpu, use_n2_cost=use_n2)
+            result["prefix_tree/avg_mbs"] = len(sequences) / len(groups) if groups else 0.0
+            # Per-micro-batch sharing ratio using actual dynbsz groups and the global trie.
+            ratios = []
+            for group in groups:
+                group_raw = sum(len(sequences[i]) for i in group)
+                if group_raw == 0:
+                    continue
+                ratios.append(1.0 - trie_group_flat_tokens(group, trie) / group_raw)
+            if ratios:
+                result["prefix_tree/micro_batch_shared_ratio"] = sum(ratios) / len(ratios)
+    elif micro_batch_size > 0 and len(sequences) >= micro_batch_size:
+        # Fixed micro-batch size: consecutive slices.
+        groups_iter = (sequences[i : i + micro_batch_size] for i in range(0, len(sequences), micro_batch_size))
+        ratio = _micro_batch_ratio(groups_iter)
+        if ratio is not None:
+            result["prefix_tree/micro_batch_shared_ratio"] = ratio
+
+    return result
 
 
 def prepare_prefix_tree_micro_batches(
@@ -759,40 +917,37 @@ def prepare_prefix_tree_micro_batches(
     Expects a pre-built trie stored via ``tu.assign_non_tensor(data, prefix_tree=trie)``.
     If not present, builds one from sequences (backward-compatible fallback).
     """
-    import logging as _logging
-
-    import torch
-
-    from verl.utils import tensordict_utils as tu
-
     _logging.getLogger(__name__).warning_once(
         "prefix_tree is on: max_token_len_per_gpu is interpreted as "
-        "deduplicated (flat trie) token count, not raw sequence length."
+        "deduplicated (flat trie) token count (length estimator) or "
+        "sqrt(non_masked_attention_area) (area estimator), not raw sequence length."
     )
 
     assert "max_token_len_per_gpu" in data.keys(), "max_token_len_per_gpu must be set when use_dynamic_bsz is True"
     max_token_len_per_gpu = data["max_token_len_per_gpu"]
+
+    estimator = tu.get_non_tensor_data(data, "prefix_tree_dynbsz_length_estimator", default="length")
+    use_n2_cost = estimator == "area"
+
+    # After pre-dispatch each CP rank processes flat_tokens/CP tokens, so the total
+    # budget across all CP ranks is max_token_len_per_gpu × sp_size for both estimators.
     max_token_len = max_token_len_per_gpu * sp_size
 
     trie = tu.get_non_tensor_data(data, "prefix_tree", default=None)
     if trie is not None:
-        batch_idx_list = mbs_groups_from_trie(trie, max_token_len)
+        batch_idx_list = mbs_groups_from_trie(trie, max_token_len, use_n2_cost=use_n2_cost)
     else:
         input_ids = data["input_ids"]
         seqs = [t.tolist() for t in input_ids.unbind()]
         batch_idx_list = dfs_micro_batch_groups(seqs, max_token_len)
 
     if torch.distributed.is_initialized() and same_micro_num_in_dp and dp_group is not None:
-        from verl.utils.device import get_torch_device
-
         n_mb = torch.tensor([len(batch_idx_list)], device=get_torch_device().current_device())
         torch.distributed.all_reduce(n_mb, op=torch.distributed.ReduceOp.MAX, group=dp_group)
         while len(batch_idx_list) < n_mb.item():
             batch_idx_list.append(batch_idx_list[-1])
 
     if num_batches_divided_by is not None:
-        from verl.utils.seqlen_balancing import roundup_divisible
-
         target = roundup_divisible(len(batch_idx_list), num_batches_divided_by)
         while len(batch_idx_list) < target:
             batch_idx_list.append(batch_idx_list[-1])
@@ -853,8 +1008,6 @@ def get_dfs_balanced_partitions(
     if not _is_prefix_tree_enabled(config_or_data):
         return None
 
-    import torch
-
     batch_size = data.batch["input_ids"].shape[0] if hasattr(data, "batch") else len(data["input_ids"])
     _ids = data.batch["input_ids"] if hasattr(data, "batch") else data["input_ids"]
     _mask = (
@@ -876,8 +1029,6 @@ def get_dfs_balanced_partitions(
     if hasattr(data, "reorder"):
         data.reorder(torch.tensor(dfs_order))
     else:
-        from verl.utils import tensordict_utils as tu
-
         data = tu.index_select_tensor_dict(data, torch.tensor(dfs_order))
 
     if hasattr(data, "batch") and "attention_mask" in data.batch:
@@ -889,8 +1040,6 @@ def get_dfs_balanced_partitions(
         per_rank = batch_size // dp_size
         partition_lst = [list(range(i * per_rank, (i + 1) * per_rank)) for i in range(dp_size)]
     else:
-        from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions
-
         partition_lst = get_seqlen_balanced_partitions(
             calculate_workload(global_seqlen_lst), k_partitions=dp_size, equal_size=True
         )
@@ -905,10 +1054,6 @@ def get_prefix_balanced_partitions(
     """Partition sequences into k groups using mini-batch trie grouping."""
     if not sequences:
         return [[] for _ in range(k_partitions)]
-
-    import torch
-
-    from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions
 
     groups = build_mini_batch_prefix_groups(sequences)
 
@@ -964,7 +1109,6 @@ def get_prefix_tree_mbs_dp_partitions(
             should appear after ``data.reorder()`` — rank 0's sequences first,
             rank 1's next, etc.
     """
-    from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions
 
     def _fallback_equal_split():
         per_rank = len(sequences) // dp_size
@@ -1015,10 +1159,6 @@ def reorder_and_balance_for_prefix_tree(
     """DFS-reorder batch and compute contiguous partitions for prefix-tree."""
     if not _is_prefix_tree_enabled(config_or_data):
         return False
-
-    import torch
-
-    from verl.utils.seqlen_balancing import log_seqlen_unbalance
 
     result = get_dfs_balanced_partitions(
         data,

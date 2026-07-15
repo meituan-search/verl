@@ -88,8 +88,6 @@ class EngineConfig(BaseConfig):
         # prefix-tree flags: set by apply_engine_config (SFT) or TrainingWorker.__init__ (PPO)
         "use_prefix_tree",
         "prefix_tree_attention",
-        "prefix_tree_for_olp",
-        "prefix_tree_olb_backend",
     }
     # whether to offload param
     param_offload: bool = False

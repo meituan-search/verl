@@ -120,12 +120,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
         # Thread prefix-tree flags from model config → engine meta_info (actor training dedup)
         self.engine_config.use_prefix_tree = self.model_config.get("use_prefix_tree", False)
         self.engine_config.prefix_tree_attention = self.model_config.get("prefix_tree_attention", "flex")
-        # prefix_tree_for_olp=None means "inherit from use_prefix_tree".
-        # model_config.get returns None when the key exists with value None,
-        # ignoring the fallback — handle explicitly.
-        _olp = self.model_config.get("prefix_tree_for_olp", None)
-        self.engine_config.prefix_tree_for_olp = (
-            _olp if _olp is not None else self.engine_config.use_prefix_tree
+        self.engine_config.prefix_tree_dynbsz_length_estimator = self.model_config.get(
+            "prefix_tree_dynbsz_length_estimator", "length"
         )
 
         self.profiler_config = self.config.profiler_config
@@ -354,6 +350,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
             use_fused_kernels=self.engine_config.use_fused_kernels,
             use_prefix_tree=getattr(self.engine_config, "use_prefix_tree", False),
             prefix_tree_attention=getattr(self.engine_config, "prefix_tree_attention", "flex"),
+            prefix_tree_dynbsz_length_estimator=getattr(
+                self.engine_config, "prefix_tree_dynbsz_length_estimator", "length"
+            ),
         )
 
         for key, val in default_keys.items():
@@ -408,10 +407,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
             max_token_len_per_gpu=self.engine_config.infer_max_token_len_per_gpu,
             micro_batch_size_per_gpu=self.engine_config.infer_micro_batch_size_per_gpu,
             use_fused_kernels=self.engine_config.use_fused_kernels,
-            use_prefix_tree=getattr(
-                self.engine_config, "prefix_tree_for_olp", getattr(self.engine_config, "use_prefix_tree", False)
-            ),
+            use_prefix_tree=self.engine_config.use_prefix_tree,
             prefix_tree_attention=getattr(self.engine_config, "prefix_tree_attention", "flex"),
+            prefix_tree_dynbsz_length_estimator=getattr(
+                self.engine_config, "prefix_tree_dynbsz_length_estimator", "length"
+            ),
         )
 
         for key, val in default_keys.items():
@@ -713,6 +713,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             return
 
         set_expandable_segments(False)
+        # Flush PyTorch's CUDA memory cache before sglang resumes physical pages.
+        # Without this, cached-but-freed allocator blocks prevent cuMemCreate from
+        # succeeding even when nominal free memory is sufficient (see verl PR #2253).
+        aggressive_empty_cache(force_sync=True)
         log_gpu_memory_usage("Before resume weights", logger=logger)
 
         # 1. resume rollout memory (weights were released during sleep)

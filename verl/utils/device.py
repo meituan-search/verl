@@ -143,7 +143,10 @@ def set_expandable_segments(enable: bool) -> None:
         This function only has an effect when CUDA is available.
     """
     if is_cuda_available:
-        torch.cuda.memory._set_allocator_settings(f"expandable_segments:{enable}")
+        if hasattr(torch._C, "_accelerator_setAllocatorSettings"):
+            torch._C._accelerator_setAllocatorSettings(f"expandable_segments:{enable}")
+        else:
+            torch.cuda.memory._set_allocator_settings(f"expandable_segments:{enable}")
 
 
 def auto_set_device(config) -> None:
