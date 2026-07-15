@@ -19,8 +19,8 @@ case "$SPLIT" in
   8k)
     MAX_PROMPT=8000
     MAX_RESPONSE=500
-    MAX_TOKEN_LEN=12000
-    MAX_MODEL_LEN=12000
+    MAX_TOKEN_LEN=10000
+    MAX_MODEL_LEN=10000
     ;;
   16k)
     MAX_PROMPT=16384
@@ -103,7 +103,7 @@ TENSORBOARD_DIR="$OUTDIR/tb" python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.ppo_epochs=1 \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=1 \
-    actor_rollout_ref.actor.megatron.context_parallel_size=4 \
+    actor_rollout_ref.actor.megatron.context_parallel_size=8 \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=1 \
     actor_rollout_ref.actor.megatron.use_mbridge=True \
     actor_rollout_ref.actor.megatron.vanilla_mbridge=True \

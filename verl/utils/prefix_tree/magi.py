@@ -579,7 +579,9 @@ def _finalize_prefix_tree_batch(
             params.total_seqlen_k += pad_len
 
     if attention_type == "magi":
-        # Reuse cached MAGI key for OLP→actor_update reuse if tree structure unchanged.
+        # Cache the MAGI key on the subtrie: OLP and actor_update process the same
+        # micro-batch (same sequences, same seqlen) so the key is valid for both passes.
+        # TODO(dynamic-cp): if dynamic_context_parallel is enabled, dump this cache.
         if subtrie is not None and getattr(subtrie, "_cached_magi_key", None) is not None:
             magi_key = subtrie._cached_magi_key
         else:

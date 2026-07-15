@@ -137,6 +137,23 @@ def no_padding_2_padding(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor
     else:
         attention_mask = data["attention_mask"]
         assert not attention_mask.is_nested
+        # Same DP-padding truncation as the nested-prompt branch: prefix-tree outputs
+        # are nested tensors even when prompts are 2D-padded.  The DP dispatch may
+        # append dummy sequences to make the batch divisible by DP size; truncate them
+        # so the token-count assertion below doesn't spuriously fire.
+        if tensor.is_nested:
+            expected_bsz = prompt_ids.shape[0]
+            actual_bsz = tensor.offsets().shape[0] - 1
+            if actual_bsz > expected_bsz:
+                import logging as _log
+                _log.getLogger(__name__).error(
+                    "no_padding_2_padding: nested tensor has %d seqs, "
+                    "expected %d — DP-padding duplicate, truncating",
+                    actual_bsz, expected_bsz,
+                )
+                tensor = torch.nested.as_nested_tensor(
+                    list(tensor.unbind())[:expected_bsz], layout=torch.jagged
+                )
         prompt_lens = attention_mask[:, : prompt_ids.shape[1]].sum(dim=1)
         response_lens = attention_mask[:, prompt_ids.shape[1] :].sum(dim=1)
         max_response_len = response_ids.shape[1]
@@ -145,7 +162,10 @@ def no_padding_2_padding(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor
 
     sequence_lens = prompt_lens + response_lens
     sequence_offsets = sequence_lens.cumsum(dim=0)
-    assert sequence_offsets[-1].item() == values.shape[0]
+    assert sequence_offsets[-1].item() == values.shape[0], (
+        f"token count mismatch: expected {sequence_offsets[-1].item()} (sum of prompt+response lens) "
+        f"but tensor has {values.shape[0]} tokens — likely a prefix-tree expansion bug or stale DP truncation"
+    )
     assert not prompt_lens.eq(0).any(), f"seq_offset - resp_len - 1 assumes prompt_len > 0. Got {prompt_lens}"
 
     response_list = []

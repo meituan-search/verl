@@ -133,26 +133,6 @@ class PrefixTrie:
 
     # ── metrics ───────────────────────────────────────────────────────────
 
-    def global_shared_ratio(self) -> float:
-        """Fraction of tokens saved by prefix deduplication across the full batch.
-
-        = 1 - (flat_trie_tokens / total_raw_tokens)
-
-        Replaces ``prefix_tree/global_shared_ratio`` in ``compute_prefix_tree_metrics``.
-        """
-        # sequence_ids has been removed from TrieNode; raw token count cannot be
-        # computed without knowing how many sequences each leaf serves.
-        raise NotImplementedError("global_shared_ratio not yet implemented for PrefixTrie")
-
-    def mbs_shared_ratio(
-        self,
-    ) -> float:
-        """
-        after create a series of subtries, calculate for each subtrie and pass upward
-        Replaces ``prefix_tree/micro_batch_shared_ratio`` in ``compute_prefix_tree_metrics``.
-        """
-        raise NotImplementedError
-
     # ── future: KV cache ──────────────────────────────────────────────────
     # kv_cache: list[Optional[Tensor]]  # indexed by flat_idx — same as nodes
 
@@ -318,7 +298,7 @@ def build_global_tree_from_segments(
     samples: list,
     segment_hashes,
     segment_lengths,
-) -> Optional["TrieNode"]:
+) -> Optional[TrieNode]:
     """Build a global TrieNode from segment metadata for all uid-groups.
 
     O(N) construction using known prefix structure — no token-by-token
@@ -397,3 +377,19 @@ def build_global_tree_from_segments(
 
     return trie_root if trie_root.nodes else None
 
+
+def trie_ancestors(node: TrieNode) -> list[TrieNode]:
+    """Return ancestor chain from root-child down to node's parent (exclusive of node)."""
+    chain: list[TrieNode] = []
+    cur = node.ancestor
+    while cur is not None:
+        chain.append(cur)
+        cur = cur.ancestor
+    chain.reverse()
+    return chain
+
+
+def _is_prefix_tree_enabled(config_or_data) -> bool:
+    if isinstance(config_or_data, dict):
+        return config_or_data.get("use_prefix_tree", False)
+    return bool(getattr(config_or_data, "use_prefix_tree", False))

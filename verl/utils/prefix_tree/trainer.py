@@ -21,6 +21,7 @@ the caller never needs to gate on ``use_prefix_tree``.
 from __future__ import annotations
 
 from verl.utils.prefix_tree.dynamic import compute_prefix_tree_metrics
+from verl.utils.prefix_tree.tree import _is_prefix_tree_enabled
 
 
 def apply_engine_config(engine_config, config_or_data: dict) -> None:
@@ -60,9 +61,3 @@ def compute_metrics(
             micro_batch_size=micro_batch_size,
         )
     )
-
-
-def _is_prefix_tree_enabled(config_or_data) -> bool:
-    if isinstance(config_or_data, dict):
-        return config_or_data.get("use_prefix_tree", False)
-    return bool(getattr(config_or_data, "use_prefix_tree", False))
