@@ -139,4 +139,4 @@ Plan.md
 # AI tool dirs and editor sessions
 .agent/
 .gemini/
-*.vim
+*.vimvim

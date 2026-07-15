@@ -36,8 +36,8 @@ from verl.utils.chat_template import apply_chat_template, extract_system_prompt_
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.dataset.vision_utils import process_image, process_video
 from verl.utils.fs import copy_local_path_from_hdfs
+from verl.utils.prefix_tree.magi import _hash_prefix as _hash_prefix_ids
 from verl.utils.py_functional import convert_nested_value_to_list_recursive
-from verl.utils.prefix_tree_magi import _hash_prefix as _hash_prefix_ids
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -178,7 +178,9 @@ class MultiTurnSFTDataset(Dataset):
 
         # system prompt: <|im_start|>system\nYou are a helpful assistant.<|im_end|>\n
         # generation prompt: <|im_start|>assistant\n
-        self.system_prompt, self.generation_prompt = extract_system_prompt_and_generation(self.tokenizer)
+        self.system_prompt, self.generation_prompt = extract_system_prompt_and_generation(
+            self.tokenizer, **self.apply_chat_template_kwargs
+        )
 
     def __len__(self):
         return len(self.messages)

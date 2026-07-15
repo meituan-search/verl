@@ -42,7 +42,11 @@ from verl.utils.megatron.router_replay_utils import (
     reorder_and_merge_vpp_layers,
     set_router_replay_data,
 )
-from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_log_probs_from_logits
+from verl.utils.megatron.tensor_parallel import (
+    vocab_parallel_entropy,
+    vocab_parallel_log_probs_from_logits,
+    vocab_parallel_sum_pi_squared,
+)
 from verl.utils.megatron_peft_utils import add_base_layer_suffix, build_peft_config_for_vllm
 from verl.utils.megatron_utils import (
     check_mtp_config,
@@ -272,6 +276,7 @@ class MegatronEngine(BaseEngine):
             is_value_model=self.is_value_model,
             wrap_with_ddp=wrap_with_ddp,
             use_distributed_optimizer=self.engine_config.use_distributed_optimizer,
+            use_megatron_fsdp=self.engine_config.use_megatron_fsdp,
         )
         if self.is_value_model:
             self.model_config.hf_config.tie_word_embeddings = False
@@ -425,6 +430,7 @@ class MegatronEngine(BaseEngine):
             provider=self.provider,
             peft_cls=self.peft_cls,
             use_dist_checkpointing=self.engine_config.use_dist_checkpointing,
+            use_megatron_fsdp=self.engine_config.use_megatron_fsdp,
         )
 
         self.to(
@@ -820,7 +826,25 @@ class MegatronEngineWithLMHead(MegatronEngine):
         batch = batch.to(get_device_id())
         use_fused_kernels = tu.get_non_tensor_data(batch, key="use_fused_kernels", default=False)
         calculate_entropy = tu.get_non_tensor_data(batch, key="calculate_entropy", default=False)
+        calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
         distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
+        use_prefix_tree = tu.get_non_tensor_data(batch, key="use_prefix_tree", default=False)
+        prefix_tree_attention = tu.get_non_tensor_data(batch, key="prefix_tree_attention", default="flex")
+        if use_prefix_tree:
+            assert self.engine_config.use_remove_padding, (
+                "use_prefix_tree=True requires use_remove_padding=True (THD format). "
+                "Set model.use_remove_padding=True in your config."
+            )
+            assert prefix_tree_attention in ("flex", "magi"), (
+                f"prefix_tree_attention must be 'flex' or 'magi', got {prefix_tree_attention!r}"
+            )
+        prefix_segments_batch = tu.get_non_tensor_data(batch, key="prefix_segments", default=None)
+
+        if calculate_sum_pi_squared and use_fused_kernels:
+            raise NotImplementedError(
+                "calculate_sum_pi_squared=True is not supported with use_fused_kernels=True: "
+                "fused kernels do not materialize the full logits tensor needed for Σπ²."
+            )
         pad_mode = tu.get_non_tensor_data(batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
         temperature = batch["temperature"]
         model_inputs = self.prepare_model_inputs(batch)
@@ -898,6 +922,9 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 assert torch.all(temperature > 0).item(), f"temperature tensor must be positive. Got {temperature}"
                 logits.div_(temperature.unsqueeze(dim=-1).to(logits.dtype))
                 ret = {}
+                # sum_pi_squared is non-destructive — must run before vocab_parallel_entropy.
+                if calculate_sum_pi_squared:
+                    ret["sum_pi_squared"] = vocab_parallel_sum_pi_squared(logits)
                 if calculate_entropy:
                     logits_bak = logits.clone()
                     # # disable the hint until the fused_kernel is optimized for triton>=3.3
@@ -919,32 +946,14 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 ret["log_probs"] = log_probs
                 return ret
 
-            use_prefix_tree = tu.get_non_tensor_data(batch, key="use_prefix_tree", default=False)
-            prefix_tree_attention = tu.get_non_tensor_data(batch, key="prefix_tree_attention", default="flex")
-            if use_prefix_tree:
-                assert self.engine_config.use_remove_padding, (
-                    "use_prefix_tree=True requires use_remove_padding=True (THD format). "
-                    "Set model.use_remove_padding=True in your config."
-                )
-                assert prefix_tree_attention in ("flex", "magi"), (
-                    f"prefix_tree_attention must be 'flex' or 'magi', got {prefix_tree_attention!r}"
-                )
-            prefix_segments_batch = tu.get_non_tensor_data(batch, key="prefix_segments", default=None)
+            from verl.utils.prefix_tree.magi import get_prefix_tree_kwargs
+
             logits_processor_args = {
                 "label": label,
                 "temperature": temperature,
                 "loss_mask": loss_mask,
-                "use_prefix_tree": use_prefix_tree,
-                "prefix_tree_attention": prefix_tree_attention,
-                "prefix_segments_batch": prefix_segments_batch,
+                **get_prefix_tree_kwargs(use_prefix_tree, prefix_tree_attention, prefix_segments_batch),
             }
-
-            # COMPARE_LAYERS: reset capture state before each forward
-            import os as _os
-            if _os.environ.get('COMPARE_LAYERS') == '1':
-                import verl.models.mcore.prefix_tree_merge as _mp
-                _mp._layer_capture.clear()
-                _mp._layer_counter[0] = 0
 
             output = forward_fn(
                 model,
@@ -958,12 +967,6 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 mtp_enable_train=self.model_config.mtp.enable and self.model_config.mtp.enable_train,
                 local_cp_size=local_cp_size,
             )
-
-        # COMPARE_LAYERS: reset layer counter for next forward (save happens in engine_workers after bwd)
-        import os as _os
-        if _os.environ.get('COMPARE_LAYERS') == '1':
-            import verl.models.mcore.prefix_tree_merge as _mp
-            _mp._layer_counter[0] = 0
 
         # Router replay: record routing decisions for R2 mode
         if RouterReplayHelper.is_r2_record_action(self.tf_config, vp_rank):

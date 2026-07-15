@@ -239,7 +239,11 @@ class SFTTrainer:
         dp_size = self.engine.get_data_parallel_size()
 
         self.train_sampler = DistributedSampler(
-            self.train_dataset, shuffle=self.config.data.get("shuffle", True), num_replicas=dp_size, rank=dp_rank, drop_last=True
+            self.train_dataset,
+            shuffle=self.config.data.get("shuffle", True),
+            num_replicas=dp_size,
+            rank=dp_rank,
+            drop_last=True,
         )
 
         self.global_batch_size = config.data.train_batch_size
@@ -408,6 +412,9 @@ class SFTTrainer:
                     ).item()
                     total_tokens += metrics["train/global_tokens"]
                     metrics["train/total_tokens(B)"] = total_tokens / 1e9
+                    if self.config.data.get("use_prefix_tree", False):
+                        from verl.utils.prefix_tree.dynamic import compute_prefix_tree_metrics
+                        metrics.update(compute_prefix_tree_metrics(data["input_ids"]))
 
                     if self.engine.get_data_parallel_rank() == 0:
                         tracking.log(data=metrics, step=global_step)
