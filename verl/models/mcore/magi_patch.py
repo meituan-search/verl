@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Backward-compatibility shim — use verl.utils.prefix_tree.prefix_tree_patch_impl instead."""
+"""Backward-compatibility shim: use verl.utils.prefix_tree.prefix_tree_patch_impl instead."""
 
 from verl.utils.prefix_tree.prefix_tree_patch_impl import (  # noqa: F401
     apply_magi_patch,

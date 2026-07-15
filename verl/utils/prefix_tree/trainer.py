@@ -14,7 +14,7 @@
 
 """Prefix-tree helpers consumed by verl trainers (SFT, PPO).
 
-Every public function here is a single call that checks *config* internally —
+Every public function here is a single call that checks *config* internally;
 the caller never needs to gate on ``use_prefix_tree``.
 """
 

@@ -15,16 +15,16 @@
 
 Class hierarchy:
 
-    TrieNode        — compressed trie node; root holds flat DFS-ordered ``nodes``
+    TrieNode:       compressed trie node; root holds flat DFS-ordered ``nodes``
                       list; ``nodes[i].flat_idx == i`` for O(1) lookup and future
                       KV-cache indexing.
 
-    PrefixTrie      — common interface for navigating a prefix trie.
+    PrefixTrie:     common interface for navigating a prefix trie.
                       Both the global trie and per-micro-batch view expose this
                       interface so callers need not distinguish between them.
                       Future: ``kv_cache: list[Tensor]`` indexed by ``flat_idx``.
 
-    PrefixSubTrie   — per-micro-batch view into a PrefixTrie.  Inherits the
+    PrefixSubTrie:  per-micro-batch view into a PrefixTrie.  Inherits the
                       PrefixTrie interface.  Serialisable: ``leaf_node_ids`` and
                       ``leaf_to_sample`` are plain int lists; ``source`` is a
                       local-only back-reference, never transmitted cross-node.
@@ -38,7 +38,7 @@ from typing import Optional
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# TrieNode — compressed trie node (immutable after construction)
+# TrieNode: compressed trie node (immutable after construction)
 # ---------------------------------------------------------------------------
 
 
@@ -50,8 +50,8 @@ class TrieNode:
     set of sequences.  The root has no tokens and no parent (``ancestor=None``).
 
     ``nodes`` (root-only): flat DFS-ordered list of all non-root nodes.
-    ``nodes[i].flat_idx == i`` — assigned once during construction and never
-    mutated, making the trie effectively immutable after build.
+    ``nodes[i].flat_idx == i`` (assigned once during construction and never
+    mutated, making the trie effectively immutable after build).
     """
 
     tree_id: int
@@ -62,14 +62,14 @@ class TrieNode:
     children: dict[int, TrieNode] = field(default_factory=dict)
     # Sequence IDs that pass through this node (from trie construction).
     sequence_ids: list[int] = field(default_factory=list)
-    # Direct parent reference — single hop upward; None on root.
+    # Direct parent reference: single hop upward; None on root.
     ancestor: Optional[TrieNode] = None
     # Root-only: flat DFS list; nodes[i].flat_idx == i.
     nodes: list[TrieNode] = field(default_factory=list)
     # Root-only: leaves[sample_idx] = leaf TrieNode for that sample.
     # Direct O(1) index → leaf map; populated during tree construction.
     leaves: list[Optional[TrieNode]] = field(default_factory=list)
-    # DFS index in root.nodes — set once by _compress_trie; -1 on root.
+    # DFS index in root.nodes: set once by _compress_trie; -1 on root.
     flat_idx: int = -1
 
     @property
@@ -78,7 +78,7 @@ class TrieNode:
 
 
 # ---------------------------------------------------------------------------
-# PrefixTrie — common interface (global trie + subtrie view)
+# PrefixTrie: common interface (global trie + subtrie view)
 # ---------------------------------------------------------------------------
 
 
@@ -86,8 +86,8 @@ class PrefixTrie:
     """Common interface for navigating a prefix trie.
 
     Concrete subclasses:
-      - PrefixTrie itself  — wraps the global TrieNode root for a full batch
-      - PrefixSubTrie      — filtered view for one micro-batch
+      - PrefixTrie itself:  wraps the global TrieNode root for a full batch
+      - PrefixSubTrie:      filtered view for one micro-batch
 
     Both expose the same interface so downstream code (layout builder, MAGI
     key construction, KV-cache lookup) works identically on either.
@@ -98,7 +98,7 @@ class PrefixTrie:
 
     def __init__(self, root: TrieNode) -> None:
         self.root = root
-        self.nodes = root.nodes  # shared reference — no copy
+        self.nodes = root.nodes  # shared reference, no copy
 
     # ── navigation ────────────────────────────────────────────────────────
 
@@ -134,11 +134,11 @@ class PrefixTrie:
     # ── metrics ───────────────────────────────────────────────────────────
 
     # ── future: KV cache ──────────────────────────────────────────────────
-    # kv_cache: list[Optional[Tensor]]  # indexed by flat_idx — same as nodes
+    # kv_cache: list[Optional[Tensor]]  # indexed by flat_idx, same as nodes
 
 
 # ---------------------------------------------------------------------------
-# PrefixSubTrie — per-micro-batch view
+# PrefixSubTrie: per-micro-batch view
 # ---------------------------------------------------------------------------
 
 
@@ -151,8 +151,8 @@ class PrefixSubTrie(PrefixTrie):
 
     Serialisation
     -------------
-    ``leaf_node_ids`` and ``leaf_to_sample`` are plain int lists — tiny cross-
-    node footprint.  ``source`` is a local-only reference (not serialised);
+    ``leaf_node_ids`` and ``leaf_to_sample`` are plain int lists (tiny cross-
+    node footprint).  ``source`` is a local-only reference (not serialised);
     re-attach after deserialisation to enable KV-cache lookup.
     """
 
@@ -246,7 +246,7 @@ class PrefixSubTrie(PrefixTrie):
             node = by_flat_idx[flat_idx]
             if ancestor_flat_idx != -1 and ancestor_flat_idx in by_flat_idx:
                 node.ancestor = by_flat_idx[ancestor_flat_idx]
-                # Key by flat_idx (always unique) not first_token — keying by first
+                # Key by flat_idx (always unique) not first_token: keying by first
                 # token causes silent collision when two siblings start with the same
                 # token (e.g. two rollout responses both begin with the same word).
                 by_flat_idx[ancestor_flat_idx].children[flat_idx] = node
@@ -290,7 +290,7 @@ class PrefixSubTrie(PrefixTrie):
 
 
 # ---------------------------------------------------------------------------
-# Segment-based global trie construction (O(N) — no token comparison)
+# Segment-based global trie construction (O(N), no token comparison)
 # ---------------------------------------------------------------------------
 
 
@@ -301,7 +301,7 @@ def build_global_tree_from_segments(
 ) -> Optional[TrieNode]:
     """Build a global TrieNode from segment metadata, supporting multilevel trees.
 
-    O(N) construction using known prefix structure — no token-by-token
+    O(N) construction using known prefix structure, no token-by-token
     comparison.  Returns a TrieNode root compatible with ``mbs_groups_from_trie``
     and ``subtrie_view``.
 
@@ -327,7 +327,7 @@ def build_global_tree_from_segments(
 
     from verl.utils.prefix_tree.segment_grouper import group_by_segment_hash
 
-    # Normalize samples to list[list[int]] — production caller passes lists,
+    # Normalize samples to list[list[int]]: production caller passes lists,
     # tests may pass tensors.
     samples = [s.tolist() if hasattr(s, "tolist") else list(s) for s in samples]
 

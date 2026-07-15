@@ -774,7 +774,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         log_gpu_memory_usage("After resume kv_cache", logger=logger)
 
         self.base_sync_done = True
-        # NOTE: intentionally not re-enabling expandable segments here — doing so
+        # NOTE: intentionally not re-enabling expandable segments here: doing so
         # after weight sync causes PyTorch to make large memory reservations (OOM).
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)

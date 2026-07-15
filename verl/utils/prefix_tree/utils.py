@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import logging as _log
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Optional
@@ -24,6 +26,10 @@ from torch import Tensor
 from verl.utils.prefix_tree.tree import PrefixSubTrie, TrieNode
 
 RangeSpec = tuple[int, int]
+
+# MAGI_DUMP_STRUCT: read-only structural-dump call counter (Dump A).
+# Incremented per build_layout_from_tree_node call when the dump is active.
+_struct_dump_counter = 0
 
 
 @dataclass
@@ -261,7 +267,7 @@ def build_layout_from_tree_node(
     def _emit_attn(node: TrieNode) -> None:
         if not node.input_ids or node._flat_start >= node._flat_end:
             # No tokens or empty range after donation (e.g. single-token node that
-            # donated its only token to children) — skip rects, still recurse.
+            # donated its only token to children): skip rects, still recurse.
             for child in _subtrie_children(node):
                 _emit_attn(child)
             return
@@ -308,6 +314,40 @@ def build_layout_from_tree_node(
 
     for root in root_nodes:
         _annotate(root, 0)
+
+    # --- Dump A: per-mb ALIGNMENT (read-only, MAGI_DUMP_STRUCT=1) ---
+    # Fires after _annotate finalizes leaf_node_id_to_sample + node._owner_sample,
+    # before _emit. Captures leaf→sample mapping + per-sample first-8 tokens so we
+    # can correlate leaf ownership with the logprob-dump sample_id (by first-tokens,
+    # since uid is NOT in scope here: only samples/subtrie are passed in).
+    global _struct_dump_counter
+    if os.environ.get("MAGI_DUMP_STRUCT") == "1":
+        try:
+            _struct_dump_counter += 1
+            _c = _struct_dump_counter
+            if _c <= 128:
+                _root_owner = getattr(root_nodes[0], "_owner_sample", None) if root_nodes else None
+                _first_tokens = {}
+                for _s in range(len(samples)):
+                    _t = samples[_s]
+                    _first_tokens[_s] = _t[:8].detach().cpu().clone().tolist()
+                _rec = {
+                    "call": _c,
+                    "leaf_node_id_to_sample": dict(leaf_node_id_to_sample),
+                    "leaf_node_id_to_samples": {k: list(v) for k, v in leaf_node_id_to_samples.items()},
+                    "root_owner_sample": _root_owner,
+                    "num_samples": len(samples),
+                    "sample_first_tokens": _first_tokens,
+                    "leaf_node_ids": list(subtrie.leaf_node_ids),
+                    "leaf_to_sample": list(subtrie.leaf_to_sample),
+                    "num_root_nodes": len(root_nodes),
+                }
+                _dir = "/tmp/claude/magi_struct_dump"
+                os.makedirs(_dir, exist_ok=True)
+                torch.save(_rec, os.path.join(_dir, f"align_mb{_c}.pt"))
+        except Exception as _e:
+            _struct_logger = _log.getLogger(__name__)
+            _struct_logger.warning(f"MAGI_DUMP_STRUCT failed (Dump A): {_e}")
 
     device = samples[0].device
     flat_pieces: list[Tensor] = []

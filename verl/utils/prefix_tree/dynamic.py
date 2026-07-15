@@ -68,7 +68,7 @@ __all__ = [
 ]
 
 
-# TrieNode is canonical in tree.py — import from there (single definition).
+# TrieNode is canonical in tree.py; import from there (single definition).
 # Old code using .ancestors (list) will raise AttributeError immediately.
 from verl.utils.prefix_tree.tree import (  # noqa: E402
     PrefixSubTrie,
@@ -80,7 +80,7 @@ from verl.utils.prefix_tree.tree import (  # noqa: E402
 
 
 class _BuildNode:
-    """Internal — temporary uncompressed node used during insertion."""
+    """Internal: temporary uncompressed node used during insertion."""
 
     __slots__ = ("tree_id", "token_id", "node_id", "children", "is_end", "sequence_ids")
 
@@ -177,7 +177,7 @@ def greedy_build_tries(
             a huge value when you want a single forest).
 
     Returns:
-        (tries, num_tokens_list) — list of compressed TrieNode roots + total
+        (tries, num_tokens_list): list of compressed TrieNode roots + total
         uncompressed nodes per tree.
     """
     # Fast path: when max_tokens_per_tree is huge (e.g., sum*10), build single tree
@@ -225,12 +225,12 @@ def convert_trie_to_tree_node(
     """
     if not trie.children:
         _logging.getLogger(__name__).warning(
-            "prefix_tree: convert_trie_to_tree_node: trie has no children — no sharing, returning None"
+            "prefix_tree: convert_trie_to_tree_node: trie has no children; no sharing, returning None"
         )
         return None
     if len(trie.children) > 1:
         _logging.getLogger(__name__).warning(
-            "prefix_tree: convert_trie_to_tree_node: multiple roots (%d) — returning None",
+            "prefix_tree: convert_trie_to_tree_node: multiple roots (%d), returning None",
             len(trie.children),
         )
         return None
@@ -251,7 +251,7 @@ def build_tree_dynamic(samples: list[Tensor]) -> Optional[PrefixSubTrie]:
     tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=max_tokens_per_tree)
     if not tries or len(tries) > 1:
         _logging.getLogger(__name__).warning(
-            "prefix_tree: build_tree_dynamic: multi-forest or empty tries (len=%d) — returning None",
+            "prefix_tree: build_tree_dynamic: multi-forest or empty tries (len=%d), returning None",
             len(tries),
         )
         return None
@@ -271,7 +271,7 @@ def _trie_seq_ids(node: TrieNode) -> list[int]:
 def _trie_effective_tokens(node: TrieNode) -> int:
     """Total unique (flat) tokens in a compressed-trie subtree.
 
-    Counts the tokens owned by this node plus all its descendants — i.e. the
+    Counts the tokens owned by this node plus all its descendants, i.e. the
     flat token count that would result from laying this subtree out for
     prefix-tree attention.
     """
@@ -285,7 +285,7 @@ def trie_group_flat_tokens(group: list[int], trie: TrieNode) -> int:
     """Flat (deduplicated) token count for a subset of sequences within a trie.
 
     Counts tokens on the minimal sub-trie spanning exactly the sequences in
-    ``group`` — i.e. the effective forward-pass token budget when those
+    ``group``, i.e. the effective forward-pass token budget when those
     sequences are processed together with prefix sharing.
 
     Args:
@@ -328,8 +328,8 @@ def build_mini_batch_prefix_groups(
     Returns:
         List of ``(seq_indices, effective_token_count)`` pairs.
 
-        * ``seq_indices`` — original sample indices that share a common prefix.
-        * ``effective_token_count`` — flat (deduplicated) token count for this
+        * ``seq_indices``: original sample indices that share a common prefix.
+        * ``effective_token_count``: flat (deduplicated) token count for this
           group: shared prefix length + unique branch tokens.  Use this instead
           of raw sequence lengths for load-balancing workload estimates.
     """
@@ -351,11 +351,11 @@ def build_mini_batch_prefix_groups(
             current = child
 
         if not current.children:
-            # Leaf — all sequences in this trie share the full path (e.g. identical
+            # Leaf: all sequences in this trie share the full path (e.g. identical
             # sequences, or a single sequence).
             groups.append((list(current.sequence_ids), shared_len))
         else:
-            # Branching node — each child subtree is an independent group.
+            # Branching node: each child subtree is an independent group.
             for child in current.children.values():
                 seq_ids = _trie_seq_ids(child)
                 effective = shared_len + _trie_effective_tokens(child)
@@ -370,7 +370,7 @@ def dfs_leaf_order(
 ) -> list[int]:
     """Return sample indices in DFS pre-order.
 
-    If ``trie`` is provided (pre-built), walks it directly — no rebuild.
+    If ``trie`` is provided (pre-built), walks it directly, no rebuild.
     Otherwise builds one via greedy token-by-token insertion.
 
     Args:
@@ -402,7 +402,7 @@ def dfs_micro_batch_groups(
 
     Builds ONE trie over all sequences, then traverses leaves in DFS pre-order.
     Greedily packs leaves into micro-batches: the **budget is flat (deduplicated)
-    trie tokens** — prefix counted once + unique branch tokens — not raw sequence
+    trie tokens**: prefix counted once + unique branch tokens; not raw sequence
     lengths.  This means a micro-batch of k sequences that share a long common
     prefix uses far fewer budget tokens than k × seq_len, allowing more sequences
     per batch.
@@ -444,7 +444,7 @@ def dfs_micro_batch_groups(
                 inc = sum(len(n.input_ids) for n in new_nodes)
 
                 if current_group and current_eff + inc > max_token_len:  # noqa: B023
-                    # Flush — start a fresh batch with this leaf
+                    # Flush: start a fresh batch with this leaf
                     all_groups.append(current_group[:])  # noqa: B023
                     current_group.clear()  # noqa: B023
                     covered.clear()  # noqa: B023
@@ -497,7 +497,7 @@ def trie_dfs_leaf_order_from_leaf_idx(leaf_idx: np.ndarray, trie: TrieNode) -> l
     leaf_to_positions: dict[int, list[int]] = {}
     for new_pos, leaf_fid in enumerate(leaf_idx.tolist()):
         if leaf_fid < 0:
-            raise ValueError(f"leaf_idx[{new_pos}]={leaf_fid} — sample has no leaf assigned.")
+            raise ValueError(f"leaf_idx[{new_pos}]={leaf_fid}; sample has no leaf assigned.")
         leaf_to_positions.setdefault(int(leaf_fid), []).append(new_pos)
 
     ordered: list[int] = []
@@ -609,7 +609,7 @@ def mbs_groups_from_leaf_idx(
     for new_pos, leaf_fid in enumerate(leaf_idx.tolist()):
         if leaf_fid < 0:
             raise ValueError(
-                f"leaf_idx[{new_pos}]={leaf_fid} — sample has no leaf assigned. "
+                f"leaf_idx[{new_pos}]={leaf_fid}; sample has no leaf assigned. "
                 f"_build_global_trie must populate leaf_idx for every sample."
             )
         leaf_to_positions.setdefault(int(leaf_fid), []).append(new_pos)
@@ -617,8 +617,7 @@ def mbs_groups_from_leaf_idx(
     for node in trie.nodes:
         if not node.children and node.flat_idx not in leaf_to_positions:
             raise ValueError(
-                f"trie leaf flat_idx={node.flat_idx} has no sample in leaf_idx — "
-                f"trie and leaf_idx are out of sync."
+                f"trie leaf flat_idx={node.flat_idx} has no sample in leaf_idx: trie and leaf_idx are out of sync."
             )
 
     all_groups: list[list[int]] = []
@@ -694,7 +693,7 @@ def subtrie_view(
     if not leaf_to_sample:
         return None
     if set(leaf_to_sample) != keep_leaf_ids:
-        _logging.getLogger(__name__).warning("prefix_tree: subtrie_view: unmatched sequences — FA3 fallback")
+        _logging.getLogger(__name__).warning("prefix_tree: subtrie_view: unmatched sequences: FA3 fallback")
         return None
     batch_size = max(leaf_to_sample) + 1 if leaf_to_sample else 0
     subtrie = PrefixSubTrie(
@@ -719,7 +718,7 @@ def compute_prefix_sharing_ratio(input_ids, attention_mask=None) -> float:
         input_ids: One of:
             - ``torch.nested`` ``NestedTensor`` (jagged, SFT no-padding path)
             - ``list[list[int]]`` of raw token sequences
-            - 2-D padded ``Tensor`` of shape ``(batch, max_len)`` — requires
+            - 2-D padded ``Tensor`` of shape ``(batch, max_len)``: requires
               ``attention_mask`` to trim padding
         attention_mask: Optional 2-D ``Tensor`` ``(batch, max_len)`` used to
             trim padding when ``input_ids`` is a padded 2-D tensor.
@@ -761,13 +760,13 @@ def compute_prefix_tree_metrics(
     """Compute prefix-tree metrics as a ``prefix_tree/`` namespace dict.
 
     Returns a dict with keys:
-        ``prefix_tree/global_shared_ratio``      — fraction of tokens saved by deduplication
-        ``prefix_tree/micro_batch_shared_ratio`` — mean per-micro-batch sharing ratio;
+        ``prefix_tree/global_shared_ratio``      : fraction of tokens saved by deduplication
+        ``prefix_tree/micro_batch_shared_ratio`` : mean per-micro-batch sharing ratio;
                                                    computed from trie groups (dynbsz) or
                                                    consecutive slices of ``micro_batch_size`` (fixed mbs)
-        ``prefix_tree/packed_tokens``             — deduplicated packed trie token count
-        ``prefix_tree/raw_tokens``               — total raw token count across all sequences
-        ``prefix_tree/avg_mbs``                  — avg sequences per micro-batch (dynbsz only)
+        ``prefix_tree/packed_tokens``             : deduplicated packed trie token count
+        ``prefix_tree/raw_tokens``               : total raw token count across all sequences
+        ``prefix_tree/avg_mbs``                  : avg sequences per micro-batch (dynbsz only)
 
     Args:
         input_ids: NestedTensor, padded 2-D Tensor, or list[list[int]].
@@ -916,7 +915,7 @@ def prepare_prefix_tree_micro_batches(
             batch_idx_list.append(batch_idx_list[-1])
 
     micro_batches = [tu.index_select_tensor_dict(data, idx) for idx in batch_idx_list]
-    # Compute deduplicated (flat) token count per micro-batch — used for PP
+    # Compute deduplicated (flat) token count per micro-batch, used for PP
     # sort and for imbalance diagnostics.
     if trie is not None:
         tokens_per_group = [trie_group_flat_tokens(g, trie) for g in batch_idx_list]
@@ -940,7 +939,7 @@ def create_and_attach_subtrie_views(micro_batches, batch_idx_list, trie) -> None
 
     Reads ``leaf_idx`` from each microbatch's ``non_tensor_batch`` (which
     survives ``DataProto.reorder`` automatically) to determine which leaf
-    each local sample belongs to — no dependence on the trie's
+    each local sample belongs to, no dependence on the trie's
     ``sequence_ids`` (which go stale after reorder).
     """
     if trie is None or batch_idx_list is None:
@@ -952,7 +951,7 @@ def create_and_attach_subtrie_views(micro_batches, batch_idx_list, trie) -> None
             raise ValueError(
                 "create_and_attach_subtrie_views: microbatch has no leaf_idx in "
                 "non_tensor_batch.  _build_global_trie must attach leaf_idx and it "
-                "must survive reorder/chunk — this is a bug."
+                "must survive reorder/chunk: this is a bug."
             )
         leaf_to_local: dict[int, int] = {}
         leaf_node_ids: list[int] = []
@@ -960,8 +959,7 @@ def create_and_attach_subtrie_views(micro_batches, batch_idx_list, trie) -> None
         for local_pos, leaf_fid in enumerate(mb_leaf_idx.tolist()):
             if leaf_fid < 0:
                 raise ValueError(
-                    f"microbatch leaf_idx[{local_pos}]={leaf_fid} — no leaf assigned "
-                    f"(bug in _build_global_trie)."
+                    f"microbatch leaf_idx[{local_pos}]={leaf_fid}; no leaf assigned (bug in _build_global_trie)."
                 )
             if leaf_fid not in leaf_to_local:
                 leaf_to_local[leaf_fid] = len(leaf_node_ids)
@@ -1092,7 +1090,7 @@ def get_prefix_tree_mbs_dp_partitions(
         mbs_per_rank: ``mbs_per_rank[i]`` is the list of mbs groups (each a
             ``list[int]`` of sequence indices) assigned to rank ``i``.
         new_seq_order: Flat list of original sequence indices in the order they
-            should appear after ``data.reorder()`` — rank 0's sequences first,
+            should appear after ``data.reorder()``; rank 0's sequences first,
             rank 1's next, etc.
     """
 
@@ -1206,7 +1204,7 @@ def build_local_mbs_groups(
             default=-1,
         )
         if trie_max_id < n_local:
-            # Trie was built from the shard's local samples — IDs are local positions.
+            # Trie was built from the shard's local samples; IDs are local positions.
             # Process per-branch, but no global→local translation needed.
             all_groups: list[list[int]] = []
             for token, child in dp_subtrie.children.items():
@@ -1215,7 +1213,7 @@ def build_local_mbs_groups(
                 all_groups.extend(mbs_groups_from_trie(branch_root, max_token_len))
             return [list(g) for g in all_groups if g]
 
-        # Trie uses global IDs — invert global_idx to a {global_id: local_pos} dict.
+        # Trie uses global IDs: invert global_idx to a {global_id: local_pos} dict.
         mapping: dict[int, int] = {g: i for i, g in enumerate(global_to_local)}
     else:
         mapping = global_to_local

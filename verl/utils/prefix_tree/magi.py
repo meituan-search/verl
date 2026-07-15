@@ -38,6 +38,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import logging as _log
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -49,6 +50,13 @@ from verl.utils.prefix_tree.dynamic import build_tree_dynamic
 from verl.utils.prefix_tree.tree import PrefixSubTrie
 from verl.utils.prefix_tree.utils import build_layout_from_tree_node
 
+# MAGI_DUMP_STRUCT: read-only structural-dump state (Dump C).
+# _build_sample_tensors is called multiple times per micro-batch (log_probs,
+# entropy, hidden), so we dump once per distinct pt_batch object (keyed by id)
+# and cap at the first 2 distinct pt_batches (= first 2 micro-batches).
+_struct_dump_seen: set[int] = set()
+_struct_dump_count: int = 0
+
 
 @dataclass
 class PrefixTreeMagiBatch:
@@ -59,7 +67,7 @@ class PrefixTreeMagiBatch:
     tree_packed_position_ids: Tensor  # (total_tokens,)
     tree_packed_loss_mask: Optional[Tensor]  # (total_tokens,) or None
 
-    # Attention keys — one will be None depending on prefix_tree_attention setting
+    # Attention keys: one will be None depending on prefix_tree_attention setting
     magi_key: object  # MAGI key (None when using flex)
     flex_key: object  # flex_attention block_mask (None when using magi)
 
@@ -142,7 +150,7 @@ def build_prefix_tree_micro_batch(
     """
     # Lazy import: ``_unpack_nested_to_list`` and ``_finalize_prefix_tree_batch``
     # live in :mod:`verl.utils.prefix_tree.forward`, which imports this module at
-    # load time — a top-level import here would create a cycle.
+    # load time; a top-level import here would create a cycle.
     from verl.utils.prefix_tree.forward import (
         _finalize_prefix_tree_batch,
         _unpack_nested_to_list,
@@ -150,9 +158,7 @@ def build_prefix_tree_micro_batch(
 
     samples = _unpack_nested_to_list(input_ids, mask=loss_mask)
     if not samples:
-        _log.getLogger(__name__).warning(
-            "prefix_tree: build_prefix_tree_micro_batch got empty samples — returning None"
-        )
+        _log.getLogger(__name__).warning("prefix_tree: build_prefix_tree_micro_batch got empty samples; returning None")
         return None
     loss_masks_by_sample = _unpack_nested_to_list(loss_mask)
     position_ids_by_sample = _unpack_nested_to_list(position_ids, mask=loss_mask)
@@ -160,7 +166,7 @@ def build_prefix_tree_micro_batch(
     if subtrie is None:
         # No pre-built subtrie (e.g. use_dynamic_bsz=False): build locally.
         # build_tree_dynamic does token-by-token trie detection on this mb's
-        # samples — slower than the global path but correct.
+        # samples; slower than the global path but correct.
         subtrie = build_tree_dynamic(samples)
 
     if subtrie is None:
@@ -204,6 +210,52 @@ def _build_sample_tensors(flat_tensor: Tensor, pt_batch: PrefixTreeMagiBatch) ->
     Shared logic for restore_flat_to_nested and expand_flat_to_per_sample.
     Returns sample_tensors[sample_idx] = cat(ancestor_slices..., leaf_slice).
     """
+    # --- Dump C: per-sample SCATTER mapping (read-only, MAGI_DUMP_STRUCT=1) ---
+    # Fires once per distinct pt_batch (first 2 micro-batches). Captures the
+    # packed→per-sample source ranges (prefix + ancestor chain + leaf slice per
+    # sample) so we can verify each sample's output logits are gathered from the
+    # correct packed positions.
+    if os.environ.get("MAGI_DUMP_STRUCT") == "1":
+        try:
+            global _struct_dump_seen, _struct_dump_count
+            _pbid = id(pt_batch)
+            if _pbid not in _struct_dump_seen and _struct_dump_count < 2:
+                _struct_dump_seen.add(_pbid)
+                _struct_dump_count += 1
+                _c = _struct_dump_count
+                _scatter = []
+                for _leaf_idx, _sample_idx in enumerate(pt_batch.segment_to_sample):
+                    _s, _e = pt_batch.segment_ranges[_leaf_idx]
+                    if pt_batch.ancestor_segment_ranges is not None:
+                        _chain = [tuple(a) for a in pt_batch.ancestor_segment_ranges[_leaf_idx]]
+                    else:
+                        _chain = []
+                    _scatter.append(
+                        {
+                            "leaf_idx": _leaf_idx,
+                            "sample_idx": _sample_idx,
+                            "leaf_range": (_s, _e),
+                            "ancestor_ranges": _chain,
+                            "prefix_range": tuple(pt_batch.prefix_range),
+                        }
+                    )
+                _rec = {
+                    "call": _c,
+                    "flat_tensor_shape": tuple(flat_tensor.shape),
+                    "prefix_range": tuple(pt_batch.prefix_range),
+                    "original_batch_size": pt_batch.original_batch_size,
+                    "real_tokens": pt_batch.real_tokens,
+                    "segment_to_sample": list(pt_batch.segment_to_sample),
+                    "segment_ranges": [tuple(r) for r in pt_batch.segment_ranges],
+                    "scatter": _scatter,
+                }
+                _dir = "/tmp/claude/magi_struct_dump"
+                os.makedirs(_dir, exist_ok=True)
+                torch.save(_rec, os.path.join(_dir, f"scatter_mb{_c}.pt"))
+        except Exception as _e:
+            _struct_logger = _log.getLogger(__name__)
+            _struct_logger.warning(f"MAGI_DUMP_STRUCT failed (Dump C): {_e}")
+
     prefix_start, prefix_end = pt_batch.prefix_range
     prefix_slice = flat_tensor[prefix_start:prefix_end]
     n = pt_batch.original_batch_size
@@ -252,7 +304,7 @@ def expand_flat_to_per_sample(
 
     Replicates shared prefix/anchor slices for each sample, returning a single
     flat tensor ordered by original sample index (matching restore_flat_to_nested).
-    Uses torch.cat instead of nested tensors — safe for autograd (training).
+    Uses torch.cat instead of nested tensors; safe for autograd (training).
 
     Args:
         flat_tensor: (total_flat_tokens, ...) deduplicated representation.
@@ -283,12 +335,12 @@ def prefix_tree_rope_context(model, position_ids: Optional[Tensor]):
       a sequential table ``[0..max_seq_len-1]``.  The override builds the full
       table (``cp_group=None``) and indexes it by ``position_ids``.
     - **M-RoPE** (``Qwen3VLMultimodalRotaryEmbedding`` /
-      ``MultimodalRotaryEmbedding`` — ``forward(position_ids, mrope_section)``):
+      ``MultimodalRotaryEmbedding``: ``forward(position_ids, mrope_section)``):
       builds freqs directly from ``position_ids``, so each token's RoPE is
       whatever ``position_ids`` says.  The override broadcasts the 1D per-token
       positions to 3D ``[3, 1, T]`` (text-only: all three dims identical) and
       passes them to the original forward with ``cp_group=None`` (MAGI already
-      dispatched — no internal CP slicing).  No table indexing needed.
+      dispatched; no internal CP slicing).  No table indexing needed.
 
     No-op when ``model`` has no ``rotary_pos_emb`` or ``position_ids`` is None.
     """
@@ -308,7 +360,7 @@ def prefix_tree_rope_context(model, position_ids: Optional[Tensor]):
         _mrope_section = getattr(model, "mrope_section", None)
 
         def _rope_fwd_with_pids(*args, **kwargs):
-            # Broadcast 1D per-token positions to [3, 1, T] — text-only: all
+            # Broadcast 1D per-token positions to [3, 1, T]; text-only: all
             # three M-RoPE dims (temporal/height/width) are identical.
             pids_3d = pids.view(1, 1, -1).expand(3, 1, -1).contiguous()
             return _real_rope_fwd(pids_3d, _mrope_section, cp_group=None)
@@ -320,7 +372,7 @@ def prefix_tree_rope_context(model, position_ids: Optional[Tensor]):
         def _rope_fwd_with_pids(max_seq_len, offset=0, packed_seq=False, cp_group=None):
             actual_seq_len = int(pids.max().item()) + 1
             emb = _orig_rope_fn(rope_mod, actual_seq_len, offset=0, packed_seq=True, cp_group=None)
-            # All PP stages use seq-first Q=(seq,1,H,D) — freqs=(seq,1,1,dim)
+            # All PP stages use seq-first Q=(seq,1,H,D); freqs=(seq,1,1,dim)
             # broadcasts correctly: Q×freqs → (seq,1,H,D).
             indexed = emb[pids.to(emb.device)]
             return indexed
@@ -363,7 +415,7 @@ def prefix_tree_decoder_key_context(model, magi_attention_key=None, flex_attenti
         model.decoder.forward = _real_decoder_forward
 
 
-# model-forward helpers — consumed by verl/models/mcore/model_forward.py
+# model-forward helpers: consumed by verl/models/mcore/model_forward.py
 
 
 _PREFIX_TREE_KEYS = frozenset(

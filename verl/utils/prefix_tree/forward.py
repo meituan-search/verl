@@ -21,11 +21,11 @@ functions in this module.
 
 Public entry points:
 
-- :func:`unfuse_try_forward_prefix_tree` — unfused-path driver.
-- :func:`fuse_try_forward_prefix_tree` — fused-path driver.
-- :func:`fuse_forward_body` — fused-path body invoked by the patched
+- :func:`unfuse_try_forward_prefix_tree`: unfused-path driver.
+- :func:`fuse_try_forward_prefix_tree`: fused-path driver.
+- :func:`fuse_forward_body`: fused-path body invoked by the patched
   ``_fused_GPTModel_forward``.
-- :func:`dispatch_magi` (renamed from ``dispatch_pt_batch``) — slices
+- :func:`dispatch_magi` (renamed from ``dispatch_pt_batch``): slices
   per-CP-rank local tensors via magi dispatch.
 """
 
@@ -58,7 +58,6 @@ from verl.utils.prefix_tree.magi import (
     restore_flat_to_nested,
     strip_prefix_tree_args,
 )
-
 
 # ---------------------------------------------------------------------------
 # Shared helpers (extracted from the forward functions below)
@@ -108,8 +107,8 @@ def _expand_temperature(t, pt_batch: PrefixTreeMagiBatch, total_flat: int, devic
     """Expand a temperature spec to a ``(total_flat, 1)`` per-token tensor.
 
     Handles three cases:
-      * NestedTensor (per-sample): fill every token — prefix, each leaf, and
-        each leaf's ancestor chain — with the sample's temperature.
+      * NestedTensor (per-sample): fill every token (prefix, each leaf, and
+        each leaf's ancestor chain) with the sample's temperature.
       * Scalar ``Tensor``: broadcast via ``torch.full``.
       * Plain scalar (``float`` / ``int``): same broadcast.
 
@@ -120,7 +119,7 @@ def _expand_temperature(t, pt_batch: PrefixTreeMagiBatch, total_flat: int, devic
     if isinstance(t, torch.Tensor) and t.is_nested:
         # Per-sample temperature: expand to match tree-packed structure.
         # The flat layout contains prefix root + internal ancestor nodes +
-        # leaf nodes, so we must fill every token — covering prefix, each
+        # leaf nodes, so we must fill every token: covering prefix, each
         # leaf, and each leaf's ancestor chain (ancestor_segment_ranges).
         # Missing the internal ancestor tokens shrinks the cat below total_flat.
         temp_by_sample = t.values()  # (batch_size,)
@@ -259,7 +258,7 @@ def _finalize_prefix_tree_batch(
 
     Pads to TP/CP divisibility, builds the requested attention key, and wraps
     the result into a :class:`PrefixTreeMagiBatch`. Padding tokens are not
-    added to the attention rectangles — they are stripped before loss, and
+    added to the attention rectangles; they are stripped before loss, and
     MAGI assigns zero attention weight to out-of-range positions.
     """
     real_tokens = params.tree_packed_tokens.shape[0]
@@ -457,7 +456,7 @@ def unfuse_forward_prefix_tree(
         # output_orig is (1, flat_tokens, hidden_dim) after normalization above.
         # Stage 0 transposes BSH→SBHD internally (embedding → seq-first).
         # We must send the same seq-first format (seq, 1, hidden) so all downstream
-        # stages also get seq-first Q — no per-stage conditional needed, PP=N safe.
+        # stages also get seq-first Q; no per-stage conditional needed, PP=N safe.
         return output_orig.permute(1, 0, 2)  # (1,seq,hid) → (seq,1,hid)
 
 
@@ -481,7 +480,7 @@ def unfuse_try_forward_prefix_tree(
     """
     if vision_model or mtp_enable_train:
         _log.getLogger(__name__).warning(
-            "prefix_tree: skipping prefix-tree path (vision_model=%s, mtp_enable_train=%s) — "
+            "prefix_tree: skipping prefix-tree path (vision_model=%s, mtp_enable_train=%s); "
             "falling back to standard THD",
             vision_model,
             mtp_enable_train,
@@ -508,7 +507,7 @@ def unfuse_try_forward_prefix_tree(
         )
 
     _log.getLogger(__name__).warning(
-        "prefix_tree: build_prefix_tree_batch returned None — falling back to standard THD path "
+        "prefix_tree: build_prefix_tree_batch returned None; falling back to standard THD path "
         "(post_process=%s). If this appears for one PP stage but not the other, the hidden-state "
         "format will mismatch between stages.",
         post_process,
@@ -600,7 +599,7 @@ def fuse_forward_body(
     key injection are already active (installed by the caller via
     :func:`prefix_tree_rope_context` and :func:`prefix_tree_decoder_key_context`).
 
-    Vocab projection stays fused via :func:`linear_cross_entropy` — no
+    Vocab projection stays fused via :func:`linear_cross_entropy`: no
     ``(flat_tokens, vocab)`` logits tensor is materialised.
     """
     from collections import OrderedDict as _OrderedDict
@@ -649,13 +648,9 @@ def fuse_forward_body(
         output_weight = model.embedding.word_embeddings.weight
 
     if magi_key is not None:
-        logprobs, entropy = _run_lce_magi(
-            hidden_states, output_weight, labels, temperature, magi_key, pt_batch, model
-        )
+        logprobs, entropy = _run_lce_magi(hidden_states, output_weight, labels, temperature, magi_key, pt_batch, model)
     else:
-        logprobs, entropy = _run_lce_flex(
-            hidden_states, output_weight, labels, temperature, model
-        )
+        logprobs, entropy = _run_lce_flex(hidden_states, output_weight, labels, temperature, model)
 
     if _has_cfg_log(model.config):
         payload = _OrderedDict(
@@ -721,7 +716,7 @@ def fuse_try_forward_prefix_tree(
     Counterpart of :func:`unfuse_try_forward_prefix_tree` for the
     ``use_fused_kernels=True`` path.  The vocab projection + log-prob
     computation stays fused inside ``_fused_GPTModel_forward`` via
-    :func:`linear_cross_entropy` — the unfused path materialises
+    :func:`linear_cross_entropy`: the unfused path materialises
     ``(flat_tokens, vocab)`` logits and runs ``logits_processor`` outside the
     model, but the fused path never materialises the full vocab tensor.
 
@@ -729,7 +724,6 @@ def fuse_try_forward_prefix_tree(
       - **Scalar temperature only.**  ``linear_cross_entropy`` asserts
         ``isinstance(temperature, float)``.  Per-sample temperature must use
         the unfused path.
-      - **Scalar temperature only.**  Per-sample temperature requires unfused path.
       - **PP support**: on non-last stages (``not post_process``), returns the
         raw hidden-state tensor (pipeline schedule sends it to the next stage).
         Last stage (``post_process=True``) returns the log_probs/entropy dict.
@@ -737,7 +731,7 @@ def fuse_try_forward_prefix_tree(
     Args:
         model: Megatron GPTModel (forward patched to ``_fused_GPTModel_forward``).
         input_ids: NestedTensor of shape (batch_size, variable_seqlen).
-        labels: NestedTensor — used for per-sample offsets only; actual labels
+        labels: NestedTensor, used for per-sample offsets only; actual labels
             come from ``pt_batch.tree_packed_labels`` (pre-shifted per sample).
         temperature: scalar float.
         logits_processor_args: dict containing ``use_prefix_tree``,
@@ -748,7 +742,7 @@ def fuse_try_forward_prefix_tree(
     Returns:
         ``{"log_probs": NestedTensor, "entropy": NestedTensor}`` (entropy only
         when ``calculate_entropy=True``), or ``None`` when no prefix sharing is
-        detected — caller falls through to the standard fused path.
+        detected; caller falls through to the standard fused path.
     """
 
     prefix_tree_attention = (logits_processor_args or {}).get("prefix_tree_attention", "flex")
@@ -762,7 +756,7 @@ def fuse_try_forward_prefix_tree(
     )
     if pb is None:
         _log.getLogger(__name__).warning(
-            "prefix_tree: build_prefix_tree_batch returned None — falling back to standard fused path"
+            "prefix_tree: build_prefix_tree_batch returned None; falling back to standard fused path"
         )
         strip_prefix_tree_args(logits_processor_args)
         return None
@@ -774,15 +768,15 @@ def fuse_try_forward_prefix_tree(
     post_process = unwrap_model(model).post_process
 
     # Only the last PP stage (post_process=True) needs labels for LCE.
-    # Non-last stages pass labels=None — fuse_forward_body returns before LCE.
+    # Non-last stages pass labels=None; fuse_forward_body returns before LCE.
     real_tokens = pb.real_tokens
     if post_process:
         if pb.tree_packed_labels is None:
             _log.getLogger(__name__).warning(
-                "prefix_tree[fused]: tree_packed_labels is None — falling back to standard fused path"
+                "prefix_tree[fused]: tree_packed_labels is None; falling back to standard fused path"
             )
             return None
-        # Pass flat (deduped) labels — LCE runs on real_tokens, not total_expanded.
+        # Pass flat (deduped) labels; LCE runs on real_tokens, not total_expanded.
         labels_arg = pb.tree_packed_labels[:real_tokens]
     else:
         labels_arg = None
@@ -801,15 +795,11 @@ def fuse_try_forward_prefix_tree(
     if not post_process:
         return output_orig
 
-    # output_orig.log_probs / .entropy are (real_tokens,) flat — expand then split.
+    # output_orig.log_probs / .entropy are (real_tokens,) flat; expand then split.
     cu_seqlens = input_ids.offsets()
     batch_size = input_ids.shape[0]
 
-    log_probs = expand_flat_to_per_sample(output_orig.log_probs.reshape(-1), pb)
-    output = {
-        "log_probs": _flat_to_nested_per_sample(log_probs, cu_seqlens, batch_size, pb)
-    }
+    output = {"log_probs": _flat_to_nested_per_sample(output_orig.log_probs.reshape(-1), cu_seqlens, batch_size, pb)}
     if calculate_entropy:
-        entropy = expand_flat_to_per_sample(output_orig.entropy.reshape(-1), pb)
-        output["entropy"] = _flat_to_nested_per_sample(entropy, cu_seqlens, batch_size, pb)
+        output["entropy"] = _flat_to_nested_per_sample(output_orig.entropy.reshape(-1), cu_seqlens, batch_size, pb)
     return output

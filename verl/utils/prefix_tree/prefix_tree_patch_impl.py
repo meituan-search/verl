@@ -72,7 +72,7 @@ def flex_attn_forward(
     Returns ``(total_tokens, 1, num_heads*head_dim)``.
 
     Uses torch.utils.checkpoint to avoid storing the O(T²) attention score
-    matrix for backward — recomputes the forward pass instead (O(T) memory).
+    matrix for backward; recomputes the forward pass instead (O(T) memory).
     """
 
     T, _, H, D = query.shape
@@ -169,7 +169,7 @@ def get_prefix_tree_attn_metrics() -> dict:
 def apply_prefix_tree_patch() -> None:
     """Monkey-patch upstream Megatron-LM classes to support prefix-tree attention (flex and MAGI).
 
-    Safe to call multiple times — subsequent calls are no-ops (checks for the
+    Safe to call multiple times: subsequent calls are no-ops (checks for the
     ``_magi_patched`` sentinel attribute).
     """
 
@@ -177,7 +177,7 @@ def apply_prefix_tree_patch() -> None:
         return  # skip the double-patching
 
     # ------------------------------------------------------------------
-    # 1. TEDotProductAttention.forward — add early-return MAGI branch
+    # 1. TEDotProductAttention.forward: add early-return MAGI branch
     # ------------------------------------------------------------------
     _orig_te_forward = TEDotProductAttention.forward
 
@@ -202,7 +202,7 @@ def apply_prefix_tree_patch() -> None:
         if flex_attention_key is not None:
             _inc_non_fa3()
             return flex_attn_forward(query, key, value, flex_attention_key)
-        # FA3 fallback — logged once per occurrence so it shows up in monitoring
+        # FA3 fallback: logged once per occurrence so it shows up in monitoring
         _inc_fa3()
         logging.getLogger(__name__).warning_once("prefix_tree_patch: using FA3 attention path (fallback)")
         return _orig_te_forward(
@@ -221,7 +221,7 @@ def apply_prefix_tree_patch() -> None:
     TEDotProductAttention.forward = _te_forward
 
     # ------------------------------------------------------------------
-    # 2. SelfAttention._checkpointed_attention_forward — thread kwarg
+    # 2. SelfAttention._checkpointed_attention_forward: thread kwarg
     # ------------------------------------------------------------------
     _orig_sa_ckpt = SelfAttention._checkpointed_attention_forward
 
@@ -276,7 +276,7 @@ def apply_prefix_tree_patch() -> None:
     SelfAttention._checkpointed_attention_forward = _sa_ckpt_forward
 
     # ------------------------------------------------------------------
-    # 3. SelfAttention.forward — accept and pass magi/flex attention key
+    # 3. SelfAttention.forward: accept and pass magi/flex attention key
     # ------------------------------------------------------------------
     _orig_sa_forward = SelfAttention.forward
 
@@ -307,7 +307,7 @@ def apply_prefix_tree_patch() -> None:
     SelfAttention.forward = _sa_forward
 
     # ------------------------------------------------------------------
-    # 4. TransformerLayer.forward — accept and pass magi/flex attention key
+    # 4. TransformerLayer.forward: accept and pass magi/flex attention key
     # ------------------------------------------------------------------
     _orig_tl_forward = TransformerLayer.forward
 
@@ -340,7 +340,7 @@ def apply_prefix_tree_patch() -> None:
     TransformerLayer.forward = _tl_forward
 
     # ------------------------------------------------------------------
-    # 5. TransformerBlock.forward — accept and pass magi/flex attention key
+    # 5. TransformerBlock.forward: accept and pass magi/flex attention key
     # ------------------------------------------------------------------
     _orig_tb_forward = TransformerBlock.forward
 
@@ -400,7 +400,7 @@ def apply_prefix_tree_patch() -> None:
     TransformerBlock.forward = _transformer_block_forward
 
     # ------------------------------------------------------------------
-    # 6. GPTModel.forward — accept and pass magi/flex attention key.
+    # 6. GPTModel.forward: accept and pass magi/flex attention key.
     #    Patches rope_mod.forward with _rope_fwd_with_pids for the duration
     #    of the call so patch #7 uses correct per-token position indexing.
     # ------------------------------------------------------------------
@@ -426,7 +426,7 @@ def apply_prefix_tree_patch() -> None:
 
         # Patch RotaryEmbedding using position_ids (= pt_batch.local_tree_packed_position_ids,
         # per-sample positions that reset within each sample). Closure captures pids
-        # per-batch — no global state needed.
+        # per-batch: no global state needed.
         rope_mod = getattr(self, "rotary_pos_emb", None)
         pids = position_ids.reshape(-1) if (position_ids is not None and rope_mod is not None) else None
         _real_rope_fwd = rope_mod.forward if rope_mod is not None else None
@@ -455,7 +455,7 @@ def apply_prefix_tree_patch() -> None:
     GPTModel.forward = _gpt_forward
 
     # ------------------------------------------------------------------
-    # 7. RotaryEmbedding.forward — bypass CP-rank RoPE slicing for prefix-tree.
+    # 7. RotaryEmbedding.forward: bypass CP-rank RoPE slicing for prefix-tree.
     #
     # Root cause of CP>1 bug: Megatron's get_pos_emb_on_this_cp_rank slices RoPE
     # assuming rank r holds sequential positions [r*T/CP .. (r+1)*T/CP].  After

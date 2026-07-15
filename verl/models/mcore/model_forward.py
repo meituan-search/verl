@@ -266,7 +266,7 @@ def gptmodel_forward_model_engine(
             if output is not None:
                 return output
             _log.getLogger(__name__).warning(
-                "prefix_tree: unfuse_try_forward_prefix_tree returned None — falling back to standard THD path"
+                "prefix_tree: unfuse_try_forward_prefix_tree returned None; falling back to standard THD path"
             )
 
         input_ids_rmpad, packed_seq_params, position_ids_rmpad = preprocess_thd_engine(

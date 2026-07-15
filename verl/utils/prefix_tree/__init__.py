@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from . import trainer  # noqa: F401 — sub-module registrations
+from . import trainer  # noqa: F401  # sub-module registrations
 from .dynamic import (
     TrieNode,
     build_mini_batch_prefix_groups,
