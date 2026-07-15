@@ -82,7 +82,7 @@ class PrefixTreeMagiBatch:
     # original batch size (= number of leaves for single-level tree)
     original_batch_size: int
 
-    # pre-shifted labels (labels_by_sample packed into flat layout); avoids torch.roll
+    # per-token labels derived from tree_packed_tokens via within-segment shift
     tree_packed_labels: Optional[Tensor] = None  # (total_tokens,)
 
     # number of real (non-padding) tokens; may be < tree_packed_input_ids.shape[0]
@@ -152,7 +152,6 @@ def build_prefix_tree_micro_batch(
     tp_size: int = 1,
     cp_size: int = 1,
     subtrie: Optional[PrefixSubTrie] = None,
-    rolled_labels: Optional[NestedTensor] = None,
 ) -> Optional[PrefixTreeMagiBatch]:
     """Build a PrefixTreeMagiBatch from a micro-batch using a per-mb subtrie.
 
@@ -189,12 +188,6 @@ def build_prefix_tree_micro_batch(
         return None
     loss_masks_by_sample = _unpack_nested_to_list(loss_mask)
     position_ids_by_sample = _unpack_nested_to_list(position_ids, mask=loss_mask)
-    _unpacked = _unpack_nested_to_list(rolled_labels, mask=loss_mask) if rolled_labels is not None else None
-    labels_by_sample = (
-        _unpacked
-        if _unpacked is not None
-        else [torch.cat([s[1:], torch.zeros(1, dtype=s.dtype, device=s.device)]) for s in samples]
-    )
 
     if subtrie is None:
         # No pre-built subtrie (e.g. use_dynamic_bsz=False): build locally.
@@ -215,7 +208,6 @@ def build_prefix_tree_micro_batch(
             subtrie,
             loss_masks_by_sample=loss_masks_by_sample,
             position_ids_by_sample=position_ids_by_sample,
-            labels_by_sample=labels_by_sample,
         )
         return _finalize_prefix_tree_batch(
             params,
@@ -815,9 +807,7 @@ def unfuse_try_forward_prefix_tree(
     return None
 
 
-def build_prefix_tree_batch(
-    model, input_ids, logits_processor_args, vision_model, mtp_enable_train, rolled_labels=None
-):
+def build_prefix_tree_batch(model, input_ids, logits_processor_args, vision_model, mtp_enable_train):
     """Build prefix-tree micro-batch from *logits_processor_args*.
 
     Returns :class:`PrefixTreeMagiBatch` or ``None`` when the per-mb subtrie
@@ -839,7 +829,6 @@ def build_prefix_tree_batch(
         tp_size=mpu.get_tensor_model_parallel_world_size(),
         cp_size=mpu.get_context_parallel_world_size(),
         subtrie=subtrie,
-        rolled_labels=rolled_labels,
     )
 
 
@@ -886,15 +875,8 @@ def unfuse_forward_prefix_tree(
         logits_flat = output_orig.squeeze(0)  # (flat_tokens, vocab)
         tree_packed_ids = pt_batch.tree_packed_input_ids[:real_tokens]  # (flat_tokens,)
 
-        # Labels are pre-shifted per sample before packing (labels_by_sample[i] = input_ids[i][1:]+[0]).
-        # This avoids cross-segment boundary errors — no torch.roll needed on the flat layout.
-        if pt_batch.tree_packed_labels is not None:
-            tree_packed_label = pt_batch.tree_packed_labels[:real_tokens].unsqueeze(1)
-        else:
-            # Fallback for batches built without labels_by_sample (e.g. cached subtrie).
-            tree_packed_label = torch.roll(tree_packed_ids, shifts=-1, dims=0)
-            tree_packed_label[-1] = 0
-            tree_packed_label = tree_packed_label.unsqueeze(1)
+        # Labels are derived from tree_packed_tokens via within-segment shift; leaf-end positions are 0.
+        tree_packed_label = pt_batch.tree_packed_labels[:real_tokens].unsqueeze(1)
 
         orig_args = logits_processor_args or {}
         total_flat = tree_packed_ids.shape[0]
