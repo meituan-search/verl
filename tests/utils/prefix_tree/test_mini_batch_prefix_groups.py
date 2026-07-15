@@ -26,6 +26,10 @@ from verl.utils.prefix_tree.dynamic import (
     build_mini_batch_prefix_groups,
     dfs_leaf_order,
     get_prefix_balanced_partitions,
+    get_prefix_tree_mbs_dp_partitions,
+    greedy_build_tries,
+    mbs_groups_from_trie,
+    trie_group_flat_tokens,
 )
 
 # ---------------------------------------------------------------------------
@@ -345,3 +349,100 @@ def test_dfs_micro_batch_groups_flat_budget():
     groups2 = dfs_micro_batch_groups(seqs, max_token_len=9)
     total = sum(len(g) for g in groups2)
     assert total == 4
+
+
+# ---------------------------------------------------------------------------
+# trie_group_flat_tokens — mbs workload estimator
+# ---------------------------------------------------------------------------
+
+
+def _build_trie(sequences):
+    max_tokens = sum(len(s) for s in sequences) * 10
+    tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=max_tokens)
+    return tries[0]
+
+
+def test_trie_group_flat_tokens_all_sequences():
+    """Full group equals the whole trie's flat token count.
+
+    Trie structure for [[1,2,3,10],[1,2,3,11],[1,2,4,12]]:
+      root → [1,2](2) → [3](1) → [10](1)
+                                → [11](1)
+                      → [4,12](2)
+    flat = 2+1+1+1+2 = 7
+    """
+    seqs = [[1, 2, 3, 10], [1, 2, 3, 11], [1, 2, 4, 12]]
+    trie = _build_trie(seqs)
+    flat = trie_group_flat_tokens(list(range(len(seqs))), trie)
+    assert flat == 7
+
+
+def test_trie_group_flat_tokens_subgroup():
+    """Subgroup pays for its minimal sub-trie including shared ancestors."""
+    # Same trie: root → [1,2](2) → [3](1) → [10](1)
+    #                                       → [11](1)
+    #                             → [4,12](2)
+    seqs = [[1, 2, 3, 10], [1, 2, 3, 11], [1, 2, 4, 12]]
+    trie = _build_trie(seqs)
+    # Group {0,1}: [1,2]=2 + [3]=1 + [10]=1 + [11]=1 = 5
+    flat_01 = trie_group_flat_tokens([0, 1], trie)
+    assert flat_01 == 5
+    # Group {2}: [1,2]=2 + [4,12]=2 = 4  (still pays for the shared [1,2] root edge)
+    flat_2 = trie_group_flat_tokens([2], trie)
+    assert flat_2 == 4
+
+
+def test_trie_group_flat_tokens_after_mbs_sort():
+    """After mbs are sorted/reordered for DP assignment the trie is unchanged
+    and trie_group_flat_tokens returns the same value for each group."""
+    seqs = [[1, 2, 3, i] for i in range(8)]  # 8 seqs sharing [1,2,3]
+    trie = _build_trie(seqs)
+    mbs_groups = mbs_groups_from_trie(trie, max_token_len=10)
+
+    # Record flat tokens for each mbs before any reordering.
+    flat_before = [trie_group_flat_tokens(g, trie) for g in mbs_groups]
+
+    # Simulate what get_prefix_tree_mbs_dp_partitions does: sort mbs by flat
+    # tokens and reassign to ranks — the trie object must remain intact.
+    sorted_groups = sorted(mbs_groups, key=lambda g: trie_group_flat_tokens(g, trie))
+    flat_after = [trie_group_flat_tokens(g, trie) for g in sorted_groups]
+
+    assert sorted(flat_before) == sorted(flat_after), "Flat token counts must be stable after mbs reordering"
+
+
+# ---------------------------------------------------------------------------
+# get_prefix_tree_mbs_dp_partitions — DP assignment correctness
+# ---------------------------------------------------------------------------
+
+
+def test_mbs_dp_partitions_covers_all_sequences():
+    """Every sequence index appears exactly once across all ranks."""
+    seqs = [[1, 2, i] for i in range(16)]
+    mbs_per_rank, new_seq_order = get_prefix_tree_mbs_dp_partitions(seqs, max_token_len=20, dp_size=4)
+    assert len(mbs_per_rank) == 4
+    all_seqs = sorted(i for rank in mbs_per_rank for grp in rank for i in grp)
+    assert all_seqs == sorted(new_seq_order)
+    assert set(all_seqs) == set(range(len(seqs)))
+
+
+def test_mbs_dp_partitions_equal_mbs_count_per_rank():
+    """Each rank receives the same number of mbs (equal_size=True at mbs level).
+
+    8 seqs sharing [1,2,3] with budget=7: flat per group = 3+4 = 7, so exactly
+    2 mbs are formed (seqs 0-3 and 4-7), one per rank.
+    """
+    seqs = [[1, 2, 3, i] for i in range(8)]
+    mbs_per_rank, _ = get_prefix_tree_mbs_dp_partitions(seqs, max_token_len=7, dp_size=2)
+    assert len(mbs_per_rank[0]) == len(mbs_per_rank[1])
+
+
+def test_mbs_dp_partitions_mbs_not_split():
+    """No mbs group is split across ranks — each group stays on exactly one rank."""
+    # 4 seqs sharing [1,2,3], 4 seqs sharing [5,6,7]
+    seqs = [[1, 2, 3, i] for i in range(4)] + [[5, 6, 7, i] for i in range(4)]
+    mbs_per_rank, _ = get_prefix_tree_mbs_dp_partitions(seqs, max_token_len=15, dp_size=2)
+
+    all_rank_groups = [frozenset(i for grp in rank for i in grp) for rank in mbs_per_rank]
+    # Collect all groups that appear in the assignment and verify no overlap
+    for r0, r1 in [(0, 1)]:
+        assert all_rank_groups[r0].isdisjoint(all_rank_groups[r1]), "Sequence appears on more than one rank"

@@ -247,7 +247,7 @@ def gptmodel_forward_model_engine(
     if data_format == "thd":
         use_prefix_tree = (logits_processor_args or {}).get("use_prefix_tree", False)
         prefix_tree_attention = (logits_processor_args or {}).get("prefix_tree_attention", "flex")
-        from verl.utils.prefix_tree.magi import build_prefix_tree_batch, forward_prefix_tree
+        from verl.utils.prefix_tree.magi import build_prefix_tree_batch, forward_prefix_tree, strip_prefix_tree_args
 
         pb = build_prefix_tree_batch(
             model,
@@ -258,7 +258,7 @@ def gptmodel_forward_model_engine(
             mtp_enable_train,
         )
         if pb is not None:
-            output = forward_prefix_tree(
+            return forward_prefix_tree(
                 model,
                 pb,
                 prefix_tree_attention,
@@ -267,83 +267,82 @@ def gptmodel_forward_model_engine(
                 post_process,
                 model_kwargs,
             )
+        # No prefix sharing in this batch — strip prefix-tree keys so the
+        # preprocess_thd_engine loop below doesn't receive non-tensor values.
+        strip_prefix_tree_args(logits_processor_args)
+
+        input_ids_rmpad, packed_seq_params, position_ids_rmpad = preprocess_thd_engine(
+            input_ids,
+            pre_process=pre_process or (post_process and mtp_enable_train),
+            use_fp8_padding=use_fp8_padding,
+            local_cp_size=local_cp_size,
+        )
+        input_ids_rmpad = input_ids_rmpad.contiguous()
+
+        args = {}
+        if mtp_enable_train and post_process:
+            # Use input_ids sequence length to ensure label and loss_mask alignment
+            input_ids_offsets = input_ids.offsets()
+            input_ids_lengths = input_ids_offsets.diff().tolist()
+
+            for k in ["label", "loss_mask"]:
+                v = logits_processor_args[k]
+                v = _convert_to_nested_tensor(v, input_ids_lengths)
+                logits_processor_args[k] = v
+                args[k] = preprocess_thd_engine(
+                    v,
+                    pre_process=True,
+                    need_roll=True,
+                    use_fp8_padding=use_fp8_padding,
+                    local_cp_size=local_cp_size,
+                )[0]
+
+            model_kwargs["labels"] = args["label"].contiguous()
+            model_kwargs["loss_mask"] = args["loss_mask"].contiguous()
+
+        if logits_processor_args and "loss_mask" in logits_processor_args:
+            logits_processor_args.pop("loss_mask")
+
+        # For VLM model, need to pass bshd format `input_ids` and `attention_mask`.
+        attention_mask = None
+        if vision_model:
+            input_ids_rmpad, attention_mask = build_vlm_attn_mask_thd(input_ids, pad_token_id)
+
+        output_orig = model(
+            input_ids=input_ids_rmpad,
+            attention_mask=attention_mask,
+            position_ids=position_ids_rmpad if mtp_enable_train else None,  # position_ids is only needed for MTP
+            packed_seq_params=packed_seq_params,
+            **model_kwargs,
+        )
+
+        if post_process and logits_processor is not None:
+            args = {
+                k: preprocess_thd_engine(
+                    v,
+                    pre_process=True,
+                    need_roll=(k == "label"),
+                    use_fp8_padding=use_fp8_padding,
+                    local_cp_size=local_cp_size,
+                )[0]
+                for k, v in logits_processor_args.items()
+            }
+            output_dict = logits_processor(output_orig, **args)
+            output = {
+                k: postprocess_thd_engine(
+                    v, packed_seq_params, input_ids, batch_size, post_process=post_process, local_cp_size=local_cp_size
+                )
+                for k, v in output_dict.items()
+            }
         else:
-            input_ids_rmpad, packed_seq_params, position_ids_rmpad = preprocess_thd_engine(
+            output = postprocess_thd_engine(
+                output_orig,
+                packed_seq_params,
                 input_ids,
-                pre_process=pre_process or (post_process and mtp_enable_train),
-                use_fp8_padding=use_fp8_padding,
+                batch_size,
+                post_process=post_process,
                 local_cp_size=local_cp_size,
             )
-            input_ids_rmpad = input_ids_rmpad.contiguous()
-
-            args = {}
-            if mtp_enable_train and post_process:
-                input_ids_offsets = input_ids.offsets()
-                input_ids_lengths = input_ids_offsets.diff().tolist()
-
-                for k in ["label", "loss_mask"]:
-                    v = logits_processor_args[k]
-                    v = _convert_to_nested_tensor(v, input_ids_lengths)
-                    logits_processor_args[k] = v
-                    args[k] = preprocess_thd_engine(
-                        v,
-                        pre_process=True,
-                        need_roll=True,
-                        use_fp8_padding=use_fp8_padding,
-                        local_cp_size=local_cp_size,
-                    )[0]
-
-                model_kwargs["labels"] = args["label"].contiguous()
-                model_kwargs["loss_mask"] = args["loss_mask"].contiguous()
-
-            from verl.utils.prefix_tree.magi import strip_prefix_tree_args
-
-            strip_prefix_tree_args(logits_processor_args)
-
-            attention_mask = None
-            if vision_model:
-                input_ids_rmpad, attention_mask = build_vlm_attn_mask_thd(input_ids, pad_token_id)
-
-            output_orig = model(
-                input_ids=input_ids_rmpad,
-                attention_mask=attention_mask,
-                position_ids=position_ids_rmpad if not vision_model else None,
-                packed_seq_params=packed_seq_params,
-                **model_kwargs,
-            )
-
-            if post_process and logits_processor is not None:
-                args = {
-                    k: preprocess_thd_engine(
-                        v,
-                        pre_process=True,
-                        need_roll=(k == "label"),
-                        use_fp8_padding=use_fp8_padding,
-                        local_cp_size=local_cp_size,
-                    )[0]
-                    for k, v in logits_processor_args.items()
-                }
-                output_dict = logits_processor(output_orig, **args)
-                output = {
-                    k: postprocess_thd_engine(
-                        v,
-                        packed_seq_params,
-                        input_ids,
-                        batch_size,
-                        post_process=post_process,
-                        local_cp_size=local_cp_size,
-                    )
-                    for k, v in output_dict.items()
-                }
-            else:
-                output = postprocess_thd_engine(
-                    output_orig,
-                    packed_seq_params,
-                    input_ids,
-                    batch_size,
-                    post_process=post_process,
-                    local_cp_size=local_cp_size,
-                )
     else:
         """
         data_format: "thd" or "bshd", default is "thd",

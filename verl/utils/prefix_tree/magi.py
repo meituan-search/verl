@@ -42,37 +42,6 @@ import torch
 from torch import Tensor
 from torch.nested._internal.nested_tensor import NestedTensor
 
-# ============================================================================
-# Hash utilities (consumed by train-time prefix segment builders)
-# ============================================================================
-
-
-def _hash_prefix(token_ids_flat: torch.Tensor) -> int:  # noqa: F821
-    """128-bit hash of a 1-D token-id tensor."""
-    raw = token_ids_flat.numpy().tobytes()
-    try:
-        import xxhash
-
-        return xxhash.xxh128_intdigest(raw)
-    except ImportError:
-        import hashlib
-
-        return int.from_bytes(hashlib.md5(raw).digest(), "little")
-
-
-def build_prefix_segments_single_turn(
-    input_ids: torch.Tensor,  # noqa: F821
-    attention_mask=None,
-) -> list[tuple[int, int]]:
-    """Build a single-entry prefix_segments list for one sample."""
-
-    ids = input_ids.flatten()
-    if attention_mask is not None:
-        mask = attention_mask.flatten().bool()
-        ids = ids[mask]
-    h = _hash_prefix(ids.cpu())
-    return [(h, int(ids.numel()))]
-
 
 @dataclass
 class PrefixTreeMagiBatch:
@@ -112,9 +81,6 @@ class PrefixTreeMagiBatch:
     local_flat_input_ids: Optional[Tensor] = None
     local_flat_position_ids: Optional[Tensor] = None
     local_flat_loss_mask: Optional[Tensor] = None
-
-    # optimization: skip merge/spread in middle attention layers
-    no_expand_middle: bool = False
 
     def __post_init__(self):
         if self.real_tokens == 0:
@@ -163,11 +129,15 @@ def build_prefix_tree_micro_batch(
     attention_type: str = "flex",
     tp_size: int = 1,
     cp_size: int = 1,
+    cached_result: tuple | None = None,
 ) -> Optional[PrefixTreeMagiBatch]:
     """Build a PrefixTreeMagiBatch from a micro-batch of NestedTensor sequences.
 
     Detects shared-prefix trees through token-by-token trie insertion
     (arbitrary depth, no rollout-side metadata required).
+
+    When ``cached_result=(tree_root, leaf_to_sample)`` is provided, skips
+    trie construction and uses the pre-computed tree.
 
     Returns None when there is no shared prefix, signalling the caller to
     fall back to the standard attention path.
@@ -205,19 +175,27 @@ def build_prefix_tree_micro_batch(
     loss_masks_by_sample = _unpack_nested_to_list(loss_mask)
     position_ids_by_sample = _unpack_nested_to_list(position_ids)
 
-    from verl.utils.prefix_tree.dynamic import build_tree_dynamic
+    if cached_result is not None:
+        tree_root, leaf_to_sample = cached_result
+    else:
+        from verl.utils.prefix_tree.dynamic import build_tree_dynamic
 
-    if _magi_timing:
-        _torch_pt.cuda.nvtx.range_push("prefix_tree/build_tree")
-    t_tree0 = _ev() if _magi_timing else None
-    result = build_tree_dynamic(samples)
-    t_tree1 = _ev() if _magi_timing else None
-    if _magi_timing:
-        _torch_pt.cuda.nvtx.range_pop()
+        if _magi_timing:
+            _torch_pt.cuda.nvtx.range_push("prefix_tree/build_tree")
+        t_tree0 = _ev() if _magi_timing else None
+        result = build_tree_dynamic(samples)
+        t_tree1 = _ev() if _magi_timing else None
+        if _magi_timing:
+            _torch_pt.cuda.nvtx.range_pop()
 
-    if result is None:
-        return None
-    tree_root, leaf_to_sample = result
+        if result is None:
+            import logging as _log
+            _log.getLogger(__name__).warning(
+                "build_prefix_tree_micro_batch: no prefix sharing found (n=%d); "
+                "falling back to standard attention", len(samples)
+            )
+            return None
+        tree_root, leaf_to_sample = result
 
     try:
         if _magi_timing:
@@ -261,7 +239,12 @@ def build_prefix_tree_micro_batch(
                 flush=True,
             )
         return ret
-    except (ValueError, AssertionError, RuntimeError):
+    except (ValueError, AssertionError, RuntimeError) as _e:
+        import logging as _log, traceback as _tb
+        _log.getLogger(__name__).warning(
+            "build_prefix_tree_micro_batch: falling back to standard attention "
+            "(%s: %s)\n%s", type(_e).__name__, _e, _tb.format_exc()
+        )
         # Multilevel tree produced non-monotonic leaf ranges or inconsistent
         # token layout.  Fall back to standard attention for this micro-batch.
         return None
@@ -485,7 +468,15 @@ def _build_magi_key_sp_scaled(original_key, model, tp_size: int):
 # ============================================================================
 
 
-_PREFIX_TREE_KEYS = frozenset({"loss_mask", "use_prefix_tree", "prefix_tree_attention", "prefix_tree_no_expand_middle"})
+_PREFIX_TREE_KEYS = frozenset(
+    {
+        "loss_mask",
+        "use_prefix_tree",
+        "prefix_tree_attention",
+        "prefix_tree_subtree",
+        "prefix_tree_no_expand_middle",
+    }
+)
 
 
 def strip_prefix_tree_args(logits_processor_args: dict | None) -> None:
@@ -503,7 +494,6 @@ def strip_prefix_tree_args(logits_processor_args: dict | None) -> None:
 def get_prefix_tree_kwargs(
     use_prefix_tree: bool,
     prefix_tree_attention: str,
-    prefix_tree_no_expand_middle: bool = False,
 ) -> dict:
     """Return prefix-tree keys for injection into *logits_processor_args*.
 
@@ -515,7 +505,6 @@ def get_prefix_tree_kwargs(
     return {
         "use_prefix_tree": use_prefix_tree,
         "prefix_tree_attention": prefix_tree_attention,
-        "prefix_tree_no_expand_middle": prefix_tree_no_expand_middle,
     }
 
 
@@ -530,21 +519,19 @@ def build_prefix_tree_batch(model, input_ids, logits_processor_args, use_prefix_
 
     prefix_tree_attention = (logits_processor_args or {}).get("prefix_tree_attention", "flex")
     loss_mask_nested = (logits_processor_args or {}).get("loss_mask", None)
-    no_expand_middle = (logits_processor_args or {}).get("prefix_tree_no_expand_middle", False)
+    cached_result = (logits_processor_args or {}).get("prefix_tree_subtree")
 
     from megatron.core import parallel_state as _mpu
 
-    pb = build_prefix_tree_micro_batch(
+    return build_prefix_tree_micro_batch(
         model,
         input_ids,
         loss_mask_nested,
         attention_type=prefix_tree_attention,
         tp_size=_mpu.get_tensor_model_parallel_world_size(),
         cp_size=_mpu.get_context_parallel_world_size(),
+        cached_result=cached_result,
     )
-    if pb is not None:
-        pb.no_expand_middle = no_expand_middle
-    return pb
 
 
 def forward_prefix_tree(

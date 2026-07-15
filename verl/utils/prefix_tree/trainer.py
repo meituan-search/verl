@@ -20,8 +20,6 @@ the caller never needs to gate on ``use_prefix_tree``.
 
 from __future__ import annotations
 
-import numpy as np
-
 # ──────────────────────── engine config ──────────────────────────
 
 
@@ -29,6 +27,7 @@ def apply_engine_config(engine_config, config_or_data: dict) -> None:
     """Thread prefix-tree flags from config into *engine_config*."""
     engine_config.use_prefix_tree = config_or_data.get("use_prefix_tree", False)
     engine_config.prefix_tree_attention = config_or_data.get("prefix_tree_attention", "flex")
+    engine_config.prefix_tree_olb_backend = config_or_data.get("prefix_tree_olb_backend", None)
 
 
 # ──────────────────────── meta info ─────────────────────────────
@@ -38,6 +37,7 @@ def add_meta_info(meta_dict: dict, config_or_data: dict) -> None:
     """Add prefix-tree entries to a meta-info dict (mutates in-place)."""
     meta_dict["use_prefix_tree"] = config_or_data.get("use_prefix_tree", False)
     meta_dict["prefix_tree_attention"] = config_or_data.get("prefix_tree_attention", "flex")
+    meta_dict["prefix_tree_olb_backend"] = config_or_data.get("prefix_tree_olb_backend", None)
 
 
 # ──────────────────────── metrics ───────────────────────────────
@@ -55,62 +55,34 @@ def compute_metrics(metrics: dict, input_ids, config_or_data: dict) -> None:
     metrics.update(compute_prefix_tree_metrics(input_ids))
 
 
-# ──────────────────────── prefix segments injection ──────────────
-
-
-def inject_prefix_segments(gen_batch_output, config_or_data: dict) -> None:
-    """Build ``prefix_segments`` for prefix-tree MAGI attention after generation.
-
-    Mutates ``gen_batch_output.non_tensor_batch["prefix_segments"]``.
-    No-op when *use_prefix_tree* is disabled or segments already exist.
-    """
-    if not _is_prefix_tree_enabled(config_or_data):
-        return
-    if gen_batch_output.batch is None or "input_ids" not in gen_batch_output.batch.keys():
-        return
-
-    if "prefix_segments" in gen_batch_output.non_tensor_batch:
-        return
-
-    from verl.utils.prefix_tree.magi import build_prefix_segments_single_turn
-
-    _ids = gen_batch_output.batch["input_ids"]
-    _mask = gen_batch_output.batch.get("attention_mask", None)
-    rollout_n = config_or_data.get("n", 1)
-
-    # Compute once per unique prompt (before repeat), then repeat.
-    if hasattr(gen_batch_output, "_orig_ids"):
-        _orig_ids = gen_batch_output._orig_ids
-        _orig_mask = gen_batch_output._orig_mask
-    else:
-        _orig_ids = gen_batch_output.batch["input_ids"]
-        _orig_mask = gen_batch_output.batch.get("attention_mask", None)
-
-    unique_segs = np.array(
-        [
-            build_prefix_segments_single_turn(_orig_ids[i], _orig_mask[i] if _orig_mask is not None else None)
-            for i in range(_orig_ids.shape[0])
-        ],
-        dtype=object,
-    )
-    gen_batch_output.non_tensor_batch["prefix_segments"] = np.repeat(unique_segs, repeats=rollout_n, axis=0)
-
-
 # ──────────────────────── disable for log-prob ───────────────────
 
 
-def disable_for_log_prob(batch_td, config_or_data: dict, micro_batch_size_per_gpu: int) -> None:
-    """Disable prefix-tree and dynamic bsz for log-prob computation pass."""
+def configure_olb_backend(batch_td, config_or_data: dict) -> None:
+    """Apply *prefix_tree_olb_backend* override before old log-prob forward.
+
+    Called before ``compute_log_prob`` — not on fallback.  The fallback
+    (inside the try/except in ``_compute_old_log_prob``) always disables
+    prefix-tree entirely regardless of config.
+
+    - ``None``: no-op, keep training backend
+    - ``"magi"`` / ``"flex"``: override to that prefix-tree backend
+    - ``"fa3"``: explicitly disable prefix-tree (use plain FA3) for this pass
+    - anything else: raises ``ValueError`` — prevents silent fallback to FA3
+    """
     if not _is_prefix_tree_enabled(config_or_data):
         return
     from verl.utils import tensordict_utils as tu
 
-    tu.assign_non_tensor(
-        batch_td,
-        use_prefix_tree=False,
-        use_dynamic_bsz=False,
-        micro_batch_size_per_gpu=micro_batch_size_per_gpu,
-    )
+    olb = config_or_data.get("prefix_tree_olb_backend", None)
+    if olb is None:
+        return
+    if olb in ("magi", "flex"):
+        tu.assign_non_tensor(batch_td, prefix_tree_attention=olb)
+    elif olb == "fa3":
+        tu.assign_non_tensor(batch_td, use_prefix_tree=False)
+    else:
+        raise ValueError(f"Unknown prefix_tree_olb_backend {olb!r}. Valid values: None, 'magi', 'flex', 'fa3'.")
 
 
 # ──────────────────────── internal ──────────────────────────────

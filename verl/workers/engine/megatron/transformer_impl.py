@@ -823,7 +823,10 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 dp_rank=mpu.get_data_parallel_rank(),
             )
 
+        _pt_subtree = tu.pop(batch, key="prefix_tree_subtree", default=None)
         batch = batch.to(get_device_id())
+        if _pt_subtree is not None:
+            tu.assign_non_tensor(batch, prefix_tree_subtree=_pt_subtree)
         use_fused_kernels = tu.get_non_tensor_data(batch, key="use_fused_kernels", default=False)
         calculate_entropy = tu.get_non_tensor_data(batch, key="calculate_entropy", default=False)
         calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
@@ -952,6 +955,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 "temperature": temperature,
                 "loss_mask": loss_mask,
                 **get_prefix_tree_kwargs(use_prefix_tree, prefix_tree_attention),
+                "prefix_tree_subtree": tu.get_non_tensor_data(batch, "prefix_tree_subtree", default=None),
             }
 
             output = forward_fn(
