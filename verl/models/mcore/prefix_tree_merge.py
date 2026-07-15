@@ -86,19 +86,14 @@ def magi_attn_forward(
     value: Tensor,
     magi_attention_key: object,
 ) -> Tensor:
-    """Execute MAGI dispatch → calc_attn → undispatch for prefix-tree batches.
+    """Execute MAGI calc_attn for prefix-tree batches.
 
-    Input tensors are in thd layout: ``(total_tokens, 1, num_heads, head_dim)``.
-    Returns ``(total_tokens, 1, num_heads*head_dim)`` — matching the packed-seq
-    thd output shape expected by ``linear_proj``.
-
-    With SP+CP: Q/K/V arrive as (T/TP, 1, H, D) due to SP scatter. We gather
-    across TP to get full T tokens, then dispatch/calc_attn/undispatch across
-    CP ranks, then scatter back to T/TP for SP-consistent output.
+    Always dispatches/undispatches for CP correctness. Returns
+    ``(total_tokens, 1, num_heads*head_dim)``.
     """
     from magi_attention.api import calc_attn, dispatch, undispatch
 
-    q = query.squeeze(1)   # (T, np, hn) — already full T (Megatron gathers SP before calling here)
+    q = query.squeeze(1)
     k = key.squeeze(1)
     v = value.squeeze(1)
 
@@ -108,8 +103,6 @@ def magi_attn_forward(
 
     out, _ = calc_attn(dq, dk, dv, magi_attention_key)
 
-    if _timing:
-        _torch.cuda.nvtx.range_push(f"{_pfx}/undispatch")
     out = undispatch(out, magi_attention_key)
 
     return out.reshape(out.shape[0], 1, -1)
@@ -160,10 +153,18 @@ def apply_prefix_tree_patch() -> None:
         if flex_attention_key is not None:
             return flex_attn_forward(query, key, value, flex_attention_key)
         # FA3 path
-        return _orig_te_forward(self, query, key, value, attention_mask, attn_mask_type,
-                                attention_bias=attention_bias,
-                                packed_seq_params=packed_seq_params,
-                                num_splits=num_splits, **kwargs)
+        return _orig_te_forward(
+            self,
+            query,
+            key,
+            value,
+            attention_mask,
+            attn_mask_type,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+            num_splits=num_splits,
+            **kwargs,
+        )
 
     TEDotProductAttention.forward = _te_forward
 

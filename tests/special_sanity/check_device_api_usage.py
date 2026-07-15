@@ -28,6 +28,7 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "verl/utils/torch_functional.py",  # import flash_attn only on cuda
     "verl/utils/profiler/nvtx_profile.py",  # appear in NsightSystemsProfiler
     "verl/utils/profiler/torch_profile.py",  # appear in TorchProfiler
+    "verl/utils/prefix_tree/magi.py",  # appear in CUDA events/NVTX for profiling
     "verl/utils/profiler/config.py",  # appear in TorchProfilerToolConfig
     "verl/utils/kernel/linear_cross_entropy.py",  # appear in nvidia nvtx
     "verl/utils/rendezvous/ray_backend.py",  # appear in cupy importance

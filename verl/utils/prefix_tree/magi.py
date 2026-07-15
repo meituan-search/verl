@@ -42,11 +42,36 @@ import torch
 from torch import Tensor
 from torch.nested._internal.nested_tensor import NestedTensor
 
-from verl.utils.prefix_tree.hash_based import (
-    _hash_prefix,  # noqa: F401  re-exported for backwards-compat callers
-    build_prefix_segments_single_turn,  # noqa: F401  re-exported for backwards-compat callers
-    build_tree_hash_based,
-)
+# ============================================================================
+# Hash utilities (consumed by train-time prefix segment builders)
+# ============================================================================
+
+
+def _hash_prefix(token_ids_flat: torch.Tensor) -> int:  # noqa: F821
+    """128-bit hash of a 1-D token-id tensor."""
+    raw = token_ids_flat.numpy().tobytes()
+    try:
+        import xxhash
+
+        return xxhash.xxh128_intdigest(raw)
+    except ImportError:
+        import hashlib
+
+        return int.from_bytes(hashlib.md5(raw).digest(), "little")
+
+
+def build_prefix_segments_single_turn(
+    input_ids: torch.Tensor,  # noqa: F821
+    attention_mask=None,
+) -> list[tuple[int, int]]:
+    """Build a single-entry prefix_segments list for one sample."""
+
+    ids = input_ids.flatten()
+    if attention_mask is not None:
+        mask = attention_mask.flatten().bool()
+        ids = ids[mask]
+    h = _hash_prefix(ids.cpu())
+    return [(h, int(ids.numel()))]
 
 
 @dataclass
@@ -87,6 +112,9 @@ class PrefixTreeMagiBatch:
     local_flat_input_ids: Optional[Tensor] = None
     local_flat_position_ids: Optional[Tensor] = None
     local_flat_loss_mask: Optional[Tensor] = None
+
+    # optimization: skip merge/spread in middle attention layers
+    no_expand_middle: bool = False
 
     def __post_init__(self):
         if self.real_tokens == 0:
@@ -132,23 +160,14 @@ def build_prefix_tree_micro_batch(
     input_ids: NestedTensor,
     loss_mask: Optional[NestedTensor] = None,
     position_ids: Optional[NestedTensor] = None,
-    prefix_segments_batch: Optional[list[list[tuple[int, int]]]] = None,
     attention_type: str = "flex",
     tp_size: int = 1,
     cp_size: int = 1,
-    dynamic_trie: bool = False,
 ) -> Optional[PrefixTreeMagiBatch]:
     """Build a PrefixTreeMagiBatch from a micro-batch of NestedTensor sequences.
 
-    Two detection paths, selected by ``dynamic_trie``:
-
-      - ``dynamic_trie=False`` (default): hash-based fast path. Uses
-        ``prefix_segments_batch`` (per-sample turn-level hashes) when
-        provided, otherwise falls back to a token-level LCP scan. Supports
-        depth-1 and depth-2 tree shapes only.
-      - ``dynamic_trie=True``: token-by-token trie insertion. Detects
-        arbitrary-depth shared-prefix trees directly from the token
-        sequences. ``prefix_segments_batch`` is ignored on this path.
+    Detects shared-prefix trees through token-by-token trie insertion
+    (arbitrary depth, no rollout-side metadata required).
 
     Returns None when there is no shared prefix, signalling the caller to
     fall back to the standard attention path.
@@ -159,15 +178,9 @@ def build_prefix_tree_micro_batch(
         loss_mask: Optional NestedTensor matching input_ids shape.
         position_ids: Optional NestedTensor matching input_ids shape.
             When None, default RoPE-compatible position IDs are generated.
-        prefix_segments_batch: Optional per-sample prior knowledge injected by
-            the dataset or trainer (hash-path only). See
-            :func:`verl.utils.prefix_tree.hash_based.build_tree_hash_based`
-            for the expected format. Ignored when ``dynamic_trie=True``.
         attention_type: ``"flex"`` or ``"magi"``.
         tp_size / cp_size: Tensor / context parallel world sizes (for
             SP-divisibility padding).
-        dynamic_trie: when True, dispatch to the trie path in
-            :mod:`verl.utils.prefix_tree.dynamic`. Default False.
 
     Returns:
         PrefixTreeMagiBatch or None.
@@ -192,15 +205,12 @@ def build_prefix_tree_micro_batch(
     loss_masks_by_sample = _unpack_nested_to_list(loss_mask)
     position_ids_by_sample = _unpack_nested_to_list(position_ids)
 
+    from verl.utils.prefix_tree.dynamic import build_tree_dynamic
+
     if _magi_timing:
         _torch_pt.cuda.nvtx.range_push("prefix_tree/build_tree")
     t_tree0 = _ev() if _magi_timing else None
-    if dynamic_trie:
-        from verl.utils.prefix_tree.dynamic import build_tree_dynamic
-
-        result = build_tree_dynamic(samples)
-    else:
-        result = build_tree_hash_based(samples, prefix_segments_batch=prefix_segments_batch)
+    result = build_tree_dynamic(samples)
     t_tree1 = _ev() if _magi_timing else None
     if _magi_timing:
         _torch_pt.cuda.nvtx.range_pop()
@@ -475,7 +485,7 @@ def _build_magi_key_sp_scaled(original_key, model, tp_size: int):
 # ============================================================================
 
 
-_PREFIX_TREE_KEYS = frozenset({"loss_mask", "use_prefix_tree", "prefix_tree_attention", "prefix_segments_batch"})
+_PREFIX_TREE_KEYS = frozenset({"loss_mask", "use_prefix_tree", "prefix_tree_attention", "prefix_tree_no_expand_middle"})
 
 
 def strip_prefix_tree_args(logits_processor_args: dict | None) -> None:
@@ -493,7 +503,7 @@ def strip_prefix_tree_args(logits_processor_args: dict | None) -> None:
 def get_prefix_tree_kwargs(
     use_prefix_tree: bool,
     prefix_tree_attention: str,
-    prefix_segments_batch=None,
+    prefix_tree_no_expand_middle: bool = False,
 ) -> dict:
     """Return prefix-tree keys for injection into *logits_processor_args*.
 
@@ -505,7 +515,7 @@ def get_prefix_tree_kwargs(
     return {
         "use_prefix_tree": use_prefix_tree,
         "prefix_tree_attention": prefix_tree_attention,
-        "prefix_segments_batch": prefix_segments_batch,
+        "prefix_tree_no_expand_middle": prefix_tree_no_expand_middle,
     }
 
 
@@ -519,29 +529,22 @@ def build_prefix_tree_batch(model, input_ids, logits_processor_args, use_prefix_
         return None
 
     prefix_tree_attention = (logits_processor_args or {}).get("prefix_tree_attention", "flex")
-    prefix_tree_dynamic = (logits_processor_args or {}).get("prefix_tree_dynamic", False)
     loss_mask_nested = (logits_processor_args or {}).get("loss_mask", None)
-    prefix_segments_batch = (logits_processor_args or {}).get("prefix_segments_batch", None)
-    if prefix_segments_batch is not None:
-        import numpy as _np
-
-        if isinstance(prefix_segments_batch, _np.ndarray):
-            prefix_segments_batch = prefix_segments_batch.tolist()
-        elif hasattr(prefix_segments_batch, "__iter__") and not isinstance(prefix_segments_batch, list):
-            prefix_segments_batch = [el.data if hasattr(el, "data") else el for el in prefix_segments_batch]
+    no_expand_middle = (logits_processor_args or {}).get("prefix_tree_no_expand_middle", False)
 
     from megatron.core import parallel_state as _mpu
 
-    return build_prefix_tree_micro_batch(
+    pb = build_prefix_tree_micro_batch(
         model,
         input_ids,
         loss_mask_nested,
-        prefix_segments_batch=prefix_segments_batch,
         attention_type=prefix_tree_attention,
         tp_size=_mpu.get_tensor_model_parallel_world_size(),
         cp_size=_mpu.get_context_parallel_world_size(),
-        dynamic_trie=prefix_tree_dynamic,
     )
+    if pb is not None:
+        pb.no_expand_middle = no_expand_middle
+    return pb
 
 
 def forward_prefix_tree(
@@ -587,6 +590,13 @@ def forward_prefix_tree(
 
         output_orig_thd = output_orig.squeeze(0).unsqueeze(1)
         flat_label = torch.roll(pt_batch.flat_input_ids[:real_tokens], shifts=-1, dims=0).unsqueeze(1)
+        # Fix leaf-boundary labels: after the roll, the last token of each leaf gets the first
+        # token of the next leaf as its label, which is wrong. Reset to self-prediction
+        # (same token) so the log_prob at that position is not systematically biased.
+        # This mirrors standard packed-seq behaviour where the last position has loss_mask=0.
+        for _, leaf_end in pt_batch.leaf_ranges:
+            if leaf_end <= real_tokens:
+                flat_label[leaf_end - 1, 0] = pt_batch.flat_input_ids[leaf_end - 1]
         orig_args = logits_processor_args or {}
         total_tokens = flat_label.shape[0]
         if "temperature" in orig_args:
@@ -601,16 +611,15 @@ def forward_prefix_tree(
         else:
             flat_t = torch.ones(total_tokens, 1, dtype=torch.float32, device=flat_label.device)
         flat_args = {
-            k: v
-            for k, v in orig_args.items()
-            if k not in ("label", "temperature", "loss_mask", "use_prefix_tree", "prefix_segments_batch")
+            k: v for k, v in orig_args.items() if k not in ("label", "temperature", "loss_mask", "use_prefix_tree")
         }
         flat_args["label"] = flat_label
         flat_args["temperature"] = flat_t
         output_dict = logits_processor(output_orig_thd, **flat_args)
-        if isinstance(output_dict, dict) and "log_probs" in output_dict:
-            lp_flat = output_dict["log_probs"].reshape(-1)[:real_tokens]
-            output_dict["log_probs"] = restore_flat_to_nested(lp_flat, pt_batch)
+        if isinstance(output_dict, dict):
+            for key, val in list(output_dict.items()):
+                if isinstance(val, torch.Tensor):
+                    output_dict[key] = restore_flat_to_nested(val.reshape(-1)[:real_tokens], pt_batch)
         return output_dict
     else:
         real_tokens = pt_batch.real_tokens

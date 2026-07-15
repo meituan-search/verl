@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from . import trainer  # noqa: F401 — sub-module registrations
 from .dynamic import (
     TrieNode,
     build_mini_batch_prefix_groups,
@@ -21,10 +22,16 @@ from .dynamic import (
     convert_trie_to_tree_node,
     dfs_leaf_order,
     dfs_micro_batch_groups,
+    get_dfs_balanced_partitions,
+    get_prefix_balanced_partitions,
     greedy_build_tries,
+    mbs_groups_from_trie,
     prepare_prefix_tree_micro_batches,
+    prune_trie,
+    reorder_and_balance_for_prefix_tree,
+    trie_dfs_leaf_order,
+    trie_to_leaf_ids,
 )
-from .hash_based import _hash_prefix as hash_prefix
 from .magi import (
     PrefixTreeMagiBatch,
     build_prefix_segments_single_turn,
@@ -35,7 +42,16 @@ from .magi import (
     restore_flat_to_nested,
     strip_prefix_tree_args,
 )
-from .utils import TreeNode, build_layout_from_tree_node, build_prefix_tree_params, longest_common_prefix_length
+from .magi import (
+    _hash_prefix as hash_prefix,
+)
+from .utils import (
+    PrefixTreeParams,
+    RangeSpec,
+    TreeNode,
+    build_layout_from_tree_node,
+    longest_common_prefix_length,
+)
 
 __all__ = [
     # dynamic
@@ -47,10 +63,15 @@ __all__ = [
     "convert_trie_to_tree_node",
     "dfs_leaf_order",
     "dfs_micro_batch_groups",
+    "get_dfs_balanced_partitions",
+    "get_prefix_balanced_partitions",
     "greedy_build_tries",
+    "mbs_groups_from_trie",
     "prepare_prefix_tree_micro_batches",
-    # hash_based
-    "hash_prefix",
+    "prune_trie",
+    "reorder_and_balance_for_prefix_tree",
+    "trie_dfs_leaf_order",
+    "trie_to_leaf_ids",
     # magi
     "PrefixTreeMagiBatch",
     "build_prefix_segments_single_turn",
@@ -58,11 +79,13 @@ __all__ = [
     "build_prefix_tree_micro_batch",
     "forward_prefix_tree",
     "get_prefix_tree_kwargs",
+    "hash_prefix",
     "restore_flat_to_nested",
     "strip_prefix_tree_args",
     # utils
+    "PrefixTreeParams",
+    "RangeSpec",
     "TreeNode",
     "build_layout_from_tree_node",
-    "build_prefix_tree_params",
     "longest_common_prefix_length",
 ]

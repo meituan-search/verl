@@ -73,7 +73,22 @@ def prepare_micro_batches(
     force_group_size = tu.get_non_tensor_data(data=data, key="force_group_size", default=1)
 
     if use_dynamic_bsz and use_prefix_tree:
-        from verl.utils.prefix_tree.dynamic import prepare_prefix_tree_micro_batches
+        from verl.utils.prefix_tree.dynamic import (
+            greedy_build_tries,
+            prepare_prefix_tree_micro_batches,
+            trie_dfs_leaf_order,
+        )
+
+        # Build trie once, thread through batch metadata.
+        input_ids = data["input_ids"]
+        seqs = [t.tolist() for t in input_ids.unbind()]
+        max_tokens = sum(len(s) for s in seqs) * 10
+        tries, _ = greedy_build_tries(seqs, max_tokens_per_tree=max_tokens)
+        if tries:
+            trie = tries[0]
+            dfs_order = trie_dfs_leaf_order(trie)
+            data = tu.index_select_tensor_dict(data, torch.tensor(dfs_order))
+            tu.set_non_tensor_data(data, "prefix_tree", trie)
 
         micro_batches, batch_idx_list = prepare_prefix_tree_micro_batches(
             data,
@@ -98,12 +113,18 @@ def prepare_micro_batches(
             force_group_size=force_group_size,
         )
     else:
+        # When use_prefix_tree=True, the batch is already DFS-ordered by the
+        # global _balance_batch step (reorder_and_balance_for_prefix_tree).
+        # Contiguous micro-batch slices then naturally group same-prompt sequences
+        # together so the prefix tree can find shared prefixes.  No local re-sort needed.
         total_data_size = len(data)
         micro_batch_size_per_gpu = data["micro_batch_size_per_gpu"]
         assert total_data_size % (force_group_size * micro_batch_size_per_gpu) == 0, (
             "data size must be divisible by force_group_size * micro_batch_size_per_gpu"
         )
-        micro_batches = tu.chunk_tensordict(data, total_data_size // (micro_batch_size_per_gpu * force_group_size))
+        mbs = micro_batch_size_per_gpu * force_group_size
+        n_micro = total_data_size // mbs
+        micro_batches = tu.chunk_tensordict(data, n_micro)
         batch_idx_list = None
     return micro_batches, batch_idx_list
 

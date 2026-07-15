@@ -1096,44 +1096,19 @@ class RayPPOTrainer:
                 k_partitions=dp_size,
             )
 
-        elif self.config.actor_rollout_ref.rollout.get("use_prefix_tree", False):
-            # Prefix-tree path: reorder batch in DFS trie order so sequences sharing
-            # the same prompt prefix land on the same DP rank and micro-batch.
-            # Combined with use_prefix_grouper, same-prompt rollouts stay co-located.
-            from verl.utils.prefix_tree.dynamic import dfs_leaf_order
+        elif self.config.actor_rollout_ref.model.get("use_prefix_tree", False):
+            # DFS reorder for prefix sharing.
+            from verl.utils.prefix_tree.dynamic import reorder_and_balance_for_prefix_tree
 
-            _ids = batch.batch["input_ids"]
-            _mask = batch.batch.get("attention_mask", None)
-            # Strip ALL padding (left and right) using the mask so the trie sees
-            # only real tokens.  Slicing [:seqlen] would include left-pad tokens,
-            # making same-prompt sequences appear to have different prefixes.
-            if _mask is not None:
-                _seqs = [_ids[i][_mask[i].bool()].tolist() or [0] for i in range(batch_size)]
-            else:
-                _seqs = [_ids[i].tolist() for i in range(batch_size)]
-            _dfs_order = dfs_leaf_order(_seqs)
-            # Append any missing indices (e.g. zero-length sequences not in trie)
-            if len(_dfs_order) < batch_size:
-                _missing = [i for i in range(batch_size) if i not in set(_dfs_order)]
-                _dfs_order = _dfs_order + _missing
-            batch.reorder(torch.tensor(_dfs_order))
-            # Recompute workloads on DFS-reordered batch
-            attention_mask = batch.batch["attention_mask"]
-            global_seqlen_lst = attention_mask.view(batch_size, -1).sum(-1)
-            workload_lst = calculate_workload(global_seqlen_lst)
-            # Use contiguous slicing (not KK) to preserve DFS grouping.
-            # KK sorts indices within each partition, which scatters same-prompt
-            # sequences across ranks and breaks micro-batch prefix sharing.
-            # DFS order already distributes load reasonably evenly.
-            per_rank = batch_size // dp_size
-            global_partition_lst = [list(range(i * per_rank, (i + 1) * per_rank)) for i in range(dp_size)]
-            global_idx = torch.arange(batch_size)  # contiguous — DFS order preserved
-            batch.reorder(global_idx)
-            global_balance_stats = log_seqlen_unbalance(
-                seqlen_list=global_seqlen_lst.tolist(), partitions=global_partition_lst, prefix=logging_prefix
-            )
-            metrics.update(global_balance_stats)
-            return
+            if reorder_and_balance_for_prefix_tree(
+                batch,
+                self.config.actor_rollout_ref.model,
+                dp_size,
+                attention_mask=attention_mask,
+                metrics=metrics,
+                logging_prefix=logging_prefix,
+            ):
+                return
 
         elif keep_minibatch:
             # Decouple the DP balancing and mini-batching.
@@ -1238,14 +1213,15 @@ class RayPPOTrainer:
             # Disable prefix tree AND dynamic batching so the fallback uses
             # static micro-batches (log_prob_micro_batch_size_per_gpu), not the
             # token-budget path which would create 1-seq micro-batches at small budgets.
-            tu.assign_non_tensor(
+            from verl.utils.prefix_tree.trainer import disable_for_log_prob
+
+            disable_for_log_prob(
                 batch_td,
-                use_prefix_tree=False,
-                use_dynamic_bsz=False,
-                micro_batch_size_per_gpu=self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu,
+                self.config.actor_rollout_ref.model,
+                self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu,
             )
             _fb_out = self.actor_rollout_wg.compute_log_prob(batch_td)
-            entropy   = no_padding_2_padding(tu.get(_fb_out, "entropy"),   batch_td)
+            entropy = no_padding_2_padding(tu.get(_fb_out, "entropy"), batch_td)
             log_probs = no_padding_2_padding(tu.get(_fb_out, "log_probs"), batch_td)
             del _fb_out
         if sum_pi_squared is not None:
@@ -1258,6 +1234,7 @@ class RayPPOTrainer:
             result["sum_pi_squared"] = sum_pi_squared.float()
         old_log_prob = tu.get_tensordict(result)
         old_log_prob = DataProto.from_tensordict(old_log_prob)
+
         return old_log_prob, old_log_prob_mfu
 
     def _update_actor(self, batch: DataProto) -> DataProto:
@@ -1412,41 +1389,9 @@ class RayPPOTrainer:
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 rollout_n = self.config.actor_rollout_ref.rollout.n
                 gen_batch_output = gen_batch.repeat(repeat_times=rollout_n, interleave=True)
-                # Inject prefix_segments prior for prefix-tree MAGI attention.
-                # DataProto.repeat() already propagates existing prefix_segments entries
-                # (np.repeat interleaves them correctly).  This fallback handles datasets
-                # that do not yet produce per-sub-turn prefix_segments.
-                if (
-                    self.config.actor_rollout_ref.rollout.get("use_prefix_tree", False)
-                    and gen_batch_output.batch is not None
-                    and "input_ids" in gen_batch_output.batch.keys()
-                ):
-                    _ids = gen_batch_output.batch["input_ids"]
-                    _mask = gen_batch_output.batch.get("attention_mask", None)
+                from verl.utils.prefix_tree.trainer import inject_prefix_segments
 
-                    # Inject prefix_segments when dataset doesn't supply them.
-                    if "prefix_segments" not in gen_batch_output.non_tensor_batch:
-                        from verl.utils.prefix_tree.magi import build_prefix_segments_single_turn
-
-                        # gen_batch_output = gen_batch.repeat(rollout_n, interleave=True)
-                        # All rollout_n copies of each prompt are identical at this point,
-                        # so compute once per unique prompt then repeat — 4x fewer calls.
-                        _orig_ids  = gen_batch.batch["input_ids"]
-                        _orig_mask = gen_batch.batch.get("attention_mask", None)
-                        unique_segs = np.array(
-                            [
-                                build_prefix_segments_single_turn(
-                                    _orig_ids[i],
-                                    _orig_mask[i] if _orig_mask is not None else None,
-                                )
-                                for i in range(_orig_ids.shape[0])
-                            ],
-                            dtype=object,
-                        )
-                        # interleave repeat: [A,B,C] × n=4 → [A,A,A,A,B,B,B,B,C,C,C,C]
-                        gen_batch_output.non_tensor_batch["prefix_segments"] = np.repeat(
-                            unique_segs, repeats=rollout_n, axis=0
-                        )
+                inject_prefix_segments(gen_batch_output, self.config.actor_rollout_ref.model)
 
                 if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                     # NOTE: REMAX needs one sampled rollout plus one greedy baseline per prompt.
@@ -1480,43 +1425,9 @@ class RayPPOTrainer:
                     if "__do_sample__" in gen_batch_output.non_tensor_batch:
                         gen_batch_output.pop(non_tensor_batch_keys=["__do_sample__"])
 
-                    # Inject prefix_segments for multilevel tree support.
-                    # Only needed with use_dynamic_bsz=True (multiple prompt-groups per
-                    # micro-batch): enables hash-based group detection so the multilevel
-                    # tree can find per-group 700-token prefixes beyond the short global LCP.
-                    # With static mbs (use_dynamic_bsz=False), single-group micro-batches
-                    # find the prefix via LCP scan — no prefix_segments needed and the
-                    # simpler path avoids assertion failures in restore_flat_to_nested.
-                    if (
-                        self.config.actor_rollout_ref.rollout.get("use_prefix_tree", False)
-                        and self.config.actor_rollout_ref.actor.use_dynamic_bsz
-                        and "prefix_segments" not in gen_batch_output.non_tensor_batch
-                        and gen_batch_output.batch is not None
-                        and "input_ids" in gen_batch_output.batch.keys()
-                    ):
-                        from verl.utils.prefix_tree.hash_based import _hash_prefix
-                        _ids_t = gen_batch_output.batch["input_ids"]  # (B, max_seq_len)
-                        _mask_t = gen_batch_output.batch.get("attention_mask", None)
-                        _K = 50  # first 50 tokens are always prompt (chat template start)
-                        _segs = []
-                        for _i in range(_ids_t.shape[0]):
-                            _valid = _ids_t[_i][_mask_t[_i].bool()] if _mask_t is not None else _ids_t[_i]
-                            _first_k = _valid[:_K] if _valid.shape[0] >= _K else _valid
-                            _h = _hash_prefix(_first_k.cpu())
-                            _segs.append([(_h, int(_valid.shape[0]))])
-                        gen_batch_output.non_tensor_batch["prefix_segments"] = np.array(_segs, dtype=object)
+                    from verl.utils.prefix_tree.trainer import compute_metrics
 
-                    # Compute prefix sharing ratio on full prompt+response sequences
-                    # (must be after generation so responses are included).
-                    if self.config.actor_rollout_ref.rollout.get("use_prefix_tree", False):
-                        from verl.utils.prefix_tree.dynamic import compute_prefix_tree_metrics
-
-                        metrics.update(
-                            compute_prefix_tree_metrics(
-                                gen_batch_output.batch["input_ids"],
-                                gen_batch_output.batch.get("attention_mask", None),
-                            )
-                        )
+                    compute_metrics(metrics, gen_batch_output.batch["input_ids"], self.config.actor_rollout_ref.model)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         gen_baseline_output = combined_gen_output.slice(num_sampled_prompts, None)

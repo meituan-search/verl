@@ -36,7 +36,6 @@ from verl.utils.chat_template import apply_chat_template, extract_system_prompt_
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.dataset.vision_utils import process_image, process_video
 from verl.utils.fs import copy_local_path_from_hdfs
-from verl.utils.prefix_tree.magi import _hash_prefix as _hash_prefix_ids
 from verl.utils.py_functional import convert_nested_value_to_list_recursive
 
 logger = logging.getLogger(__file__)
@@ -315,19 +314,6 @@ class MultiTurnSFTDataset(Dataset):
             for k, v in _inputs.items():
                 multi_modal_inputs.setdefault(k, []).append(v)
 
-        # Compute prefix_segments before concatenation (one entry per sub-turn).
-        # Each entry is (hash_of_this_turn_tokens, cumulative_token_count).
-        # Per-turn hash (not cumulative): enables O(batch×turns) multilevel tree
-        # detection by grouping samples sharing the same turn content directly.
-        # Entries whose cumulative_len exceeds the final (possibly truncated)
-        # sequence length are dropped below when building `res`.
-        _prefix_segs_raw: list[tuple[int, int]] = []
-        _cum_len = 0
-        for _t in input_ids:
-            _h = _hash_prefix_ids(_t)  # hash of this turn only
-            _cum_len += int(_t.numel())
-            _prefix_segs_raw.append((_h, _cum_len))
-
         input_ids = torch.cat(input_ids, dim=0)
         loss_mask = torch.cat(loss_mask, dim=0)
         attention_mask = torch.cat(attention_mask, dim=0)
@@ -412,7 +398,6 @@ class MultiTurnSFTDataset(Dataset):
                 "attention_mask": attention_mask,
                 "position_ids": position_ids,
                 "loss_mask": loss_mask,
-                "prefix_segments": [s for s in _prefix_segs_raw if s[1] <= _final_len],
             }
             if len(multi_modal_inputs) > 0:
                 res["multi_modal_inputs"] = multi_modal_inputs
@@ -432,7 +417,6 @@ class MultiTurnSFTDataset(Dataset):
                 "input_ids": input_ids,
                 "position_ids": position_ids,
                 "loss_mask": loss_mask,
-                "prefix_segments": [s for s in _prefix_segs_raw if s[1] <= _final_len],
             }
             if len(multi_modal_inputs) > 0:
                 res["multi_modal_inputs"] = multi_modal_inputs

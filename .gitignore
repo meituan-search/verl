@@ -99,6 +99,7 @@ celerybeat-schedule
 venv/
 .venv/
 ENV/
+!**/workers/env/
 
 # Spyder project settings
 .spyderproject
@@ -121,6 +122,8 @@ ENV/
 # ckpt
 *.lock
 
+# data
+*.parquet
 
 
 # local logs
@@ -128,15 +131,3 @@ logs
 log
 outputs
 .history
-
-# Claude Code investigation workspace (not for submission)
-.jobs/
-.claude/
-FIX-*.md
-PERFTEST.md
-Plan.md
-
-# AI tool dirs and editor sessions
-.agent/
-.gemini/
-*.vimvim

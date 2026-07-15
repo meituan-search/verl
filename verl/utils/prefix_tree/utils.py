@@ -14,22 +14,102 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
 from torch import Tensor
 
-from verl.utils.prefix_tree.params import PrefixTreeParams, RangeSpec
+RangeSpec = tuple[int, int]
+
+
+@dataclass
+class PrefixTreeParams:
+    """Metadata for a flattened PrefixTree batch."""
+
+    prefix_range: RangeSpec
+    prefix_segments: list[RangeSpec]
+    leaf_ranges: list[RangeSpec]
+    leaf_segments: list[RangeSpec]
+    leaf_to_sample: list[int]
+    sample_to_leaf_range: dict[int, RangeSpec]
+    q_ranges: list[RangeSpec]
+    k_ranges: list[RangeSpec]
+    mask_types: list[str]
+    total_seqlen_q: int
+    total_seqlen_k: int
+    flat_tokens: Optional[Tensor] = None
+    flat_labels: Optional[Tensor] = None
+    flat_loss_mask: Optional[Tensor] = None
+    flat_position_ids: Optional[Tensor] = None
+
+    def __post_init__(self) -> None:
+        if len(self.leaf_ranges) != len(self.leaf_segments):
+            raise ValueError("leaf_ranges and leaf_segments must have the same length")
+        if len(self.leaf_ranges) != len(self.leaf_to_sample):
+            raise ValueError("leaf_ranges and leaf_to_sample must have the same length")
+        if len(self.q_ranges) != len(self.k_ranges) or len(self.q_ranges) != len(self.mask_types):
+            raise ValueError("q_ranges, k_ranges, and mask_types must have the same length")
+        if set(self.leaf_to_sample) != set(self.sample_to_leaf_range):
+            raise ValueError("sample_to_leaf_range must cover exactly the samples in leaf_to_sample")
+
+        prefix_start, prefix_end = self.prefix_range
+        if prefix_start != 0:
+            raise ValueError("prefix_range must start at 0 in flattened PrefixTree layout")
+        if prefix_end < prefix_start:
+            raise ValueError("prefix_range must be non-decreasing")
+
+        for leaf_range, leaf_segment in zip(self.leaf_ranges, self.leaf_segments, strict=False):
+            leaf_start, leaf_end = leaf_range
+            if leaf_end < leaf_start:
+                raise ValueError("leaf ranges must be non-decreasing")
+            if leaf_segment != leaf_range:
+                raise ValueError("leaf_segments must equal leaf_ranges")
+
+        if self.total_seqlen_q != self.total_seqlen_k:
+            raise ValueError("PrefixTree expects matching q/k sequence lengths")
+        if self.leaf_ranges and self.leaf_ranges[-1][1] != self.total_seqlen_q:
+            raise ValueError("last leaf range must end at total sequence length")
+        if not self.leaf_ranges and self.prefix_range[1] != self.total_seqlen_q:
+            raise ValueError("prefix-only PrefixTree must end at total sequence length")
+
+        for sample_idx, leaf_range in zip(self.leaf_to_sample, self.leaf_ranges, strict=False):
+            if self.sample_to_leaf_range[sample_idx] != leaf_range:
+                raise ValueError("sample_to_leaf_range does not match leaf_to_sample ordering")
+
+        for name, tensor in {
+            "flat_tokens": self.flat_tokens,
+            "flat_labels": self.flat_labels,
+            "flat_loss_mask": self.flat_loss_mask,
+            "flat_position_ids": self.flat_position_ids,
+        }.items():
+            if tensor is not None and tensor.numel() != self.total_seqlen_q:
+                raise ValueError(f"{name} must have total_seqlen_q elements")
+
+    @property
+    def prefix_len(self) -> int:
+        return self.prefix_range[1] - self.prefix_range[0]
+
+    @property
+    def branch_lengths(self) -> list[int]:
+        return [end - start for start, end in self.leaf_ranges]
+
+    @property
+    def num_samples(self) -> int:
+        return len(self.leaf_to_sample)
+
+    def get_leaf_range(self, sample_idx: int) -> RangeSpec:
+        return self.sample_to_leaf_range[sample_idx]
+
 
 __all__ = [
+    "RangeSpec",
+    "PrefixTreeParams",
     "TreeNode",
     "build_prefix_tree_dense_mask",
-    "build_prefix_tree_flex_spec",
-    "build_multilevel_flex_spec",
+    "build_prefix_tree_attention_spec",
     "build_layout_from_tree_node",
-    "build_prefix_tree_params",
     "extract_sample_tensor",
     "extract_sample_tensors",
     "longest_common_prefix_length",
@@ -64,40 +144,10 @@ class TreeNode:
         return not self.children
 
 
-def build_prefix_tree_flex_spec(
-    prefix_len: int,
-    branch_lengths: Iterable[int],
-) -> tuple[list[RangeSpec], list[RangeSpec], list[str]]:
-    """Encode the root-shared PrefixTree mask as MAGI flex rectangles."""
-    if prefix_len < 0:
-        raise ValueError("prefix_len must be non-negative")
-
-    q_ranges: list[RangeSpec] = [(0, prefix_len)]
-    k_ranges: list[RangeSpec] = [(0, prefix_len)]
-    mask_types = ["causal"]
-
-    current = prefix_len
-    for branch_len in branch_lengths:
-        if branch_len < 0:
-            raise ValueError("branch_lengths must be non-negative")
-
-        branch_range = (current, current + branch_len)
-        q_ranges.append(branch_range)
-        k_ranges.append((0, prefix_len))
-        mask_types.append("full")
-
-        q_ranges.append(branch_range)
-        k_ranges.append(branch_range)
-        mask_types.append("causal")
-        current += branch_len
-
-    return q_ranges, k_ranges, mask_types
-
-
-def build_multilevel_flex_spec(
+def build_prefix_tree_attention_spec(
     root: TreeNode,
 ) -> tuple[list[RangeSpec], list[RangeSpec], list[str]]:
-    """Encode a multi-level prefix tree as MAGI flex rectangles.
+    """Encode a prefix tree as attention rectangle specs.
 
     The flat token layout is a DFS pre-order walk of the tree: each node's
     own tokens come before any of its descendants' tokens.
@@ -106,9 +156,6 @@ def build_multilevel_flex_spec(
     - One ``CAUSAL`` rectangle covering the node's own tokens (self-attention).
     - For each leaf descendant: one ``FULL`` rectangle from that leaf's tokens
       to this node's tokens (the leaf attends fully to every ancestor).
-
-    This generalises the single-level encoding in ``build_prefix_tree_flex_spec``:
-    a depth-1 tree with one root and B leaves produces identical output.
 
     Args:
         root: Root ``TreeNode`` of the tree.  ``segment_len`` must be > 0 for
@@ -207,13 +254,13 @@ def build_layout_from_tree_node(
             sample's RoPE positions match the original layout.
 
     Returns:
-        PrefixTreeParams with ``multilevel=True``. Also stashes
+        PrefixTreeParams. Also stashes
         ``_leaf_ancestor_ranges`` on the params instance for downstream
         ``restore_flat_to_nested``.
     """
-    # build_multilevel_flex_spec assigns _flat_start / _flat_end to every node
+    # build_prefix_tree_attention_spec assigns _flat_start/_flat_end to every node
     # as a side effect — we rely on that for leaf_ranges + ancestor ranges below.
-    q_ranges, k_ranges, mask_types = build_multilevel_flex_spec(tree_root)
+    q_ranges, k_ranges, mask_types = build_prefix_tree_attention_spec(tree_root)
 
     # Walk top-down: assign each node its owner sample (first leaf descendant)
     # and owner offset (= sum of ancestor segment_lens). Also collect leaves in
@@ -307,7 +354,6 @@ def build_layout_from_tree_node(
         flat_labels=None,
         flat_loss_mask=flat_loss_mask,
         flat_position_ids=flat_position_ids,
-        multilevel=True,
     )
     params._leaf_ancestor_ranges = leaf_ancestor_ranges  # type: ignore[attr-defined]
     return params
@@ -368,67 +414,6 @@ def longest_common_prefix_length(sequences: Sequence[Tensor]) -> int:
     return prefix_len
 
 
-def build_prefix_tree_params(
-    tokens_by_sample: Sequence[Tensor],
-    *,
-    sample_indices: Optional[Sequence[int]] = None,
-    prefix_len: Optional[int] = None,
-    labels_by_sample: Optional[Sequence[Tensor]] = None,
-    loss_masks_by_sample: Optional[Sequence[Tensor]] = None,
-    position_ids_by_sample: Optional[Sequence[Tensor]] = None,
-) -> PrefixTreeParams:
-    """Build PrefixTreeParams for a root-shared batch flattened as [prefix][leaf_1][leaf_2]....
-
-    `labels_by_sample` is only safe when the shared-prefix label slices are identical across all
-    samples. Autoregressive next-token labels often diverge at the prefix/leaf boundary, so callers
-    should omit labels unless they have already accounted for that ambiguity.
-    """
-    tokens_reference = _validate_sequence_field("tokens_by_sample", tokens_by_sample)
-    normalized_sample_indices = _normalize_sample_indices(len(tokens_by_sample), sample_indices)
-
-    if prefix_len is None:
-        prefix_len = longest_common_prefix_length(tokens_by_sample)
-    else:
-        if prefix_len < 0:
-            raise ValueError("prefix_len must be non-negative")
-        if prefix_len > min(sequence.numel() for sequence in tokens_by_sample):
-            raise ValueError("prefix_len cannot exceed the shortest sequence")
-        _validate_shared_prefix("tokens_by_sample", tokens_by_sample, prefix_len)
-
-    branch_lengths = [sequence.numel() - prefix_len for sequence in tokens_by_sample]
-    prefix_range = (0, prefix_len)
-    leaf_ranges = _build_leaf_ranges(prefix_len, branch_lengths)
-    q_ranges, k_ranges, mask_types = build_prefix_tree_flex_spec(prefix_len, branch_lengths)
-
-    flat_tokens = _flatten_root_shared_field("tokens_by_sample", tokens_by_sample, prefix_len)
-    flat_labels = _flatten_optional_field("labels_by_sample", labels_by_sample, tokens_by_sample, prefix_len)
-    flat_loss_mask = _flatten_optional_field("loss_masks_by_sample", loss_masks_by_sample, tokens_by_sample, prefix_len)
-    if position_ids_by_sample is None:
-        flat_position_ids = _build_default_position_ids(prefix_len, branch_lengths, tokens_reference.device)
-    else:
-        flat_position_ids = _flatten_optional_field(
-            "position_ids_by_sample", position_ids_by_sample, tokens_by_sample, prefix_len
-        )
-
-    return PrefixTreeParams(
-        prefix_range=prefix_range,
-        prefix_segments=[prefix_range],
-        leaf_ranges=leaf_ranges,
-        leaf_segments=list(leaf_ranges),
-        leaf_to_sample=list(normalized_sample_indices),
-        sample_to_leaf_range=dict(zip(normalized_sample_indices, leaf_ranges, strict=False)),
-        q_ranges=q_ranges,
-        k_ranges=k_ranges,
-        mask_types=mask_types,
-        total_seqlen_q=flat_tokens.numel(),
-        total_seqlen_k=flat_tokens.numel(),
-        flat_tokens=flat_tokens,
-        flat_labels=flat_labels,
-        flat_loss_mask=flat_loss_mask,
-        flat_position_ids=flat_position_ids,
-    )
-
-
 def extract_sample_tensor(
     flat_tensor: Tensor,
     prefix_tree_params: PrefixTreeParams,
@@ -456,77 +441,6 @@ def extract_sample_tensors(
     }
 
 
-def _build_default_position_ids(
-    prefix_len: int,
-    branch_lengths: Sequence[int],
-    device: torch.device,
-) -> Tensor:
-    pieces = [torch.arange(prefix_len, device=device, dtype=torch.long)]
-    pieces.extend(
-        torch.arange(prefix_len, prefix_len + branch_len, device=device, dtype=torch.long)
-        for branch_len in branch_lengths
-    )
-    return torch.cat(pieces, dim=0)
-
-
-def _build_leaf_ranges(prefix_len: int, branch_lengths: Sequence[int]) -> list[RangeSpec]:
-    leaf_ranges: list[RangeSpec] = []
-    current = prefix_len
-    for branch_len in branch_lengths:
-        leaf_range = (current, current + branch_len)
-        leaf_ranges.append(leaf_range)
-        current += branch_len
-    return leaf_ranges
-
-
-def _flatten_optional_field(
-    name: str,
-    field_by_sample: Optional[Sequence[Tensor]],
-    tokens_by_sample: Sequence[Tensor],
-    prefix_len: int,
-) -> Optional[Tensor]:
-    if field_by_sample is None:
-        return None
-    _validate_auxiliary_field(name, field_by_sample, tokens_by_sample)
-    return _flatten_root_shared_field(name, field_by_sample, prefix_len)
-
-
-def _flatten_root_shared_field(
-    name: str,
-    field_by_sample: Sequence[Tensor],
-    prefix_len: int,
-) -> Tensor:
-    reference = _validate_sequence_field(name, field_by_sample)
-    _validate_shared_prefix(name, field_by_sample, prefix_len)
-
-    pieces = [reference[:prefix_len]]
-    pieces.extend(sequence[prefix_len:] for sequence in field_by_sample)
-    return torch.cat(pieces, dim=0)
-
-
-def _normalize_sample_indices(num_samples: int, sample_indices: Optional[Sequence[int]]) -> list[int]:
-    if sample_indices is None:
-        return list(range(num_samples))
-    if len(sample_indices) != num_samples:
-        raise ValueError("sample_indices must have the same length as tokens_by_sample")
-    if len(set(sample_indices)) != len(sample_indices):
-        raise ValueError("sample_indices must be unique")
-    return list(sample_indices)
-
-
-def _validate_auxiliary_field(
-    name: str,
-    field_by_sample: Sequence[Tensor],
-    tokens_by_sample: Sequence[Tensor],
-) -> None:
-    _validate_sequence_field(name, field_by_sample)
-    if len(field_by_sample) != len(tokens_by_sample):
-        raise ValueError(f"{name} must have the same length as tokens_by_sample")
-    for index, (field_tensor, token_tensor) in enumerate(zip(field_by_sample, tokens_by_sample, strict=False)):
-        if field_tensor.numel() != token_tensor.numel():
-            raise ValueError(f"{name}[{index}] must have the same number of elements as tokens_by_sample[{index}]")
-
-
 def _validate_sequence_field(name: str, sequences: Sequence[Tensor]) -> Tensor:
     if not sequences:
         raise ValueError(f"{name} must contain at least one sequence")
@@ -544,13 +458,6 @@ def _validate_sequence_field(name: str, sequences: Sequence[Tensor]) -> Tensor:
             raise ValueError(f"{name} must have a single dtype")
 
     return reference
-
-
-def _validate_shared_prefix(name: str, sequences: Sequence[Tensor], prefix_len: int) -> None:
-    reference_prefix = sequences[0][:prefix_len]
-    for index, sequence in enumerate(sequences[1:], start=1):
-        if not torch.equal(sequence[:prefix_len], reference_prefix):
-            raise ValueError(f"{name}[{index}] does not match the shared prefix")
 
 
 def _validate_flat_tensor(flat_tensor: Tensor, prefix_tree_params: PrefixTreeParams) -> None:
