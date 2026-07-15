@@ -1,0 +1,4 @@
+# Ray job: LongReason GRPO dynbsz MAGI — 128k split
+entrypoint: SPLIT=128k MODEL_PATH=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-ai-search/deepsearch_files_ssd/LLMbasemodels/huggingface.co/Qwen/Qwen3-1.7B bash prefix_script/run_grpo_longreason_dynbsz_magi.sh
+runtime_env:
+  working_dir: ./

@@ -121,9 +121,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
         # Thread prefix-tree flags from model config → engine meta_info (actor training dedup)
         self.engine_config.use_prefix_tree = self.model_config.get("use_prefix_tree", False)
         self.engine_config.prefix_tree_attention = self.model_config.get("prefix_tree_attention", "flex")
-        self.engine_config.prefix_tree_dynbsz_length_estimator = self.model_config.get(
-            "prefix_tree_dynbsz_length_estimator", "length"
-        )
 
         self.profiler_config = self.config.profiler_config
         if self.profiler_config is not None:
@@ -321,7 +318,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 _t_train_start = time.perf_counter()
                 actor_output = self.train_batch(mini_batch_td)
                 _t_train_end = time.perf_counter()
-                logger.warning(f"train_mini_batch: batch_idx={batch_idx} overhead={_t_train_start - _iter_start:.3f}s train={_t_train_end - _t_train_start:.3f}s")
+                logger.warning(
+                    f"train_mini_batch: batch_idx={batch_idx} overhead={_t_train_start - _iter_start:.3f}s train={_t_train_end - _t_train_start:.3f}s"
+                )
                 output_lst.append(actor_output)
 
             if self.engine.is_mp_src_rank_with_outputs():
@@ -362,9 +361,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
             use_fused_kernels=self.engine_config.use_fused_kernels,
             use_prefix_tree=getattr(self.engine_config, "use_prefix_tree", False),
             prefix_tree_attention=getattr(self.engine_config, "prefix_tree_attention", "flex"),
-            prefix_tree_dynbsz_length_estimator=getattr(
-                self.engine_config, "prefix_tree_dynbsz_length_estimator", "length"
-            ),
         )
 
         for key, val in default_keys.items():
@@ -421,9 +417,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
             use_fused_kernels=self.engine_config.use_fused_kernels,
             use_prefix_tree=self.engine_config.use_prefix_tree,
             prefix_tree_attention=getattr(self.engine_config, "prefix_tree_attention", "flex"),
-            prefix_tree_dynbsz_length_estimator=getattr(
-                self.engine_config, "prefix_tree_dynbsz_length_estimator", "length"
-            ),
         )
 
         for key, val in default_keys.items():

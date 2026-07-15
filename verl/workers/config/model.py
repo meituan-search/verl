@@ -122,8 +122,6 @@ class HFModelConfig(BaseConfig):
     # Prefix-tree shared-prefix deduplication for actor/SFT training.
     use_prefix_tree: bool = False
     prefix_tree_attention: str = "flex"
-    # dynbsz budget estimator: "length" = flat deduplicated tokens, "area" = sqrt(non-masked attention area)
-    prefix_tree_dynbsz_length_estimator: str = "length"
 
     # TODO: unify fsdp and megatron lora config
     # fsdp lora related. We may setup a separate config later

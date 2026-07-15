@@ -27,8 +27,8 @@ from .dynamic import (
     greedy_build_tries,
     mbs_groups_from_trie,
     prepare_prefix_tree_micro_batches,
-    prune_trie,
     reorder_and_balance_for_prefix_tree,
+    subtrie_view,
     trie_dfs_leaf_order,
     trie_to_leaf_ids,
 )
@@ -66,7 +66,7 @@ __all__ = [
     "greedy_build_tries",
     "mbs_groups_from_trie",
     "prepare_prefix_tree_micro_batches",
-    "prune_trie",
+    "subtrie_view",
     "reorder_and_balance_for_prefix_tree",
     "trie_dfs_leaf_order",
     "trie_to_leaf_ids",

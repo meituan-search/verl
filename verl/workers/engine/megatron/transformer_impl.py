@@ -664,16 +664,10 @@ class MegatronEngine(BaseEngine):
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
         # batch should be a list of batches inside micro-batches
-        _t_gen_start = logging.time.perf_counter()
         batch_generator = make_batch_generator(micro_batches, vpp_size=len(self.module))
-        _t_gen_end = logging.time.perf_counter()
-        logger.warning(f"forward_backward_batch: make_batch_generator took {_t_gen_end - _t_gen_start:.3f}s")
 
         # TODO: we may use the new schedule instead
         # for flash-attn: (seq_len, batch_size, hidden_size) = (mbs*seq_len, 1, hidden_size)
-        import time as _time
-
-        _t_fb_start = _time.perf_counter()
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step,
             data_iterator=batch_generator,
@@ -682,10 +676,6 @@ class MegatronEngine(BaseEngine):
             seq_length=1,  # the communication shape is obtained via p2p comm
             micro_batch_size=1,  # the communication shape is obtained via p2p comm
             forward_only=forward_only,
-        )
-        _t_fb_end = _time.perf_counter()
-        logger.warning(
-            f"forward_backward_batch: forward_backward_func took {_t_fb_end - _t_fb_start:.3f}s for {n_micro_batch} microbatches"
         )
 
         if losses_reduced and self.is_mp_src_rank_with_outputs():

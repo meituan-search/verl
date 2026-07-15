@@ -1,4 +1,16 @@
-#!/usr/bin/env python3
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Local test + benchmark for build_tree_from_segments vs build_tree_dynamic.
 
 Runs with plain Python + torch (no Megatron, no GPU needed — CPU tensors only).
@@ -12,14 +24,14 @@ Verifies:
 Usage:
     python3 tests/utils/prefix_tree/bench_build_tree.py
 """
+
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import time
-import os
 
-import numpy as np
 import torch
 
 # ── Direct module loading (bypasses __init__.py which imports magi.py) ──────
@@ -39,9 +51,7 @@ sys.modules["verl_prefix_tree_pkg"] = _pkg
 
 
 def _load(name: str, rel_path: str):
-    spec = importlib.util.spec_from_file_location(
-        f"verl_prefix_tree_pkg.{name}", os.path.join(_PKG_DIR, rel_path)
-    )
+    spec = importlib.util.spec_from_file_location(f"verl_prefix_tree_pkg.{name}", os.path.join(_PKG_DIR, rel_path))
     mod = importlib.util.module_from_spec(spec)
     sys.modules[f"verl_prefix_tree_pkg.{name}"] = mod
     spec.loader.exec_module(mod)
@@ -123,7 +133,9 @@ def make_grpo_samples(n_rollouts: int, prefix_len: int, resp_len: int, vocab: in
     return samples, prefix
 
 
-def make_grpo_samples_same_first_token(n_rollouts: int, prefix_len: int, resp_len: int, vocab: int = 151936, seed: int = 0):
+def make_grpo_samples_same_first_token(
+    n_rollouts: int, prefix_len: int, resp_len: int, vocab: int = 151936, seed: int = 0
+):
     """Like make_grpo_samples but all responses start with the same token."""
     g = torch.Generator().manual_seed(seed)
     prefix = torch.randint(0, vocab, (prefix_len,), generator=g)
@@ -150,10 +162,10 @@ def layout_flat_tokens(subtrie: PrefixSubTrie, samples: list) -> list[int]:
 
 def verify_subtrie_correctness(sub: PrefixSubTrie, samples: list, prefix_len: int, n_rollouts: int):
     """Verify a subtrie is internally correct:
-      - leaf_to_sample covers all samples
-      - flat layout starts with the shared prefix
-      - flat total <= raw total (deduplication happened)
-      - flat total >= prefix_len + n_rollouts (at least 1 token per leaf)
+    - leaf_to_sample covers all samples
+    - flat layout starts with the shared prefix
+    - flat total <= raw total (deduplication happened)
+    - flat total >= prefix_len + n_rollouts (at least 1 token per leaf)
     """
     assert sub is not None
     assert set(sub.leaf_to_sample) == set(range(n_rollouts)), (
@@ -162,9 +174,7 @@ def verify_subtrie_correctness(sub: PrefixSubTrie, samples: list, prefix_len: in
     flat = layout_flat_tokens(sub, samples)
     raw_total = sum(len(s) for s in samples)
     assert len(flat) <= raw_total, f"flat {len(flat)} > raw {raw_total} — no dedup!"
-    assert len(flat) >= prefix_len + n_rollouts, (
-        f"flat {len(flat)} too small — expected >= {prefix_len + n_rollouts}"
-    )
+    assert len(flat) >= prefix_len + n_rollouts, f"flat {len(flat)} too small — expected >= {prefix_len + n_rollouts}"
     # Prefix tokens must appear once at the start
     expected_prefix = samples[0][:prefix_len].tolist()
     assert flat[:prefix_len] == expected_prefix, "prefix tokens mismatch at start of flat layout"
@@ -214,9 +224,7 @@ def test_same_first_token_suffix():
     n_rollouts = 4
     prefix_len = 50
     resp_len = 10
-    samples, prefix = make_grpo_samples_same_first_token(
-        n_rollouts, prefix_len, resp_len, seed=7
-    )
+    samples, prefix = make_grpo_samples_same_first_token(n_rollouts, prefix_len, resp_len, seed=7)
     suffixes = [s[prefix_len:] for s in samples]
     first_tokens = [int(s[0]) for s in suffixes]
     assert len(set(first_tokens)) == 1, "test setup broken: suffixes don't share first token"
@@ -234,8 +242,7 @@ def test_same_first_token_suffix():
 
     # Both must cover all samples — collision would drop samples
     assert set(sub_seg.leaf_to_sample) == set(range(n_rollouts)), (
-        f"COLLISION: segments path dropped samples! "
-        f"got {set(sub_seg.leaf_to_sample)} expected {set(range(n_rollouts))}"
+        f"COLLISION: segments path dropped samples! got {set(sub_seg.leaf_to_sample)} expected {set(range(n_rollouts))}"
     )
     verify_subtrie_correctness(sub_seg, samples, prefix_len, n_rollouts)
     verify_subtrie_correctness(sub_dyn, samples, prefix_len, n_rollouts)
@@ -244,11 +251,9 @@ def test_same_first_token_suffix():
     flat_dyn = layout_flat_tokens(sub_dyn, samples)
     # Direct construction keeps suffixes independent (no dedup of coincidental
     # token overlap), so flat_seg >= flat_dyn is expected.  Both are valid.
-    assert len(flat_seg) >= len(flat_dyn), (
-        f"segments flat {len(flat_seg)} < dynamic {len(flat_dyn)} — unexpected"
-    )
+    assert len(flat_seg) >= len(flat_dyn), f"segments flat {len(flat_seg)} < dynamic {len(flat_dyn)} — unexpected"
 
-    print(f"  PASS: same-first-token suffixes handled correctly")
+    print("  PASS: same-first-token suffixes handled correctly")
     print(f"  flat: segments={len(flat_seg)}  dynamic={len(flat_dyn)} (dyn dedups shared suffix token)")
     print(f"  leaves: segments={len(sub_seg.leaf_node_ids)}  dynamic={len(sub_dyn.leaf_node_ids)}")
 
@@ -257,9 +262,7 @@ def test_leaf_coverage():
     """Every sample must have a leaf entry."""
     print("\n=== Test: leaf coverage ===")
     samples, _ = make_grpo_samples(n_rollouts=8, prefix_len=200, resp_len=30, seed=99)
-    hashes, lengths = create_grpo_segment_metadata(
-        prompt_uids=["p0"] * 8, prompt_lengths=[200] * 8, rollout_n=8
-    )
+    hashes, lengths = create_grpo_segment_metadata(prompt_uids=["p0"] * 8, prompt_lengths=[200] * 8, rollout_n=8)
     sub = build_tree_from_segments(samples, hashes, lengths, **INJECTED)
     assert sub is not None
     assert set(sub.leaf_to_sample) == set(range(8)), f"missing samples: {set(range(8)) - set(sub.leaf_to_sample)}"
@@ -346,7 +349,7 @@ def bench_multiple_scales():
         flat_dyn = layout_flat_tokens(sub_dyn, samples)
         match = flat_seg[:prefix_len] == flat_dyn[:prefix_len]
 
-        print(f"  {prefix_len:>12}  {t_seg:>14.1f}  {t_dyn:>14.1f}  {t_dyn/t_seg:>8.2f}x  {str(match):>6}")
+        print(f"  {prefix_len:>12}  {t_seg:>14.1f}  {t_dyn:>14.1f}  {t_dyn / t_seg:>8.2f}x  {str(match):>6}")
 
 
 if __name__ == "__main__":

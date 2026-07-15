@@ -104,14 +104,13 @@ def prepare_micro_batches(
             # Compute prefix-tree metrics from the already-built trie — correct
             # sequence lengths (NestedTensor, no padding) and no trie rebuild.
             max_token_len_per_gpu = tu.get_non_tensor_data(data, "max_token_len_per_gpu", default=None)
-            estimator = tu.get_non_tensor_data(data, "prefix_tree_dynbsz_length_estimator", default="length")
             pt_metrics = {
                 "prefix_tree/global_shared_ratio": 1.0 - flat / total_raw,
                 "prefix_tree/flat_tokens": flat,
                 "prefix_tree/raw_tokens": total_raw,
             }
             if max_token_len_per_gpu is not None:
-                groups = mbs_groups_from_trie(trie, max_token_len_per_gpu * sp_size, use_n2_cost=(estimator == "area"))  # TODO: use PrefixTrie
+                groups = mbs_groups_from_trie(trie, max_token_len_per_gpu * sp_size)  # TODO: use PrefixTrie
                 pt_metrics["prefix_tree/avg_mbs"] = len(seqs) / len(groups) if groups else 0.0
                 ratios = [
                     1.0 - trie_group_flat_tokens(g, trie) / sum(len(seqs[i]) for i in g)  # TODO: use PrefixTrie
