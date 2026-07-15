@@ -1,4 +1,4 @@
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright 2025-2026 Meituan Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -40,6 +40,7 @@ from .magi import (
     get_prefix_tree_kwargs,
     restore_flat_to_nested,
     strip_prefix_tree_args,
+    try_forward_prefix_tree,
 )
 from .utils import (
     PrefixTreeParams,
@@ -76,6 +77,7 @@ __all__ = [
     "get_prefix_tree_kwargs",
     "restore_flat_to_nested",
     "strip_prefix_tree_args",
+    "try_forward_prefix_tree",
     # utils
     "PrefixTreeParams",
     "RangeSpec",

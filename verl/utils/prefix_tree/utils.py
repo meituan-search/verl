@@ -1,4 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2025-2026 Meituan Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -172,9 +172,9 @@ def build_prefix_tree_attention_spec(
 
     # Assign flat token offsets with a DFS pre-order walk.
     def _assign_offsets(node: TreeNode, start: int) -> int:
-        node._flat_start = start  # type: ignore[attr-defined]
-        node._flat_end = start + node.segment_len  # type: ignore[attr-defined]
-        cur = node._flat_end  # type: ignore[attr-defined]
+        node._flat_start = start
+        node._flat_end = start + node.segment_len
+        cur = node._flat_end
         for child in node.children:
             cur = _assign_offsets(child, cur)
         return cur
@@ -194,9 +194,8 @@ def build_prefix_tree_attention_spec(
     def _emit_node(node: TreeNode) -> None:
         if node.segment_len == 0:
             return
-        node_range: RangeSpec = (node._flat_start, node._flat_end)  # type: ignore[attr-defined]
+        node_range: RangeSpec = (node._flat_start, node._flat_end)
 
-        # Self-attention: causal over this node's own tokens.
         q_ranges.append(node_range)
         k_ranges.append(node_range)
         mask_types.append("causal")
@@ -204,11 +203,10 @@ def build_prefix_tree_attention_spec(
         if node.is_leaf:
             return
 
-        # Every descendant attends fully to this node's tokens.
         for desc in _collect_descendants(node):
             if desc.segment_len == 0:
                 continue
-            desc_range: RangeSpec = (desc._flat_start, desc._flat_end)  # type: ignore[attr-defined]
+            desc_range: RangeSpec = (desc._flat_start, desc._flat_end)
             q_ranges.append(desc_range)
             k_ranges.append(node_range)
             mask_types.append("full")
@@ -270,11 +268,11 @@ def build_layout_from_tree_node(
     leaf_cursor = [0]  # mutable closure cell
 
     def _annotate(node: TreeNode, owner_offset: int) -> int:
-        node._owner_offset = owner_offset  # type: ignore[attr-defined]
+        node._owner_offset = owner_offset
         if node.is_leaf:
             sample_idx = int(leaf_to_sample[leaf_cursor[0]])
             leaf_cursor[0] += 1
-            node._owner_sample = sample_idx  # type: ignore[attr-defined]
+            node._owner_sample = sample_idx
             leaves_in_dfs.append(node)
             return sample_idx
         child_offset = owner_offset + node.segment_len
@@ -284,12 +282,11 @@ def build_layout_from_tree_node(
             owner = _annotate(child, child_offset)
             if i == 0:
                 first_owner = owner
-        node._owner_sample = first_owner  # type: ignore[attr-defined]
-        return first_owner  # type: ignore[return-value]
+        node._owner_sample = first_owner
+        return first_owner
 
     _annotate(tree_root, 0)
 
-    # Emit flat tokens via DFS pre-order using each node's (owner_sample, owner_offset).
     device = samples[0].device
     flat_pieces: list[Tensor] = []
     flat_lm_pieces: Optional[list[Tensor]] = [] if loss_masks_by_sample is not None else None
@@ -298,8 +295,8 @@ def build_layout_from_tree_node(
 
     def _emit(node: TreeNode) -> None:
         if node.segment_len > 0:
-            owner = node._owner_sample  # type: ignore[attr-defined]
-            s = node._owner_offset  # type: ignore[attr-defined]
+            owner = node._owner_sample
+            s = node._owner_offset
             e = s + node.segment_len
             flat_pieces.append(samples[owner][s:e])
             if flat_lm_pieces is not None:
@@ -322,7 +319,7 @@ def build_layout_from_tree_node(
             torch.cat(default_pid_pieces) if default_pid_pieces else torch.empty(0, dtype=torch.long, device=device)
         )
 
-    leaf_ranges = [(leaf._flat_start, leaf._flat_end) for leaf in leaves_in_dfs]  # type: ignore[attr-defined]
+    leaf_ranges = [(leaf._flat_start, leaf._flat_end) for leaf in leaves_in_dfs]
     leaf_to_sample_list = [int(s) for s in leaf_to_sample]
     sample_to_leaf_range = {s: r for s, r in zip(leaf_to_sample_list, leaf_ranges, strict=False)}
 
@@ -331,12 +328,12 @@ def build_layout_from_tree_node(
         chain: list[RangeSpec] = []
         cur = parent_of.get(id(leaf))
         while cur is not None:
-            chain.append((cur._flat_start, cur._flat_end))  # type: ignore[attr-defined]
+            chain.append((cur._flat_start, cur._flat_end))
             cur = parent_of.get(id(cur))
         chain.reverse()  # root first
         leaf_ancestor_ranges.append(chain)
 
-    prefix_range = (tree_root._flat_start, tree_root._flat_end)  # type: ignore[attr-defined]
+    prefix_range = (tree_root._flat_start, tree_root._flat_end)
 
     params = PrefixTreeParams(
         prefix_range=prefix_range,
@@ -355,7 +352,7 @@ def build_layout_from_tree_node(
         flat_loss_mask=flat_loss_mask,
         flat_position_ids=flat_position_ids,
     )
-    params._leaf_ancestor_ranges = leaf_ancestor_ranges  # type: ignore[attr-defined]
+    params._leaf_ancestor_ranges = leaf_ancestor_ranges
     return params
 
 

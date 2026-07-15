@@ -76,7 +76,6 @@ def prepare_micro_batches(
         from verl.utils.prefix_tree.dynamic import (
             greedy_build_tries,
             prepare_prefix_tree_micro_batches,
-            trie_dfs_leaf_order,
         )
 
         # Build trie once, thread through batch metadata.
@@ -86,8 +85,6 @@ def prepare_micro_batches(
         tries, _ = greedy_build_tries(seqs, max_tokens_per_tree=max_tokens)
         if tries:
             trie = tries[0]
-            dfs_order = trie_dfs_leaf_order(trie)
-            data = tu.index_select_tensor_dict(data, torch.tensor(dfs_order))
             tu.assign_non_tensor(data, prefix_tree=trie)
 
         micro_batches, batch_idx_list = prepare_prefix_tree_micro_batches(

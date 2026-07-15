@@ -387,6 +387,22 @@ def apply_prefix_tree_patch() -> None:
 
     TEDotProductAttention._prefix_tree_patched = True
 
+    # Patch RoPE to re-index cos/sin by per-sample position IDs.
+    # When set_prefix_tree_position_ids() is called before a MAGI forward,
+    # the returned rotary_pos_emb is re-indexed to per-sample positions.
+    _rope_wrapped = RotaryEmbedding.forward
+
+    def _rope_forward_with_per_sample(self, max_seq_len, offset=0, packed_seq=False, cp_group=None):
+        from verl.utils.prefix_tree.magi import _per_sample_pos_ids
+
+        emb = _rope_wrapped(self, max_seq_len, offset, packed_seq, cp_group)
+        if _per_sample_pos_ids is not None:
+            pids = _per_sample_pos_ids.to(emb.device)
+            emb = emb[pids]
+        return emb
+
+    RotaryEmbedding.forward = _rope_forward_with_per_sample
+
 
 # Backward-compatibility alias
 apply_magi_patch = apply_prefix_tree_patch
