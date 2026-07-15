@@ -180,6 +180,10 @@ class PrefixSubTrie(PrefixTrie):
     # Computed at construction time in batch input order — ready for non_tensor_data.
     leaf_ids: np.ndarray  # shape (batch_size,), dtype int64
 
+    # MAGI key cache for OLP→actor_update reuse. Populated on first forward,
+    # reused if tree structure and CP group haven't changed.
+    _cached_magi_key: Optional[object] = None
+
     def __init__(
         self,
         source: PrefixTrie,
@@ -225,8 +229,7 @@ class PrefixSubTrie(PrefixTrie):
         and reconstruct detached nodes on __setstate__.
         """
         nodes_data = [
-            (n.flat_idx, n.input_ids, n.ancestor.flat_idx if n.ancestor else -1, n.sequence_ids)
-            for n in self.nodes
+            (n.flat_idx, n.input_ids, n.ancestor.flat_idx if n.ancestor else -1, n.sequence_ids) for n in self.nodes
         ]
         return {
             "leaf_node_ids": self.leaf_node_ids,
@@ -248,8 +251,7 @@ class PrefixSubTrie(PrefixTrie):
         # Reconstruct detached TrieNode objects (subtrie-only children links).
         by_flat_idx: dict[int, TrieNode] = {}
         for flat_idx, input_ids, _anc, sequence_ids in state["nodes_data"]:
-            node = TrieNode(tree_id=-1, input_ids=list(input_ids),
-                            sequence_ids=list(sequence_ids), flat_idx=flat_idx)
+            node = TrieNode(tree_id=-1, input_ids=list(input_ids), sequence_ids=list(sequence_ids), flat_idx=flat_idx)
             by_flat_idx[flat_idx] = node
 
         for flat_idx, input_ids, ancestor_flat_idx, _seq in state["nodes_data"]:
@@ -260,6 +262,7 @@ class PrefixSubTrie(PrefixTrie):
                 by_flat_idx[ancestor_flat_idx].children[first_token] = node
 
         self.nodes = [by_flat_idx[fid] for fid, _, _, _ in state["nodes_data"]]
+        self._cached_magi_key = None
 
     def create_sub_trie(
         self,
@@ -294,3 +297,64 @@ class PrefixSubTrie(PrefixTrie):
             loss_masks_by_sample=loss_masks_by_sample,
             position_ids_by_sample=position_ids_by_sample,
         )
+
+
+# ---------------------------------------------------------------------------
+# Static tree builders (from known structure, avoiding token-by-token detection)
+# ---------------------------------------------------------------------------
+
+
+def build_tree_from_segments(
+    samples: list,
+    segments: list[list[tuple[int, int]]],
+    _BuildNode=None,
+    _insert_sequence=None,
+    _compress_trie=None,
+    convert_trie_to_tree_node=None,
+) -> Optional["PrefixSubTrie"]:
+    """Build tree from pre-computed segment metadata (fast path).
+
+    Instead of token-by-token comparison, groups samples by their first segment
+    hash. All samples with the same first segment hash share that prefix.
+
+    Args:
+        samples: List of token tensors.
+        segments: List of [(hash, length), ...] per sample from segment_grouper.
+        _BuildNode, _insert_sequence, _compress_trie, convert_trie_to_tree_node:
+            Injected dependencies from dynamic.py to avoid circular imports.
+
+    Returns:
+        PrefixSubTrie or None if no sharing detected.
+    """
+    if not samples or len(samples) < 2:
+        return None
+
+    from verl.utils.prefix_tree.segment_grouper import group_by_segment_hash
+
+    # Group by first segment (the shared prefix)
+    groups = group_by_segment_hash(segments, level=0)
+
+    # Find largest group with shared prefix
+    largest_group = max(groups.values(), key=len, default=[])
+    if len(largest_group) < 2:
+        return None  # No sharing
+
+    # Build tree: shared prefix node + individual response branches
+    root = _BuildNode(0, -1, -1)
+    all_nodes: list = []
+
+    # Get shared prefix tokens from first sample in group
+    first_idx, prefix_len = largest_group[0]
+    prefix_tokens = samples[first_idx][:prefix_len].tolist()
+
+    # Insert shared prefix
+    _insert_sequence(root, all_nodes, prefix_tokens, 0, -1)
+
+    # Insert full sequences for all samples in group
+    for seq_idx, _ in largest_group:
+        seq_tokens = samples[seq_idx].tolist()
+        _insert_sequence(root, all_nodes, seq_tokens, 0, seq_idx)
+
+    # Compress and convert
+    trie = _compress_trie(root)
+    return convert_trie_to_tree_node(trie)

@@ -48,6 +48,7 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import extract_reward
+from verl.utils.prefix_tree.segment_grouper import create_grpo_segment_metadata
 from verl.trainer.ppo.utils import (
     Role,
     WorkerType,
@@ -1434,6 +1435,19 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+
+                    # Create segment metadata for prefix-tree fast path (GRPO)
+                    if self.config.actor_rollout_ref.model.get("use_prefix_tree", False):
+                        rollout_n = self.config.actor_rollout_ref.rollout.n
+                        if rollout_n > 1 and "uid" in batch.non_tensor_batch:
+                            # Get prompt lengths (input_ids before response generation)
+                            prompt_lens = batch.batch["attention_mask"].sum(dim=-1).tolist()
+                            segment_metadata = create_grpo_segment_metadata(
+                                prompt_uids=batch.non_tensor_batch["uid"].tolist(),
+                                prompt_lengths=prompt_lens,
+                                rollout_n=rollout_n,
+                            )
+                            batch.non_tensor_batch["segment_metadata"] = segment_metadata
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
