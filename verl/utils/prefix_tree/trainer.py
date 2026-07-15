@@ -36,7 +36,7 @@ def add_meta_info(meta_dict: dict, config_or_data: dict) -> None:
     meta_dict["prefix_tree_attention"] = config_or_data.get("prefix_tree_attention", "flex")
 
 
-def compute_metrics(
+def pt_metrics(
     metrics: dict,
     input_ids,  # TODO: use PrefixTrie / PrefixSubTrie
     config_or_data: dict,

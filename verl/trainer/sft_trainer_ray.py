@@ -365,9 +365,9 @@ class SFTTrainer:
                 metrics["train/global_tokens"] = torch.sum(torch.tensor(batch_seqlens, device=self.device_name)).item()
                 total_tokens += metrics["train/global_tokens"]
                 metrics["train/total_tokens(B)"] = total_tokens / 1e9
-                from verl.utils.prefix_tree.trainer import compute_metrics
+                from verl.utils.prefix_tree.trainer import pt_metrics
 
-                compute_metrics(metrics, data["input_ids"], self.config.data)
+                pt_metrics(metrics, data["input_ids"], self.config.data)
                 tracking.log(data=metrics, step=global_step)
 
                 is_last_step = global_step >= self.total_training_steps

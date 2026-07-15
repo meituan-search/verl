@@ -26,6 +26,11 @@ from verl.utils.torch_functional import masked_mean, masked_sum
 from verl.workers.config import ActorConfig, CriticConfig
 from verl.workers.utils.padding import no_padding_2_padding
 
+# Diagnostic flag (env-var gated). When MAGI_DIAG=1, ppo_loss prints a comparison
+# of old_log_prob (rollout/OLP) vs new_log_prob (actor update forward) for each
+# micro-batch. Zero overhead when unset.
+MAGI_DIAG = os.environ.get("MAGI_DIAG", "0") == "1"
+
 
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
     pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
@@ -102,25 +107,35 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     loss_mode = config.policy_loss.get("loss_mode", "vanilla")
 
-    # Diagnostic: compare old_log_prob vs new_log_prob (MAGI_DIAG=1)
-    if os.environ.get("MAGI_DIAG") == "1" and "response_mask" in data:
+    # Diagnostic: compare old_log_prob (rollout/OLP) vs new_log_prob (actor update)
+    if MAGI_DIAG:
         old_lp = old_log_prob
         new_lp = log_prob
-        response_mask = data["response_mask"].to(bool)
+        mask = response_mask
+        shape_match = old_lp.shape == new_lp.shape
         diff = (new_lp - old_lp).abs()
-        mean_diff = (diff * response_mask).sum() / response_mask.sum().clamp(min=1)
-        max_diff = (diff * response_mask).max()
-        num_nonzero = (diff * response_mask > 1e-6).sum().item()
-        num_total = response_mask.sum().item()
-        import logging
-
-        _lg = logging.getLogger(__name__)
-        _lg.warning(
-            f"[MAGI-DIAG] old_log_prob vs new_log_prob diff: "
-            f"mean={mean_diff.item():.6f} max={max_diff.item():.6f} "
-            f"nonzero={num_nonzero}/{num_total} "
-            f"frac={num_nonzero / num_total * 100:.2f}%"
+        masked_diff = diff * mask
+        num_total = mask.sum().item()
+        num_total_safe = max(num_total, 1)
+        max_diff = masked_diff.max().item()
+        mean_diff = masked_diff.sum().item() / num_total_safe
+        num_gt_tol = (masked_diff > 1e-3).sum().item()
+        frac_gt_tol = num_gt_tol / num_total_safe
+        print(
+            f"[MAGI_DIAG] old_log_prob vs new_log_prob: "
+            f"shape_match={shape_match} "
+            f"max_abs_diff={max_diff:.6f} mean_abs_diff={mean_diff:.6f} "
+            f"frac_gt_1e-3={frac_gt_tol:.4f} ({num_gt_tol}/{num_total})",
+            flush=True,
         )
+        # per-sample mean diff for first 3 samples
+        for i in range(min(3, old_lp.size(0))):
+            mi = mask[i].sum().item()
+            if mi > 0:
+                si = masked_diff[i].sum().item() / mi
+            else:
+                si = 0.0
+            print(f"[MAGI_DIAG] sample[{i}] mean_abs_diff={si:.6f}", flush=True)
 
     policy_loss_fn = get_policy_loss_fn(loss_mode)
     pg_loss, pg_metrics = policy_loss_fn(

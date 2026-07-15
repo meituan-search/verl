@@ -216,10 +216,11 @@ class TestNestedTensorUnpack:
 
     def test_nested_tensor_unpack_and_flat_layout(self, monkeypatch):
         """Monkeypatch _build_magi_key to skip GPU/dist; verify flat layout."""
+        import verl.utils.prefix_tree.forward as ptf
         import verl.utils.prefix_tree.magi as ptm
 
         # Stub out _build_magi_key so we don't need GPU
-        monkeypatch.setattr(ptm, "_build_magi_key", lambda model, params: object())
+        monkeypatch.setattr(ptf, "_build_magi_key", lambda model, params: object())
 
         # Stub model with config
         class FakeConfig:
@@ -251,9 +252,10 @@ class TestNestedTensorUnpack:
         assert result.segment_ranges == [(3, 5), (5, 6), (6, 9)]
 
     def test_no_shared_prefix_returns_none(self, monkeypatch):
+        import verl.utils.prefix_tree.forward as ptf
         import verl.utils.prefix_tree.magi as ptm
 
-        monkeypatch.setattr(ptm, "_build_magi_key", lambda model, params: object())
+        monkeypatch.setattr(ptf, "_build_magi_key", lambda model, params: object())
 
         class FakeModel:
             class config:
@@ -273,9 +275,10 @@ class TestNestedTensorUnpack:
 
     def test_loss_mask_flattened(self, monkeypatch):
         """loss_mask NestedTensor is correctly flattened into flat_loss_mask."""
+        import verl.utils.prefix_tree.forward as ptf
         import verl.utils.prefix_tree.magi as ptm
 
-        monkeypatch.setattr(ptm, "_build_magi_key", lambda model, params: object())
+        monkeypatch.setattr(ptf, "_build_magi_key", lambda model, params: object())
 
         class FakeModel:
             class config:

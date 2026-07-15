@@ -108,7 +108,6 @@ class PrefixTreeParams:
 __all__ = [
     "RangeSpec",
     "PrefixTreeParams",
-    "build_prefix_tree_dense_mask",
     "build_prefix_tree_attention_spec",
     "build_layout_from_tree_node",
     "extract_sample_tensor",
@@ -423,42 +422,6 @@ def build_layout_from_tree_node(
     )
     params._leaf_ancestor_ranges = leaf_ancestor_ranges
     return params
-
-
-def build_prefix_tree_dense_mask(
-    total_tokens: int,
-    q_ranges: Sequence[RangeSpec],
-    k_ranges: Sequence[RangeSpec],
-    mask_types: Sequence[str],
-    *,
-    device: Optional[torch.device | str] = None,
-) -> Tensor:
-    """Materialize a dense mask from PrefixTree flex rectangles."""
-    if len(q_ranges) != len(k_ranges) or len(q_ranges) != len(mask_types):
-        raise ValueError("q_ranges, k_ranges, and mask_types must have the same length")
-    if total_tokens < 0:
-        raise ValueError("total_tokens must be non-negative")
-
-    mask = torch.zeros(total_tokens, total_tokens, dtype=torch.bool, device=device)
-    for (q_start, q_end), (k_start, k_end), mask_type in zip(q_ranges, k_ranges, mask_types, strict=False):
-        if q_start < 0 or k_start < 0 or q_end < q_start or k_end < k_start:
-            raise ValueError("range specs must be non-decreasing and non-negative")
-        if q_end > total_tokens or k_end > total_tokens:
-            raise ValueError("range specs must not exceed total_tokens")
-        if q_end == q_start or k_end == k_start:
-            continue
-
-        if mask_type == "full":
-            mask[q_start:q_end, k_start:k_end] = True
-            continue
-        if mask_type != "causal":
-            raise ValueError(f"Unsupported mask type: {mask_type}")
-
-        q_pos = torch.arange(q_start, q_end, device=mask.device).unsqueeze(1)
-        k_pos = torch.arange(k_start, k_end, device=mask.device).unsqueeze(0)
-        mask[q_start:q_end, k_start:k_end] |= k_pos <= q_pos
-
-    return mask
 
 
 def longest_common_prefix_length(sequences: Sequence[Tensor]) -> int:

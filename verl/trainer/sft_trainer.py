@@ -412,9 +412,9 @@ class SFTTrainer:
                     ).item()
                     total_tokens += metrics["train/global_tokens"]
                     metrics["train/total_tokens(B)"] = total_tokens / 1e9
-                    from verl.utils.prefix_tree.trainer import compute_metrics
+                    from verl.utils.prefix_tree.trainer import pt_metrics
 
-                    compute_metrics(metrics, data["input_ids"], self.config.data)
+                    pt_metrics(metrics, data["input_ids"], self.config.data)
 
                     if self.engine.get_data_parallel_rank() == 0:
                         tracking.log(data=metrics, step=global_step)

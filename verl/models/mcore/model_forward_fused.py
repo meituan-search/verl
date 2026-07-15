@@ -163,7 +163,7 @@ def fused_forward_model_engine(vision_model: bool = False):
         # Rolling (copied from preprocess_thd_engine) is needed before pack;
         # FP8/CP alignment skipped — handled by prefix-tree's own path.
         if use_prefix_tree and not vision_model:
-            from verl.utils.prefix_tree.magi import fuse_try_forward_prefix_tree
+            from verl.utils.prefix_tree.forward import fuse_try_forward_prefix_tree
 
             output = fuse_try_forward_prefix_tree(
                 model=model,
@@ -290,8 +290,8 @@ def _fused_GPTModel_forward(
         _flex_key = kwargs.get("flex_attention_key", None)
 
     if (_magi_key is not None or _flex_key is not None) and pt_batch is not None:
+        from verl.utils.prefix_tree.forward import fuse_forward_body
         from verl.utils.prefix_tree.magi import (
-            fuse_forward_body,
             prefix_tree_decoder_key_context,
             prefix_tree_rope_context,
         )

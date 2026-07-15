@@ -250,7 +250,7 @@ def gptmodel_forward_model_engine(
         prefix_tree_attention = (logits_processor_args or {}).get("prefix_tree_attention", "flex")
 
         if use_prefix_tree:
-            from verl.utils.prefix_tree.magi import unfuse_try_forward_prefix_tree
+            from verl.utils.prefix_tree.forward import unfuse_try_forward_prefix_tree
 
             output = unfuse_try_forward_prefix_tree(
                 model,

@@ -195,16 +195,6 @@ class TestPrepareMicroBatchesDynamicPrefixTree(unittest.TestCase):
                    if tu.get_non_tensor_data(mb, "prefix_tree_subtree", default=None) is not None}
         self.assertEqual(len(sources), 1, "trie was rebuilt per micro-batch — multiple source objects found")
 
-    def test_prefix_tree_metrics_attached_to_data(self):
-        """prefix_tree_metrics must be attached to the full data after a trie is built."""
-        td = _make_data(batch_size=4, seq_len=8, use_dynamic_bsz=True, use_prefix_tree=True, max_token_len_per_gpu=512)
-        prepare_micro_batches(td)
-        metrics = tu.get_non_tensor_data(td, "prefix_tree_metrics", default=None)
-        self.assertIsNotNone(metrics)
-        self.assertIn("prefix_tree/global_shared_ratio", metrics)
-        self.assertIn("prefix_tree/flat_tokens", metrics)
-        self.assertIn("prefix_tree/raw_tokens", metrics)
-
 
 # ---------------------------------------------------------------------------
 # Tests: Path 2 — dynamic_bsz=True, prefix_tree=False

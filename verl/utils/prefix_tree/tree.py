@@ -299,18 +299,20 @@ def build_global_tree_from_segments(
     segment_hashes,
     segment_lengths,
 ) -> Optional[TrieNode]:
-    """Build a global TrieNode from segment metadata for all uid-groups.
+    """Build a global TrieNode from segment metadata, supporting multilevel trees.
 
     O(N) construction using known prefix structure — no token-by-token
     comparison.  Returns a TrieNode root compatible with ``mbs_groups_from_trie``
     and ``subtrie_view``.
 
-    For each uid-group (same first segment hash):
-    - 2+ sequences: prefix_node (shared prompt tokens) + N leaf_nodes (responses)
-    - 1 sequence:   single leaf_node under root (no sharing; still in trie for metrics)
+    Recurses through every segment level: samples sharing levels 0..k get an
+    ancestor node at each shared level.  A sample bottoms out into a leaf when
+    its segments are exhausted, when its subgroup becomes a singleton, or when
+    no further sharing is found.  Leaf ``input_ids`` = all remaining tokens
+    after the last shared segment.
 
-    Children of the root are keyed by uid_hash (deterministic DFS order).
-    Children of prefix nodes are keyed by sample_idx (no first-token collision).
+    Children of the root are keyed by level-0 hash (deterministic DFS order).
+    Children of intermediate nodes are keyed by ``flat_idx`` (unique).
 
     Args:
         samples: List of token tensors (one per sequence).
@@ -349,20 +351,18 @@ def build_global_tree_from_segments(
             trie_root.nodes.append(prefix_node)
             trie_root.children[uid_hash] = prefix_node
 
-            for seq_idx, _ in group:
-                suffix = samples[seq_idx][prefix_len:].tolist()
-                leaf = TrieNode(
-                    tree_id=0,
-                    input_ids=suffix,
-                    sequence_ids=[seq_idx],
-                    ancestor=prefix_node,
-                    flat_idx=len(trie_root.nodes),
-                )
-                trie_root.nodes.append(leaf)
-                prefix_node.children[seq_idx] = leaf
-                trie_root.leaves[seq_idx] = leaf
+            _build_segment_subtree(
+                samples,
+                segment_hashes,
+                segment_lengths,
+                group_sids=all_seq_ids,
+                level=1,
+                accumulated_len=prefix_len,
+                parent_node=prefix_node,
+                trie_root=trie_root,
+            )
         else:
-            seq_idx, _ = group[0]
+            seq_idx = group[0][0]
             all_tokens = samples[seq_idx].tolist()
             leaf = TrieNode(
                 tree_id=0,
@@ -376,6 +376,83 @@ def build_global_tree_from_segments(
             trie_root.leaves[seq_idx] = leaf
 
     return trie_root if trie_root.nodes else None
+
+
+def _build_segment_subtree(
+    samples,
+    segment_hashes,
+    segment_lengths,
+    group_sids: list[int],
+    level: int,
+    accumulated_len: int,
+    parent_node: TrieNode,
+    trie_root: TrieNode,
+) -> None:
+    """Recursively build ancestor nodes for shared segments at ``level`` >= 1.
+
+    Samples in *group_sids* already share levels 0..level-1.  Subgroup by hash
+    at *level*: 2+ sharing → ancestor node + recurse on the suffix; singleton
+    subgroup or segment-exhausted sample → leaf with all remaining tokens.
+    """
+    # Samples whose segment list ended before this level → leaves with remaining tokens.
+    for sid in group_sids:
+        if level >= len(segment_hashes[sid]):
+            remaining = samples[sid][accumulated_len:].tolist()
+            leaf = TrieNode(
+                tree_id=0,
+                input_ids=remaining,
+                sequence_ids=[sid],
+                ancestor=parent_node,
+                flat_idx=len(trie_root.nodes),
+            )
+            trie_root.nodes.append(leaf)
+            parent_node.children[leaf.flat_idx] = leaf
+            trie_root.leaves[sid] = leaf
+
+    # Subgroup remaining samples by hash at this level.
+    subgroups: dict[int, list[int]] = {}
+    for sid in group_sids:
+        if level < len(segment_hashes[sid]):
+            h = int(segment_hashes[sid][level])
+            subgroups.setdefault(h, []).append(sid)
+
+    for hash_val in sorted(subgroups.keys()):
+        subgroup = subgroups[hash_val]
+        if len(subgroup) >= 2:
+            seg_len = int(segment_lengths[subgroup[0]][level])
+            seg_tokens = samples[subgroup[0]][accumulated_len : accumulated_len + seg_len].tolist()
+            node = TrieNode(
+                tree_id=0,
+                input_ids=seg_tokens,
+                sequence_ids=list(subgroup),
+                ancestor=parent_node,
+                flat_idx=len(trie_root.nodes),
+            )
+            trie_root.nodes.append(node)
+            parent_node.children[node.flat_idx] = node
+            _build_segment_subtree(
+                samples,
+                segment_hashes,
+                segment_lengths,
+                group_sids=subgroup,
+                level=level + 1,
+                accumulated_len=accumulated_len + seg_len,
+                parent_node=node,
+                trie_root=trie_root,
+            )
+        else:
+            sid = subgroup[0]
+            remaining = samples[sid][accumulated_len:].tolist()
+            leaf = TrieNode(
+                tree_id=0,
+                input_ids=remaining,
+                sequence_ids=[sid],
+                ancestor=parent_node,
+                flat_idx=len(trie_root.nodes),
+            )
+            trie_root.nodes.append(leaf)
+            parent_node.children[leaf.flat_idx] = leaf
+            trie_root.leaves[sid] = leaf
 
 
 def trie_ancestors(node: TrieNode) -> list[TrieNode]:

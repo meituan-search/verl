@@ -62,6 +62,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.metric import reduce_metrics
+from verl.utils.prefix_tree.trainer import pt_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
@@ -71,6 +72,76 @@ from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.rollout.llm_server import LLMServerManager
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
+
+def _attach_segment_metadata(batch: DataProto, rollout_n: int) -> None:
+    """Attach segment metadata for prefix-tree fast path (GRPO).
+
+    Creates segment_hashes and segment_lengths from the batch's prompt UIDs and
+    prompt lengths, storing them in non_tensor_batch as numpy object arrays so
+    they survive reorder()/chunk()/to_tensordict() round-trips.
+    """
+    if rollout_n < 2:
+        return
+    prompt_uids = batch.non_tensor_batch.get("uid", None)
+    if prompt_uids is None:
+        return
+    attention_mask = batch.batch["attention_mask"]
+    response_length = batch.batch["responses"].size(1)
+    prompt_lengths = attention_mask[:, :-response_length].sum(dim=-1).cpu().tolist()
+    from verl.utils.prefix_tree.segment_grouper import create_grpo_segment_metadata
+
+    segment_hashes, segment_lengths = create_grpo_segment_metadata(
+        prompt_uids=list(prompt_uids),
+        prompt_lengths=prompt_lengths,
+        rollout_n=rollout_n,
+    )
+    batch.non_tensor_batch["segment_hashes"] = segment_hashes
+    batch.non_tensor_batch["segment_lengths"] = segment_lengths
+
+
+def _build_global_trie(batch: DataProto) -> None:
+    """Build global prefix trie from segment metadata (or token-by-token fallback)
+    and attach to batch. Mutates batch in-place.
+
+    - trie → batch.meta_info["prefix_tree"] (TrieNode root, shared across samples)
+    - leaf_idx → batch.non_tensor_batch["leaf_idx"] (np.int64 array, sample → leaf flat_idx)
+
+    Both survive DataProto.reorder/chunk/slice/concat/repeat natively:
+    non_tensor_batch propagates via numpy indexing; meta_info wraps as NonTensorData.
+    """
+    import numpy as np
+
+    from verl.utils.prefix_tree.dynamic import greedy_build_tries
+    from verl.utils.prefix_tree.tree import build_global_tree_from_segments
+
+    input_ids = batch.batch["input_ids"]
+    attention_mask = batch.batch.get("attention_mask", None)
+    if attention_mask is not None:
+        seqs = [input_ids[i][attention_mask[i].bool()].tolist() or [0] for i in range(len(input_ids))]
+    else:
+        seqs = [input_ids[i].tolist() for i in range(len(input_ids))]
+    total_raw = sum(len(s) for s in seqs)
+
+    seg_hashes = batch.non_tensor_batch.get("segment_hashes", None)
+    seg_lengths = batch.non_tensor_batch.get("segment_lengths", None)
+    trie = None
+    if seg_hashes is not None and seg_lengths is not None:
+        trie = build_global_tree_from_segments(seqs, seg_hashes, seg_lengths)
+    if trie is None:
+        tries, _ = greedy_build_tries(seqs, max_tokens_per_tree=total_raw * 10)
+        if tries and total_raw > 0:
+            trie = tries[0]
+    if trie is None:
+        return
+
+    leaf_idx = np.full(len(seqs), -1, dtype=np.int64)
+    for flat_idx, node in enumerate(trie.nodes):
+        if not node.children:  # leaf
+            for seq_id in node.sequence_ids:
+                leaf_idx[seq_id] = flat_idx
+
+    batch.meta_info["prefix_tree"] = trie
+    batch.non_tensor_batch["leaf_idx"] = leaf_idx
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -1407,9 +1478,7 @@ class RayPPOTrainer:
                     if "__do_sample__" in gen_batch_output.non_tensor_batch:
                         gen_batch_output.pop(non_tensor_batch_keys=["__do_sample__"])
 
-                    from verl.utils.prefix_tree.trainer import compute_metrics
-
-                    compute_metrics(
+                    pt_metrics(
                         metrics,
                         gen_batch_output.batch["input_ids"],
                         self.config.actor_rollout_ref.model,
@@ -1436,7 +1505,12 @@ class RayPPOTrainer:
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
-                    # Create segment metadata for prefix-tree fast path (GRPO)
+                    # Build global prefix trie once at trainer level — segment metadata
+                    # fast path (O(N) hash-based) with greedy_build_tries fallback.
+                    # Attaches trie to batch.meta_info and leaf_idx to non_tensor_batch.
+                    if self.config.actor_rollout_ref.model.get("use_prefix_tree", False):
+                        _attach_segment_metadata(batch, self.config.actor_rollout_ref.rollout.n)
+                        _build_global_trie(batch)
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.

@@ -893,7 +893,13 @@ def get_dfs_balanced_partitions(
     else:
         seqs = [_ids[i].tolist() for i in range(batch_size)]
 
-    dfs_order = dfs_leaf_order(seqs)
+    # Reuse globally-built trie if attached (built once in ray_trainer._build_global_trie).
+    # Falls back to building a throwaway trie inside dfs_leaf_order when absent.
+    if hasattr(data, "batch"):
+        attached_trie = data.meta_info.get("prefix_tree", None)
+    else:
+        attached_trie = tu.get_non_tensor_data(data, "prefix_tree", default=None)
+    dfs_order = dfs_leaf_order(seqs, trie=attached_trie)
     if len(dfs_order) < batch_size:
         missing = [i for i in range(batch_size) if i not in set(dfs_order)]
         dfs_order = dfs_order + missing

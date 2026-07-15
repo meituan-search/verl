@@ -72,53 +72,12 @@ def prepare_micro_batches(
 
     force_group_size = tu.get_non_tensor_data(data=data, key="force_group_size", default=1)
 
-    # ── Phase 1: build global trie whenever prefix-tree is on ─────────────────
-    # Decoupled from use_dynamic_bsz: trie building and subtrie attachment are
-    # universal optimizations (DFS ordering, flat-token deduplication) that apply
-    # regardless of whether micro-batch splitting is dynamic or fixed.
-    if use_prefix_tree:
-        from verl.utils.prefix_tree.dynamic import (
-            greedy_build_tries,
-            mbs_groups_from_trie,
-            trie_group_flat_tokens,
-        )
-        import numpy as np
-
-        input_ids = data["input_ids"]
-        seqs = [t.tolist() for t in input_ids.unbind()]
-        total_raw = sum(len(s) for s in seqs)
-        tries, num_tokens = greedy_build_tries(seqs, max_tokens_per_tree=total_raw * 10)
-        if tries and total_raw > 0:
-            trie = tries[0]
-            flat = num_tokens[0]
-            tu.assign_non_tensor(data, prefix_tree=trie)
-            _leaf_ids = np.full(len(seqs), -1, dtype=np.int64)
-            for _flat_idx, _node in enumerate(trie.nodes):
-                if not _node.children:
-                    for _seq_id in _node.sequence_ids:
-                        _leaf_ids[_seq_id] = _flat_idx
-            tu.assign_non_tensor(data, prefix_tree_leaf_ids=_leaf_ids)
-            max_token_len_per_gpu = tu.get_non_tensor_data(data, "max_token_len_per_gpu", default=None)
-            pt_metrics = {
-                "prefix_tree/global_shared_ratio": 1.0 - flat / total_raw,
-                "prefix_tree/packed_tokens": flat,
-                "prefix_tree/raw_tokens": total_raw,
-            }
-            if max_token_len_per_gpu is not None:
-                groups = mbs_groups_from_trie(trie, max_token_len_per_gpu * sp_size)
-                pt_metrics["prefix_tree/avg_mbs"] = len(seqs) / len(groups) if groups else 0.0
-                ratios = [
-                    1.0 - trie_group_flat_tokens(g, trie) / sum(len(seqs[i]) for i in g)
-                    for g in groups
-                    if sum(len(seqs[i]) for i in g) > 0
-                ]
-                if ratios:
-                    pt_metrics["prefix_tree/micro_batch_shared_ratio"] = sum(ratios) / len(ratios)
-            tu.assign_non_tensor(data, prefix_tree_metrics=pt_metrics)
-
-    # ── Phase 2: split into micro-batches ──────────────────────────────────────
+    # Phase 1 (global trie build) moved to ray_trainer._build_global_trie.
+    # The trie arrives attached as data["prefix_tree"] (NonTensorData in meta_info).
+    # Phase 2 below reads it via prepare_prefix_tree_micro_batches → subtrie_view.
     if use_prefix_tree:
         from verl.utils.prefix_tree.dynamic import prepare_prefix_tree_micro_batches
+
         micro_batches, batch_idx_list = prepare_prefix_tree_micro_batches(
             data,
             sp_size=sp_size,

@@ -32,17 +32,20 @@ from .dynamic import (
     trie_dfs_leaf_order,
     trie_to_leaf_ids,
 )
-from .magi import (
-    PrefixTreeMagiBatch,
+from .forward import (
     build_prefix_tree_batch,
-    build_prefix_tree_micro_batch,
+    fuse_forward_body,
     fuse_try_forward_prefix_tree,
     fuse_undispatch_and_expand_hidden,
+    unfuse_forward_prefix_tree,
+    unfuse_try_forward_prefix_tree,
+)
+from .magi import (
+    PrefixTreeMagiBatch,
+    build_prefix_tree_micro_batch,
     get_prefix_tree_kwargs,
     restore_flat_to_nested,
     strip_prefix_tree_args,
-    unfuse_forward_prefix_tree,
-    unfuse_try_forward_prefix_tree,
 )
 from .utils import (
     PrefixTreeParams,
@@ -70,10 +73,11 @@ __all__ = [
     "reorder_and_balance_for_prefix_tree",
     "trie_dfs_leaf_order",
     "trie_to_leaf_ids",
-    # magi
+    # magi / forward
     "PrefixTreeMagiBatch",
     "build_prefix_tree_batch",
     "build_prefix_tree_micro_batch",
+    "fuse_forward_body",
     "fuse_try_forward_prefix_tree",
     "fuse_undispatch_and_expand_hidden",
     "get_prefix_tree_kwargs",
