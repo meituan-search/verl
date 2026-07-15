@@ -159,6 +159,9 @@ def fused_forward_model_engine(vision_model: bool = False):
         # - post_process=True (last stage): recv CP-local → MAGI → undispatch → LCE
         _pt_args = logits_processor_args or {}
         use_prefix_tree = _pt_args.get("use_prefix_tree", False)
+
+        # Rolling (copied from preprocess_thd_engine) is needed before pack;
+        # FP8/CP alignment skipped — handled by prefix-tree's own path.
         if use_prefix_tree and not vision_model:
             from verl.utils.prefix_tree.magi import fuse_try_forward_prefix_tree
 
@@ -176,6 +179,7 @@ def fused_forward_model_engine(vision_model: bool = False):
                 "prefix_tree: fuse_try_forward_prefix_tree returned None — falling back to standard fused path"
             )
 
+        # Standard FA3 fused path (unchanged from upstream):
         fp8 = unwrap_model(model).config.fp8
         use_fp8_padding = fp8 in ["e4m3", "hybrid"]
 
@@ -207,6 +211,7 @@ def fused_forward_model_engine(vision_model: bool = False):
             labels, pre_process=True, need_roll=True, use_fp8_padding=use_fp8_padding
         )
         labels_rmpad = labels_rmpad.contiguous()
+
         output_orig: CausalLMOutputForPPO = model(
             input_ids=input_ids_rmpad,
             attention_mask=attention_mask,

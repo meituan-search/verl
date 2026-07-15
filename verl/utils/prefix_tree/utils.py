@@ -225,12 +225,28 @@ def build_layout_from_tree_node(
     k_ranges: list[RangeSpec] = []
     mask_types: list[str] = []
 
-    def _assign_offsets(node: TrieNode, start: int) -> int:
+    def _assign_offsets(node: TrieNode, start: int, donated_in: bool = False) -> int:
+        """Assign flat positions with boundary-shift: each non-leaf donates its last
+        token to every child so the child independently packs it from its own sample,
+        giving the correct per-sample label at the prefix/leaf boundary.
+
+        donated_in: parent donated its last token → this node includes 1 extra token.
+        donated_out: this node donates its last token → children each include 1 extra.
+        """
+        children = _subtrie_children(node)
         node._flat_start = start
-        node._flat_end = start + len(node.input_ids)
+        extra_in = 1 if donated_in else 0
+        if children and len(node.input_ids) > 1:
+            donated_out = True
+            node._flat_end = start + extra_in + len(node.input_ids) - 1
+        else:
+            donated_out = False
+            node._flat_end = start + extra_in + len(node.input_ids)
+        node._donated_in = donated_in
+        node._donated_out = donated_out
         cur = node._flat_end
-        for child in _subtrie_children(node):
-            cur = _assign_offsets(child, cur)
+        for child in children:
+            cur = _assign_offsets(child, cur, donated_out)
         return cur
 
     pos = 0
@@ -300,18 +316,32 @@ def build_layout_from_tree_node(
 
     def _emit(node: TrieNode) -> None:
         if node.input_ids:
-            owner = node._owner_sample
+            children = _subtrie_children(node)
             s = node._owner_offset
             e = s + len(node.input_ids)
-            flat_pieces.append(samples[owner][s:e])
-            if flat_lm_pieces is not None:
-                flat_lm_pieces.append(loss_masks_by_sample[owner][s:e])
-            if flat_pid_pieces is not None:
-                flat_pid_pieces.append(position_ids_by_sample[owner][s:e])
+            donated_in = getattr(node, "_donated_in", False)
+            donated_out = getattr(node, "_donated_out", False)
+            # Slice into sample sequence: include donated boundary from parent (-1 on s),
+            # exclude token donated to children (-1 on e).
+            s_emit = s - 1 if donated_in else s
+            e_emit = e - 1 if donated_out else e
+            if not children:
+                # Leaf: use THIS leaf's own sample so the boundary label is per-sample
+                # correct (labels_by_sample[leaf][s-1] = r1_leaf, not r1_owner).
+                leaf_sample = leaf_node_id_to_sample[node.flat_idx]
+                src = leaf_sample
             else:
-                default_pid_pieces.append(torch.arange(s, e, device=device, dtype=torch.long))
+                # Non-leaf: use owner's tokens (shared prefix/ancestor tokens).
+                src = node._owner_sample
+            flat_pieces.append(samples[src][s_emit:e_emit])
+            if flat_lm_pieces is not None:
+                flat_lm_pieces.append(loss_masks_by_sample[src][s_emit:e_emit])
+            if flat_pid_pieces is not None:
+                flat_pid_pieces.append(position_ids_by_sample[src][s_emit:e_emit])
+            else:
+                default_pid_pieces.append(torch.arange(s_emit, e_emit, device=device, dtype=torch.long))
             if flat_label_pieces is not None:
-                flat_label_pieces.append(labels_by_sample[owner][s:e])
+                flat_label_pieces.append(labels_by_sample[src][s_emit:e_emit])
         for child in _subtrie_children(node):
             _emit(child)
 

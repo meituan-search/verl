@@ -152,6 +152,7 @@ def build_prefix_tree_micro_batch(
     tp_size: int = 1,
     cp_size: int = 1,
     subtrie: Optional[PrefixSubTrie] = None,
+    rolled_labels: Optional[NestedTensor] = None,
 ) -> Optional[PrefixTreeMagiBatch]:
     """Build a PrefixTreeMagiBatch from a micro-batch using a per-mb subtrie.
 
@@ -188,9 +189,12 @@ def build_prefix_tree_micro_batch(
         return None
     loss_masks_by_sample = _unpack_nested_to_list(loss_mask)
     position_ids_by_sample = _unpack_nested_to_list(position_ids, mask=loss_mask)
-    # Pre-shift labels per sample before packing: labels[i][k] = input_ids[i][k+1].
-    # This avoids cross-segment boundary errors in the flat layout — no roll needed.
-    labels_by_sample = [torch.cat([s[1:], torch.zeros(1, dtype=s.dtype, device=s.device)]) for s in samples]
+    _unpacked = _unpack_nested_to_list(rolled_labels, mask=loss_mask) if rolled_labels is not None else None
+    labels_by_sample = (
+        _unpacked
+        if _unpacked is not None
+        else [torch.cat([s[1:], torch.zeros(1, dtype=s.dtype, device=s.device)]) for s in samples]
+    )
 
     if subtrie is None:
         # No pre-built subtrie (e.g. use_dynamic_bsz=False): build locally.
@@ -464,6 +468,11 @@ def fuse_forward_body(
 
     if magi_key is not None:
         # CP-local LCE: run on local hidden (local_tokens), undispatch 1D outputs (KB-scale).
+        # Gather from sequence-parallel region first (TP>1 shards the sequence in SP mode).
+        if model.config.sequence_parallel:
+            from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+
+            hidden_states = gather_from_sequence_parallel_region(hidden_states)
         local_indices = get_position_ids(magi_key)
         flat_padded = pt_batch.tree_packed_input_ids.shape[0]
         pad = flat_padded - labels.shape[0]
@@ -806,7 +815,9 @@ def unfuse_try_forward_prefix_tree(
     return None
 
 
-def build_prefix_tree_batch(model, input_ids, logits_processor_args, vision_model, mtp_enable_train):
+def build_prefix_tree_batch(
+    model, input_ids, logits_processor_args, vision_model, mtp_enable_train, rolled_labels=None
+):
     """Build prefix-tree micro-batch from *logits_processor_args*.
 
     Returns :class:`PrefixTreeMagiBatch` or ``None`` when the per-mb subtrie
@@ -828,6 +839,7 @@ def build_prefix_tree_batch(model, input_ids, logits_processor_args, vision_mode
         tp_size=mpu.get_tensor_model_parallel_world_size(),
         cp_size=mpu.get_context_parallel_world_size(),
         subtrie=subtrie,
+        rolled_labels=rolled_labels,
     )
 
 
@@ -845,14 +857,15 @@ def unfuse_forward_prefix_tree(
 
     if prefix_tree_attention == "magi":
         local_input_ids, local_position_ids = dispatch_pt_batch(pt_batch)
-        output_orig = model(
-            input_ids=local_input_ids,
-            attention_mask=None,
-            position_ids=local_position_ids,
-            packed_seq_params=None,
-            magi_attention_key=pt_batch.magi_key,
-            **model_kwargs,
-        )
+        with prefix_tree_rope_context(model, local_position_ids):
+            output_orig = model(
+                input_ids=local_input_ids,
+                attention_mask=None,
+                position_ids=local_position_ids,
+                packed_seq_params=None,
+                magi_attention_key=pt_batch.magi_key,
+                **model_kwargs,
+            )
     else:
         output_orig = model(
             input_ids=tree_packed_input_ids,

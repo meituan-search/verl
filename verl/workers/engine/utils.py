@@ -72,48 +72,43 @@ def prepare_micro_batches(
 
     force_group_size = tu.get_non_tensor_data(data=data, key="force_group_size", default=1)
 
-    if use_dynamic_bsz and use_prefix_tree:
+    # ── Phase 1: build global trie whenever prefix-tree is on ─────────────────
+    # Decoupled from use_dynamic_bsz: trie building and subtrie attachment are
+    # universal optimizations (DFS ordering, flat-token deduplication) that apply
+    # regardless of whether micro-batch splitting is dynamic or fixed.
+    if use_prefix_tree:
         from verl.utils.prefix_tree.dynamic import (
             greedy_build_tries,
             mbs_groups_from_trie,
-            prepare_prefix_tree_micro_batches,
             trie_group_flat_tokens,
         )
+        import numpy as np
 
-        # Build trie once, thread through batch metadata.
         input_ids = data["input_ids"]
         seqs = [t.tolist() for t in input_ids.unbind()]
         total_raw = sum(len(s) for s in seqs)
-        max_tokens = total_raw * 10
-        tries, num_tokens = greedy_build_tries(seqs, max_tokens_per_tree=max_tokens)
+        tries, num_tokens = greedy_build_tries(seqs, max_tokens_per_tree=total_raw * 10)
         if tries and total_raw > 0:
-            trie = tries[0]  # TODO: use PrefixTrie
+            trie = tries[0]
             flat = num_tokens[0]
-            tu.assign_non_tensor(data, prefix_tree=trie)  # TODO: use PrefixTrie
-
-            # Build leaf_ids: sample_idx → flat position of that sample's leaf node.
-            # TODO: move into PrefixTrie constructor once TrieNode gets flat_idx.
-            import numpy as np
+            tu.assign_non_tensor(data, prefix_tree=trie)
             _leaf_ids = np.full(len(seqs), -1, dtype=np.int64)
             for _flat_idx, _node in enumerate(trie.nodes):
-                if not _node.children:  # leaf node
+                if not _node.children:
                     for _seq_id in _node.sequence_ids:
                         _leaf_ids[_seq_id] = _flat_idx
             tu.assign_non_tensor(data, prefix_tree_leaf_ids=_leaf_ids)
-
-            # Compute prefix-tree metrics from the already-built trie — correct
-            # sequence lengths (NestedTensor, no padding) and no trie rebuild.
             max_token_len_per_gpu = tu.get_non_tensor_data(data, "max_token_len_per_gpu", default=None)
             pt_metrics = {
                 "prefix_tree/global_shared_ratio": 1.0 - flat / total_raw,
-                "prefix_tree/flat_tokens": flat,
+                "prefix_tree/packed_tokens": flat,
                 "prefix_tree/raw_tokens": total_raw,
             }
             if max_token_len_per_gpu is not None:
-                groups = mbs_groups_from_trie(trie, max_token_len_per_gpu * sp_size)  # TODO: use PrefixTrie
+                groups = mbs_groups_from_trie(trie, max_token_len_per_gpu * sp_size)
                 pt_metrics["prefix_tree/avg_mbs"] = len(seqs) / len(groups) if groups else 0.0
                 ratios = [
-                    1.0 - trie_group_flat_tokens(g, trie) / sum(len(seqs[i]) for i in g)  # TODO: use PrefixTrie
+                    1.0 - trie_group_flat_tokens(g, trie) / sum(len(seqs[i]) for i in g)
                     for g in groups
                     if sum(len(seqs[i]) for i in g) > 0
                 ]
@@ -121,6 +116,9 @@ def prepare_micro_batches(
                     pt_metrics["prefix_tree/micro_batch_shared_ratio"] = sum(ratios) / len(ratios)
             tu.assign_non_tensor(data, prefix_tree_metrics=pt_metrics)
 
+    # ── Phase 2: split into micro-batches ──────────────────────────────────────
+    if use_dynamic_bsz and use_prefix_tree:
+        from verl.utils.prefix_tree.dynamic import prepare_prefix_tree_micro_batches
         micro_batches, batch_idx_list = prepare_prefix_tree_micro_batches(
             data,
             sp_size=sp_size,
@@ -156,7 +154,12 @@ def prepare_micro_batches(
         mbs = micro_batch_size_per_gpu * force_group_size
         n_micro = total_data_size // mbs
         micro_batches = tu.chunk_tensordict(data, n_micro)
-        batch_idx_list = None
+        batch_idx_list = [list(range(i * mbs, (i + 1) * mbs)) for i in range(n_micro)]
+        # Attach subtries for prefix-tree even with fixed mbs (same helper as dynbsz).
+        if use_prefix_tree:
+            from verl.utils.prefix_tree.dynamic import create_and_attach_subtrie_views
+            trie = tu.get_non_tensor_data(data, "prefix_tree", default=None)
+            create_and_attach_subtrie_views(micro_batches, batch_idx_list, trie)
     return micro_batches, batch_idx_list
 
 
