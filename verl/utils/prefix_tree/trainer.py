@@ -20,8 +20,13 @@ the caller never needs to gate on ``use_prefix_tree``.
 
 from __future__ import annotations
 
-from verl.utils.prefix_tree.dynamic import compute_prefix_tree_metrics
-from verl.utils.prefix_tree.tree import _is_prefix_tree_enabled
+import time
+
+import numpy as np
+
+from verl.utils.prefix_tree.dynamic import compute_prefix_tree_metrics, greedy_build_tries
+from verl.utils.prefix_tree.segment_grouper import create_grpo_segment_metadata
+from verl.utils.prefix_tree.tree import _is_prefix_tree_enabled, build_global_tree_from_segments
 
 
 def apply_engine_config(engine_config, config_or_data: dict) -> None:
@@ -65,3 +70,75 @@ def pt_metrics(
             trie=trie,
         )
     )
+
+
+def attach_segment_metadata(batch, rollout_n: int) -> None:
+    """Attach segment metadata for prefix-tree fast path (GRPO).
+
+    Creates segment_hashes and segment_lengths from the batch's prompt UIDs and
+    prompt lengths, storing them in non_tensor_batch as numpy object arrays so
+    they survive reorder()/chunk()/to_tensordict() round-trips.
+    """
+    if rollout_n < 2:
+        return
+    prompt_uids = batch.non_tensor_batch.get("uid", None)
+    if prompt_uids is None:
+        return
+    attention_mask = batch.batch["attention_mask"]
+    response_length = batch.batch["responses"].size(1)
+    prompt_lengths = attention_mask[:, :-response_length].sum(dim=-1).cpu().tolist()
+
+    segment_hashes, segment_lengths = create_grpo_segment_metadata(
+        prompt_uids=list(prompt_uids),
+        prompt_lengths=prompt_lengths,
+        rollout_n=rollout_n,
+    )
+    batch.non_tensor_batch["segment_hashes"] = segment_hashes
+    batch.non_tensor_batch["segment_lengths"] = segment_lengths
+
+
+def build_global_trie(batch) -> float:
+    """Build global prefix trie from segment metadata (or token-by-token fallback)
+    and attach to batch. Mutates batch in-place.
+
+    - trie -> batch.meta_info["prefix_tree"] (TrieNode root, shared across samples)
+    - leaf_idx -> batch.non_tensor_batch["leaf_idx"] (np.int64 array, sample -> leaf flat_idx)
+
+    Both survive DataProto.reorder/chunk/slice/concat/repeat natively:
+    non_tensor_batch propagates via numpy indexing; meta_info wraps as NonTensorData.
+
+    Returns:
+        Wall-clock seconds spent building the trie (segment fast path or greedy
+        fallback), excluding input prep and leaf_idx assignment.
+    """
+    input_ids = batch.batch["input_ids"]
+    attention_mask = batch.batch.get("attention_mask", None)
+    if attention_mask is not None:
+        seqs = [input_ids[i][attention_mask[i].bool()].tolist() or [0] for i in range(len(input_ids))]
+    else:
+        seqs = [input_ids[i].tolist() for i in range(len(input_ids))]
+    total_raw = sum(len(s) for s in seqs)
+
+    seg_hashes = batch.non_tensor_batch.get("segment_hashes", None)
+    seg_lengths = batch.non_tensor_batch.get("segment_lengths", None)
+    _t0 = time.perf_counter()
+    trie = None
+    if seg_hashes is not None and seg_lengths is not None:
+        trie = build_global_tree_from_segments(seqs, seg_hashes, seg_lengths)
+    if trie is None:
+        tries, _ = greedy_build_tries(seqs, max_tokens_per_tree=total_raw * 10)
+        if tries and total_raw > 0:
+            trie = tries[0]
+    _t1 = time.perf_counter()
+    if trie is None:
+        return 0.0
+
+    leaf_idx = np.full(len(seqs), -1, dtype=np.int64)
+    for flat_idx, node in enumerate(trie.nodes):
+        if not node.children:  # leaf
+            for seq_id in node.sequence_ids:
+                leaf_idx[seq_id] = flat_idx
+
+    batch.meta_info["prefix_tree"] = trie
+    batch.non_tensor_batch["leaf_idx"] = leaf_idx
+    return _t1 - _t0

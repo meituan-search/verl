@@ -94,42 +94,6 @@ def calculate_debug_metrics(data: DataProto) -> dict:
     response_length = responses.size(1)
 
     response_mask = log_prob_mask[:, -response_length:]
-
-    import os as _os
-    if _os.environ.get("MAGI_DUMP_LP", "0") == "1":
-        try:
-            import torch as _T
-            _mi = getattr(data, "meta_info", {}) or {}
-            _path_tag = _mi.get("prefix_tree_path_tag", "unknown")
-            _leaf = None
-            _ntb = getattr(data, "non_tensor_batch", {}) or {}
-            if "leaf_idx" in _ntb:
-                _leaf = _T.as_tensor(_ntb["leaf_idx"]).long()
-            _gstep = int(_mi.get("global_step", -1))
-            _mbidx = int(_mi.get("micro_batch_idx", 0))
-            _resp = responses
-            _rec = {
-                "sglang_logprob": rollout_old_log_probs[:, -response_length:].detach().cpu().clone(),
-                "magi_logprob":   actor_old_log_probs[:, -response_length:].detach().cpu().clone(),
-                "response_mask":  response_mask.detach().cpu().clone(),
-                "token_id":       _resp[:, -response_length:].detach().cpu().clone(),
-                "leaf_idx":       _leaf.detach().cpu().clone() if _leaf is not None else None,
-                "path_tag":       _path_tag,
-                "call":           "olp",
-                "sample_id":      list(_ntb["uid"]) if "uid" in _ntb else None,
-                "global_step":    _gstep,
-                "micro_batch_idx": _mbidx,
-            }
-            _dir = "/tmp/claude/magi_logprob_dump"
-            _os.makedirs(_dir, exist_ok=True)
-            _T.save(_rec, _os.path.join(_dir, f"lp_{_gstep}_{_mbidx}_{_path_tag}.pt"))
-        except Exception as _e:
-            try:
-                from verl.utils.debug.metrics import logger as _logger
-            except Exception:
-                import logging as _lg; _logger = _lg.getLogger(__name__)
-            _logger.warning(f"MAGI_DUMP_LP failed: {_e}")
-
     # calculate pearson corrcoef
     actor_probs = torch.exp(actor_old_log_probs)
     rollout_probs = torch.exp(rollout_old_log_probs)

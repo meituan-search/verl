@@ -18,6 +18,7 @@ from tensordict import TensorDict
 
 from verl.utils import tensordict_utils as tu
 from verl.utils.attention_utils import index_first_axis, unpad_input
+from verl.utils.prefix_tree.utils import truncate_dp_padding
 
 
 def left_right_2_no_padding(data: TensorDict) -> TensorDict:
@@ -121,19 +122,7 @@ def no_padding_2_padding(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor
         # MAGI nested tensors may have extra DP-padding sequences appended by
         # restore_dynamic_batch.  Truncate to the expected batch size so the
         # token-count assertion below doesn't spuriously fire.
-        if tensor.is_nested:
-            expected_bsz = prompt_lens.shape[0]
-            actual_bsz = tensor.offsets().shape[0] - 1
-            if actual_bsz > expected_bsz:
-                import logging as _log
-
-                _log.getLogger(__name__).error(
-                    "no_padding_2_padding: MAGI nested tensor has %d seqs, "
-                    "expected %d; DP-padding duplicate, truncating",
-                    actual_bsz,
-                    expected_bsz,
-                )
-                tensor = torch.nested.as_nested_tensor(list(tensor.unbind())[:expected_bsz], layout=torch.jagged)
+        tensor = truncate_dp_padding(tensor, prompt_lens.shape[0], label="MAGI nested tensor")
     else:
         attention_mask = data["attention_mask"]
         assert not attention_mask.is_nested
@@ -141,18 +130,7 @@ def no_padding_2_padding(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor
         # are nested tensors even when prompts are 2D-padded.  The DP dispatch may
         # append dummy sequences to make the batch divisible by DP size; truncate them
         # so the token-count assertion below doesn't spuriously fire.
-        if tensor.is_nested:
-            expected_bsz = prompt_ids.shape[0]
-            actual_bsz = tensor.offsets().shape[0] - 1
-            if actual_bsz > expected_bsz:
-                import logging as _log
-
-                _log.getLogger(__name__).error(
-                    "no_padding_2_padding: nested tensor has %d seqs, expected %d; DP-padding duplicate, truncating",
-                    actual_bsz,
-                    expected_bsz,
-                )
-                tensor = torch.nested.as_nested_tensor(list(tensor.unbind())[:expected_bsz], layout=torch.jagged)
+        tensor = truncate_dp_padding(tensor, prompt_ids.shape[0])
         prompt_lens = attention_mask[:, : prompt_ids.shape[1]].sum(dim=1)
         response_lens = attention_mask[:, prompt_ids.shape[1] :].sum(dim=1)
         max_response_len = response_ids.shape[1]

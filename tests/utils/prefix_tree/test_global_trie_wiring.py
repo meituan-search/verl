@@ -1,3 +1,17 @@
+# Copyright 2025-2026 Meituan Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 #!/usr/bin/env python3
 """End-to-end test: segment metadata → global trie → leaf_idx propagation.
 
@@ -317,9 +331,7 @@ def test_multilevel_leaf_input_ids_are_response_only():
     for sid, expected in enumerate(expected_responses):
         leaf = trie.leaves[sid]
         assert leaf is not None, f"no leaf for sample {sid}"
-        assert leaf.input_ids == expected, (
-            f"sample {sid} leaf input_ids={leaf.input_ids}, expected {expected}"
-        )
+        assert leaf.input_ids == expected, f"sample {sid} leaf input_ids={leaf.input_ids}, expected {expected}"
 
 
 def test_multilevel_ancestor_input_ids_are_segment_tokens():
@@ -329,15 +341,11 @@ def test_multilevel_ancestor_input_ids_are_segment_tokens():
 
     roots = [n for n in trie.nodes if n.ancestor is None and n.children]
     root_token_sets = {tuple(n.input_ids) for n in roots}
-    assert {(10, 11, 12), (50, 51, 52)} == root_token_sets, (
-        f"root prefix tokens mismatch: {root_token_sets}"
-    )
+    assert {(10, 11, 12), (50, 51, 52)} == root_token_sets, f"root prefix tokens mismatch: {root_token_sets}"
 
     intermediates = [n for n in trie.nodes if n.ancestor is not None and n.children]
     inter_token_sets = {tuple(n.input_ids) for n in intermediates}
-    assert {(20, 21), (60, 61)} == inter_token_sets, (
-        f"intermediate token mismatch: {inter_token_sets}"
-    )
+    assert {(20, 21), (60, 61)} == inter_token_sets, f"intermediate token mismatch: {inter_token_sets}"
 
 
 def test_multilevel_leaves_cover_all_samples():

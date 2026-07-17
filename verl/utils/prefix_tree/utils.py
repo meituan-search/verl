@@ -535,3 +535,27 @@ def _validate_flat_tensor(flat_tensor: Tensor, prefix_tree_params: PrefixTreePar
         raise ValueError("flat_tensor must have a sequence dimension")
     if flat_tensor.shape[0] != prefix_tree_params.total_seqlen_q:
         raise ValueError("flat_tensor sequence length must equal prefix_tree_params.total_seqlen_q")
+
+
+def truncate_dp_padding(tensor: Tensor, expected_bsz: int, *, label: str = "nested tensor") -> Tensor:
+    """Truncate DP-padding dummy sequences from a jagged nested tensor.
+
+    restore_dynamic_batch may append dummy sequences to make the batch
+    divisible by DP size. Truncate to *expected_bsz* so downstream
+    token-count assertions don't spuriously fire. No-op if tensor is not
+    nested or actual_bsz <= expected_bsz.
+    """
+    if not tensor.is_nested:
+        return tensor
+    actual_bsz = tensor.offsets().shape[0] - 1
+    if actual_bsz <= expected_bsz:
+        return tensor
+    import logging as _log
+
+    _log.getLogger(__name__).error(
+        "no_padding_2_padding: %s has %d seqs, expected %d; DP-padding duplicate, truncating",
+        label,
+        actual_bsz,
+        expected_bsz,
+    )
+    return torch.nested.as_nested_tensor(list(tensor.unbind())[:expected_bsz], layout=torch.jagged)

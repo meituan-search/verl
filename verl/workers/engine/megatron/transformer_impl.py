@@ -678,13 +678,6 @@ class MegatronEngine(BaseEngine):
             forward_only=forward_only,
         )
 
-        if losses_reduced and self.is_mp_src_rank_with_outputs():
-            pt_metrics = tu.get_non_tensor_data(data, "prefix_tree_metrics", default=None)
-            if pt_metrics:
-                if "metrics" not in losses_reduced[0]:
-                    losses_reduced[0]["metrics"] = {}
-                losses_reduced[0]["metrics"].update(pt_metrics)
-
         if self.model_config.mtp.enable and mpu.is_pipeline_last_stage(ignore_virtual=True):
             # All CP ranks must participate in the all_reduce inside get_megatron_mtp_loss,
             # because save_loss_to_tracker uses avg_group=DP+CP group.
