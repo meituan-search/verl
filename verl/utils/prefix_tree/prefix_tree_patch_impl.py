@@ -1,4 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2025 Meituan Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -146,19 +146,6 @@ def _make_attn_counters():
 
 
 _reset_attn_counters, _inc_fa3, _inc_non_fa3, _get_attn_metrics = _make_attn_counters()
-
-
-def reset_prefix_tree_attn_counters() -> None:
-    """Reset per-batch attention-path counters. Call at batch start."""
-    _reset_attn_counters()
-
-
-def get_prefix_tree_attn_metrics() -> dict:
-    """Return per-batch attention-path call counts and fallback ratio.
-
-    Call at batch end (after forward/backward) to log to tensorboard.
-    """
-    return _get_attn_metrics()
 
 
 def maybe_reset_attn_counters(engine_config) -> None:

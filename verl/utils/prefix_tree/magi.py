@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Meituan Ltd. and/or its affiliates
+# Copyright 2025 Meituan Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 """Prefix-tree + MAGI utilities for verl SFT training.
 
 Dispatches a micro-batch through either the hash-based
-(:mod:`verl.utils.prefix_tree.hash_based`) or dynamic-trie
+(:mod:`verl.utils.prefix_tree.segment_grouper`) or dynamic-trie
 (:mod:`verl.utils.prefix_tree.dynamic`) detection path, materialises a flat
 layout via :func:`verl.utils.prefix_tree.utils.build_layout_from_tree_node`,
 and builds a MAGI / flex attention key for the result.
@@ -366,7 +366,6 @@ _PREFIX_TREE_KEYS = frozenset(
         "use_prefix_tree",
         "prefix_tree_attention",
         "prefix_tree_subtree",
-        "prefix_tree_no_expand_middle",
     }
 )
 

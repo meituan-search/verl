@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Meituan Ltd. and/or its affiliates
+# Copyright 2025 Meituan Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -112,10 +112,3 @@ def group_by_segment_hash(
         length = int(sample_lengths[level])
         groups.setdefault(hash_val, []).append((sample_idx, length))
     return groups
-
-
-def has_segment_metadata(non_tensor_batch) -> bool:
-    """True if segment_hashes and segment_lengths are present."""
-    if non_tensor_batch is None:
-        return False
-    return "segment_hashes" in non_tensor_batch and "segment_lengths" in non_tensor_batch

@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Meituan Ltd. and/or its affiliates
+# Copyright 2025 Meituan Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -227,8 +227,8 @@ def _build_magi_key(model, params):
     # num_heads_q must match for the flatten_head_groups path (enabled via
     # MAGI_ATTENTION_FLATTEN_HEAD_GROUPS=1) which asserts equality.
     num_heads_q = cfg.num_attention_heads // tp_size
-    # GQA: num_query_groups may be set; fall back to num_heads_q if not
-    num_heads_kv = (getattr(cfg, "num_query_groups", num_heads_q) or num_heads_q) // tp_size
+    # GQA: num_query_groups may be set; fall back to num_attention_heads (full) if not
+    num_heads_kv = (getattr(cfg, "num_query_groups", None) or cfg.num_attention_heads) // tp_size
     head_dim = cfg.kv_channels  # hidden_size // num_attention_heads
 
     try:
@@ -478,6 +478,9 @@ def unfuse_try_forward_prefix_tree(
     from *logits_processor_args* so the caller can fall through to the
     standard THD path.
     """
+    # Unfused path blocks VLM unconditionally (3D M-RoPE not wired here).
+    # Fused path (fuse_try_forward_prefix_tree) only blocks VLM-with-images
+    # so text-only VLM batches proceed; see vision_model+has_vision_data guard there.
     if vision_model or mtp_enable_train:
         _log.getLogger(__name__).warning(
             "prefix_tree: skipping prefix-tree path (vision_model=%s, mtp_enable_train=%s); "
@@ -677,6 +680,9 @@ def fuse_try_forward_prefix_tree(
     temperature: float,
     logits_processor_args: dict,
     calculate_entropy: bool,
+    *,
+    vision_model: bool = False,
+    has_vision_data: bool = False,
 ):
     """Fused-path: try to build + forward a prefix-tree batch with fused vocab projection.
 
@@ -705,12 +711,21 @@ def fuse_try_forward_prefix_tree(
             ``prefix_tree_attention``, ``segment_hashes``, ``segment_lengths``,
             ``prefix_tree_subtree``.  Prefix-tree keys are stripped on return.
         calculate_entropy: whether to return ``entropy`` alongside ``log_probs``.
+        vision_model: whether the model is a VLM-config model (has vision_config).
+        has_vision_data: whether ``pixel_values`` is present in multi_modal_inputs.
 
     Returns:
         ``{"log_probs": NestedTensor, "entropy": NestedTensor}`` (entropy only
         when ``calculate_entropy=True``), or ``None`` when no prefix sharing is
         detected; caller falls through to the standard fused path.
     """
+
+    # VLM-with-images: 3D M-RoPE position handling not yet wired
+    # (prefix_tree_rope_context assumes 1D). Text-only on ViT-config models
+    # passes through to the standard fused path below.
+    if vision_model and has_vision_data:
+        strip_prefix_tree_args(logits_processor_args)
+        return None
 
     prefix_tree_attention = (logits_processor_args or {}).get("prefix_tree_attention", "flex")
 

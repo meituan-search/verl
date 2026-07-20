@@ -119,17 +119,10 @@ def no_padding_2_padding(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor
         response_lens = response_ids.offsets().diff()
         if max_response_len < 0:
             max_response_len = response_lens.max().item()
-        # MAGI nested tensors may have extra DP-padding sequences appended by
-        # restore_dynamic_batch.  Truncate to the expected batch size so the
-        # token-count assertion below doesn't spuriously fire.
         tensor = truncate_dp_padding(tensor, prompt_lens.shape[0], label="MAGI nested tensor")
     else:
         attention_mask = data["attention_mask"]
         assert not attention_mask.is_nested
-        # Same DP-padding truncation as the nested-prompt branch: prefix-tree outputs
-        # are nested tensors even when prompts are 2D-padded.  The DP dispatch may
-        # append dummy sequences to make the batch divisible by DP size; truncate them
-        # so the token-count assertion below doesn't spuriously fire.
         tensor = truncate_dp_padding(tensor, prompt_ids.shape[0])
         prompt_lens = attention_mask[:, : prompt_ids.shape[1]].sum(dim=1)
         response_lens = attention_mask[:, prompt_ids.shape[1] :].sum(dim=1)

@@ -149,6 +149,7 @@ verl is fast with:
    data/transfer_queue.md
    advance/grafana_prometheus.md
    advance/mtp.md
+   advance/prefix_tree.md
 
 .. toctree::
    :maxdepth: 2

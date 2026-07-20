@@ -38,6 +38,8 @@ from verl.utils.dataset.dataset_utils import SFTTensorCollator
 from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
 from verl.utils.device import auto_set_device, get_device_name
 from verl.utils.logger import log_with_rank
+from verl.utils.prefix_tree.dynamic import get_dfs_balanced_partitions
+from verl.utils.prefix_tree.trainer import add_meta_info, apply_engine_config, pt_metrics
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions
 from verl.utils.tracking import Tracking
 from verl.workers.engine_workers import TrainingWorker
@@ -110,7 +112,6 @@ class SFTTrainer:
         from verl.workers.utils.losses import sft_loss
 
         self.loss_fn = partial(sft_loss, config=None)
-        from verl.utils.prefix_tree.trainer import apply_engine_config
 
         apply_engine_config(self.engine_config, self.config.data)
 
@@ -292,7 +293,6 @@ class SFTTrainer:
             "pad_mode": self.config.data.pad_mode,
             "pad_token_id": self.model_config.tokenizer.pad_token_id,
         }
-        from verl.utils.prefix_tree.trainer import add_meta_info
 
         add_meta_info(meta_info, self.config.data)
 
@@ -321,8 +321,6 @@ class SFTTrainer:
                 if self.config.trainer.balance_batch:
                     global_seqlen_lst = torch.Tensor([item.size()[0] for item in data["input_ids"]])
                     dp_size = max(self.training_client._query_dispatch_info("train")) + 1
-
-                    from verl.utils.prefix_tree.dynamic import get_dfs_balanced_partitions
 
                     result = get_dfs_balanced_partitions(
                         data,
@@ -365,8 +363,6 @@ class SFTTrainer:
                 metrics["train/global_tokens"] = torch.sum(torch.tensor(batch_seqlens, device=self.device_name)).item()
                 total_tokens += metrics["train/global_tokens"]
                 metrics["train/total_tokens(B)"] = total_tokens / 1e9
-                from verl.utils.prefix_tree.trainer import pt_metrics
-
                 pt_metrics(metrics, data["input_ids"], self.config.data)
                 tracking.log(data=metrics, step=global_step)
 

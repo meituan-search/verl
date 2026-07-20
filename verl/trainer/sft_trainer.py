@@ -39,6 +39,7 @@ from verl.utils.device import auto_set_device, get_device_name
 from verl.utils.distributed import destroy_global_process_group
 from verl.utils.logger import log_with_rank
 from verl.utils.memory_utils import aggressive_empty_cache
+from verl.utils.prefix_tree.trainer import add_meta_info, apply_engine_config, pt_metrics
 from verl.utils.profiler import log_gpu_memory_usage
 from verl.utils.tracking import Tracking
 from verl.workers.engine_workers import TrainingWorker
@@ -161,8 +162,6 @@ class SFTTrainer:
         from verl.workers.utils.losses import sft_loss
 
         self.loss_fn = partial(sft_loss, config=None)
-
-        from verl.utils.prefix_tree.trainer import apply_engine_config
 
         apply_engine_config(self.engine_config, self.config.data)
 
@@ -358,7 +357,6 @@ class SFTTrainer:
             "pad_mode": self.config.data.pad_mode,
             "pad_token_id": self.model_config.tokenizer.pad_token_id,
         }
-        from verl.utils.prefix_tree.trainer import add_meta_info
 
         add_meta_info(meta_info, self.config.data)
 
@@ -412,7 +410,6 @@ class SFTTrainer:
                     ).item()
                     total_tokens += metrics["train/global_tokens"]
                     metrics["train/total_tokens(B)"] = total_tokens / 1e9
-                    from verl.utils.prefix_tree.trainer import pt_metrics
 
                     pt_metrics(metrics, data["input_ids"], self.config.data)
 

@@ -22,6 +22,7 @@ from tensordict import TensorDict
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.device import is_npu_available
+from verl.utils.prefix_tree.dynamic import prepare_prefix_tree_micro_batches
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import rearrange_micro_batches, restore_dynamic_batch
 
@@ -72,12 +73,7 @@ def prepare_micro_batches(
 
     force_group_size = tu.get_non_tensor_data(data=data, key="force_group_size", default=1)
 
-    # Phase 1 (global trie build) moved to ray_trainer._build_global_trie.
-    # The trie arrives attached as data["prefix_tree"] (NonTensorData in meta_info).
-    # Phase 2 below reads it via prepare_prefix_tree_micro_batches → subtrie_view.
     if use_prefix_tree:
-        from verl.utils.prefix_tree.dynamic import prepare_prefix_tree_micro_batches
-
         micro_batches, batch_idx_list = prepare_prefix_tree_micro_batches(
             data,
             sp_size=sp_size,

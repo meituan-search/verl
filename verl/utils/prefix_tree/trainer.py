@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Meituan Ltd. and/or its affiliates
+# Copyright 2025 Meituan Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -102,7 +102,7 @@ def attach_segment_metadata(batch, rollout_n: int) -> None:
     batch.non_tensor_batch["segment_lengths"] = segment_lengths
 
 
-def build_global_trie(batch) -> float:
+def build_global_trie(batch, *, metrics=None, rollout_n=None) -> float:
     """Build global prefix trie from segment metadata (or token-by-token fallback)
     and attach to batch. Mutates batch in-place.
 
@@ -112,10 +112,21 @@ def build_global_trie(batch) -> float:
     Both survive DataProto.reorder/chunk/slice/concat/repeat natively:
     non_tensor_batch propagates via numpy indexing; meta_info wraps as NonTensorData.
 
+    Args:
+        batch: DataProto to mutate.
+        metrics: Optional metrics dict. When provided, sets
+            ``metrics["prefix_tree/timing_s"]`` and
+            ``batch.meta_info["prefix_tree_path_tag"]`` after the build.
+        rollout_n: Optional rollout.n. When provided, calls
+            :func:`attach_segment_metadata` first (no-op if rollout_n < 2 or
+            no uids).
+
     Returns:
         Wall-clock seconds spent building the trie (segment fast path or greedy
         fallback), excluding input prep and leaf_idx assignment.
     """
+    if rollout_n is not None:
+        attach_segment_metadata(batch, rollout_n)
     input_ids = batch.batch["input_ids"]
     attention_mask = batch.batch.get("attention_mask", None)
     if attention_mask is not None:
@@ -135,6 +146,9 @@ def build_global_trie(batch) -> float:
         if tries and total_raw > 0:
             trie = tries[0]
     _t1 = time.perf_counter()
+    if metrics is not None:
+        metrics["prefix_tree/timing_s"] = _t1 - _t0
+        batch.meta_info["prefix_tree_path_tag"] = "segment" if seg_hashes is not None else "uniform"
     if trie is None:
         return 0.0
 

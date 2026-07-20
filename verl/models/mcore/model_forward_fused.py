@@ -158,13 +158,8 @@ def fused_forward_model_engine(vision_model: bool = False):
         # - post_process=True (last stage): recv CP-local → MAGI → undispatch → LCE
         _pt_args = logits_processor_args or {}
         use_prefix_tree = _pt_args.get("use_prefix_tree", False)
-        has_vision_data = "pixel_values" in multi_modal_inputs
 
-        # Rolling (copied from preprocess_thd_engine) is needed before pack;
-        # FP8/CP alignment skipped — handled by prefix-tree's own path.
-        # Guard defers VLM-with-images: 3D M-RoPE position handling not yet wired
-        # (prefix_tree_rope_context assumes 1D). Text-only on ViT-config models passes through.
-        if use_prefix_tree and not (vision_model and has_vision_data):
+        if use_prefix_tree:
             from verl.utils.prefix_tree.forward import fuse_try_forward_prefix_tree
 
             output = fuse_try_forward_prefix_tree(
@@ -174,6 +169,8 @@ def fused_forward_model_engine(vision_model: bool = False):
                 temperature=temperature,
                 logits_processor_args=_pt_args,
                 calculate_entropy=calculate_entropy,
+                vision_model=vision_model,
+                has_vision_data="pixel_values" in multi_modal_inputs,
             )
             if output is not None:
                 return output

@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Meituan Ltd. and/or its affiliates
+# Copyright 2025 Meituan Ltd. and/or its affiliates
 # Copyright 2025-2026 The AReaL Authors (Ant Group, Tsinghua University, HKUST)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -261,19 +261,6 @@ def _trie_seq_ids(node: TrieNode) -> list[int]:
     return ids
 
 
-def _trie_effective_tokens(node: TrieNode) -> int:
-    """Total unique (flat) tokens in a compressed-trie subtree.
-
-    Counts the tokens owned by this node plus all its descendants, i.e. the
-    flat token count that would result from laying this subtree out for
-    prefix-tree attention.
-    """
-    total = len(node.input_ids)
-    for child in node.children.values():
-        total += _trie_effective_tokens(child)
-    return total
-
-
 def trie_group_flat_tokens(group: list[int], trie: TrieNode) -> int:
     """Flat (deduplicated) token count for a subset of sequences within a trie.
 
@@ -367,13 +354,19 @@ def dfs_micro_batch_groups(
     return all_groups
 
 
-def trie_dfs_leaf_order(trie: TrieNode) -> list[int]:
-    """Return sample indices in DFS pre-order from an existing trie."""
+def _trie_dfs_leaf_order(trie: TrieNode, leaf_positions_fn) -> list[int]:
+    """Shared DFS pre-order walk over trie leaves.
+
+    Args:
+        trie: root node (``is_root`` handled).
+        leaf_positions_fn: called with each leaf ``TrieNode``; returns the
+            list of positions to emit for that leaf.
+    """
     ordered: list[int] = []
 
     def _walk(node: TrieNode) -> None:
         if not node.children:
-            ordered.extend(node.sequence_ids)
+            ordered.extend(leaf_positions_fn(node))
         else:
             for child in node.children.values():
                 _walk(child)
@@ -384,6 +377,11 @@ def trie_dfs_leaf_order(trie: TrieNode) -> list[int]:
     else:
         _walk(trie)
     return ordered
+
+
+def trie_dfs_leaf_order(trie: TrieNode) -> list[int]:
+    """Return sample indices in DFS pre-order from an existing trie."""
+    return _trie_dfs_leaf_order(trie, lambda n: list(n.sequence_ids))
 
 
 def trie_dfs_leaf_order_from_leaf_idx(leaf_idx: np.ndarray, trie: TrieNode) -> list[int]:
@@ -399,12 +397,52 @@ def trie_dfs_leaf_order_from_leaf_idx(leaf_idx: np.ndarray, trie: TrieNode) -> l
             raise ValueError(f"leaf_idx[{new_pos}]={leaf_fid}; sample has no leaf assigned.")
         leaf_to_positions.setdefault(int(leaf_fid), []).append(new_pos)
 
-    ordered: list[int] = []
-    for node in trie.nodes:
-        if node.children:
-            continue
-        ordered.extend(leaf_to_positions.get(node.flat_idx, []))
-    return ordered
+    return _trie_dfs_leaf_order(trie, lambda n: leaf_to_positions.get(n.flat_idx, []))
+
+
+def _mbs_groups_dfs(
+    leaf_entries: list[tuple[TrieNode, list[int]]],
+    max_token_len: int,
+) -> list[list[int]]:
+    """Shared DFS-budget walk for micro-batch grouping.
+
+    Args:
+        leaf_entries: ``(leaf_node, positions)`` pairs in DFS pre-order.
+            ``positions`` are the sample indices (or batch positions) to emit
+            for that leaf.
+        max_token_len: flat-token budget per micro-batch.
+
+    Budget is flat (deduplicated) tokens.  When a trie leaf holds multiple
+    positions (identical sequences), all stay in the same DFS group.
+    Duplicates are handled correctly: build_layout_from_tree_node includes the
+    representative's leaf range in the duplicate's ancestor_segment_ranges so
+    expand_flat_to_per_sample reconstructs the full sequence for each.
+    Keeping duplicates in-group avoids an extra singleton group that would
+    cause same_micro_num_in_dp to pad the other DP rank.
+    """
+    all_groups: list[list[int]] = []
+    current_group: list[int] = []
+    covered: set[int] = set()
+    current_eff = 0  # flat tokens accumulated in current group
+
+    for node, positions in leaf_entries:
+        path = trie_ancestors(node) + [node]
+        new_nodes = [n for n in path if n.flat_idx not in covered]
+        inc = sum(len(n.input_ids) for n in new_nodes)
+        if current_group and current_eff + inc > max_token_len:
+            all_groups.append(current_group[:])
+            current_group.clear()
+            covered.clear()
+            current_eff = 0
+            new_nodes = path
+            inc = sum(len(n.input_ids) for n in new_nodes)
+        current_group.extend(positions)
+        covered.update(n.flat_idx for n in new_nodes)
+        current_eff += inc
+
+    if current_group:
+        all_groups.append(current_group[:])
+    return all_groups
 
 
 def mbs_groups_from_trie(
@@ -421,48 +459,22 @@ def mbs_groups_from_trie(
     Keeping duplicates in-group avoids an extra singleton group that would
     cause same_micro_num_in_dp to pad the other DP rank.
     """
-    all_groups: list[list[int]] = []
+    leaf_entries: list[tuple[TrieNode, list[int]]] = []
 
-    for trie_root in [trie]:
-        current_group: list[int] = []
-        covered: set[int] = set()
-        current_eff = 0  # flat tokens accumulated in current group
-
-        def _visit(node: TrieNode) -> None:
-            nonlocal current_eff
-            if not node.children:
-                path = trie_ancestors(node) + [node]
-                new_nodes = [n for n in path if id(n) not in covered]  # noqa: B023
-                inc = sum(len(n.input_ids) for n in new_nodes)
-                if current_group and current_eff + inc > max_token_len:  # noqa: B023
-                    all_groups.append(current_group[:])  # noqa: B023
-                    current_group.clear()  # noqa: B023
-                    covered.clear()  # noqa: B023
-                    current_eff = 0
-                    new_nodes = path
-                    inc = sum(len(n.input_ids) for n in new_nodes)
-                # Keep all sequence_ids (including duplicates) in the same group.
-                # Duplicates share the same leaf node; build_layout_from_tree_node
-                # handles them via ancestor_segment_ranges (rep's leaf range is added
-                # to the duplicate's ancestor chain), so expand_flat_to_per_sample
-                # correctly reconstructs the full sequence for the duplicate.
-                current_group.extend(node.sequence_ids)  # noqa: B023
-                covered.update(id(n) for n in new_nodes)  # noqa: B023
-                current_eff += inc
-            else:
-                for child in node.children.values():
-                    _visit(child)
-
-        if trie_root.is_root:
-            for child in trie_root.children.values():
-                _visit(child)
+    def _collect(node: TrieNode) -> None:
+        if not node.children:
+            leaf_entries.append((node, list(node.sequence_ids)))
         else:
-            _visit(trie_root)
+            for child in node.children.values():
+                _collect(child)
 
-        if current_group:
-            all_groups.append(current_group)
+    if trie.is_root:
+        for child in trie.children.values():
+            _collect(child)
+    else:
+        _collect(trie)
 
-    return all_groups
+    return _mbs_groups_dfs(leaf_entries, max_token_len)
 
 
 def mbs_groups_from_leaf_idx(
@@ -486,37 +498,17 @@ def mbs_groups_from_leaf_idx(
             )
         leaf_to_positions.setdefault(int(leaf_fid), []).append(new_pos)
 
-    for node in trie.nodes:
-        if not node.children and node.flat_idx not in leaf_to_positions:
-            raise ValueError(
-                f"trie leaf flat_idx={node.flat_idx} has no sample in leaf_idx: trie and leaf_idx are out of sync."
-            )
-
-    all_groups: list[list[int]] = []
-    current_group: list[int] = []
-    covered: set[int] = set()
-    current_eff = 0
-
+    leaf_entries: list[tuple[TrieNode, list[int]]] = []
     for node in trie.nodes:
         if node.children:
             continue
-        positions = leaf_to_positions[node.flat_idx]
-        path = trie_ancestors(node) + [node]
-        new_nodes = [n for n in path if n.flat_idx not in covered]
-        inc = sum(len(n.input_ids) for n in new_nodes)
-        if current_group and current_eff + inc > max_token_len:
-            all_groups.append(current_group[:])
-            current_group.clear()
-            covered.clear()
-            current_eff = 0
-            new_nodes = path
-            inc = sum(len(n.input_ids) for n in new_nodes)
-        current_group.extend(positions)
-        covered.update(n.flat_idx for n in new_nodes)
-        current_eff += inc
-    if current_group:
-        all_groups.append(current_group[:])
-    return all_groups
+        if node.flat_idx not in leaf_to_positions:
+            raise ValueError(
+                f"trie leaf flat_idx={node.flat_idx} has no sample in leaf_idx: trie and leaf_idx are out of sync."
+            )
+        leaf_entries.append((node, leaf_to_positions[node.flat_idx]))
+
+    return _mbs_groups_dfs(leaf_entries, max_token_len)
 
 
 def subtrie_view(

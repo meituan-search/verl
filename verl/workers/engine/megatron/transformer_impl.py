@@ -61,6 +61,7 @@ from verl.utils.megatron_utils import (
     unwrap_model,
 )
 from verl.utils.model import extract_multi_modal_inputs, load_mcore_dist_weights
+from verl.utils.prefix_tree.magi import get_prefix_tree_logits_args, read_prefix_tree_batch_config
 from verl.utils.seqlen_balancing import restore_dynamic_batch
 from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
 
@@ -841,8 +842,6 @@ class MegatronEngineWithLMHead(MegatronEngine):
             tu.assign_non_tensor(batch, prefix_tree_subtree=_pt_subtree)
 
         if self.engine_config.use_prefix_tree:
-            from verl.utils.prefix_tree.magi import read_prefix_tree_batch_config
-
             use_prefix_tree, _ = read_prefix_tree_batch_config(batch, tu, self.engine_config.use_remove_padding)
         else:
             use_prefix_tree = False
@@ -898,8 +897,6 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 temperature_value = float(temperature)
 
         if use_prefix_tree:
-            from verl.utils.prefix_tree.magi import get_prefix_tree_logits_args
-
             _pt_logits_args = get_prefix_tree_logits_args(batch, tu)
         else:
             _pt_logits_args = {}

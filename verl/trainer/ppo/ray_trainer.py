@@ -62,7 +62,8 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.metric import reduce_metrics
-from verl.utils.prefix_tree.trainer import attach_segment_metadata, build_global_trie, pt_metrics
+from verl.utils.prefix_tree.dynamic import reorder_and_balance_for_prefix_tree
+from verl.utils.prefix_tree.trainer import build_global_trie, pt_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
@@ -1098,9 +1099,6 @@ class RayPPOTrainer:
             )
 
         elif self.config.actor_rollout_ref.model.get("use_prefix_tree", False):
-            # DFS reorder for prefix sharing.
-            from verl.utils.prefix_tree.dynamic import reorder_and_balance_for_prefix_tree
-
             if reorder_and_balance_for_prefix_tree(
                 batch,
                 self.config.actor_rollout_ref.model,
@@ -1425,15 +1423,8 @@ class RayPPOTrainer:
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
-                    # Build global prefix trie once at trainer level; segment metadata
-                    # fast path (O(N) hash-based) with greedy_build_tries fallback.
-                    # Attaches trie to batch.meta_info and leaf_idx to non_tensor_batch.
                     if self.config.actor_rollout_ref.model.get("use_prefix_tree", False):
-                        attach_segment_metadata(batch, self.config.actor_rollout_ref.rollout.n)
-                        _trie_build_s = build_global_trie(batch)
-                        _has_segs = batch.non_tensor_batch.get("segment_hashes", None) is not None
-                        batch.meta_info["prefix_tree_path_tag"] = "segment" if _has_segs else "uniform"
-                        metrics["prefix_tree/timing_s"] = _trie_build_s
+                        build_global_trie(batch, metrics=metrics, rollout_n=self.config.actor_rollout_ref.rollout.n)
 
                     pt_metrics(
                         metrics,

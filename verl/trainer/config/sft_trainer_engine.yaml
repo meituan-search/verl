@@ -99,4 +99,3 @@ trainer:
 
   profile_interval: [-1, -1]
 
-        kill: none
