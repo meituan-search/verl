@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import logging as _log
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Optional
@@ -27,19 +26,13 @@ from verl.utils.prefix_tree.tree import PrefixSubTrie, TrieNode
 
 RangeSpec = tuple[int, int]
 
-# MAGI_DUMP_STRUCT: read-only structural-dump call counter (Dump A).
-# Incremented per build_layout_from_tree_node call when the dump is active.
-_struct_dump_counter = 0
-
 
 @dataclass
 class PrefixTreeParams:
     """Metadata for a flattened PrefixTree batch."""
 
     prefix_range: RangeSpec
-    prefix_segments: list[RangeSpec]
     leaf_ranges: list[RangeSpec]
-    leaf_segments: list[RangeSpec]
     leaf_to_sample: list[int]
     sample_to_leaf_range: dict[int, RangeSpec]
     q_ranges: list[RangeSpec]
@@ -53,8 +46,6 @@ class PrefixTreeParams:
     tree_packed_position_ids: Optional[Tensor] = None
 
     def __post_init__(self) -> None:
-        if len(self.leaf_ranges) != len(self.leaf_segments):
-            raise ValueError("leaf_ranges and leaf_segments must have the same length")
         if len(self.leaf_ranges) != len(self.leaf_to_sample):
             raise ValueError("leaf_ranges and leaf_to_sample must have the same length")
         if len(self.q_ranges) != len(self.k_ranges) or len(self.q_ranges) != len(self.mask_types):
@@ -68,12 +59,10 @@ class PrefixTreeParams:
         if prefix_end < prefix_start:
             raise ValueError("prefix_range must be non-decreasing")
 
-        for leaf_range, leaf_segment in zip(self.leaf_ranges, self.leaf_segments, strict=False):
+        for leaf_range in self.leaf_ranges:
             leaf_start, leaf_end = leaf_range
             if leaf_end < leaf_start:
                 raise ValueError("leaf ranges must be non-decreasing")
-            if leaf_segment != leaf_range:
-                raise ValueError("leaf_segments must equal leaf_ranges")
 
         if self.total_seqlen_q != self.total_seqlen_k:
             raise ValueError("PrefixTree expects matching q/k sequence lengths")
@@ -114,86 +103,8 @@ class PrefixTreeParams:
 __all__ = [
     "RangeSpec",
     "PrefixTreeParams",
-    "build_prefix_tree_attention_spec",
     "build_layout_from_tree_node",
-    "extract_sample_tensor",
-    "extract_sample_tensors",
-    "longest_common_prefix_length",
 ]
-
-
-def build_prefix_tree_attention_spec(
-    root: TrieNode,
-) -> tuple[list[RangeSpec], list[RangeSpec], list[str]]:
-    """Encode a prefix tree as attention rectangle specs.
-
-    The flat token layout is a DFS pre-order walk of the tree: each node's
-    own tokens come before any of its descendants' tokens.
-
-    For each node we emit:
-    - One ``CAUSAL`` rectangle covering the node's own tokens (self-attention).
-    - For each leaf descendant: one ``FULL`` rectangle from that leaf's tokens
-      to this node's tokens (the leaf attends fully to every ancestor).
-
-    Args:
-        root: Root ``TrieNode`` of the subtrie.  Nodes with empty ``input_ids``
-            are skipped.
-
-    Returns:
-        ``(q_ranges, k_ranges, mask_types)`` ready to pass to
-        ``magi_attn_flex_key``.
-    """
-    q_ranges: list[RangeSpec] = []
-    k_ranges: list[RangeSpec] = []
-    mask_types: list[str] = []
-
-    # Assign flat token offsets with a DFS pre-order walk.
-    def _assign_offsets(node: TrieNode, start: int) -> int:
-        node._flat_start = start
-        node._flat_end = start + len(node.input_ids)
-        cur = node._flat_end
-        for child in node.children.values():
-            cur = _assign_offsets(child, cur)
-        return cur
-
-    _assign_offsets(root, 0)
-
-    # Collect all descendant nodes (non-root) in DFS order.
-    def _collect_descendants(node: TrieNode) -> list[TrieNode]:
-        result: list[TrieNode] = []
-        for child in node.children.values():
-            result.append(child)
-            result.extend(_collect_descendants(child))
-        return result
-
-    # For each node: emit its own CAUSAL self-rect, then one FULL rect per
-    # descendant that attends to this node's tokens.
-    def _emit_node(node: TrieNode) -> None:
-        if not node.input_ids:
-            return
-        node_range: RangeSpec = (node._flat_start, node._flat_end)
-
-        q_ranges.append(node_range)
-        k_ranges.append(node_range)
-        mask_types.append("causal")
-
-        if not node.children:
-            return
-
-        for desc in _collect_descendants(node):
-            if not desc.input_ids:
-                continue
-            desc_range: RangeSpec = (desc._flat_start, desc._flat_end)
-            q_ranges.append(desc_range)
-            k_ranges.append(node_range)
-            mask_types.append("full")
-
-        for child in node.children.values():
-            _emit_node(child)
-
-    _emit_node(root)
-
-    return q_ranges, k_ranges, mask_types
 
 
 def build_layout_from_tree_node(
@@ -315,40 +226,6 @@ def build_layout_from_tree_node(
     for root in root_nodes:
         _annotate(root, 0)
 
-    # --- Dump A: per-mb ALIGNMENT (read-only, MAGI_DUMP_STRUCT=1) ---
-    # Fires after _annotate finalizes leaf_node_id_to_sample + node._owner_sample,
-    # before _emit. Captures leaf→sample mapping + per-sample first-8 tokens so we
-    # can correlate leaf ownership with the logprob-dump sample_id (by first-tokens,
-    # since uid is NOT in scope here: only samples/subtrie are passed in).
-    global _struct_dump_counter
-    if os.environ.get("MAGI_DUMP_STRUCT") == "1":
-        try:
-            _struct_dump_counter += 1
-            _c = _struct_dump_counter
-            if _c <= 128:
-                _root_owner = getattr(root_nodes[0], "_owner_sample", None) if root_nodes else None
-                _first_tokens = {}
-                for _s in range(len(samples)):
-                    _t = samples[_s]
-                    _first_tokens[_s] = _t[:8].detach().cpu().clone().tolist()
-                _rec = {
-                    "call": _c,
-                    "leaf_node_id_to_sample": dict(leaf_node_id_to_sample),
-                    "leaf_node_id_to_samples": {k: list(v) for k, v in leaf_node_id_to_samples.items()},
-                    "root_owner_sample": _root_owner,
-                    "num_samples": len(samples),
-                    "sample_first_tokens": _first_tokens,
-                    "leaf_node_ids": list(subtrie.leaf_node_ids),
-                    "leaf_to_sample": list(subtrie.leaf_to_sample),
-                    "num_root_nodes": len(root_nodes),
-                }
-                _dir = "/tmp/claude/magi_struct_dump"
-                os.makedirs(_dir, exist_ok=True)
-                torch.save(_rec, os.path.join(_dir, f"align_mb{_c}.pt"))
-        except Exception as _e:
-            _struct_logger = _log.getLogger(__name__)
-            _struct_logger.warning(f"MAGI_DUMP_STRUCT failed (Dump A): {_e}")
-
     device = samples[0].device
     flat_pieces: list[Tensor] = []
     flat_lm_pieces: Optional[list[Tensor]] = [] if loss_masks_by_sample is not None else None
@@ -446,9 +323,7 @@ def build_layout_from_tree_node(
 
     params = PrefixTreeParams(
         prefix_range=prefix_range,
-        prefix_segments=[prefix_range],
         leaf_ranges=leaf_ranges,
-        leaf_segments=list(leaf_ranges),
         leaf_to_sample=leaf_to_sample_list,
         sample_to_leaf_range=sample_to_leaf_range,
         q_ranges=q_ranges,
@@ -465,78 +340,6 @@ def build_layout_from_tree_node(
     return params
 
 
-def longest_common_prefix_length(sequences: Sequence[Tensor]) -> int:
-    """Return the longest common token prefix across 1D tensors."""
-    reference = _validate_sequence_field("sequences", sequences)
-    prefix_len = reference.numel()
-
-    for sequence in sequences[1:]:
-        prefix_len = min(prefix_len, sequence.numel())
-        if prefix_len == 0:
-            return 0
-
-        mismatch = (reference[:prefix_len] != sequence[:prefix_len]).nonzero(as_tuple=False)
-        if mismatch.numel() > 0:
-            prefix_len = mismatch[0, 0].item()
-        if prefix_len == 0:
-            return 0
-
-    return prefix_len
-
-
-def extract_sample_tensor(
-    flat_tensor: Tensor,
-    prefix_tree_params: PrefixTreeParams,
-    sample_idx: int,
-) -> Tensor:
-    """Restore one sample view by concatenating the shared prefix with its leaf segment."""
-    _validate_flat_tensor(flat_tensor, prefix_tree_params)
-
-    prefix_start, prefix_end = prefix_tree_params.prefix_range
-    leaf_start, leaf_end = prefix_tree_params.get_leaf_range(sample_idx)
-    prefix = flat_tensor[prefix_start:prefix_end]
-    leaf = flat_tensor[leaf_start:leaf_end]
-    return torch.cat([prefix, leaf], dim=0)
-
-
-def extract_sample_tensors(
-    flat_tensor: Tensor,
-    prefix_tree_params: PrefixTreeParams,
-) -> dict[int, Tensor]:
-    """Restore per-sample views keyed by original sample index."""
-    _validate_flat_tensor(flat_tensor, prefix_tree_params)
-    return {
-        sample_idx: extract_sample_tensor(flat_tensor, prefix_tree_params, sample_idx)
-        for sample_idx in prefix_tree_params.leaf_to_sample
-    }
-
-
-def _validate_sequence_field(name: str, sequences: Sequence[Tensor]) -> Tensor:
-    if not sequences:
-        raise ValueError(f"{name} must contain at least one sequence")
-
-    reference = sequences[0]
-    if reference.ndim != 1:
-        raise ValueError(f"{name} must contain 1D tensors")
-
-    for sequence in sequences[1:]:
-        if sequence.ndim != 1:
-            raise ValueError(f"{name} must contain 1D tensors")
-        if sequence.device != reference.device:
-            raise ValueError(f"{name} must be on a single device")
-        if sequence.dtype != reference.dtype:
-            raise ValueError(f"{name} must have a single dtype")
-
-    return reference
-
-
-def _validate_flat_tensor(flat_tensor: Tensor, prefix_tree_params: PrefixTreeParams) -> None:
-    if flat_tensor.ndim == 0:
-        raise ValueError("flat_tensor must have a sequence dimension")
-    if flat_tensor.shape[0] != prefix_tree_params.total_seqlen_q:
-        raise ValueError("flat_tensor sequence length must equal prefix_tree_params.total_seqlen_q")
-
-
 def truncate_dp_padding(tensor: Tensor, expected_bsz: int, *, label: str = "nested tensor") -> Tensor:
     """Truncate DP-padding dummy sequences from a jagged nested tensor.
 
@@ -550,7 +353,6 @@ def truncate_dp_padding(tensor: Tensor, expected_bsz: int, *, label: str = "nest
     actual_bsz = tensor.offsets().shape[0] - 1
     if actual_bsz <= expected_bsz:
         return tensor
-    import logging as _log
 
     _log.getLogger(__name__).error(
         "no_padding_2_padding: %s has %d seqs, expected %d; DP-padding duplicate, truncating",

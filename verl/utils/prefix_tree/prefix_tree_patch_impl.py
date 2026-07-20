@@ -470,7 +470,3 @@ def apply_prefix_tree_patch() -> None:
     # ------------------------------------------------------------------
 
     TEDotProductAttention._prefix_tree_patched = True
-
-
-# Backward-compatibility alias
-apply_magi_patch = apply_prefix_tree_patch

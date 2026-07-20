@@ -25,7 +25,6 @@ from verl.utils.prefix_tree.dynamic import (
     mbs_groups_from_trie,
     subtrie_view,
     trie_dfs_leaf_order,
-    trie_to_leaf_ids,
 )
 from verl.utils.prefix_tree.tree import PrefixSubTrie
 
@@ -90,28 +89,6 @@ class TestTrieDfsLeafOrder:
         b_adjacent = b_positions[1] - b_positions[0] == 1
         assert a_adjacent, f"A-set not adjacent: {order}"
         assert b_adjacent, f"B-set not adjacent: {order}"
-
-
-# ---------------------------------------------------------------------------
-# trie_to_leaf_ids
-# ---------------------------------------------------------------------------
-
-
-class TestTrieToLeafIds:
-    def test_basic(self):
-        raw = [[1, 2, 3, 4], [1, 2, 3, 5], [1, 2, 6, 7]]
-        tries, _ = greedy_build_tries(raw, max_tokens_per_tree=1000)
-        trie = tries[0]
-        leaf_ids = trie_to_leaf_ids(trie)
-        assert len(leaf_ids) == len(raw)
-        assert set(leaf_ids) == {0, 1, 2}  # 3 unique leaf IDs
-
-    def test_no_sharing(self):
-        """Different first tokens produce multiple root children; no single trie."""
-        raw = [[1, 2], [3, 4], [5, 6]]
-        tries, _ = greedy_build_tries(raw, max_tokens_per_tree=1000)
-        # May produce multiple tries
-        assert len(tries) >= 1
 
 
 # ---------------------------------------------------------------------------

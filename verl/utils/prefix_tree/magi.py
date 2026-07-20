@@ -38,7 +38,6 @@ from __future__ import annotations
 import contextlib
 import functools
 import logging as _log
-import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -50,13 +49,6 @@ from verl.utils.prefix_tree.dynamic import build_tree_dynamic
 from verl.utils.prefix_tree.tree import PrefixSubTrie
 from verl.utils.prefix_tree.utils import build_layout_from_tree_node
 
-# MAGI_DUMP_STRUCT: read-only structural-dump state (Dump C).
-# _build_sample_tensors is called multiple times per micro-batch (log_probs,
-# entropy, hidden), so we dump once per distinct pt_batch object (keyed by id)
-# and cap at the first 2 distinct pt_batches (= first 2 micro-batches).
-_struct_dump_seen: set[int] = set()
-_struct_dump_count: int = 0
-
 
 @dataclass
 class PrefixTreeMagiBatch:
@@ -65,7 +57,6 @@ class PrefixTreeMagiBatch:
     # tree-packed input tensors ready to pass to model(...)
     tree_packed_input_ids: Tensor  # (total_tokens,)
     tree_packed_position_ids: Tensor  # (total_tokens,)
-    tree_packed_loss_mask: Optional[Tensor]  # (total_tokens,) or None
 
     # Attention keys: one will be None depending on prefix_tree_attention setting
     magi_key: object  # MAGI key (None when using flex)
@@ -94,11 +85,10 @@ class PrefixTreeMagiBatch:
     ancestor_segment_ranges: Optional[list[list[tuple[int, int]]]] = None
 
     # CP-local tensors: after magi dispatch, each CP rank only processes its assigned tokens.
-    # When CP=1, these equal tree_packed_input_ids/tree_packed_position_ids/tree_packed_loss_mask.
+    # When CP=1, these equal tree_packed_input_ids/tree_packed_position_ids.
     # Shape: (local_tokens, ...) where local_tokens = total_tokens / cp_effective
     local_tree_packed_input_ids: Optional[Tensor] = None
     local_tree_packed_position_ids: Optional[Tensor] = None
-    local_tree_packed_loss_mask: Optional[Tensor] = None
 
     def __post_init__(self):
         if self.real_tokens == 0:
@@ -108,8 +98,6 @@ class PrefixTreeMagiBatch:
             self.local_tree_packed_input_ids = self.tree_packed_input_ids
         if self.local_tree_packed_position_ids is None:
             self.local_tree_packed_position_ids = self.tree_packed_position_ids
-        if self.local_tree_packed_loss_mask is None:
-            self.local_tree_packed_loss_mask = self.tree_packed_loss_mask
 
 
 def build_prefix_tree_micro_batch(
@@ -210,52 +198,6 @@ def _build_sample_tensors(flat_tensor: Tensor, pt_batch: PrefixTreeMagiBatch) ->
     Shared logic for restore_flat_to_nested and expand_flat_to_per_sample.
     Returns sample_tensors[sample_idx] = cat(ancestor_slices..., leaf_slice).
     """
-    # --- Dump C: per-sample SCATTER mapping (read-only, MAGI_DUMP_STRUCT=1) ---
-    # Fires once per distinct pt_batch (first 2 micro-batches). Captures the
-    # packed→per-sample source ranges (prefix + ancestor chain + leaf slice per
-    # sample) so we can verify each sample's output logits are gathered from the
-    # correct packed positions.
-    if os.environ.get("MAGI_DUMP_STRUCT") == "1":
-        try:
-            global _struct_dump_seen, _struct_dump_count
-            _pbid = id(pt_batch)
-            if _pbid not in _struct_dump_seen and _struct_dump_count < 2:
-                _struct_dump_seen.add(_pbid)
-                _struct_dump_count += 1
-                _c = _struct_dump_count
-                _scatter = []
-                for _leaf_idx, _sample_idx in enumerate(pt_batch.segment_to_sample):
-                    _s, _e = pt_batch.segment_ranges[_leaf_idx]
-                    if pt_batch.ancestor_segment_ranges is not None:
-                        _chain = [tuple(a) for a in pt_batch.ancestor_segment_ranges[_leaf_idx]]
-                    else:
-                        _chain = []
-                    _scatter.append(
-                        {
-                            "leaf_idx": _leaf_idx,
-                            "sample_idx": _sample_idx,
-                            "leaf_range": (_s, _e),
-                            "ancestor_ranges": _chain,
-                            "prefix_range": tuple(pt_batch.prefix_range),
-                        }
-                    )
-                _rec = {
-                    "call": _c,
-                    "flat_tensor_shape": tuple(flat_tensor.shape),
-                    "prefix_range": tuple(pt_batch.prefix_range),
-                    "original_batch_size": pt_batch.original_batch_size,
-                    "real_tokens": pt_batch.real_tokens,
-                    "segment_to_sample": list(pt_batch.segment_to_sample),
-                    "segment_ranges": [tuple(r) for r in pt_batch.segment_ranges],
-                    "scatter": _scatter,
-                }
-                _dir = "/tmp/claude/magi_struct_dump"
-                os.makedirs(_dir, exist_ok=True)
-                torch.save(_rec, os.path.join(_dir, f"scatter_mb{_c}.pt"))
-        except Exception as _e:
-            _struct_logger = _log.getLogger(__name__)
-            _struct_logger.warning(f"MAGI_DUMP_STRUCT failed (Dump C): {_e}")
-
     prefix_start, prefix_end = pt_batch.prefix_range
     prefix_slice = flat_tensor[prefix_start:prefix_end]
     n = pt_batch.original_batch_size
@@ -439,23 +381,6 @@ def strip_prefix_tree_args(logits_processor_args: dict | None) -> None:
         return
     for k in _PREFIX_TREE_KEYS:
         logits_processor_args.pop(k, None)
-
-
-def get_prefix_tree_kwargs(
-    use_prefix_tree: bool,
-    prefix_tree_attention: str,
-) -> dict:
-    """Return prefix-tree keys for injection into *logits_processor_args*.
-
-    When prefix-tree is off returns an empty dict so no prefix keys pollute
-    the args dict.
-    """
-    if not use_prefix_tree:
-        return {}
-    return {
-        "use_prefix_tree": use_prefix_tree,
-        "prefix_tree_attention": prefix_tree_attention,
-    }
 
 
 def read_prefix_tree_batch_config(batch, tu, use_remove_padding: bool = True) -> tuple[bool, str]:

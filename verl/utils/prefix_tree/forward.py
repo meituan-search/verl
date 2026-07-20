@@ -272,10 +272,6 @@ def _finalize_prefix_tree_batch(
             params.tree_packed_position_ids = torch.cat(
                 [params.tree_packed_position_ids, params.tree_packed_position_ids.new_zeros(pad_len)]
             )
-            if params.tree_packed_loss_mask is not None:
-                params.tree_packed_loss_mask = torch.cat(
-                    [params.tree_packed_loss_mask, params.tree_packed_loss_mask.new_zeros(pad_len)]
-                )
             params.total_seqlen_q += pad_len
             params.total_seqlen_k += pad_len
 
@@ -297,7 +293,6 @@ def _finalize_prefix_tree_batch(
     return PrefixTreeMagiBatch(
         tree_packed_input_ids=params.tree_packed_tokens,
         tree_packed_position_ids=params.tree_packed_position_ids,
-        tree_packed_loss_mask=params.tree_packed_loss_mask,
         tree_packed_labels=params.tree_packed_labels,
         magi_key=magi_key,
         flex_key=flex_key,
@@ -309,7 +304,6 @@ def _finalize_prefix_tree_batch(
         ancestor_segment_ranges=getattr(params, "_leaf_ancestor_ranges", None),
         local_tree_packed_input_ids=params.tree_packed_tokens,
         local_tree_packed_position_ids=params.tree_packed_position_ids,
-        local_tree_packed_loss_mask=params.tree_packed_loss_mask,
     )
 
 
@@ -668,32 +662,6 @@ def fuse_forward_body(
     output.entropy = entropy
     output.log_probs = logprobs
     return output
-
-
-def fuse_undispatch_and_expand_hidden(
-    hidden: Tensor,
-    magi_key,
-    pt_batch: PrefixTreeMagiBatch,
-) -> Tensor:
-    """Fused-path: convert per-rank local hidden states → per-sample flat order.
-
-    Used inside ``_fused_GPTModel_forward`` to prepare hidden states for
-    ``linear_cross_entropy``.  The output is in per-sample flat order (prefix
-    replicated per sample, leaves concatenated in sample-index order), matching
-    ``labels_rmpad`` from ``preprocess_thd_engine(labels, need_roll=True)``.
-
-    Args:
-        hidden: (1, local_tokens, hidden_dim) local hidden states from decoder.
-        magi_key: MAGI key for ``undispatch``.
-        pt_batch: PrefixTreeMagiBatch.
-
-    Returns:
-        (1, total_expanded, hidden_dim) per-sample flat hidden states.
-    """
-    hidden = undispatch(hidden.squeeze(0), magi_key)  # (flat_padded, hidden)
-    hidden = hidden[: pt_batch.real_tokens]  # (real_tokens, hidden)
-    hidden = expand_flat_to_per_sample(hidden, pt_batch)  # (total_expanded, hidden)
-    return hidden.unsqueeze(0)
 
 
 def fuse_try_forward_prefix_tree(

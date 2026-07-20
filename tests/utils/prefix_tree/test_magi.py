@@ -60,16 +60,11 @@ class TestBuildPrefixTreeLayout:
         return build_layout_from_tree_node(tokens, result)
 
     def test_basic_shared_prefix(self):
-        from verl.utils.prefix_tree.utils import longest_common_prefix_length
-
         tokens = [
             torch.tensor([10, 20, 30, 41, 42]),
             torch.tensor([10, 20, 30, 51]),
             torch.tensor([10, 20, 30, 61, 62, 63]),
         ]
-        prefix_len = longest_common_prefix_length(tokens)
-        assert prefix_len == 3
-
         params = self._build_params_from_tokens(tokens)
 
         # flat layout: [10,20,30] + [41,42] + [51] + [61,62,63]
@@ -77,15 +72,6 @@ class TestBuildPrefixTreeLayout:
         assert params.prefix_range == (0, 3)
         assert params.leaf_ranges == [(3, 5), (5, 6), (6, 9)]
         assert params.total_seqlen_q == 9
-
-    def test_no_shared_prefix_returns_zero(self):
-        from verl.utils.prefix_tree.utils import longest_common_prefix_length
-
-        tokens = [
-            torch.tensor([1, 2, 3]),
-            torch.tensor([4, 5, 6]),
-        ]
-        assert longest_common_prefix_length(tokens) == 0
 
     def test_flex_spec_structure(self):
         tokens = [
@@ -130,7 +116,6 @@ class TestRestoreFlatToNested:
         return PrefixTreeMagiBatch(
             tree_packed_input_ids=params.tree_packed_tokens,
             tree_packed_position_ids=params.tree_packed_position_ids,
-            tree_packed_loss_mask=None,
             magi_key=None,
             flex_key=None,
             segment_to_sample=params.leaf_to_sample,
@@ -274,34 +259,23 @@ class TestNestedTensorUnpack:
         assert result is None
 
     def test_loss_mask_flattened(self, monkeypatch):
-        """loss_mask NestedTensor is correctly flattened into flat_loss_mask."""
-        import verl.utils.prefix_tree.forward as ptf
-        import verl.utils.prefix_tree.magi as ptm
-
-        monkeypatch.setattr(ptf, "_build_magi_key", lambda model, params: object())
-
-        class FakeModel:
-            class config:
-                num_attention_heads = 8
-                num_query_groups = 8
-                kv_channels = 128
-                fp8 = None
-
-            pre_process = True
-            post_process = True
+        """loss_mask NestedTensor is correctly flattened into params.tree_packed_loss_mask."""
+        from verl.utils.prefix_tree.dynamic import build_tree_dynamic
+        from verl.utils.prefix_tree.utils import build_layout_from_tree_node
 
         token_lists = [[10, 20, 30, 41, 42], [10, 20, 30, 51]]
         loss_lists = [[0.0, 0.0, 1.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]]
 
-        input_ids = _make_nested(token_lists)
-        loss_mask = _make_nested_float(loss_lists)
+        tokens = [torch.tensor(t) for t in token_lists]
+        loss_masks = [torch.tensor(lm, dtype=torch.float) for lm in loss_lists]
 
-        result = ptm.build_prefix_tree_micro_batch(FakeModel(), input_ids, loss_mask=loss_mask)
-        assert result is not None
-        assert result.tree_packed_loss_mask is not None
+        subtrie = build_tree_dynamic(tokens)
+        assert subtrie is not None
+        params = build_layout_from_tree_node(tokens, subtrie, loss_masks_by_sample=loss_masks)
+        assert params.tree_packed_loss_mask is not None
         # flat: [prefix_loss(3)] + [leaf_0_loss(2)] + [leaf_1_loss(1)]
         # prefix loss taken from sample 0: [0,0,1], leaf_0: [1,1], leaf_1: [1]
         assert torch.equal(
-            result.tree_packed_loss_mask,
+            params.tree_packed_loss_mask,
             torch.tensor([0.0, 0.0, 1.0, 1.0, 1.0, 1.0]),
         )

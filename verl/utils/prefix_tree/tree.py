@@ -58,7 +58,6 @@ class TrieNode:
     start_idx: int = -1
     end_idx: int = -1
     input_ids: list[int] = field(default_factory=list)
-    position_ids: list[int] = field(default_factory=list)
     children: dict[int, TrieNode] = field(default_factory=dict)
     # Sequence IDs that pass through this node (from trie construction).
     sequence_ids: list[int] = field(default_factory=list)
@@ -105,31 +104,6 @@ class PrefixTrie:
     def __getitem__(self, flat_idx: int) -> TrieNode:
         """O(1) node lookup by flat_idx."""
         return self.nodes[flat_idx]
-
-    def __iter__(self):
-        """Iterate nodes in DFS order."""
-        return iter(self.nodes)
-
-    def __len__(self) -> int:
-        return len(self.nodes)
-
-    # ── factory ───────────────────────────────────────────────────────────
-
-    def create_sub_trie(
-        self,
-        leaf_node_ids: list[int],
-        leaf_to_sample: list[int],
-    ) -> PrefixSubTrie:
-        """Return a PrefixSubTrie view for the given leaf flat_idx values.
-
-        Replaces ``subtrie_view(trie, keep_leaf_ids)``.
-        """
-        return PrefixSubTrie(
-            source=self,
-            leaf_node_ids=leaf_node_ids,
-            leaf_to_sample=leaf_to_sample,
-            batch_size=max(leaf_to_sample) + 1 if leaf_to_sample else 0,
-        )
 
     # ── metrics ───────────────────────────────────────────────────────────
 
@@ -253,40 +227,6 @@ class PrefixSubTrie(PrefixTrie):
 
         self.nodes = [by_flat_idx[fid] for fid, _, _, _ in state["nodes_data"]]
         self._cached_magi_key = None
-
-    def create_sub_trie(
-        self,
-        leaf_node_ids: list[int],
-        leaf_to_sample: list[int],
-    ) -> PrefixSubTrie:
-        """Create a further-pruned sub-view from this subtrie."""
-        return PrefixSubTrie(
-            source=self.source or self,
-            leaf_node_ids=leaf_node_ids,
-            leaf_to_sample=leaf_to_sample,
-            batch_size=max(leaf_to_sample) + 1 if leaf_to_sample else 0,
-        )
-
-    # ── layout builder ────────────────────────────────────────────────────
-
-    def build_layout(
-        self,
-        samples: list,
-        position_ids_by_sample=None,
-        loss_masks_by_sample=None,
-    ):
-        """Build flat token layout and attention range specs for this micro-batch.
-
-        Returns a ``PrefixTreeParams`` with q_ranges, k_ranges, mask_types, packed tensors.
-        """
-        from verl.utils.prefix_tree.utils import build_layout_from_tree_node
-
-        return build_layout_from_tree_node(
-            samples,
-            self,
-            loss_masks_by_sample=loss_masks_by_sample,
-            position_ids_by_sample=position_ids_by_sample,
-        )
 
 
 # ---------------------------------------------------------------------------

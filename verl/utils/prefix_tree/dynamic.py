@@ -45,10 +45,8 @@ from verl.utils.seqlen_balancing import (
 
 __all__ = [
     "build_tree_dynamic",
-    "build_mini_batch_prefix_groups",
     "dfs_leaf_order",
     "dfs_micro_batch_groups",
-    "compute_prefix_sharing_ratio",
     # Lower-level helpers exposed for testing / benchmarking
     "TrieNode",
     "greedy_build_tries",
@@ -57,14 +55,9 @@ __all__ = [
     "subtrie_view",
     # Load balancing
     "trie_group_flat_tokens",
-    "get_prefix_tree_mbs_dp_partitions",
     "get_dfs_balanced_partitions",
-    "get_prefix_balanced_partitions",
     "reorder_and_balance_for_prefix_tree",
     "create_and_attach_subtrie_views",
-    # DP dispatch helpers
-    "balance_uid_groups_for_dp",
-    "build_local_mbs_groups",
 ]
 
 
@@ -311,59 +304,6 @@ def trie_group_flat_tokens(group: list[int], trie: TrieNode) -> int:
     return sum(_count(c) for c in trie.children.values())
 
 
-def build_mini_batch_prefix_groups(
-    sequences: list[list[int]],
-) -> list[tuple[list[int], int]]:
-    """Build a mini-batch trie and return prefix-sharing groups for load balancing.
-
-    Builds a single compressed trie over all sequences, then walks down the
-    shared spine to the first branching point.  Each child subtree at that
-    branching point becomes one group: the sequences in the group all share a
-    common prefix, so they should be assigned to the *same* DP rank / micro-batch
-    to benefit from prefix deduplication.
-
-    Args:
-        sequences: per-sample token lists (the full mini-batch).
-
-    Returns:
-        List of ``(seq_indices, effective_token_count)`` pairs.
-
-        * ``seq_indices``: original sample indices that share a common prefix.
-        * ``effective_token_count``: flat (deduplicated) token count for this
-          group: shared prefix length + unique branch tokens.  Use this instead
-          of raw sequence lengths for load-balancing workload estimates.
-    """
-    if not sequences:
-        return []
-
-    max_tokens = sum(len(s) for s in sequences) * 10  # one big forest
-    tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=max_tokens)
-
-    groups: list[tuple[list[int], int]] = []
-    for trie_root in tries:
-        # Walk the spine (single-child path) accumulating the shared prefix length.
-        # trie_root is a virtual root (is_root=True, no tokens).
-        shared_len = 0
-        current = trie_root
-        while len(current.children) == 1:
-            child = next(iter(current.children.values()))
-            shared_len += len(child.input_ids)
-            current = child
-
-        if not current.children:
-            # Leaf: all sequences in this trie share the full path (e.g. identical
-            # sequences, or a single sequence).
-            groups.append((list(current.sequence_ids), shared_len))
-        else:
-            # Branching node: each child subtree is an independent group.
-            for child in current.children.values():
-                seq_ids = _trie_seq_ids(child)
-                effective = shared_len + _trie_effective_tokens(child)
-                groups.append((seq_ids, effective))
-
-    return groups
-
-
 def dfs_leaf_order(
     sequences: list[list[int]],
     trie: Optional[TrieNode] = None,
@@ -465,33 +405,6 @@ def trie_dfs_leaf_order_from_leaf_idx(leaf_idx: np.ndarray, trie: TrieNode) -> l
             continue
         ordered.extend(leaf_to_positions.get(node.flat_idx, []))
     return ordered
-
-
-def trie_to_leaf_ids(trie: TrieNode) -> np.ndarray:  # noqa: F821
-    """Return np.array mapping sample_idx → leaf_id (DFS order)."""
-    leaf_id = [-1]  # counter
-    mapping: dict[int, int] = {}
-
-    def _walk(node: TrieNode) -> None:
-        if not node.children:
-            for sid in node.sequence_ids:
-                mapping[sid] = leaf_id[0]
-            leaf_id[0] += 1
-        else:
-            for child in node.children.values():
-                _walk(child)
-
-    if trie.is_root:
-        for child in trie.children.values():
-            _walk(child)
-    else:
-        _walk(trie)
-
-    max_idx = max(mapping.keys()) if mapping else -1
-    result = np.full(max_idx + 1, -1, dtype=np.int32)
-    for sid, lid in mapping.items():
-        result[sid] = lid
-    return result
 
 
 def mbs_groups_from_trie(
@@ -662,51 +575,6 @@ def subtrie_view(
         batch_size=batch_size,
     )
     return subtrie
-
-
-def compute_prefix_sharing_ratio(input_ids, attention_mask=None) -> float:
-    """Compute prefix-sharing ratio from a batch of token sequences.
-
-    ratio = 1 - flat_trie_tokens / total_raw_tokens
-
-    ``flat_trie_tokens`` counts each shared token exactly once (the trie
-    representation); ``total_raw_tokens`` is the sum of all sequence lengths.
-    A ratio of 0 means no sharing; 1 means every token is shared.
-
-    Args:
-        input_ids: One of:
-            - ``torch.nested`` ``NestedTensor`` (jagged, SFT no-padding path)
-            - ``list[list[int]]`` of raw token sequences
-            - 2-D padded ``Tensor`` of shape ``(batch, max_len)``: requires
-              ``attention_mask`` to trim padding
-        attention_mask: Optional 2-D ``Tensor`` ``(batch, max_len)`` used to
-            trim padding when ``input_ids`` is a padded 2-D tensor.
-
-    Returns:
-        ``float`` in ``[0, 1]``.  Returns ``0.0`` for empty or single-sequence
-        input, or when no prefix is shared.
-    """
-    if isinstance(input_ids, Tensor) and input_ids.is_nested:
-        sequences = [t.tolist() for t in input_ids.unbind()]
-    elif isinstance(input_ids, Tensor) and input_ids.dim() == 2:
-        # Padded tensor path (PPO rollout output)
-        seqlens = (
-            attention_mask.sum(dim=-1).tolist()
-            if attention_mask is not None
-            else [input_ids.shape[1]] * input_ids.shape[0]
-        )
-        sequences = [input_ids[i, : int(seqlens[i])].tolist() for i in range(input_ids.shape[0])]
-    elif isinstance(input_ids, list):
-        sequences = input_ids
-    else:
-        return 0.0
-
-    total_raw = sum(len(s) for s in sequences)
-    if total_raw == 0:
-        return 0.0
-
-    _, num_tokens = greedy_build_tries(sequences, max_tokens_per_tree=total_raw * 10)
-    return 1.0 - sum(num_tokens) / total_raw
 
 
 def compute_prefix_tree_metrics(
@@ -988,217 +856,6 @@ def get_dfs_balanced_partitions(
         )
 
     return partition_lst, global_seqlen_lst, data
-
-
-def get_prefix_balanced_partitions(
-    sequences: list[list[int]],
-    k_partitions: int,
-) -> list[list[int]]:
-    """Partition sequences into k groups using mini-batch trie grouping."""
-    if not sequences:
-        return [[] for _ in range(k_partitions)]
-
-    groups = build_mini_batch_prefix_groups(sequences)
-
-    group_workloads = [int(calculate_workload(torch.tensor([eff])).item()) for _, eff in groups]
-
-    if len(groups) <= k_partitions:
-        partitions: list[list[int]] = [list(seq_ids) for seq_ids, _ in groups]
-        while len(partitions) < k_partitions:
-            partitions.append([])
-        return partitions
-
-    group_partitions = get_seqlen_balanced_partitions(
-        seqlen_list=group_workloads,
-        k_partitions=k_partitions,
-        equal_size=False,
-    )
-
-    sample_partitions = []
-    for gp in group_partitions:
-        sample_indices: list[int] = []
-        for gi in gp:
-            sample_indices.extend(groups[gi][0])
-        sample_partitions.append(sorted(sample_indices))
-
-    return sample_partitions
-
-
-def get_prefix_tree_mbs_dp_partitions(
-    sequences: list[list[int]],
-    max_token_len: int,
-    dp_size: int,
-) -> tuple[list[list[list[int]]], list[int]]:
-    """Partition micro-batches across DP ranks using flat-token workload balance.
-
-    Forms micro-batches globally from the full batch trie, estimates the flat
-    (deduplicated) token cost of each mbs via :func:`trie_group_flat_tokens`,
-    then assigns whole mbs to DP ranks with equal mbs count per rank.
-
-    Treating mbs as atomic units preserves the prefix-sharing ratio: no mbs is
-    ever split across ranks, so the deduplicated token count computed at mbs
-    formation time remains valid after DP assignment.
-
-    Args:
-        sequences: Per-sample token lists for the full global batch.
-        max_token_len: Flat-token budget per micro-batch
-            (``max_token_len_per_gpu * sp_size``).
-        dp_size: Number of data-parallel ranks.
-
-    Returns:
-        mbs_per_rank: ``mbs_per_rank[i]`` is the list of mbs groups (each a
-            ``list[int]`` of sequence indices) assigned to rank ``i``.
-        new_seq_order: Flat list of original sequence indices in the order they
-            should appear after ``data.reorder()``; rank 0's sequences first,
-            rank 1's next, etc.
-    """
-
-    def _fallback_equal_split():
-        per_rank = len(sequences) // dp_size
-        mbs_per_rank = [[[i] for i in range(r * per_rank, (r + 1) * per_rank)] for r in range(dp_size)]
-        return mbs_per_rank, list(range(len(sequences)))
-
-    max_total = sum(len(s) for s in sequences) * 10
-    tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=max_total)
-    if not tries:
-        return _fallback_equal_split()
-
-    trie = tries[0]
-    mbs_groups = mbs_groups_from_trie(trie, max_token_len)  # TODO: use PrefixSubTrie / PrefixTrie interface
-    if len(mbs_groups) < dp_size:
-        return _fallback_equal_split()
-
-    # Estimate flat token cost per mbs.
-    mbs_flat_tokens = [trie_group_flat_tokens(g, trie) for g in mbs_groups]
-
-    # Pad to a multiple of dp_size so equal_size=True is satisfied.
-    while len(mbs_groups) % dp_size:
-        mbs_groups.append(mbs_groups[-1])
-        mbs_flat_tokens.append(mbs_flat_tokens[-1])
-
-    # Assign equal mbs count per rank, balanced by flat token workload.
-    mbs_assignment = get_seqlen_balanced_partitions(mbs_flat_tokens, dp_size, equal_size=True)
-
-    mbs_per_rank: list[list[list[int]]] = []
-    new_seq_order: list[int] = []
-    for rank_mbs_indices in mbs_assignment:
-        rank_mbs = [mbs_groups[i] for i in rank_mbs_indices]
-        mbs_per_rank.append(rank_mbs)
-        for grp in rank_mbs:
-            new_seq_order.extend(grp)
-
-    return mbs_per_rank, new_seq_order
-
-
-def balance_uid_groups_for_dp(
-    uid_groups: list[list[int]],
-    group_flat_costs: list[int],
-    dp_size: int,
-) -> list[list[int]]:
-    """Assign uid-groups to DP ranks using Karmarkar-Karp balancing.
-
-    Keeps all rollouts of the same prompt on the same DP rank (atomic).
-    Balances flat token cost across ranks to minimize PP bubble.
-
-    Args:
-        uid_groups: uid_groups[g] = list of sample indices in group g.
-        group_flat_costs: flat token cost per uid-group (from trie).
-        dp_size: number of data-parallel ranks.
-
-    Returns:
-        assignment[rank] = list of sample indices for that rank.
-    """
-    if not uid_groups:
-        return [[] for _ in range(dp_size)]
-    n_groups = len(uid_groups)
-    n_mb = min(n_groups, dp_size)
-    group_partitions = get_seqlen_balanced_partitions(
-        seqlen_list=group_flat_costs,
-        k_partitions=n_mb,
-        equal_size=False,
-    )
-    result = []
-    for partition in group_partitions:
-        samples: list[int] = []
-        for g_idx in partition:
-            samples.extend(uid_groups[g_idx])
-        result.append(samples)
-    while len(result) < dp_size:
-        result.append([])
-    return result
-
-
-def build_local_mbs_groups(
-    dp_subtrie,
-    global_to_local,
-    max_token_len: int,
-) -> list[list[int]]:
-    """Return micro-batch groups with LOCAL sample indices.
-
-    Calls mbs_groups_from_trie on the dp_subtrie (which uses global IDs),
-    then converts each group's global IDs to local positions.
-
-    When ``global_to_local`` is a ``dict``, the trie is traversed only through
-    branches relevant to the shard (identified by ``global_to_local.keys()``),
-    preventing sequences from other DP ranks from inflating group sizes.
-
-    Args:
-        dp_subtrie: TrieNode for this DP rank's shard (uses global sample IDs).
-        global_to_local: Either a ``dict`` mapping {global_id: local_pos}, or a
-            ``list`` where ``global_to_local[local_i] = global_id``.  When a
-            list is passed the trie sequence IDs are treated as local positions
-            directly (no translation).
-        max_token_len: flat token budget per micro-batch.
-
-    Returns:
-        list of micro-batches, each a list of local sample positions (0..B/DP-1).
-    """
-    if isinstance(global_to_local, list):
-        # Determine whether the trie was built with local sequence IDs (0..N-1)
-        # or global IDs that need translation.  If the trie's max sequence ID is
-        # within [0, len(global_idx)), the trie uses local positions directly.
-        n_local = len(global_to_local)
-        trie_max_id = max(
-            (sid for child in dp_subtrie.children.values() for sid in child.sequence_ids),
-            default=-1,
-        )
-        if trie_max_id < n_local:
-            # Trie was built from the shard's local samples; IDs are local positions.
-            # Process per-branch, but no global→local translation needed.
-            all_groups: list[list[int]] = []
-            for token, child in dp_subtrie.children.items():
-                branch_root = TrieNode(tree_id=dp_subtrie.tree_id)
-                branch_root.children[token] = child
-                all_groups.extend(mbs_groups_from_trie(branch_root, max_token_len))
-            return [list(g) for g in all_groups if g]
-
-        # Trie uses global IDs: invert global_idx to a {global_id: local_pos} dict.
-        mapping: dict[int, int] = {g: i for i, g in enumerate(global_to_local)}
-    else:
-        mapping = global_to_local
-
-    # Build a virtual root containing only branches relevant to this shard so
-    # that mbs_groups_from_trie does not process out-of-shard sequences.
-    shard_ids = frozenset(mapping.keys())
-    shard_children: list[tuple] = []
-    for token, child in dp_subtrie.children.items():
-        if not shard_ids.isdisjoint(child.sequence_ids):
-            shard_children.append((token, child))
-
-    # Process each top-level branch independently so that sequences from
-    # different uid-groups (branches) are never merged into the same micro-batch.
-    all_global_groups: list[list[int]] = []
-    for token, child in shard_children:
-        branch_root = TrieNode(tree_id=dp_subtrie.tree_id)
-        branch_root.children[token] = child
-        all_global_groups.extend(mbs_groups_from_trie(branch_root, max_token_len))
-
-    local_groups = []
-    for group in all_global_groups:
-        local_group = [mapping[g] for g in group if g in mapping]
-        if local_group:
-            local_groups.append(local_group)
-    return local_groups
 
 
 def reorder_and_balance_for_prefix_tree(
