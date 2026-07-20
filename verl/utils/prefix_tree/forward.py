@@ -220,9 +220,15 @@ def _build_magi_key(model, params):
     """Construct a magi_attn_flex_key from PrefixTreeParams and model config."""
 
     cfg = unwrap_model(model).config
-    num_heads_q = cfg.num_attention_heads
+    tp_size = mpu.get_tensor_model_parallel_world_size()
+    # Per-rank head counts: ColumnParallelLinear (linear_qkv) shards heads
+    # across TP ranks, so each rank's Q/KV tensors hold heads/tp heads.
+    # The kernel reads head counts from q.size(1)/k.size(1), but the key's
+    # num_heads_q must match for the flatten_head_groups path (enabled via
+    # MAGI_ATTENTION_FLATTEN_HEAD_GROUPS=1) which asserts equality.
+    num_heads_q = cfg.num_attention_heads // tp_size
     # GQA: num_query_groups may be set; fall back to num_heads_q if not
-    num_heads_kv = getattr(cfg, "num_query_groups", num_heads_q) or num_heads_q
+    num_heads_kv = (getattr(cfg, "num_query_groups", num_heads_q) or num_heads_q) // tp_size
     head_dim = cfg.kv_channels  # hidden_size // num_attention_heads
 
     try:
