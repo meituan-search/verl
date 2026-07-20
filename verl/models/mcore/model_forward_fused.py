@@ -14,7 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging as _log
 from collections import OrderedDict
 from typing import Optional
 
@@ -178,9 +177,6 @@ def fused_forward_model_engine(vision_model: bool = False):
             )
             if output is not None:
                 return output
-            _log.getLogger(__name__).warning(
-                "prefix_tree: fuse_try_forward_prefix_tree returned None — falling back to standard fused path"
-            )
 
         # Standard FA3 fused path (unchanged from upstream):
         fp8 = unwrap_model(model).config.fp8

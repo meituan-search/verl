@@ -13,7 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import logging as _log
 from typing import Optional
 
 import torch
@@ -265,9 +264,6 @@ def gptmodel_forward_model_engine(
             )
             if output is not None:
                 return output
-            _log.getLogger(__name__).warning(
-                "prefix_tree: unfuse_try_forward_prefix_tree returned None; falling back to standard THD path"
-            )
 
         input_ids_rmpad, packed_seq_params, position_ids_rmpad = preprocess_thd_engine(
             input_ids,

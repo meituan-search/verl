@@ -353,9 +353,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 tu.assign_non_tensor(data, **{key: val})
 
         if getattr(self.engine_config, "use_prefix_tree", False):
-            from verl.utils.prefix_tree.prefix_tree_patch_impl import reset_prefix_tree_attn_counters
+            from verl.utils.prefix_tree.prefix_tree_patch_impl import maybe_reset_attn_counters
 
-            reset_prefix_tree_attn_counters()
+            maybe_reset_attn_counters(self.engine_config)
 
         with (
             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
@@ -367,11 +367,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
         delta_time = timer.last
 
         if getattr(self.engine_config, "use_prefix_tree", False):
-            from verl.utils.prefix_tree.prefix_tree_patch_impl import get_prefix_tree_attn_metrics
+            from verl.utils.prefix_tree.prefix_tree_patch_impl import maybe_collect_attn_metrics
 
-            attn_metrics = get_prefix_tree_attn_metrics()
-            if attn_metrics and self.engine.is_mp_src_rank_with_outputs():
-                output.setdefault("metrics", {}).update(attn_metrics)
+            maybe_collect_attn_metrics(self.engine_config, self.engine, output)
 
         update_lr_scheduler = tu.get(data, key="update_lr_scheduler", default=False)
         # update lr scheduler
@@ -421,9 +419,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 tu.assign_non_tensor(data, **{key: val})
 
         if getattr(self.engine_config, "use_prefix_tree", False):
-            from verl.utils.prefix_tree.prefix_tree_patch_impl import reset_prefix_tree_attn_counters
+            from verl.utils.prefix_tree.prefix_tree_patch_impl import maybe_reset_attn_counters
 
-            reset_prefix_tree_attn_counters()
+            maybe_reset_attn_counters(self.engine_config)
 
         # for sft training, we need to compute loss in eval
         loss_function = self.loss_fn if compute_loss else None
@@ -438,11 +436,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
         delta_time = timer.last
 
         if getattr(self.engine_config, "use_prefix_tree", False):
-            from verl.utils.prefix_tree.prefix_tree_patch_impl import get_prefix_tree_attn_metrics
+            from verl.utils.prefix_tree.prefix_tree_patch_impl import maybe_collect_attn_metrics
 
-            attn_metrics = get_prefix_tree_attn_metrics()
-            if attn_metrics and self.engine.is_mp_src_rank_with_outputs():
-                output.setdefault("metrics", {}).update(attn_metrics)
+            maybe_collect_attn_metrics(self.engine_config, self.engine, output)
 
         if self.engine.is_mp_src_rank_with_outputs():
             final_output = self._postprocess_output(

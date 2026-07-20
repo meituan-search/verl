@@ -161,6 +161,20 @@ def get_prefix_tree_attn_metrics() -> dict:
     return _get_attn_metrics()
 
 
+def maybe_reset_attn_counters(engine_config) -> None:
+    """Reset per-batch attn counters if prefix-tree is enabled."""
+    if getattr(engine_config, "use_prefix_tree", False):
+        _reset_attn_counters()
+
+
+def maybe_collect_attn_metrics(engine_config, engine, output: dict) -> None:
+    """Gather per-batch attn metrics into output['metrics'] if PT enabled and MP src rank."""
+    if getattr(engine_config, "use_prefix_tree", False):
+        attn_metrics = _get_attn_metrics()
+        if attn_metrics and engine.is_mp_src_rank_with_outputs():
+            output.setdefault("metrics", {}).update(attn_metrics)
+
+
 # ---------------------------------------------------------------------------
 # Patch application
 # ---------------------------------------------------------------------------
