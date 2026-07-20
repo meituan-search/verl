@@ -49,6 +49,7 @@ def pt_metrics(
     max_token_len_per_gpu: int | None = None,
     micro_batch_size: int = 0,
     trie=None,
+    leaf_idx=None,
 ) -> None:
     """Compute prefix-sharing metrics if *use_prefix_tree* is enabled.
 
@@ -58,6 +59,9 @@ def pt_metrics(
     Pass *micro_batch_size* for fixed-mbs (consecutive-slice groups).
     Pass *trie* to skip the internal ``greedy_build_tries`` when the caller
     already built one (e.g. attached to ``batch.meta_info["prefix_tree"]``).
+    Pass *leaf_idx* (from ``non_tensor_batch["leaf_idx"]``) to compute
+    ``micro_batch_shared_ratio`` using the SAME grouping function
+    (``mbs_groups_from_leaf_idx``) the live mbs path uses.
     """
     if not _is_prefix_tree_enabled(config_or_data):
         return
@@ -68,6 +72,7 @@ def pt_metrics(
             max_token_len_per_gpu=max_token_len_per_gpu,
             micro_batch_size=micro_batch_size,
             trie=trie,
+            leaf_idx=leaf_idx,
         )
     )
 

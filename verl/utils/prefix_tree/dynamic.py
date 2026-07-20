@@ -583,14 +583,19 @@ def compute_prefix_tree_metrics(
     max_token_len_per_gpu: int | None = None,
     micro_batch_size: int = 0,
     trie: Optional[TrieNode] = None,
+    leaf_idx: Optional[np.ndarray] = None,
 ) -> dict:
     """Compute prefix-tree metrics as a ``prefix_tree/`` namespace dict.
 
     Returns a dict with keys:
         ``prefix_tree/global_shared_ratio``      : fraction of tokens saved by deduplication
         ``prefix_tree/micro_batch_shared_ratio`` : mean per-micro-batch sharing ratio;
-                                                   computed from trie groups (dynbsz) or
-                                                   consecutive slices of ``micro_batch_size`` (fixed mbs)
+                                                   computed from the SAME grouping function
+                                                   the live mbs path uses
+                                                   (``mbs_groups_from_leaf_idx`` when
+                                                   ``leaf_idx`` is provided, else
+                                                   ``mbs_groups_from_trie``), or consecutive
+                                                   slices of ``micro_batch_size`` (fixed mbs)
         ``prefix_tree/packed_tokens``             : deduplicated packed trie token count
         ``prefix_tree/raw_tokens``               : total raw token count across all sequences
         ``prefix_tree/avg_mbs``                  : avg sequences per micro-batch (dynbsz only)
@@ -603,6 +608,12 @@ def compute_prefix_tree_metrics(
         trie: Pre-built compressed TrieNode root. When provided, skips
             ``greedy_build_tries`` entirely (the caller already built it).
             ``input_ids`` is still needed for sequence lengths and grouping.
+        leaf_idx: Optional numpy array (sample -> leaf flat_idx) from
+            ``non_tensor_batch["leaf_idx"]``. When provided with ``trie``,
+            uses ``mbs_groups_from_leaf_idx`` -- the SAME grouping function
+            the live mbs path (``prepare_prefix_tree_micro_batches``) uses --
+            so ``micro_batch_shared_ratio`` reflects the actual mbs grouping.
+            Falls back to ``mbs_groups_from_trie`` when ``leaf_idx`` is None.
 
     Returns:
         dict of float metrics, all zero if no sequences.
@@ -658,7 +669,13 @@ def compute_prefix_tree_metrics(
         return sum(ratios) / len(ratios) if ratios else None
 
     if max_token_len_per_gpu is not None and trie is not None:
-        groups = mbs_groups_from_trie(trie, max_token_len_per_gpu)
+        # Use the SAME grouping function the live mbs path uses
+        # (prepare_prefix_tree_micro_batches -> mbs_groups_from_leaf_idx)
+        # so micro_batch_shared_ratio reflects the actual mbs grouping.
+        if leaf_idx is not None:
+            groups = mbs_groups_from_leaf_idx(leaf_idx, trie, max_token_len_per_gpu)
+        else:
+            groups = mbs_groups_from_trie(trie, max_token_len_per_gpu)
         result["prefix_tree/avg_mbs"] = len(sequences) / len(groups) if groups else 0.0
         # Per-micro-batch sharing ratio using actual dynbsz groups and the global trie.
         ratios = []

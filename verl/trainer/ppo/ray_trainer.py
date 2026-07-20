@@ -1443,6 +1443,7 @@ class RayPPOTrainer:
                             self.config.actor_rollout_ref.actor, "ppo_max_token_len_per_gpu", None
                         ),
                         trie=batch.meta_info.get("prefix_tree"),
+                        leaf_idx=batch.non_tensor_batch.get("leaf_idx"),
                     )
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
