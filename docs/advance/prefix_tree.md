@@ -56,24 +56,52 @@ For SFT, the same fields are set under `actor.model` in the SFT trainer config.
 ### Data flow
 
 ```
-batch (input_ids, attention_mask)
-  → _build_global_trie (ray_trainer.py)
-      → attach_segment_metadata: segment_hashes + segment_lengths (fast path, GRPO)
-      → build_global_tree_from_segments OR greedy_build_tries (fallback)
-      → attaches: batch.meta_info["prefix_tree"] (TrieNode root)
-                  batch.non_tensor_batch["leaf_idx"] (sample → leaf flat_idx)
-  → _balance_batch (DFS reorder for prefix locality)
-  → dispatch to DP ranks
-  → prepare_prefix_tree_micro_batches (engine/utils.py)
-      → mbs_groups_from_leaf_idx: group samples into prefix-aware micro-batches
-      → create_and_attach_subtrie_views: per-micro-batch PrefixSubTrie
-  → forward (forward.py)
-      → build_prefix_tree_batch: build PrefixTreeMagiBatch (flat tokens, attention ranges)
-      → _build_magi_key: build magi_attention_key (global shapes + CP coordination)
-      → dispatch_magi: slice to per-CP-rank local tokens
-      → model(...) with patched TEDotProductAttention → magi_attn_forward → calc_attn
-      → undispatch: gather local logits back to full layout
-  → loss (linear cross-entropy on packed labels)
+Trainer (RayPPOTrainer / SFTTrainer)
+  ├─ attach_segment_metadata()
+  │    └─ segment_hashes + segment_lengths from prompt UIDs + prompt lengths (GRPO fast path)
+  ├─ build_global_trie()
+  │    ├─ build_global_tree_from_segments (fast path) OR greedy_build_tries (fallback)
+  │    └─ attaches: batch.meta_info["prefix_tree"] (TrieNode root)
+  │                 batch.non_tensor_batch["leaf_idx"] (sample -> leaf flat_idx)
+  ├─ pt_metrics()  ─ global_shared_ratio, packed_tokens, raw_tokens
+  ├─ _balance_batch()  ─ DFS reorder for prefix locality (leaf_idx stays correct)
+  └─ dispatch to DP ranks
+       └─ prepare_prefix_tree_micro_batches()  (engine/utils.py)
+            ├─ mbs_groups_from_leaf_idx()  ─ prefix-aware micro-batch grouping
+            └─ create_and_attach_subtrie_views()  ─ per-micro-batch PrefixSubTrie
+                 └─ forward()  (forward.py)
+                      ├─ build_prefix_tree_batch()  ─ PrefixTreeMagiBatch (flat tokens, attn ranges)
+                      ├─ _build_magi_key()  ─ magi_attention_key (global shapes + CP coordination)
+                      ├─ dispatch_magi()  ─ slice to per-CP-rank local tokens
+                      ├─ model(...) with patched TEDotProductAttention
+                      │    └─ magi_attn_forward() -> calc_attn()  (magi_attention kernel)
+                      ├─ undispatch()  ─ gather local logits back to full layout
+                      └─ loss  (linear cross-entropy on packed labels)
+```
+
+### Trie -> packed layout
+
+```
+Samples (shared prompt P, responses R0..R3):
+  [P R0]  [P R1]  [P R2]  [P R3]
+
+Compressed trie:
+  root
+   └─ P (shared prefix, 1 node)
+       ├─ leaf: R0
+       ├─ leaf: R1
+       ├─ leaf: R2
+       └─ leaf: R3
+
+Flat packed layout (tokens processed once):
+  ┌─────┬─────┬─────┬─────┬─────┐
+  │  P  │ R0  │ R1  │ R2  │ R3  │
+  └─────┴─────┴─────┴─────┴─────┘
+   shared   each response attends to P + itself
+   (1x)     via block-sparse mask from trie structure
+
+  Without prefix-tree: P processed 4x (once per rollout)
+  With prefix-tree:    P processed 1x (shared node)
 ```
 
 ### Key components

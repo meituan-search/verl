@@ -723,10 +723,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             return
 
         set_expandable_segments(False)
-        # Flush PyTorch's CUDA memory cache before sglang resumes physical pages.
-        # Without this, cached-but-freed allocator blocks prevent cuMemCreate from
-        # succeeding even when nominal free memory is sufficient (see verl PR #2253).
-        aggressive_empty_cache(force_sync=True)
         log_gpu_memory_usage("Before resume weights", logger=logger)
 
         # 1. resume rollout memory (weights were released during sleep)
@@ -770,8 +766,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         log_gpu_memory_usage("After resume kv_cache", logger=logger)
 
         self.base_sync_done = True
-        # NOTE: intentionally not re-enabling expandable segments here: doing so
-        # after weight sync causes PyTorch to make large memory reservations (OOM).
+        set_expandable_segments(True)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):

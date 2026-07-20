@@ -402,7 +402,7 @@ class SFTTrainer:
                     metrics = tu.get(output, "metrics")
 
                     # TODO: we can actual accumulate metrics for N steps and perform aggregate metrics
-                    for k in ["loss", "grad_norm", "lr", "mfu", "tree_flop_ratio"]:
+                    for k in ["loss", "grad_norm", "lr", "mfu"]:
                         if k in metrics.keys():
                             value = metrics.pop(k)
                             metrics[f"train/{k}"] = value
@@ -448,7 +448,7 @@ class SFTTrainer:
                         last_valid_metric = metric
                     torch.distributed.barrier()
 
-                if (is_last_step and self.save_freq != -1) or (self.save_freq > 0 and is_save_step):
+                if is_last_step or (self.save_freq > 0 and is_save_step):
                     aggressive_empty_cache(force_sync=True)
                     self.ckpt_handler.save_checkpoint(step=global_step)
 

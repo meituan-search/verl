@@ -99,24 +99,4 @@ trainer:
 
   profile_interval: [-1, -1]
 
-# global_profiler: required by sft_trainer_ray.py when profiler.tool=nsys
-# mirrors the structure in ppo_trainer.yaml
-global_profiler:
-
-  global_tool_config:
-
-    nsys:
-
-      discrete: False
-
-      worker_nsight_options:
-
-        trace: "cuda,nvtx,cublas"
-
-        cuda-memory-usage: "true"
-
-        capture-range: "cudaProfilerApi"
-
-        capture-range-end: "stop"
-
         kill: none

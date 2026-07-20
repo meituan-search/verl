@@ -322,8 +322,7 @@ class MultiTurnSFTDataset(Dataset):
         )
 
         print_assembled_message(self.tokenizer, messages, input_ids, loss_mask, attention_mask, tools)
-        if not self.ignore_input_ids_mismatch:
-            self.sanity_check(input_ids, messages, tools, enable_thinking)
+        self.sanity_check(input_ids, messages, tools, enable_thinking)
 
         # Since the tokenizer may return user-customized results, we need to filter out inconsistent tensor shapes
         keys_to_remove = []
@@ -393,7 +392,6 @@ class MultiTurnSFTDataset(Dataset):
                 else:
                     raise ValueError(f"Unknown truncation method {self.truncation}")
 
-            _final_len = int(attention_mask.sum())  # real (non-pad) token count
             res = {
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
@@ -413,7 +411,6 @@ class MultiTurnSFTDataset(Dataset):
                 position_ids = position_ids[..., : self.max_length]
 
             # return nested tensor with out padding
-            _final_len = int(input_ids.shape[0])
             res = {
                 "input_ids": input_ids,
                 "position_ids": position_ids,
