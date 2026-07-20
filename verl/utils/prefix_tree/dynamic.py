@@ -400,19 +400,12 @@ def dfs_micro_batch_groups(
 ) -> list[list[int]]:
     """Group sequences into micro-batches in DFS trie order, budgeted by flat trie tokens.
 
-    Builds ONE trie over all sequences, then traverses leaves in DFS pre-order.
-    Greedily packs leaves into micro-batches: the **budget is flat (deduplicated)
-    trie tokens**: prefix counted once + unique branch tokens; not raw sequence
-    lengths.  This means a micro-batch of k sequences that share a long common
-    prefix uses far fewer budget tokens than k × seq_len, allowing more sequences
-    per batch.
-
-    Algorithm:
-        - Maintain ``covered``: set of trie-node IDs already in the current batch.
-        - For each leaf in DFS pre-order, its incremental cost =
-          tokens in (leaf.ancestors + [leaf]) that are NOT yet in ``covered``.
-        - If incremental cost fits within remaining budget: add to current batch.
-        - Else: flush current batch, start a new one with this leaf.
+    Builds ONE trie over all sequences (a forest in the rare greedy-split case),
+    then delegates per-trie grouping to :func:`mbs_groups_from_trie`.  The
+    budget is flat (deduplicated) trie tokens: prefix counted once + unique
+    branch tokens; not raw sequence lengths.  This means a micro-batch of k
+    sequences that share a long common prefix uses far fewer budget tokens than
+    k × seq_len, allowing more sequences per batch.
 
     Args:
         sequences: per-sample token lists (the full mini-batch).
@@ -429,42 +422,8 @@ def dfs_micro_batch_groups(
     tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=max_tokens)
 
     all_groups: list[list[int]] = []
-
     for trie_root in tries:
-        current_group: list[int] = []
-        covered: set[int] = set()  # id(TrieNode) already counted in current batch
-        current_eff = 0
-
-        def _visit(node: TrieNode) -> None:
-            nonlocal current_eff
-            if not node.children:
-                # Leaf: full path = ancestors (list of TrieNodes) + self
-                path = trie_ancestors(node) + [node]
-                new_nodes = [n for n in path if id(n) not in covered]  # noqa: B023
-                inc = sum(len(n.input_ids) for n in new_nodes)
-
-                if current_group and current_eff + inc > max_token_len:  # noqa: B023
-                    # Flush: start a fresh batch with this leaf
-                    all_groups.append(current_group[:])  # noqa: B023
-                    current_group.clear()  # noqa: B023
-                    covered.clear()  # noqa: B023
-                    current_eff = 0
-                    new_nodes = path  # all nodes are new in empty batch
-                    inc = sum(len(n.input_ids) for n in new_nodes)
-
-                current_group.extend(node.sequence_ids)  # noqa: B023
-                covered.update(id(n) for n in new_nodes)  # noqa: B023
-                current_eff += inc
-            else:
-                for child in node.children.values():  # sorted by token key
-                    _visit(child)
-
-        for child in trie_root.children.values():
-            _visit(child)
-
-        if current_group:
-            all_groups.append(current_group)
-
+        all_groups.extend(mbs_groups_from_trie(trie_root, max_token_len))
     return all_groups
 
 

@@ -521,61 +521,52 @@ def unfuse_try_forward_prefix_tree(
 # ---------------------------------------------------------------------------
 
 
-def _run_lce_magi(
+def _run_lce(
     hidden_states: Tensor,
     output_weight: Tensor,
     labels: Tensor,
     temperature: float,
-    magi_key,
-    pt_batch: PrefixTreeMagiBatch,
     model,
+    magi_key=None,
+    pt_batch: Optional[PrefixTreeMagiBatch] = None,
 ) -> tuple[Tensor, Tensor]:
-    """MAGI-branch LCE: run on CP-local hidden, undispatch 1D outputs to full flat."""
+    """Fused LCE for both MAGI and flex branches.
+
+    Shared part: gather from sequence-parallel region (if enabled), then call
+    :func:`linear_cross_entropy`.  When ``magi_key`` is given (MAGI branch),
+    labels are padded to flat-padded length and sliced by CP-local indices
+    before the call, and the 1D outputs are undispatched back to full flat
+    order and trimmed to ``real_tokens``.  Without ``magi_key`` (flex branch),
+    labels pass through directly and no undispatch is needed.
+    """
     from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy as _lce
 
     if model.config.sequence_parallel:
         from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 
         hidden_states = gather_from_sequence_parallel_region(hidden_states)
-    local_indices = get_position_ids(magi_key)
-    flat_padded = pt_batch.tree_packed_input_ids.shape[0]
-    pad = flat_padded - labels.shape[0]
-    labels_full = torch.cat([labels, labels.new_zeros(pad)]) if pad > 0 else labels
+
+    if magi_key is not None:
+        local_indices = get_position_ids(magi_key)
+        flat_padded = pt_batch.tree_packed_input_ids.shape[0]
+        pad = flat_padded - labels.shape[0]
+        labels_full = torch.cat([labels, labels.new_zeros(pad)]) if pad > 0 else labels
+        lce_labels = labels_full[local_indices]
+    else:
+        lce_labels = labels
+
     logprobs, entropy = _lce(
         hidden_states,
         output_weight,
-        labels_full[local_indices],
+        lce_labels,
         temperature,
         "none",
         mpu.get_tensor_model_parallel_group(),
     )
-    logprobs = undispatch(logprobs.reshape(-1), magi_key)[: pt_batch.real_tokens]
-    entropy = undispatch(entropy.reshape(-1), magi_key)[: pt_batch.real_tokens]
-    return logprobs, entropy
 
-
-def _run_lce_flex(
-    hidden_states: Tensor,
-    output_weight: Tensor,
-    labels: Tensor,
-    temperature: float,
-    model,
-) -> tuple[Tensor, Tensor]:
-    """Flex-branch LCE: run on full flat hidden, no undispatch needed."""
-    from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy as _lce
-
-    if model.config.sequence_parallel:
-        from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
-
-        hidden_states = gather_from_sequence_parallel_region(hidden_states)
-    logprobs, entropy = _lce(
-        hidden_states,
-        output_weight,
-        labels,
-        temperature,
-        "none",
-        mpu.get_tensor_model_parallel_group(),
-    )
+    if magi_key is not None:
+        logprobs = undispatch(logprobs.reshape(-1), magi_key)[: pt_batch.real_tokens]
+        entropy = undispatch(entropy.reshape(-1), magi_key)[: pt_batch.real_tokens]
     return logprobs, entropy
 
 
@@ -648,9 +639,11 @@ def fuse_forward_body(
         output_weight = model.embedding.word_embeddings.weight
 
     if magi_key is not None:
-        logprobs, entropy = _run_lce_magi(hidden_states, output_weight, labels, temperature, magi_key, pt_batch, model)
+        logprobs, entropy = _run_lce(
+            hidden_states, output_weight, labels, temperature, model, magi_key=magi_key, pt_batch=pt_batch
+        )
     else:
-        logprobs, entropy = _run_lce_flex(hidden_states, output_weight, labels, temperature, model)
+        logprobs, entropy = _run_lce(hidden_states, output_weight, labels, temperature, model)
 
     if _has_cfg_log(model.config):
         payload = _OrderedDict(
