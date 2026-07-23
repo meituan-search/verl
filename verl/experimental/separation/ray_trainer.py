@@ -509,7 +509,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             )
         else:  # Recompute old_log_probs
             with marked_timer("old_log_prob", timing_raw, color="blue"):
-                old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                old_log_prob, old_log_prob_mfu, old_log_prob_pt_metrics = self._compute_old_log_prob(batch)
                 entropys = old_log_prob.batch["entropys"]
                 response_masks = batch.batch["response_mask"]
                 actor_config = self.config.actor_rollout_ref.actor
@@ -524,6 +524,8 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                     "perf/mfu/actor_infer": old_log_prob_mfu,
                 }
                 metrics.update(old_log_prob_metrics)
+                if old_log_prob_pt_metrics:
+                    metrics.update(old_log_prob_pt_metrics)
                 old_log_prob.batch.pop("entropys")
                 if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
                     router_mode = getattr(self.config.actor_rollout_ref.actor.router_replay, "mode", "disabled")

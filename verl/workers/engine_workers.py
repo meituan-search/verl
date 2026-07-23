@@ -119,7 +119,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         self.engine_config.use_fused_kernels = self.model_config.get("use_fused_kernels", False)
         # Thread prefix-tree flags from model config → engine meta_info (actor training dedup)
         self.engine_config.use_prefix_tree = self.model_config.get("use_prefix_tree", False)
-        self.engine_config.prefix_tree_attention = self.model_config.get("prefix_tree_attention", "flex")
+        self.engine_config.prefix_tree_attention = self.model_config.get("prefix_tree_attention", "magi")
 
         self.profiler_config = self.config.profiler_config
         if self.profiler_config is not None:
@@ -268,6 +268,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
             )
             mini_batch_size_per_gpu = mini_batch_size // self.engine.get_data_parallel_size()
 
+        # make iterator
         dataloader = tu.make_iterator(
             data,
             mini_batch_size=mini_batch_size_per_gpu,
@@ -345,17 +346,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
             micro_batch_size_per_gpu=self.engine_config.micro_batch_size_per_gpu,
             use_fused_kernels=self.engine_config.use_fused_kernels,
             use_prefix_tree=getattr(self.engine_config, "use_prefix_tree", False),
-            prefix_tree_attention=getattr(self.engine_config, "prefix_tree_attention", "flex"),
+            prefix_tree_attention=getattr(self.engine_config, "prefix_tree_attention", "magi"),
         )
 
         for key, val in default_keys.items():
             if key not in data.keys():
                 tu.assign_non_tensor(data, **{key: val})
-
-        if getattr(self.engine_config, "use_prefix_tree", False):
-            from verl.utils.prefix_tree.prefix_tree_patch_impl import maybe_reset_attn_counters
-
-            maybe_reset_attn_counters(self.engine_config)
 
         with (
             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
@@ -365,11 +361,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
             # containing loss, model_output and metrics
             # for training, we only care about loss and metrics
         delta_time = timer.last
-
-        if getattr(self.engine_config, "use_prefix_tree", False):
-            from verl.utils.prefix_tree.prefix_tree_patch_impl import maybe_collect_attn_metrics
-
-            maybe_collect_attn_metrics(self.engine_config, self.engine, output)
 
         update_lr_scheduler = tu.get(data, key="update_lr_scheduler", default=False)
         # update lr scheduler
@@ -410,18 +401,13 @@ class TrainingWorker(Worker, DistProfilerExtension):
             max_token_len_per_gpu=self.engine_config.infer_max_token_len_per_gpu,
             micro_batch_size_per_gpu=self.engine_config.infer_micro_batch_size_per_gpu,
             use_fused_kernels=self.engine_config.use_fused_kernels,
-            use_prefix_tree=self.engine_config.use_prefix_tree,
-            prefix_tree_attention=getattr(self.engine_config, "prefix_tree_attention", "flex"),
+            use_prefix_tree=getattr(self.engine_config, "use_prefix_tree", False),
+            prefix_tree_attention=getattr(self.engine_config, "prefix_tree_attention", "magi"),
         )
 
         for key, val in default_keys.items():
             if key not in data.keys():
                 tu.assign_non_tensor(data, **{key: val})
-
-        if getattr(self.engine_config, "use_prefix_tree", False):
-            from verl.utils.prefix_tree.prefix_tree_patch_impl import maybe_reset_attn_counters
-
-            maybe_reset_attn_counters(self.engine_config)
 
         # for sft training, we need to compute loss in eval
         loss_function = self.loss_fn if compute_loss else None
@@ -434,11 +420,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
             with adapter_ctx:
                 output = self.engine.infer_batch(data, loss_function=loss_function)
         delta_time = timer.last
-
-        if getattr(self.engine_config, "use_prefix_tree", False):
-            from verl.utils.prefix_tree.prefix_tree_patch_impl import maybe_collect_attn_metrics
-
-            maybe_collect_attn_metrics(self.engine_config, self.engine, output)
 
         if self.engine.is_mp_src_rank_with_outputs():
             final_output = self._postprocess_output(

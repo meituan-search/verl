@@ -678,6 +678,14 @@ class MegatronEngine(BaseEngine):
             micro_batch_size=1,  # the communication shape is obtained via p2p comm
             forward_only=forward_only,
         )
+        if losses_reduced and self.is_mp_src_rank_with_outputs():
+            from verl.utils.prefix_tree.prefix_tree_patch_impl import (
+                maybe_collect_attn_metrics,
+                maybe_collect_mbs_metric,
+            )
+
+            maybe_collect_attn_metrics(self.engine_config, self, losses_reduced[0])
+            maybe_collect_mbs_metric(self.engine_config, self, losses_reduced[0])
 
         if self.model_config.mtp.enable and mpu.is_pipeline_last_stage(ignore_virtual=True):
             # All CP ranks must participate in the all_reduce inside get_megatron_mtp_loss,

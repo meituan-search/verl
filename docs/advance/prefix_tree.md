@@ -145,8 +145,6 @@ Base (no prefix-tree) vs MAGI prefix-tree, on two workloads — `longreason` (a 
 | base asearch | – | 133 | 370 |
 | magi asearch | 35 | 82 | 300 |
 
-> **Note (bug).** The `micro_batch_shared_ratio` shown in wandb for the asearcher is bugged — it does not exclude padding, so the displayed value is inflated. The actual prompt:response length ratio on `asearch` is 1:2.
-
 ## 7. Known limitations
 
 - **TP and SP are mutually exclusive.** When `tensor_model_parallel_size > 1`, sequence parallelism must be disabled (`actor_rollout_ref.actor.megatron.sequence_parallel=False`); the prefix-tree path does not support SP with TP.

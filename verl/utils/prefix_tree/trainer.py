@@ -23,6 +23,7 @@ from __future__ import annotations
 import time
 
 import numpy as np
+import torch
 
 from verl.utils.prefix_tree.dynamic import compute_prefix_tree_metrics, greedy_build_tries
 from verl.utils.prefix_tree.segment_grouper import create_grpo_segment_metadata
@@ -32,13 +33,13 @@ from verl.utils.prefix_tree.tree import _is_prefix_tree_enabled, build_global_tr
 def apply_engine_config(engine_config, config_or_data: dict) -> None:
     """Thread prefix-tree flags from config into *engine_config*."""
     engine_config.use_prefix_tree = config_or_data.get("use_prefix_tree", False)
-    engine_config.prefix_tree_attention = config_or_data.get("prefix_tree_attention", "flex")
+    engine_config.prefix_tree_attention = config_or_data.get("prefix_tree_attention", "magi")
 
 
 def add_meta_info(meta_dict: dict, config_or_data: dict) -> None:
     """Add prefix-tree entries to a meta-info dict (mutates in-place)."""
     meta_dict["use_prefix_tree"] = config_or_data.get("use_prefix_tree", False)
-    meta_dict["prefix_tree_attention"] = config_or_data.get("prefix_tree_attention", "flex")
+    meta_dict["prefix_tree_attention"] = config_or_data.get("prefix_tree_attention", "magi")
 
 
 def pt_metrics(
@@ -53,15 +54,24 @@ def pt_metrics(
 ) -> None:
     """Compute prefix-sharing metrics if *use_prefix_tree* is enabled.
 
-    Updates *metrics* in-place with keys like ``prefix_tree/sharing_ratio``.
-    Pass *attention_mask* to strip padding from 2-D padded tensors.
-    Pass *max_token_len_per_gpu* for dynbsz (trie-based micro-batch groups).
-    Pass *micro_batch_size* for fixed-mbs (consecutive-slice groups).
-    Pass *trie* to skip the internal ``greedy_build_tries`` when the caller
-    already built one (e.g. attached to ``batch.meta_info["prefix_tree"]``).
-    Pass *leaf_idx* (from ``non_tensor_batch["leaf_idx"]``) to compute
-    ``micro_batch_shared_ratio`` using the SAME grouping function
-    (``mbs_groups_from_leaf_idx``) the live mbs path uses.
+    Updates *metrics* in-place with the trie-structure-invariant metrics
+    ``prefix_tree/global_shared_ratio``, ``prefix_tree/packed_tokens`` and
+    ``prefix_tree/raw_tokens``.  Pass *attention_mask* to strip padding from
+    2-D padded tensors.  Pass *trie* to skip the internal
+    ``greedy_build_tries`` when the caller already built one (e.g. attached
+    to ``batch.meta_info["prefix_tree"]``).
+
+    Note: ``micro_batch_shared_ratio`` is NOT computed here.  The previous
+    pre-forward computation (on the full batch, before DP dispatch and
+    reorder) did not match the actual micro-batches the engine dispatches.
+    The accurate version is computed inside
+    ``prepare_prefix_tree_micro_batches`` (from the actual ``batch_idx_list``
+    grouping) and surfaced through the engine output via
+    ``maybe_collect_mbs_metric``; the PPO trainer threads it into the
+    ``actor/prefix_tree/micro_batch_shared_ratio`` metric from the OLP path.
+
+    The ``max_token_len_per_gpu``, ``micro_batch_size`` and ``leaf_idx``
+    parameters are kept for backward-compat callers but are no longer used.
     """
     if not _is_prefix_tree_enabled(config_or_data):
         return
@@ -107,10 +117,10 @@ def build_global_trie(batch, *, metrics=None, rollout_n=None) -> float:
     and attach to batch. Mutates batch in-place.
 
     - trie -> batch.meta_info["prefix_tree"] (TrieNode root, shared across samples)
-    - leaf_idx -> batch.non_tensor_batch["leaf_idx"] (np.int64 array, sample -> leaf flat_idx)
+    - leaf_idx -> batch.batch["leaf_idx"] (torch.long tensor, sample -> leaf flat_idx)
 
     Both survive DataProto.reorder/chunk/slice/concat/repeat natively:
-    non_tensor_batch propagates via numpy indexing; meta_info wraps as NonTensorData.
+    batch tensors propagate via torch indexing; meta_info wraps as NonTensorData.
 
     Args:
         batch: DataProto to mutate.
@@ -159,5 +169,5 @@ def build_global_trie(batch, *, metrics=None, rollout_n=None) -> float:
                 leaf_idx[seq_id] = flat_idx
 
     batch.meta_info["prefix_tree"] = trie
-    batch.non_tensor_batch["leaf_idx"] = leaf_idx
+    batch.batch["leaf_idx"] = torch.from_numpy(leaf_idx)
     return _t1 - _t0

@@ -160,6 +160,10 @@ def fused_forward_model_engine(vision_model: bool = False):
         use_prefix_tree = _pt_args.get("use_prefix_tree", False)
 
         if use_prefix_tree:
+            # Rolling (copied from preprocess_thd_engine) is needed before pack;
+            # FP8/CP alignment skipped — handled by prefix-tree's own path.
+            # Guard defers VLM-with-images: 3D M-RoPE position handling not yet wired
+            # (prefix_tree_rope_context assumes 1D). Text-only on ViT-config models passes through.
             from verl.utils.prefix_tree.forward import fuse_try_forward_prefix_tree
 
             output = fuse_try_forward_prefix_tree(
@@ -262,7 +266,11 @@ def _fused_GPTModel_forward(
     **kwargs,
 ) -> CausalLMOutputForPPO:
     """
-    Fused forward: vocab projection via linear_cross_entropy (no logits tensor).
+    Patch self._postprocess in forward for GPT models to enable fused kernel support.
+    https://github.com/NVIDIA/Megatron-LM/blob/core_v0.13.0/megatron/core/models/gpt/gpt_model.py
+
+    TODO: Currently we still need to patch `forward` because we need to pass `temperature`
+    explicitly to `self._postprocess` when calling, maybe there can be a better way to handle this?
 
     Handles both the standard fused path and the fused prefix-tree path:
     - Prefix-tree (``magi_attention_key`` + ``pt_batch`` in kwargs): installs
@@ -273,44 +281,38 @@ def _fused_GPTModel_forward(
 
     inference_context = deprecate_inference_params(inference_context, inference_params)
 
-    # Prefix-tree fused path: rope override + decoder key + fuse_forward_body.
-    # Only pop attention keys when pt_batch is also present (fused path).
-    # Unfused path passes magi_attention_key without pt_batch and relies on
-    # the key flowing through **kwargs to the patched TransformerBlock.
+    # Prefix-tree fused path: pop keys only when pt_batch is present.
+    # Unfused path leaves keys in **kwargs for the patched TransformerBlock.
     pt_batch = kwargs.pop("pt_batch", None)
     if pt_batch is not None:
         _magi_key = kwargs.pop("magi_attention_key", None)
         _flex_key = kwargs.pop("flex_attention_key", None)
-    else:
-        _magi_key = kwargs.get("magi_attention_key", None)
-        _flex_key = kwargs.get("flex_attention_key", None)
-
-    if (_magi_key is not None or _flex_key is not None) and pt_batch is not None:
-        from verl.utils.prefix_tree.forward import fuse_forward_body
-        from verl.utils.prefix_tree.magi import (
-            prefix_tree_decoder_key_context,
-            prefix_tree_rope_context,
-        )
-
-        with (
-            prefix_tree_rope_context(model, position_ids),
-            prefix_tree_decoder_key_context(model, _magi_key, _flex_key),
-        ):
-            return fuse_forward_body(
-                model,
-                input_ids=input_ids,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                temperature=temperature,
-                pt_batch=pt_batch,
-                magi_key=_magi_key,
-                flex_key=_flex_key,
-                decoder_input=decoder_input,
-                packed_seq_params=packed_seq_params,
-                extra_block_kwargs=extra_block_kwargs,
-                inference_context=inference_context,
+        if _magi_key is not None or _flex_key is not None:
+            from verl.utils.prefix_tree.forward import fuse_forward_body
+            from verl.utils.prefix_tree.magi import (
+                prefix_tree_decoder_key_context,
+                prefix_tree_rope_context,
             )
+
+            with (
+                prefix_tree_rope_context(model, position_ids),
+                prefix_tree_decoder_key_context(model, _magi_key, _flex_key),
+            ):
+                return fuse_forward_body(
+                    model,
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    temperature=temperature,
+                    pt_batch=pt_batch,
+                    magi_key=_magi_key,
+                    flex_key=_flex_key,
+                    decoder_input=decoder_input,
+                    packed_seq_params=packed_seq_params,
+                    extra_block_kwargs=extra_block_kwargs,
+                    inference_context=inference_context,
+                )
 
     preproc_output = model._preprocess(
         input_ids=input_ids,

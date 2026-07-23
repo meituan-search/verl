@@ -148,18 +148,30 @@ def _make_attn_counters():
 _reset_attn_counters, _inc_fa3, _inc_non_fa3, _get_attn_metrics = _make_attn_counters()
 
 
-def maybe_reset_attn_counters(engine_config) -> None:
-    """Reset per-batch attn counters if prefix-tree is enabled."""
-    if getattr(engine_config, "use_prefix_tree", False):
-        _reset_attn_counters()
-
-
 def maybe_collect_attn_metrics(engine_config, engine, output: dict) -> None:
-    """Gather per-batch attn metrics into output['metrics'] if PT enabled and MP src rank."""
+    """Collect attn metrics into output['metrics'] and clear counters for next batch."""
     if getattr(engine_config, "use_prefix_tree", False):
         attn_metrics = _get_attn_metrics()
         if attn_metrics and engine.is_mp_src_rank_with_outputs():
             output.setdefault("metrics", {}).update(attn_metrics)
+        _reset_attn_counters()
+
+
+def maybe_collect_mbs_metric(engine_config, engine, output: dict) -> None:
+    """Collect the post-micro-batch-build micro_batch_shared_ratio into output['metrics'].
+
+    Pulls the accurate per-micro-batch sharing ratio (computed inside
+    ``prepare_prefix_tree_micro_batches`` from the ACTUAL grouping the engine
+    dispatches) into ``output['metrics']`` and clears the collector.  Mirrors
+    :func:`maybe_collect_attn_metrics` exactly.
+    """
+    if getattr(engine_config, "use_prefix_tree", False):
+        from verl.utils.prefix_tree.dynamic import _get_mbs_metric, _reset_mbs_metric
+
+        mbs_metric = _get_mbs_metric()
+        if mbs_metric and engine.is_mp_src_rank_with_outputs():
+            output.setdefault("metrics", {}).update(mbs_metric)
+        _reset_mbs_metric()
 
 
 # ---------------------------------------------------------------------------
@@ -433,15 +445,23 @@ def apply_prefix_tree_patch() -> None:
         _real_rope_fwd = rope_mod.forward if rope_mod is not None else None
 
         if pids is not None:
+            _is_mrope = not hasattr(rope_mod, "get_emb")
+            if _is_mrope:
+                _mrope_section = getattr(self, "mrope_section", None)
 
-            def _rope_fwd_with_pids(max_seq_len, offset=0, packed_seq=False, cp_group=None):
-                actual_seq_len = int(pids.max().item()) + 1
-                emb = _orig_rope_fn(rope_mod, actual_seq_len, offset=0, packed_seq=True, cp_group=None)
-                # All PP stages use seq-first Q=(seq,1,H,D) because unfuse_forward_prefix_tree
-                # returns (seq,1,hidden) for all intermediate stages (not batch-first).
-                # freqs=(seq,1,1,dim) broadcasts correctly: Q×freqs→(seq,1,H,D) ✓
-                indexed = emb[pids.to(emb.device)]
-                return indexed
+                def _rope_fwd_with_pids(*args, **kwargs):
+                    pids_3d = pids.view(1, 1, -1).expand(3, 1, -1).contiguous()
+                    return _real_rope_fwd(pids_3d, _mrope_section, cp_group=None)
+            else:
+
+                def _rope_fwd_with_pids(max_seq_len, offset=0, packed_seq=False, cp_group=None):
+                    actual_seq_len = int(pids.max().item()) + 1
+                    emb = _orig_rope_fn(rope_mod, actual_seq_len, offset=0, packed_seq=True, cp_group=None)
+                    # All PP stages use seq-first Q=(seq,1,H,D) because unfuse_forward_prefix_tree
+                    # returns (seq,1,hidden) for all intermediate stages (not batch-first).
+                    # freqs=(seq,1,1,dim) broadcasts correctly: Q×freqs→(seq,1,H,D) ✓
+                    indexed = emb[pids.to(emb.device)]
+                    return indexed
 
             rope_mod.forward = _rope_fwd_with_pids
 

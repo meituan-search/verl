@@ -475,14 +475,14 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         """
         if self.local_trigger_step == 1:
             self.actor_rollout_wg.save_model_to_cpu(1)
-            old_log_prob, old_log_prob_mfu = super()._compute_old_log_prob(batch)
+            old_log_prob, old_log_prob_mfu, old_log_prob_pt_metrics = super()._compute_old_log_prob(batch)
         else:
             self.actor_rollout_wg.save_model_to_cpu(self.local_trigger_step)
             self.actor_rollout_wg.restore_model_from_cpu(1)
-            old_log_prob, old_log_prob_mfu = super()._compute_old_log_prob(batch)
+            old_log_prob, old_log_prob_mfu, old_log_prob_pt_metrics = super()._compute_old_log_prob(batch)
             self.actor_rollout_wg.restore_model_from_cpu(self.local_trigger_step)
             self.actor_rollout_wg.clear_cpu_model(self.local_trigger_step)
-        return old_log_prob, old_log_prob_mfu
+        return old_log_prob, old_log_prob_mfu, old_log_prob_pt_metrics
 
     def _fit_update_local_step(self):
         time_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]

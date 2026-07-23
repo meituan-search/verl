@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import logging as _log
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Optional
@@ -216,7 +215,7 @@ def build_layout_from_tree_node(
         child_offset = owner_offset + len(node.input_ids)
         first_owner: Optional[int] = None
         for i, child in enumerate(children):
-            parent_of[id(child)] = node
+            parent_of[child.flat_idx] = node
             owner = _annotate(child, child_offset)
             if i == 0:
                 first_owner = owner
@@ -294,10 +293,10 @@ def build_layout_from_tree_node(
 
     for leaf in leaves_in_dfs:
         chain: list[RangeSpec] = []
-        cur = parent_of.get(id(leaf))
+        cur = parent_of.get(leaf.flat_idx)
         while cur is not None:
             chain.append((cur._flat_start, cur._flat_end))
-            cur = parent_of.get(id(cur))
+            cur = parent_of.get(cur.flat_idx)
         chain.reverse()  # root first
 
         rep_range: RangeSpec = (leaf._flat_start, leaf._flat_end)
@@ -338,26 +337,3 @@ def build_layout_from_tree_node(
     )
     params._leaf_ancestor_ranges = leaf_ancestor_ranges
     return params
-
-
-def truncate_dp_padding(tensor: Tensor, expected_bsz: int, *, label: str = "nested tensor") -> Tensor:
-    """Truncate DP-padding dummy sequences from a jagged nested tensor.
-
-    restore_dynamic_batch may append dummy sequences to make the batch
-    divisible by DP size. Truncate to *expected_bsz* so downstream
-    token-count assertions don't spuriously fire. No-op if tensor is not
-    nested or actual_bsz <= expected_bsz.
-    """
-    if not tensor.is_nested:
-        return tensor
-    actual_bsz = tensor.offsets().shape[0] - 1
-    if actual_bsz <= expected_bsz:
-        return tensor
-
-    _log.getLogger(__name__).error(
-        "no_padding_2_padding: %s has %d seqs, expected %d; DP-padding duplicate, truncating",
-        label,
-        actual_bsz,
-        expected_bsz,
-    )
-    return torch.nested.as_nested_tensor(list(tensor.unbind())[:expected_bsz], layout=torch.jagged)

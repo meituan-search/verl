@@ -53,7 +53,6 @@ from verl.utils.megatron_utils import unwrap_model
 from verl.utils.prefix_tree.magi import (
     PrefixTreeMagiBatch,
     build_prefix_tree_micro_batch,
-    expand_flat_to_per_sample,
     prefix_tree_rope_context,
     restore_flat_to_nested,
     strip_prefix_tree_args,
@@ -87,20 +86,18 @@ def _prepare_attn_inputs(
     return local_input_ids, local_position_ids, attn_kwargs
 
 
-def _flat_to_nested_per_sample(
+def _restore_to_nested_per_sample(
     flat_tensor: Tensor,
-    cu_seqlens: Tensor,
-    batch_size: int,
     pb: PrefixTreeMagiBatch,
-):
-    """Expand a flat dedup tensor to per-sample order and split into a NestedTensor.
+) -> Tensor:
+    """Restore a flat dedup tensor to per-sample nested (jagged) format.
 
-    Shared by :func:`unfuse_forward_prefix_tree` (output restoration) and
-    :func:`fuse_try_forward_prefix_tree` (log_probs / entropy restoration).
+    Returns a NestedTensor matching non-tree model output: per-sample
+    constituents are prefix + ancestors + leaf concatenated, with DP-padding
+    tokens excluded. ``postprocess_batch_func`` and ``no_padding_2_padding``
+    handle this identically to origin's nested output.
     """
-    expanded = expand_flat_to_per_sample(flat_tensor, pb)
-    tensors = [expanded[cu_seqlens[i] : cu_seqlens[i + 1]] for i in range(batch_size)]
-    return torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
+    return restore_flat_to_nested(flat_tensor, pb)
 
 
 def _expand_temperature(t, pt_batch: PrefixTreeMagiBatch, total_flat: int, device) -> Tensor:
@@ -439,17 +436,13 @@ def unfuse_forward_prefix_tree(
         output_dict = logits_processor(logits_flat.clone().unsqueeze(1), **flat_args)
 
         if isinstance(output_dict, dict):
-            nested_ids = restore_flat_to_nested(tree_packed_ids, pt_batch)
-            cu_seqlen = nested_ids.offsets()
-            batch_size = len(cu_seqlen) - 1
-
             for key, val in output_dict.items():
                 if isinstance(val, torch.Tensor):
                     val_1d = val.reshape(-1)
                     if val_1d.shape[0] == n_logits:
                         if prefix_tree_attention == "magi":
                             val_1d = undispatch(val_1d, pt_batch.magi_key)[:real_tokens]
-                        output_dict[key] = _flat_to_nested_per_sample(val_1d, cu_seqlen, batch_size, pt_batch)
+                        output_dict[key] = _restore_to_nested_per_sample(val_1d, pt_batch)
         return output_dict
     else:
         # Intermediate PP stage (post_process=False) or no logits_processor.
@@ -777,11 +770,8 @@ def fuse_try_forward_prefix_tree(
     if not post_process:
         return output_orig
 
-    # output_orig.log_probs / .entropy are (real_tokens,) flat; expand then split.
-    cu_seqlens = input_ids.offsets()
-    batch_size = input_ids.shape[0]
-
-    output = {"log_probs": _flat_to_nested_per_sample(output_orig.log_probs.reshape(-1), cu_seqlens, batch_size, pb)}
+    # output_orig.log_probs / .entropy are (real_tokens,) flat; restore to per-sample nested.
+    output = {"log_probs": _restore_to_nested_per_sample(output_orig.log_probs.reshape(-1), pb)}
     if calculate_entropy:
-        output["entropy"] = _flat_to_nested_per_sample(output_orig.entropy.reshape(-1), cu_seqlens, batch_size, pb)
+        output["entropy"] = _restore_to_nested_per_sample(output_orig.entropy.reshape(-1), pb)
     return output

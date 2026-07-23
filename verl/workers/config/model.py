@@ -121,7 +121,7 @@ class HFModelConfig(BaseConfig):
 
     # Prefix-tree shared-prefix deduplication for actor/SFT training.
     use_prefix_tree: bool = False
-    prefix_tree_attention: str = "flex"
+    prefix_tree_attention: str = "magi"
 
     # TODO: unify fsdp and megatron lora config
     # fsdp lora related. We may setup a separate config later

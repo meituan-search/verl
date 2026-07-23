@@ -18,7 +18,6 @@ from tensordict import TensorDict
 
 from verl.utils import tensordict_utils as tu
 from verl.utils.attention_utils import index_first_axis, unpad_input
-from verl.utils.prefix_tree.utils import truncate_dp_padding
 
 
 def left_right_2_no_padding(data: TensorDict) -> TensorDict:
@@ -109,6 +108,7 @@ def no_padding_2_padding(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor
     Returns:
         tensor: sliced response tensor of shape [bsz, max_response_len, *]
     """
+    values = tensor.values() if tensor.is_nested else tensor
     prompt_ids = data["prompts"]
     response_ids = data["responses"]
 
@@ -119,23 +119,16 @@ def no_padding_2_padding(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor
         response_lens = response_ids.offsets().diff()
         if max_response_len < 0:
             max_response_len = response_lens.max().item()
-        tensor = truncate_dp_padding(tensor, prompt_lens.shape[0], label="MAGI nested tensor")
     else:
         attention_mask = data["attention_mask"]
         assert not attention_mask.is_nested
-        tensor = truncate_dp_padding(tensor, prompt_ids.shape[0])
         prompt_lens = attention_mask[:, : prompt_ids.shape[1]].sum(dim=1)
         response_lens = attention_mask[:, prompt_ids.shape[1] :].sum(dim=1)
         max_response_len = response_ids.shape[1]
 
-    values = tensor.values() if tensor.is_nested else tensor
-
     sequence_lens = prompt_lens + response_lens
     sequence_offsets = sequence_lens.cumsum(dim=0)
-    assert sequence_offsets[-1].item() == values.shape[0], (
-        f"token count mismatch: expected {sequence_offsets[-1].item()} (sum of prompt+response lens) "
-        f"but tensor has {values.shape[0]} tokens; likely a prefix-tree expansion bug or stale DP truncation"
-    )
+    assert sequence_offsets[-1].item() == values.shape[0]
     assert not prompt_lens.eq(0).any(), f"seq_offset - resp_len - 1 assumes prompt_len > 0. Got {prompt_lens}"
 
     response_list = []
@@ -148,6 +141,17 @@ def no_padding_2_padding(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor
 
     output = torch.stack(response_list, dim=0)
     return output
+
+
+def build_attention_mask_from_nested(input_ids: torch.Tensor, max_seq_len: int | None = None) -> torch.Tensor:
+    """Build a padded full-sequence attention mask from nested input ids."""
+    assert input_ids.is_nested, "input_ids must be a nested tensor"
+    device = input_ids.values().device
+    seq_lens = input_ids.offsets().diff().to(device=device)
+    if max_seq_len is None:
+        max_seq_len = int(seq_lens.max().item())
+    positions = torch.arange(max_seq_len, device=device).unsqueeze(0)
+    return (positions < seq_lens.unsqueeze(1)).to(torch.int32)
 
 
 def embeds_padding_2_no_padding(data: TensorDict) -> TensorDict:

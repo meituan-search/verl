@@ -180,7 +180,7 @@ def build_prefix_tree_micro_batch(
             cp_size=cp_size,
             subtrie=subtrie,
         )
-    except Exception as _e:
+    except (ValueError, KeyError, IndexError) as _e:
         _log.getLogger(__name__).exception(
             "build_prefix_tree_micro_batch: falling back to standard attention (%s: %s) "
             "subtrie_nodes=%d subtrie_leaves=%d",
@@ -195,7 +195,6 @@ def build_prefix_tree_micro_batch(
 def _build_sample_tensors(flat_tensor: Tensor, pt_batch: PrefixTreeMagiBatch) -> list:
     """Build a per-sample list of tensors from a flat deduplicated tensor.
 
-    Shared logic for restore_flat_to_nested and expand_flat_to_per_sample.
     Returns sample_tensors[sample_idx] = cat(ancestor_slices..., leaf_slice).
     """
     prefix_start, prefix_end = pt_batch.prefix_range
@@ -236,30 +235,6 @@ def restore_flat_to_nested(
     )
     # as_nested_tensor (not nested_tensor) preserves grad_fn through the cat ops.
     return torch.nested.as_nested_tensor(sample_tensors, layout=torch.jagged)
-
-
-def expand_flat_to_per_sample(
-    flat_tensor: Tensor,
-    pt_batch: PrefixTreeMagiBatch,
-) -> Tensor:
-    """Expand deduplicated flat tensor to per-sample flat tensor via torch.cat.
-
-    Replicates shared prefix/anchor slices for each sample, returning a single
-    flat tensor ordered by original sample index (matching restore_flat_to_nested).
-    Uses torch.cat instead of nested tensors; safe for autograd (training).
-
-    Args:
-        flat_tensor: (total_flat_tokens, ...) deduplicated representation.
-        pt_batch: PrefixTreeMagiBatch from build_prefix_tree_micro_batch.
-
-    Returns:
-        (total_expanded, ...) flat tensor with per-sample concatenation.
-    """
-    sample_tensors = _build_sample_tensors(flat_tensor, pt_batch)
-    assert all(t is not None for t in sample_tensors), (
-        "expand_flat_to_per_sample: some sample indices were not covered by segment_to_sample"
-    )
-    return torch.cat(sample_tensors, dim=0)
 
 
 @contextlib.contextmanager

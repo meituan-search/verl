@@ -163,7 +163,7 @@ class SFTTrainer:
 
         self.loss_fn = partial(sft_loss, config=None)
 
-        apply_engine_config(self.engine_config, self.config.data)
+        apply_engine_config(self.engine_config, self.config.model)
 
         config = TrainingWorkerConfig(
             model_type="language_model",
@@ -238,7 +238,7 @@ class SFTTrainer:
 
         self.train_sampler = DistributedSampler(
             self.train_dataset,
-            shuffle=self.config.data.get("shuffle", True),
+            shuffle=True,
             num_replicas=dp_size,
             rank=dp_rank,
             drop_last=True,
@@ -358,7 +358,7 @@ class SFTTrainer:
             "pad_token_id": self.model_config.tokenizer.pad_token_id,
         }
 
-        add_meta_info(meta_info, self.config.data)
+        add_meta_info(meta_info, self.config.model)
 
         train_time = 0
         total_tokens = 0
@@ -411,7 +411,8 @@ class SFTTrainer:
                     total_tokens += metrics["train/global_tokens"]
                     metrics["train/total_tokens(B)"] = total_tokens / 1e9
 
-                    pt_metrics(metrics, data["input_ids"], self.config.data)
+                    if self.config.model.get("use_prefix_tree", False):
+                        pt_metrics(metrics, data["input_ids"], self.config.model, attention_mask=data["attention_mask"])
 
                     if self.engine.get_data_parallel_rank() == 0:
                         tracking.log(data=metrics, step=global_step)

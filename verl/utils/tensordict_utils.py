@@ -349,17 +349,6 @@ def chunk_tensordict(td: TensorDict, chunks: int) -> list[TensorDict]:
 
     tds = new_td.chunk(chunks=chunks)
 
-    # Slice non-tensor numpy arrays per chunk. TensorDict.chunk() does not slice
-    # the underlying data of NonTensorData that wraps a numpy array — every chunk
-    # ends up with the full array. We fix this here.
-    from tensordict.tensorclass import NonTensorData
-
-    for key, val in td.non_tensor_items():
-        if isinstance(val, NonTensorData) and isinstance(val.data, np.ndarray):
-            arr = val.data
-            for i, chunk_td in enumerate(tds):
-                chunk_td.set_non_tensor(key, arr[i * chunk_size : (i + 1) * chunk_size])
-
     for key in nested_keys:
         nt = td[key]
         try:

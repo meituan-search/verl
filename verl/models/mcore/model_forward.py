@@ -320,7 +320,6 @@ def gptmodel_forward_model_engine(
                     local_cp_size=local_cp_size,
                 )[0]
                 for k, v in logits_processor_args.items()
-                if v is not None
             }
             output_dict = logits_processor(output_orig, **args)
             output = {
@@ -354,6 +353,7 @@ def gptmodel_forward_model_engine(
 
         if mtp_enable_train and post_process:
             args = {}
+            # Use input_ids sequence length to ensure label and loss_mask alignment
             input_ids_offsets = input_ids.offsets()
             input_ids_lengths = input_ids_offsets.diff().tolist()
 
@@ -397,6 +397,10 @@ def gptmodel_forward_model_engine(
             output = postprocess_bshd_engine(output_orig, attention_mask_bshd, post_process=post_process)
 
     if value_model and post_process:
+        # output = output[..., 0]
+        # while using nested tensor, the advanced indexing operation above will result in an error at backward, i.e.
+        # ValueError: NestedTensor _nested_select_backward_default(grad_output: t, self: jt_all, dim: any, index: any)
+        # so we use `squeeze` to remove the last dimension
         output = output.squeeze(-1)
 
     return output
