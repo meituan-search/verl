@@ -47,7 +47,6 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.metric import reduce_metrics
-from verl.utils.rollout_skip import RolloutSkip
 
 
 class SeparateRayPPOTrainer(RayPPOTrainer):
@@ -126,7 +125,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
 
         self.checkpoint_manager = CheckpointEngineManager(
             config=omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine),
-            trainer=self.actor_rollout_wg,
+            actor_wg=self.actor_rollout_wg,
             replicas=self.llm_server_manager.get_replicas(),
         )
 
@@ -161,12 +160,20 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             else:
                 raise NotImplementedError(f"Unknown strategy {self.orig_critic_cfg.strategy=}")
 
+            # Wire the critic profiler config via the hydra path (real dataclass tool_config), so the
+            # standalone critic TrainingWorker gets a working DistProfiler instead of a silent no-op.
+            critic_omega_profiler_config = self.config.critic.get("profiler", {})
+            critic_profiler_config = (
+                omega_conf_to_dataclass(critic_omega_profiler_config) if critic_omega_profiler_config else None
+            )
+
             critic_cfg = TrainingWorkerConfig(
                 model_type="value_model",
-                model_config=self.orig_critic_cfg.model_config,
+                model_config=self.orig_critic_cfg.model,
                 engine_config=engine_config,
                 optimizer_config=self.orig_critic_cfg.optim,
                 checkpoint_config=self.orig_critic_cfg.checkpoint,
+                profiler_config=critic_profiler_config,
             )
 
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
@@ -308,10 +315,6 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             if self.config.trainer.get("val_only", False):
                 return
 
-        if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
-            rollout_skip = RolloutSkip(self.config, self.actor_rollout_wg)
-            rollout_skip.wrap_generate_sequences()
-
         # add tqdm
         self.progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
@@ -381,14 +384,20 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
         self.is_last_step = self.global_steps >= self.total_training_steps
 
-    def _fit_start_profile(self):
+    def _fit_start_profile(self, should_profiler=None):
         timing_raw = self.timing_raw
+        if should_profiler is not None:
+            self.curr_step_profile = should_profiler
         with marked_timer("start_profile", timing_raw):
-            self._start_profiling(
-                not self.prev_step_profile and self.curr_step_profile
-                if self.config.global_profiler.profile_continuous_steps
-                else self.curr_step_profile
-            )
+            if should_profiler is None:
+                do_profile = (
+                    not self.prev_step_profile and self.curr_step_profile
+                    if self.config.global_profiler.profile_continuous_steps
+                    else self.curr_step_profile
+                )
+            else:
+                do_profile = should_profiler
+            self._start_profiling(do_profile)
 
     def _fit_get_batch(self, batch_dict: dict) -> DataProto:
         batch = DataProto.from_single_dict(batch_dict)
@@ -641,7 +650,11 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         if self.config.trainer.critic_warmup <= self.global_steps:
             # update weights from trainer to rollout
             with marked_timer("update_weights", timing_raw, color="red"):
-                self.checkpoint_manager.update_weights(self.global_steps)
+                sync_metrics = self.checkpoint_manager.update_weights(self.global_steps)
+            # Engines may report per-sync stats (e.g. the delta backends' changed
+            # ratio / wire payload); surface them in this step's metrics.
+            if sync_metrics:
+                self.metrics.update(sync_metrics)
 
     def _fit_dump_data(self, batch: DataProto):
         timing_raw = self.timing_raw
@@ -690,21 +703,26 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                 # TODO: Check separation is needed.
                 # self.checkpoint_manager.update_weights()
 
-    def _fit_stop_profile(self):
+    def _fit_stop_profile(self, should_profiler=None):
         timing_raw = self.timing_raw
         with marked_timer("stop_profile", timing_raw):
-            self.next_step_profile = (
-                self.global_steps + 1 in self.config.global_profiler.steps
-                if self.config.global_profiler.steps is not None
-                else False
-            )
-            self._stop_profiling(
-                self.curr_step_profile and not self.next_step_profile
-                if self.config.global_profiler.profile_continuous_steps
-                else self.curr_step_profile
-            )
+            if should_profiler is None:
+                self.next_step_profile = (
+                    self.global_steps + 1 in self.config.global_profiler.steps
+                    if self.config.global_profiler.steps is not None
+                    else False
+                )
+                do_profile = (
+                    self.curr_step_profile and not self.next_step_profile
+                    if self.config.global_profiler.profile_continuous_steps
+                    else self.curr_step_profile
+                )
+            else:
+                do_profile = should_profiler
+            self._stop_profiling(do_profile)
             self.prev_step_profile = self.curr_step_profile
-            self.curr_step_profile = self.next_step_profile
+            if should_profiler is None:
+                self.curr_step_profile = self.next_step_profile
 
     def _fit_collect_metrics(self, batch):
         metrics = self.metrics
