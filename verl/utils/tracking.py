@@ -19,6 +19,7 @@ import dataclasses
 import json
 import logging
 import os
+from contextlib import contextmanager
 from enum import Enum
 from functools import partial
 from pathlib import Path
@@ -53,6 +54,7 @@ class Tracking:
         "clearml",
         "trackio",
         "file",
+        "rl_insight",
     ]
 
     def __init__(self, project_name, experiment_name, default_backend: str | list[str] = "console", config=None):
@@ -82,9 +84,11 @@ class Tracking:
 
         if "trackio" in default_backend:
             import trackio
+            from trackio import context_vars
 
-            trackio.init(project=project_name, name=experiment_name, config=config)
-            self.logger["trackio"] = trackio
+            if context_vars.current_run.get() is None:
+                trackio.init(project=project_name, name=experiment_name, config=config)
+            self.logger["trackio"] = _TrackioLoggingAdapter(trackio)
 
         if "mlflow" in default_backend:
             import os
@@ -178,6 +182,9 @@ class Tracking:
         if "file" in default_backend:
             self.logger["file"] = FileLogger(project_name, experiment_name)
 
+        if "rl_insight" in default_backend:
+            self.logger["rl_insight"] = RLInsightLogger(project_name, experiment_name, config)
+
     def log(self, data, step, backend=None):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
@@ -198,6 +205,138 @@ class Tracking:
             self.logger["trackio"].finish()
         if "file" in self.logger:
             self.logger["file"].finish()
+        if "rl_insight" in self.logger:
+            self.logger["rl_insight"].finish()
+
+
+class RLInsightLogger:
+    """Logger backend that exports scalar metrics and rl-insight runtime signals."""
+
+    ENABLE_ENV = "VERL_RL_INSIGHT_ENABLE"
+    _init_done = False
+    _rl_insight_module = None
+    _registered_metrics: set[tuple[str | None, tuple[str, ...], str | None]] = set()
+
+    def __init__(self, project_name, experiment_name, config=None):
+        self.init(project_name=project_name, experiment_name=experiment_name, config=config)
+
+    @classmethod
+    def _get_rl_insight(cls):
+        if cls._rl_insight_module is None:
+            import rl_insight
+
+            cls._rl_insight_module = rl_insight
+        return cls._rl_insight_module
+
+    @classmethod
+    def enabled(cls) -> bool:
+        """Return whether rl-insight is globally enabled in this process."""
+        return os.getenv(cls.ENABLE_ENV) == "1"
+
+    @classmethod
+    def init(cls, project_name=None, experiment_name=None, config=None):
+        if not cls.enabled() or cls._init_done:
+            return
+
+        rl_insight_config = {}
+        if config is not None:
+            try:
+                rl_insight_config = config.get("trainer", {}).get("rl_insight", {}) or {}
+            except (AttributeError, KeyError, TypeError):
+                pass
+        cls._get_rl_insight().init(project=project_name, experiment_name=experiment_name, config=rl_insight_config)
+        cls._init_done = True
+        if config is not None:
+            cls.register_transfer_queue_metrics(config)
+
+    @classmethod
+    def log(cls, data, step):
+        if not cls.enabled():
+            return
+        if not cls._init_done:
+            cls._get_rl_insight().init()
+            cls._init_done = True
+        metric_gauge = cls._get_rl_insight().metric_gauge
+
+        for key, value in data.items():
+            try:
+                scalar = float(value)
+            except (TypeError, ValueError):
+                continue
+            metric_gauge(str(key).replace("/", "_"), scalar)
+
+    @classmethod
+    def finish(cls):
+        if not cls._init_done:
+            return
+
+        cls._get_rl_insight().finish()
+        cls._init_done = False
+        cls._registered_metrics.clear()
+
+    @classmethod
+    @contextmanager
+    def trace_state(
+        cls,
+        state_name: str,
+        *,
+        state_lane_id: str | int | None = None,
+        **labels: Any,
+    ):
+        if not cls.enabled():
+            yield
+            return
+
+        if not cls._init_done:
+            cls._get_rl_insight().init()
+            cls._init_done = True
+        with cls._get_rl_insight().trace_state(state_name, state_lane_id=state_lane_id, **labels):
+            yield
+
+    @classmethod
+    def register_rollout_metrics(
+        cls,
+        server_addresses: list[str],
+        rollout_name: str | None,
+        labels: list[dict[str, Any] | None] | None = None,
+    ) -> None:
+        cls.register_metrics(server_addresses, rollout_name, labels)
+
+    @classmethod
+    def register_transfer_queue_metrics(cls, config) -> None:
+        if not (config or {}).get("transfer_queue", {}).get("metrics", {}).get("enabled", False):
+            return
+
+        try:
+            import transfer_queue as tq
+
+            endpoint = tq.get_metrics_endpoint()
+        except Exception:
+            logger.exception("[rl-insight] Failed to get transfer_queue metrics endpoint")
+            return
+
+        if endpoint:
+            cls.register_metrics([endpoint], "transfer_queue", None)
+
+    @classmethod
+    def register_metrics(
+        cls,
+        server_addresses: list[str],
+        job_name: str | None = None,
+        labels: list[dict[str, Any] | None] | None = None,
+    ) -> None:
+        if not cls.enabled():
+            return
+
+        metric_key = (job_name, tuple(server_addresses), repr(labels))
+        if metric_key in cls._registered_metrics:
+            return
+
+        try:
+            cls._get_rl_insight().update_prometheus_config(server_addresses, job_name, labels)
+            cls._registered_metrics.add(metric_key)
+        except Exception:
+            logger.exception("[rl-insight] Failed to register metrics endpoint")
 
 
 class ClearMLLogger:
@@ -250,6 +389,20 @@ class ClearMLLogger:
 
     def finish(self):
         self._task.close()
+
+
+class _TrackioLoggingAdapter:
+    def __init__(self, trackio):
+        self.trackio = trackio
+
+    def log(self, data, step):
+        self.trackio.log(data, step=step)
+
+    def finish(self):
+        from trackio import context_vars
+
+        if context_vars.current_run.get() is not None:
+            self.trackio.finish()
 
 
 class FileLogger:
@@ -392,6 +545,8 @@ class ValidationGenerationsLogger:
             self.log_generations_to_swanlab(samples, step)
         if "mlflow" in loggers:
             self.log_generations_to_mlflow(samples, step)
+        if "trackio" in loggers:
+            self.log_generations_to_trackio(samples, step)
 
         if "clearml" in loggers:
             self.log_generations_to_clearml(samples, step)
@@ -475,6 +630,34 @@ class ValidationGenerationsLogger:
                 mlflow.log_artifact(validation_gen_step_file)
         except Exception as e:
             print(f"WARNING: save validation generation file to mlflow failed with error {e}")
+
+    def log_generations_to_trackio(self, samples, step):
+        """Log validation generations to trackio as traces."""
+        import trackio
+
+        traces = []
+        for sample_index, sample in enumerate(samples):
+            if len(sample) >= 3:
+                input_text, output_text, score = sample[0], sample[1], sample[2]
+            else:
+                input_text, output_text, score = sample, "", None
+
+            traces.append(
+                trackio.Trace(
+                    messages=[
+                        {"role": "user", "content": str(input_text)},
+                        {"role": "assistant", "content": str(output_text)},
+                    ],
+                    metadata={
+                        "source": "validation_generations",
+                        "sample_index": sample_index,
+                        "score": score,
+                    },
+                )
+            )
+
+        if traces:
+            trackio.log({"val/generations": traces}, step=step)
 
     def log_generations_to_clearml(self, samples, step):
         """Log validation generation to clearml as table"""

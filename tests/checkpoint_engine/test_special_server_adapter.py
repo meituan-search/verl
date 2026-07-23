@@ -21,13 +21,13 @@ from transformers import PreTrainedTokenizer
 
 from tests.checkpoint_engine.test_utils import create_trainer_worker_group
 from verl.checkpoint_engine import CheckpointEngineManager
-from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncLLMServerClient
 from verl.single_controller.ray import (
     RayResourcePool,
 )
 from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.config import CheckpointEngineConfig, HFModelConfig
-from verl.workers.rollout.llm_server import LLMServerClient, LLMServerManager
+from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient, LLMServerClient, LLMServerManager
 
 
 @pytest.fixture
@@ -61,7 +61,7 @@ async def _run_update_weights_with_global_steps_none(
 ):
     await checkpoint_manager.update_weights(global_steps=None)
     prompt = [{"role": "user", "content": "How to make a sandwich?"}]
-    prompt_ids = tokenizer.apply_chat_template(prompt, add_generation_prompt=True, tokenize=True)
+    prompt_ids = normalize_token_ids(tokenizer.apply_chat_template(prompt, add_generation_prompt=True, tokenize=True))
     output = await server_manager.generate(
         request_id="test_0",
         prompt_ids=prompt_ids,
@@ -91,7 +91,9 @@ async def _run_server_manager_without_resume(
     for global_steps in range(initial_steps, initial_steps + train_steps):
         tasks = []
         for i, prompt in enumerate(prompts):
-            prompt_ids = tokenizer.apply_chat_template(prompt, add_generation_prompt=True, tokenize=True)
+            prompt_ids = normalize_token_ids(
+                tokenizer.apply_chat_template(prompt, add_generation_prompt=True, tokenize=True)
+            )
             tasks.append(
                 asyncio.create_task(
                     server_manager.generate(
@@ -132,7 +134,9 @@ async def _run_server_manager_with_resume(
     # 1. rollout generate responses
     tasks = []
     for i, prompt in enumerate(prompts):
-        prompt_ids = tokenizer.apply_chat_template(prompt, add_generation_prompt=True, tokenize=True)
+        prompt_ids = normalize_token_ids(
+            tokenizer.apply_chat_template(prompt, add_generation_prompt=True, tokenize=True)
+        )
         tasks.append(
             asyncio.create_task(
                 server_manager.generate(
@@ -191,15 +195,15 @@ async def test_server_adapter(init_config):
         init_config.actor_rollout_ref.rollout.checkpoint_engine
     )
     trainer_pool = RayResourcePool(process_on_nodes=[init_config.trainer.n_gpus_per_node], max_colocate_count=3)
-    trainer = create_trainer_worker_group(trainer_pool, model_config, checkpoint_engine_config)
-    trainer.reset()
+    actor_wg = create_trainer_worker_group(trainer_pool, model_config, checkpoint_engine_config)
+    actor_wg.reset()
 
     # 2. create standalone rollout with AgentLoopManager
     llm_server_manager = await LLMServerManager.create(config=init_config)
 
     # 3. create checkpoint engine manager
     checkpoint_manager = CheckpointEngineManager(
-        config=checkpoint_engine_config, trainer=trainer, replicas=llm_server_manager.get_replicas()
+        config=checkpoint_engine_config, actor_wg=actor_wg, replicas=llm_server_manager.get_replicas()
     )
 
     n = 4

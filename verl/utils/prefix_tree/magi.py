@@ -341,6 +341,7 @@ _PREFIX_TREE_KEYS = frozenset(
         "use_prefix_tree",
         "prefix_tree_attention",
         "prefix_tree_subtree",
+        "response_attention_mask",
     }
 )
 

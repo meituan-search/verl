@@ -291,16 +291,15 @@ class ServerAdapter(BaseRollout):
     def __init__(
         self, config: RolloutConfig, model_config: HFModelConfig, device_mesh: DeviceMesh, replica_rank: int = -1
     ):
-        if config.get("quantization", None) == "fp8":
+        super().__init__(config, model_config, device_mesh)
+        if self.config.quantization == "fp8" and self.model_config.hf_config is not None:
             FP8_BLOCK_QUANT_KWARGS = {
                 "activation_scheme": "dynamic",
                 "fmt": "e4m3",
                 "quant_method": "fp8",
                 "weight_block_size": [128, 128],
             }
-            fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
-            model_config.hf_config.quantization_config = fp8_block_quant_kwargs
-        super().__init__(config, model_config, device_mesh)
+            self.model_config.hf_config.quantization_config = dict(FP8_BLOCK_QUANT_KWARGS)
         self._adapter = None
         self.hybrid_device_mesh = None
         self.gpu_id = None
@@ -449,13 +448,20 @@ class ServerAdapter(BaseRollout):
         await asyncio.to_thread(dist.barrier, group=group)
 
     async def update_weights(
-        self, weights: AsyncGenerator[tuple[str, torch.Tensor], None], global_steps: int = None, **kwargs
+        self,
+        weights: AsyncGenerator[tuple[str, torch.Tensor], None],
+        global_steps: int = None,
+        wire_format: str = "named_tensors",
+        **kwargs,
     ):
         """Update the weights of the rollout model.
 
         Args:
             weights: A generator that yields the name of the weight tensor and the tensor itself.
         """
+        assert wire_format == "named_tensors", (
+            f"TensorRT-LLM rollout only consumes full named tensors; got wire_format={wire_format!r}"
+        )
         if self.is_leader_rank:
             await self._init_server_adapter()
 
