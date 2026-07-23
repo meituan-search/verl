@@ -45,7 +45,7 @@ python3 -m verl.trainer.main_ppo \
     ... # other config
 ```
 
-A complete runnable GRPO example (Megatron, CP=4, `rollout.n=8`) is at [`examples/grpo_trainer/run_grpo_prefix_tree_magi.sh`](../../examples/grpo_trainer/run_grpo_prefix_tree_magi.sh).
+A complete runnable GRPO example (Megatron, CP=4, `rollout.n=8`) is at [`examples/grpo_trainer/run_grpo_prefix_tree_magi_megatron.sh`](../../examples/grpo_trainer/run_grpo_prefix_tree_magi_megatron.sh).
 
 ### Backend selection
 

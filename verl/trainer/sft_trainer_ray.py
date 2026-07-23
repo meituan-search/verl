@@ -38,8 +38,6 @@ from verl.utils.dataset.dataset_utils import SFTTensorCollator
 from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
 from verl.utils.device import auto_set_device, get_device_name
 from verl.utils.logger import log_with_rank
-from verl.utils.prefix_tree.dynamic import get_dfs_balanced_partitions
-from verl.utils.prefix_tree.trainer import add_meta_info, apply_engine_config, pt_metrics
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions
 from verl.utils.tracking import Tracking
 from verl.workers.engine_workers import TrainingWorker
@@ -113,8 +111,6 @@ class SFTTrainer:
 
         self.loss_fn = partial(sft_loss, config=None)
 
-        apply_engine_config(self.engine_config, self.config.model)
-
         config = TrainingWorkerConfig(
             model_type="language_model",
             model_config=self.model_config,
@@ -186,11 +182,7 @@ class SFTTrainer:
         dp_size = 1
 
         self.train_sampler = DistributedSampler(
-            self.train_dataset,
-            shuffle=True,
-            num_replicas=dp_size,
-            rank=dp_rank,
-            drop_last=True,
+            self.train_dataset, shuffle=True, num_replicas=dp_size, rank=dp_rank, drop_last=True
         )
 
         self.global_batch_size = config.data.train_batch_size
@@ -294,8 +286,6 @@ class SFTTrainer:
             "pad_token_id": self.model_config.tokenizer.pad_token_id,
         }
 
-        add_meta_info(meta_info, self.config.model)
-
         train_time = 0
         total_tokens = 0
         for epoch in range(start_epoch, self.config.trainer.total_epochs):
@@ -320,27 +310,20 @@ class SFTTrainer:
 
                 if self.config.trainer.balance_batch:
                     global_seqlen_lst = torch.Tensor([item.size()[0] for item in data["input_ids"]])
+                    global_seqlen_lst = calculate_workload(global_seqlen_lst)
                     dp_size = max(self.training_client._query_dispatch_info("train")) + 1
 
-                    result = get_dfs_balanced_partitions(
-                        data,
-                        self.config.data,
-                        dp_size,
-                        attention_mask=None,
-                        contiguous_partitions=False,
+                    global_partition_lst = get_seqlen_balanced_partitions(
+                        global_seqlen_lst, k_partitions=dp_size, equal_size=True
                     )
-                    if result is not None:
-                        global_partition_lst, global_seqlen_lst, data = result
-                    else:
-                        global_seqlen_lst = calculate_workload(global_seqlen_lst)
-                        global_partition_lst = get_seqlen_balanced_partitions(
-                            global_seqlen_lst, k_partitions=dp_size, equal_size=True
-                        )
-                        for idx, partition in enumerate(global_partition_lst):
-                            partition.sort(key=lambda x: (global_seqlen_lst[x], x))
-                            global_partition_lst[idx] = partition[::2] + partition[1::2][::-1]
+                    # Place smaller micro-batches at both ends to reduce the bubbles in pipeline parallel.
+                    for idx, partition in enumerate(global_partition_lst):
+                        partition.sort(key=lambda x: (global_seqlen_lst[x], x))
+                        ordered_partition = partition[::2] + partition[1::2][::-1]
+                        global_partition_lst[idx] = ordered_partition
 
                     global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
+
                     data = tu.index_select_tensor_dict(data, global_idx)
 
                 # start profile in SPMD mode
@@ -364,8 +347,6 @@ class SFTTrainer:
                 metrics["train/global_tokens"] = torch.sum(torch.tensor(batch_seqlens, device=self.device_name)).item()
                 total_tokens += metrics["train/global_tokens"]
                 metrics["train/total_tokens(B)"] = total_tokens / 1e9
-                if self.config.model.get("use_prefix_tree", False):
-                    pt_metrics(metrics, data["input_ids"], self.config.model, attention_mask=data["attention_mask"])
                 tracking.log(data=metrics, step=global_step)
 
                 is_last_step = global_step >= self.total_training_steps

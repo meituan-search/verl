@@ -39,7 +39,6 @@ from verl.utils.device import auto_set_device, get_device_name
 from verl.utils.distributed import destroy_global_process_group
 from verl.utils.logger import log_with_rank
 from verl.utils.memory_utils import aggressive_empty_cache
-from verl.utils.prefix_tree.trainer import add_meta_info, apply_engine_config, pt_metrics
 from verl.utils.profiler import log_gpu_memory_usage
 from verl.utils.tracking import Tracking
 from verl.workers.engine_workers import TrainingWorker
@@ -163,8 +162,6 @@ class SFTTrainer:
 
         self.loss_fn = partial(sft_loss, config=None)
 
-        apply_engine_config(self.engine_config, self.config.model)
-
         config = TrainingWorkerConfig(
             model_type="language_model",
             model_config=self.model_config,
@@ -237,11 +234,7 @@ class SFTTrainer:
         dp_size = self.engine.get_data_parallel_size()
 
         self.train_sampler = DistributedSampler(
-            self.train_dataset,
-            shuffle=True,
-            num_replicas=dp_size,
-            rank=dp_rank,
-            drop_last=True,
+            self.train_dataset, shuffle=True, num_replicas=dp_size, rank=dp_rank, drop_last=True
         )
 
         self.global_batch_size = config.data.train_batch_size
@@ -358,8 +351,6 @@ class SFTTrainer:
             "pad_token_id": self.model_config.tokenizer.pad_token_id,
         }
 
-        add_meta_info(meta_info, self.config.model)
-
         train_time = 0
         total_tokens = 0
         for epoch in range(start_epoch, self.config.trainer.total_epochs):
@@ -413,9 +404,6 @@ class SFTTrainer:
                     ).item()
                     total_tokens += metrics["train/global_tokens"]
                     metrics["train/total_tokens(B)"] = total_tokens / 1e9
-
-                    if self.config.model.get("use_prefix_tree", False):
-                        pt_metrics(metrics, data["input_ids"], self.config.model, attention_mask=data["attention_mask"])
 
                     if self.engine.get_data_parallel_rank() == 0:
                         tracking.log(data=metrics, step=global_step)

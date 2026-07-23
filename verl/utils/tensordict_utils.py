@@ -348,7 +348,6 @@ def chunk_tensordict(td: TensorDict, chunks: int) -> list[TensorDict]:
     )
 
     tds = new_td.chunk(chunks=chunks)
-
     for key in nested_keys:
         nt = td[key]
         try:

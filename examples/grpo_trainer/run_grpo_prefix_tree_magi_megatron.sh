@@ -7,9 +7,9 @@
 #   - 8 GPUs (1 node, TP=1, PP=2, CP=4)
 #
 # Usage:
-#   bash examples/grpo_trainer/run_grpo_prefix_tree_magi.sh
+#   bash examples/grpo_trainer/run_grpo_prefix_tree_magi_megatron.sh
 #   # or override model/data:
-#   HF_MODEL_PATH=Qwen/Qwen2.5-7B-Instruct bash examples/grpo_trainer/run_grpo_prefix_tree_magi.sh
+#   HF_MODEL_PATH=Qwen/Qwen2.5-7B-Instruct bash examples/grpo_trainer/run_grpo_prefix_tree_magi_megatron.sh
 
 set -xeuo pipefail
 
