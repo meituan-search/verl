@@ -53,6 +53,7 @@ from verl.utils.megatron_utils import unwrap_model
 from verl.utils.prefix_tree.magi import (
     PrefixTreeMagiBatch,
     build_prefix_tree_micro_batch,
+    prefix_tree_decoder_key_context,
     prefix_tree_rope_context,
     restore_flat_to_nested,
     strip_prefix_tree_args,
@@ -564,6 +565,54 @@ def _run_lce(
         logprobs = undispatch(logprobs.reshape(-1), magi_key)[: pt_batch.real_tokens]
         entropy = undispatch(entropy.reshape(-1), magi_key)[: pt_batch.real_tokens]
     return logprobs, entropy
+
+
+def fused_prefix_tree_forward(
+    model,
+    *,
+    input_ids: Tensor,
+    position_ids: Tensor,
+    attention_mask: Tensor,
+    labels: Optional[Tensor],
+    temperature: float,
+    pt_batch,
+    decoder_input: Optional[Tensor],
+    packed_seq_params,
+    extra_block_kwargs: Optional[dict],
+    inference_context,
+    kwargs: dict,
+):
+    """Fused-path prefix-tree forward used by the patched ``_fused_GPTModel_forward``.
+
+    Pops ``magi_attention_key`` / ``flex_attention_key`` from ``kwargs`` and installs
+    rope + decoder-key contexts before delegating to :func:`fuse_forward_body`.
+    Returns ``None`` when both attention keys are absent so the caller falls back
+    to the standard fused path.
+    """
+    _magi_key = kwargs.pop("magi_attention_key", None)
+    _flex_key = kwargs.pop("flex_attention_key", None)
+    if _magi_key is None and _flex_key is None:
+        return None
+
+    with (
+        prefix_tree_rope_context(model, position_ids),
+        prefix_tree_decoder_key_context(model, _magi_key, _flex_key),
+    ):
+        return fuse_forward_body(
+            model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            temperature=temperature,
+            pt_batch=pt_batch,
+            magi_key=_magi_key,
+            flex_key=_flex_key,
+            decoder_input=decoder_input,
+            packed_seq_params=packed_seq_params,
+            extra_block_kwargs=extra_block_kwargs,
+            inference_context=inference_context,
+        )
 
 
 def fuse_forward_body(

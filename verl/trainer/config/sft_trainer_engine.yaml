@@ -46,9 +46,6 @@ data:
   # Set to True to ignore input_ids mismatch and use the concatenated input_ids as the final input_ids.
   ignore_input_ids_mismatch: False
 
-  # Shuffle training data each epoch. Set False to preserve sample order (e.g. tree-structured datasets).
-  shuffle: True
-
 # Checkpoint configuration
 checkpoint:
   _target_: verl.trainer.config.CheckpointConfig
@@ -87,4 +84,3 @@ trainer:
   n_gpus_per_node: 1
 
   profile_interval: [-1, -1]
-

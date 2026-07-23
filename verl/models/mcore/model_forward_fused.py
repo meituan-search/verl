@@ -33,6 +33,7 @@ from verl.models.mcore.util import preprocess_packed_seqs, preprocess_thd_engine
 from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
 from verl.utils.megatron_utils import unwrap_model
 from verl.utils.model import CausalLMOutputForPPO
+from verl.utils.prefix_tree.forward import fused_prefix_tree_forward
 
 from .util import postprocess_packed_seqs_for_dict_output, postprocess_thd_engine
 
@@ -282,48 +283,28 @@ def _fused_GPTModel_forward(
 
     TODO: Currently we still need to patch `forward` because we need to pass `temperature`
     explicitly to `self._postprocess` when calling, maybe there can be a better way to handle this?
-
-    Handles both the standard fused path and the fused prefix-tree path:
-    - Prefix-tree (``magi_attention_key`` + ``pt_batch`` in kwargs): installs
-      the rope override and decoder-key plumbing, then delegates to
-      ``fuse_forward_body`` (magi.py).
-    - Standard fused (no attention key): runs preprocess → decoder → LCE.
     """
 
     inference_context = deprecate_inference_params(inference_context, inference_params)
 
-    # Prefix-tree fused path: pop keys only when pt_batch is present.
-    # Unfused path leaves keys in **kwargs for the patched TransformerBlock.
     pt_batch = kwargs.pop("pt_batch", None)
     if pt_batch is not None:
-        _magi_key = kwargs.pop("magi_attention_key", None)
-        _flex_key = kwargs.pop("flex_attention_key", None)
-        if _magi_key is not None or _flex_key is not None:
-            from verl.utils.prefix_tree.forward import fuse_forward_body
-            from verl.utils.prefix_tree.magi import (
-                prefix_tree_decoder_key_context,
-                prefix_tree_rope_context,
-            )
-
-            with (
-                prefix_tree_rope_context(model, position_ids),
-                prefix_tree_decoder_key_context(model, _magi_key, _flex_key),
-            ):
-                return fuse_forward_body(
-                    model,
-                    input_ids=input_ids,
-                    position_ids=position_ids,
-                    attention_mask=attention_mask,
-                    labels=labels,
-                    temperature=temperature,
-                    pt_batch=pt_batch,
-                    magi_key=_magi_key,
-                    flex_key=_flex_key,
-                    decoder_input=decoder_input,
-                    packed_seq_params=packed_seq_params,
-                    extra_block_kwargs=extra_block_kwargs,
-                    inference_context=inference_context,
-                )
+        output = fused_prefix_tree_forward(
+            model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            temperature=temperature,
+            pt_batch=pt_batch,
+            decoder_input=decoder_input,
+            packed_seq_params=packed_seq_params,
+            extra_block_kwargs=extra_block_kwargs,
+            inference_context=inference_context,
+            kwargs=kwargs,
+        )
+        if output is not None:
+            return output
 
     preproc_output = model._preprocess(
         input_ids=input_ids,
