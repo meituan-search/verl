@@ -1535,20 +1535,6 @@ class RayPPOTrainer:
 
                     if self.config.actor_rollout_ref.model.get("use_prefix_tree", False):
                         build_global_trie(batch, metrics=metrics, rollout_n=self.config.actor_rollout_ref.rollout.n)
-                        pt_metrics(
-                            metrics,
-                            batch.batch["input_ids"],
-                            self.config.actor_rollout_ref.model,
-                            attention_mask=batch.batch.get("attention_mask"),
-                            max_token_len_per_gpu=getattr(
-                                self.config.actor_rollout_ref.actor, "ppo_max_token_len_per_gpu", None
-                            ),
-                            trie=batch.meta_info.get("prefix_tree"),
-                            leaf_idx=batch.batch.get("leaf_idx"),
-                        )
-                        metrics.update(
-                            {f"actor/{k}": metrics.pop(k) for k in list(metrics) if k.startswith("prefix_tree/")}
-                        )
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
@@ -1727,6 +1713,23 @@ class RayPPOTrainer:
                             self.checkpoint_manager.update_weights(self.global_steps)
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+
+                        if self.config.actor_rollout_ref.model.get("use_prefix_tree", False):
+                            pt_metrics(
+                                actor_output_metrics,
+                                batch.batch["input_ids"],
+                                self.config.actor_rollout_ref.model,
+                                attention_mask=batch.batch.get("attention_mask"),
+                                max_token_len_per_gpu=getattr(
+                                    self.config.actor_rollout_ref.actor, "ppo_max_token_len_per_gpu", None
+                                ),
+                                trie=batch.meta_info.get("prefix_tree"),
+                                leaf_idx=batch.batch.get("leaf_idx"),
+                            )
+                            actor_output_metrics.update(
+                                {f"actor/{k}": actor_output_metrics.pop(k) for k in list(actor_output_metrics) if k.startswith("prefix_tree/")}
+                            )
+
                         metrics.update(actor_output_metrics)
 
                     # Log rollout generations if enabled
