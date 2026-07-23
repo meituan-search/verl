@@ -19,7 +19,8 @@ import gc
 import logging
 import os
 import warnings
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from inspect import signature
 from typing import Callable, ContextManager, Optional
 
 import torch
@@ -566,6 +567,10 @@ class FSDPEngine(BaseEngine):
 
         # Load base model with specified configuration and dtype
         module = self._build_module()
+        try:
+            self.pass_packed_cu_seqlens = "cu_seqlens" in signature(module.forward).parameters
+        except (TypeError, ValueError):
+            self.pass_packed_cu_seqlens = False
         # Apply LoRA adapters if low-rank adaptation is enabled
         if self._is_lora:
             module = self._build_lora_module(module)
@@ -635,6 +640,34 @@ class FSDPEngine(BaseEngine):
     def get_context_parallel_group(self):
         raise NotImplementedError
 
+    @contextmanager
+    def _gradient_sync_context(self, *, is_last_micro_batch: bool):
+        """Skip FSDP gradient communication on non-final accumulation steps.
+
+        During gradient accumulation the optimizer only steps after the final
+        micro-batch, so gradients only need to be synchronized once per
+        mini-batch. Deferring synchronization on the non-final micro-batches
+        reduces FSDP gradient collectives from one reduce-scatter per
+        micro-batch to a single round, at the cost of temporarily retaining
+        unsharded gradients until the final backward.
+        """
+        if is_last_micro_batch:
+            yield
+            return
+
+        version = fsdp_version(self.module)
+        if version == 1:
+            with self.module.no_sync():
+                yield
+        elif version == 2:
+            self.module.set_requires_gradient_sync(False)
+            try:
+                yield
+            finally:
+                self.module.set_requires_gradient_sync(True)
+        else:
+            yield
+
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> list[TensorDict]:
         # note that the global_batch_size should include data on all the dp
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
@@ -659,8 +692,13 @@ class FSDPEngine(BaseEngine):
         # and _build_fsdp_module, so self.scaler may not be set.
         scaler = getattr(self, "scaler", None)
 
-        for micro_batch in micro_batches:
-            with ctx:
+        for micro_batch_idx, micro_batch in enumerate(micro_batches):
+            sync_ctx = (
+                nullcontext()
+                if forward_only
+                else self._gradient_sync_context(is_last_micro_batch=micro_batch_idx == len(micro_batches) - 1)
+            )
+            with ctx, sync_ctx:
                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
 
                 if not forward_only:
@@ -1037,6 +1075,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
         multi_modal_inputs = extract_multi_modal_inputs(micro_batch.get("multi_modal_inputs", []))
         input_ids = micro_batch["input_ids"]
         position_ids = micro_batch["position_ids"]
+        pass_packed_cu_seqlens = getattr(self, "pass_packed_cu_seqlens", False)
 
         if not isinstance(temperature, torch.Tensor):
             temperature = torch.tensor([temperature] * input_ids.shape[0], device=input_ids.device)
@@ -1053,9 +1092,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
             # input_ids (bsz, j1)
             temperature_rmpad = verl_F.expand_as_nested(temperature, input_ids).values()  # (total_nnz,)
             temperature_rmpad = temperature_rmpad.unsqueeze(0)  # (1, total_nnz)
+            packed_cu_seqlens = None
 
             if pad_mode == DatasetPadMode.NO_PADDING:
                 input_ids_rmpad = input_ids.values().unsqueeze(0)  # (1, total_nnz)
+                packed_cu_seqlens = input_ids.offsets().to(device=input_ids_rmpad.device, dtype=torch.long)
                 if position_ids.dim() == 3:
                     position_ids_rmpad = position_ids.values().unsqueeze(1)  # (4, 1, total_nnz)
                 else:
@@ -1067,6 +1108,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
             input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
 
             # pad and slice the inputs if sp > 1
+            sp_pad_size = 0
+            is_vlm_model = False
             if self.use_ulysses_sp:
                 is_vlm_model = hasattr(getattr(self.module, "module", self.module).config, "vision_config")
                 if is_vlm_model:
@@ -1094,6 +1137,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 )
 
                 output_args["pad_size"] = pad_size
+                sp_pad_size = pad_size
 
             input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
             temperature_rmpad = temperature_rmpad.squeeze(0)
@@ -1107,6 +1151,18 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 "attention_mask": None,
                 "position_ids": position_ids_rmpad,
             }
+            if packed_cu_seqlens is not None and pass_packed_cu_seqlens:
+                model_cu_seqlens = packed_cu_seqlens
+                if self.use_ulysses_sp and sp_pad_size:
+                    padded_total = int(model_cu_seqlens[-1].item()) + int(sp_pad_size)
+                    model_cu_seqlens = torch.cat(
+                        [
+                            model_cu_seqlens,
+                            model_cu_seqlens.new_tensor([padded_total]),
+                        ]
+                    )
+                model_inputs["cu_seqlens"] = model_cu_seqlens
+                model_inputs["cu_seqlens_cpu"] = model_cu_seqlens.cpu()
 
         else:
             if pad_mode == DatasetPadMode.NO_PADDING:

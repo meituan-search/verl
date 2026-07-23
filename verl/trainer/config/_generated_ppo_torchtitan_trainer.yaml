@@ -117,6 +117,13 @@ actor_rollout_ref:
           _target_: verl.utils.profiler.config.TorchProfilerToolConfig
           contents: []
           discrete: false
+          schedule:
+            _target_: verl.utils.profiler.config.TorchProfilerScheduleConfig
+            skip_first: 0
+            wait: 0
+            warmup: 0
+            active: 0
+            repeat: 0
         torch_memory:
           _target_: verl.utils.profiler.config.TorchMemoryToolConfig
           trace_alloc_max_entries: ${oc.select:global_profiler.global_tool_config.torch_memory.trace_alloc_max_entries,100000}
@@ -216,6 +223,13 @@ actor_rollout_ref:
           _target_: verl.utils.profiler.config.TorchProfilerToolConfig
           contents: []
           discrete: false
+          schedule:
+            _target_: verl.utils.profiler.config.TorchProfilerScheduleConfig
+            skip_first: 0
+            wait: 0
+            warmup: 0
+            active: 0
+            repeat: 0
         torch_memory:
           _target_: verl.utils.profiler.config.TorchMemoryToolConfig
           trace_alloc_max_entries: ${oc.select:global_profiler.global_tool_config.torch_memory.trace_alloc_max_entries,100000}
@@ -383,6 +397,8 @@ actor_rollout_ref:
     enable_gradient_checkpointing: true
     enable_activation_offload: false
     use_remove_padding: true
+    use_prefix_tree: false
+    prefix_tree_attention: magi
     lora_rank: 0
     lora_alpha: 16
     target_modules: all-linear
@@ -564,6 +580,13 @@ critic:
         _target_: verl.utils.profiler.config.TorchProfilerToolConfig
         contents: []
         discrete: false
+        schedule:
+          _target_: verl.utils.profiler.config.TorchProfilerScheduleConfig
+          skip_first: 0
+          wait: 0
+          warmup: 0
+          active: 0
+          repeat: 0
       torch_memory:
         _target_: verl.utils.profiler.config.TorchMemoryToolConfig
         trace_alloc_max_entries: ${oc.select:global_profiler.global_tool_config.torch_memory.trace_alloc_max_entries,100000}
@@ -587,6 +610,8 @@ critic:
     enable_gradient_checkpointing: true
     enable_activation_offload: false
     use_remove_padding: true
+    use_prefix_tree: false
+    prefix_tree_attention: magi
     lora_rank: 0
     lora_alpha: 16
     target_modules: all-linear

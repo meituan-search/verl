@@ -196,12 +196,21 @@ class PPOTrainer(ABC):
             critic_cfg: CriticConfig = omega_conf_to_dataclass(self.config.critic)
             critic_cfg.engine.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
             critic_cfg.engine.max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
+
+            # Wire the critic profiler config via the hydra path (real dataclass tool_config), so the
+            # standalone critic TrainingWorker gets a working DistProfiler instead of a silent no-op.
+            critic_omega_profiler_config = self.config.critic.get("profiler", {})
+            critic_profiler_config = (
+                omega_conf_to_dataclass(critic_omega_profiler_config) if critic_omega_profiler_config else None
+            )
+
             worker_cfg = TrainingWorkerConfig(
                 model_type="value_model",
                 model_config=critic_cfg.model,
                 engine_config=critic_cfg.engine,
                 optimizer_config=critic_cfg.optim,
                 checkpoint_config=critic_cfg.checkpoint,
+                profiler_config=critic_profiler_config,
             )
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=worker_cfg)
@@ -562,6 +571,15 @@ class PPOTrainer(ABC):
         return
 
     # ------------------------------ common methods ------------------------------
+
+    def _get_n_gpus_for_throughput(self) -> int:
+        """Return the total number of GPUs used for throughput normalization.
+
+        By default this is the trainer-side GPU count from the resource pool
+        manager.  Modes that use additional dedicated GPUs (e.g. separate-async
+        standalone rollout) should override this to include them.
+        """
+        return self.resource_pool_manager.get_n_gpus()
 
     def _init_tokenizer(self):
         """Initialize tokenizer."""
@@ -1676,10 +1694,15 @@ class PPOTrainer(ABC):
                 partition_id=batch.partition_id,
                 select_fields=["extra_fields"],
             )
-            extra_fields = spec_data["extra_fields"].tolist()
-            spec_drafts = [extra_field["spec_num_draft_tokens"] for extra_field in extra_fields]
-            spec_accepts = [extra_field["spec_num_accepted_tokens"] for extra_field in extra_fields]
-            spec_verifies = [extra_field["spec_num_verify_steps"] for extra_field in extra_fields]
+            extra_fields = spec_data.pop("extra_fields").tolist()
+            # The rollout omits the spec_* stats when the backend does not report
+            # per-request spec-decode stats; leave all three as None in that case.
+            if extra_fields and all(
+                isinstance(extra_field, dict) and "spec_num_draft_tokens" in extra_field for extra_field in extra_fields
+            ):
+                spec_drafts = [extra_field["spec_num_draft_tokens"] for extra_field in extra_fields]
+                spec_accepts = [extra_field["spec_num_accepted_tokens"] for extra_field in extra_fields]
+                spec_verifies = [extra_field["spec_num_verify_steps"] for extra_field in extra_fields]
 
         data = data.to_padded_tensor()
         data["token_level_scores"] = data["rm_scores"]
@@ -1702,7 +1725,7 @@ class PPOTrainer(ABC):
         )
         metrics.update(compute_data_metrics(batch=metrics_batch, use_critic=self.use_critic))
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-        n_gpus = self.resource_pool_manager.get_n_gpus()
+        n_gpus = self._get_n_gpus_for_throughput()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
         gradient_norm = metrics.get("actor/grad_norm", None)
         metrics.update(compute_variance_proxy_metrics(batch=metrics_batch, gradient_norm=gradient_norm))
