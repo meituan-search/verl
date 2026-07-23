@@ -152,19 +152,11 @@ def fused_forward_model_engine(vision_model: bool = False):
         pre_process = unwrap_model(model).pre_process
         post_process = unwrap_model(model).post_process
 
-        # Prefix-tree (MAGI) fused path: all PP stages use MAGI-dispatched tokens.
-        # - pre_process=True (stage 0): dispatch → embedding → MAGI → raw hidden out
-        # - pre_process=False, post_process=False (intermediate): recv CP-local →
-        #   MAGI → raw hidden out
-        # - post_process=True (last stage): recv CP-local → MAGI → undispatch → LCE
         _pt_args = logits_processor_args or {}
         use_prefix_tree = _pt_args.get("use_prefix_tree", False)
 
         if use_prefix_tree:
-            # Rolling (copied from preprocess_thd_engine) is needed before pack;
-            # FP8/CP alignment skipped — handled by prefix-tree's own path.
-            # Guard defers VLM-with-images: 3D M-RoPE position handling not yet wired
-            # (prefix_tree_rope_context assumes 1D). Text-only on ViT-config models passes through.
+            # Prefix-tree (MAGI) fused path.
             from verl.utils.prefix_tree.forward import fuse_try_forward_prefix_tree
 
             output = fuse_try_forward_prefix_tree(
