@@ -152,17 +152,20 @@ def build_prefix_tree_micro_batch(
     position_ids_by_sample = _unpack_nested_to_list(position_ids, mask=loss_mask)
 
     if subtrie is None:
-        # No pre-built subtrie (e.g. use_dynamic_bsz=False): build locally.
-        # build_tree_dynamic does token-by-token trie detection on this mb's
-        # samples; slower than the global path but correct.
-        subtrie = build_tree_dynamic(samples)
-
-    if subtrie is None:
-        _log.getLogger(__name__).error(
-            "build_prefix_tree_micro_batch: no prefix sharing found (n=%d); falling back to standard attention",
-            len(samples),
+        # The per-microbatch subtrie MUST be built once globally on the driver
+        # (build_global_trie -> create_and_attach_subtrie_views) and transmitted
+        # to workers via the batch's prefix_tree_subtree field. Rebuilding per
+        # micro-batch here (the old build_tree_dynamic fallback) is wrong: it
+        # sees only this mb's samples, so prefix-sharing detection is local
+        # instead of global, AND it costs ~13s/step (5x greedy_build_tries on
+        # the actor hot path, starving the GPU). Fail loudly instead of
+        # silently degrading correctness + perf.
+        raise RuntimeError(
+            "build_prefix_tree_micro_batch: prefix_tree_subtree is None. The global "
+            "trie was not built/transmitted to this worker (build_global_trie not called "
+            "on the driver, or prefix_tree_subtree did not survive dispatch). Per-microbatch "
+            "rebuild is disabled — fix the driver to attach the global trie."
         )
-        return None
 
     try:
         params = build_layout_from_tree_node(

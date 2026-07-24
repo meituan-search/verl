@@ -663,12 +663,13 @@ def compute_prefix_tree_metrics(
             "prefix_tree/raw_tokens": 0,
         }
 
-    # Build the trie once (or reuse the caller-provided one).
+    # Reuse the caller-provided global trie (built once on the driver).
     if trie is None:
-        tries, num_tokens = greedy_build_tries(sequences, max_tokens_per_tree=total_raw * 10)
-        flat = sum(num_tokens)
-    else:
-        flat = sum(len(n.input_ids) for n in trie.nodes) if trie else 0
+        raise RuntimeError(
+            "compute_prefix_tree_metrics: global trie is None. The driver must call "
+            "build_global_trie and pass trie=... Per-call rebuild is disabled."
+        )
+    flat = sum(len(n.input_ids) for n in trie.nodes) if trie else 0
 
     return {
         "prefix_tree/global_shared_ratio": 1.0 - flat / total_raw,
@@ -693,15 +694,17 @@ def prepare_prefix_tree_micro_batches(
       using DFS trie order so same-prefix sequences stay together.
 
     Expects a pre-built trie stored via ``tu.assign_non_tensor(data, prefix_tree=trie)``.
-    If not present, falls back to token-by-token trie construction (dynbsz) or plain range
-    order (fixed mbs).
+    The global trie MUST be built once on the driver (build_global_trie) and transmitted
+    to workers; per-worker rebuild is disabled (it was wrong — local-only prefix sharing —
+    and cost ~13s/step starving the GPU).
     """
     trie = tu.get_non_tensor_data(data, "prefix_tree", default=None)
     leaf_idx = data.get("leaf_idx", None) if hasattr(data, "get") else data["leaf_idx"]
-    if trie is not None and leaf_idx is None:
-        raise ValueError(
-            "prepare_prefix_tree_micro_batches: trie is attached but leaf_idx is "
-            "missing from batch.  _build_global_trie must attach both."
+    if trie is None or leaf_idx is None:
+        raise RuntimeError(
+            "prepare_prefix_tree_micro_batches: global trie (prefix_tree) or leaf_idx is "
+            "None. The driver must call build_global_trie to build+attach the global trie "
+            "before dispatching to workers. Per-worker rebuild is disabled."
         )
 
     use_dynamic_bsz_local = tu.get_non_tensor_data(data, "use_dynamic_bsz", default=True)
@@ -712,22 +715,13 @@ def prepare_prefix_tree_micro_batches(
             "deduplicated (flat trie) token count, not raw sequence length."
         )
         max_token_len = data["max_token_len_per_gpu"] * sp_size
-        if trie is not None:
-            batch_idx_list = mbs_groups_from_leaf_idx(leaf_idx, trie, max_token_len)
-        else:
-            input_ids = data["input_ids"]
-            seqs = [t.tolist() for t in input_ids.unbind()]
-            batch_idx_list = dfs_micro_batch_groups(seqs, max_token_len)
+        batch_idx_list = mbs_groups_from_leaf_idx(leaf_idx, trie, max_token_len)
     else:
         # Fixed mbs: chunk by sequence count in DFS trie order so same-prefix
         # sequences land in the same micro-batch.
         mbs = data["micro_batch_size_per_gpu"] * force_group_size
-        n = len(data)
-        if trie is not None:
-            dfs_order = trie_dfs_leaf_order_from_leaf_idx(leaf_idx, trie)
-        else:
-            dfs_order = list(range(n))
-        batch_idx_list = [dfs_order[i : i + mbs] for i in range(0, n, mbs)]
+        dfs_order = trie_dfs_leaf_order_from_leaf_idx(leaf_idx, trie)
+        batch_idx_list = [dfs_order[i : i + mbs] for i in range(0, len(dfs_order), mbs)]
 
     if torch.distributed.is_initialized() and same_micro_num_in_dp and dp_group is not None:
         n_mb = torch.tensor([len(batch_idx_list)], device=get_torch_device().current_device())
