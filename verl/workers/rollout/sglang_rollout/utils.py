@@ -83,7 +83,15 @@ def _compact_for_bucket(tensor: torch.Tensor) -> torch.Tensor:
     transiently doubles the tensor's footprint -- which OOMs on multi-GiB fused MoE weights
     (e.g. ``[num_experts, ...]`` ``gate_up_proj``/``qkv``) while the actor params and rollout
     weights are both already resident. Skip the clone when the tensor already owns its storage.
+
+    NOTE: A view tensor whose data fills the *entire* underlying storage would pass the
+    ``nbytes == numel * element_size`` test (false negative) -- e.g. a chunk view spanning a
+    full NCCL bucket.  Those are caught by the ``_base`` guard.
     """
+    # View tensors share storage with a parent buffer (e.g. NCCL recv bucket) that may
+    # be overwritten by double-buffering before the bucket is flushed.
+    if tensor._base is not None:
+        return tensor.clone()
     if tensor.is_contiguous() and tensor.untyped_storage().nbytes() == tensor.numel() * tensor.element_size():
         return tensor
     return tensor.clone()
