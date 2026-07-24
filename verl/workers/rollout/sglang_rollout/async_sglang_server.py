@@ -403,12 +403,20 @@ class SGLangHttpServer:
         sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
         server_args = ServerArgs(**args)
-        # For SGLang main branch or version >= 0.5.10
-        # The latest main branch of SGLang has wrapped the _launch_subprocesses function inside the Engine class
-        if version.parse(sglang.__version__) >= version.parse("0.5.10"):
-            from sglang.srt.entrypoints.http_server import Engine
+        # Some dev builds expose the new Engine launcher while reporting a pre-0.5 version.
+        import sglang.srt.entrypoints.http_server as http_server
 
-            self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = Engine._launch_subprocesses(
+        has_http_engine_launch = hasattr(http_server, "Engine") and hasattr(
+            http_server.Engine, "_launch_subprocesses"
+        )
+        has_entrypoint_engine_launch = hasattr(sglang.srt.entrypoints.engine.Engine, "_launch_subprocesses")
+        if (
+            version.parse(sglang.__version__) >= version.parse("0.5.10")
+            or has_http_engine_launch
+            or has_entrypoint_engine_launch
+        ):
+            engine_cls = http_server.Engine if has_http_engine_launch else sglang.srt.entrypoints.engine.Engine
+            self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = engine_cls._launch_subprocesses(
                 server_args=server_args,
                 init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
                 run_scheduler_process_func=sglang.srt.entrypoints.engine.run_scheduler_process,

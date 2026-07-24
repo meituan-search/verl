@@ -88,7 +88,13 @@ from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_
 from verl.utils.skip import SkipManager
 from verl.utils.tracking import Tracking, ValidationGenerationsLogger
 from verl.workers.config import CriticConfig, DistillationConfig
-from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker, TrainingWorkerConfig
+from verl.workers.engine_workers import (
+    ActorRolloutRefWorker,
+    FusedTeacherActorRolloutRefWorker,
+    TrainingWorker,
+    TrainingWorkerConfig,
+    is_fused_teacher_enabled,
+)
 from verl.workers.rollout.llm_server import LLMServerClient, LLMServerManager
 from verl.workers.utils.losses import value_loss
 from verl.workers.utils.padding import response_from_nested, response_to_nested
@@ -129,6 +135,10 @@ class PPOTrainer(ABC):
         self.use_critic = need_critic(self.config)
         self.use_reference_policy = need_reference_policy(self.config)
         self.use_teacher_policy = need_teacher_policy(self.config)
+        self.fused_teacher_enabled = bool(
+            self.use_teacher_policy
+            and self.config.distillation.get("teacher_execution", "rollout") == "trainer"
+        )
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
@@ -283,12 +293,15 @@ class PPOTrainer(ABC):
 
         # 8. initialize teacher loop manager
         if self.use_teacher_policy:
-            teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
-            self.teacher_model_manager = MultiTeacherModelManager(
-                config=self.config,
-                resource_pool=teacher_resource_pool,
-            )
             self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
+            if self.fused_teacher_enabled:
+                self.teacher_model_manager = None
+            else:
+                teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
+                self.teacher_model_manager = MultiTeacherModelManager(
+                    config=self.config,
+                    resource_pool=teacher_resource_pool,
+                )
         else:
             self.teacher_model_manager = None
             self.distillation_config = None
@@ -324,7 +337,7 @@ class PPOTrainer(ABC):
         Returns:
             dict[str, LLMServerClient]: The teacher server clients.
         """
-        return self.teacher_model_manager.get_client() if self.use_teacher_policy else None
+        return self.teacher_model_manager.get_client() if self.teacher_model_manager is not None else None
 
     def get_reward_handles(self) -> list[ray.actor.ActorHandle]:
         """Get the handles of reward loop workers."""
@@ -485,6 +498,12 @@ class PPOTrainer(ABC):
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
             self.on_sample_end()
 
+        # Trainer-colocated OPD scores the sampled trajectories before any actor
+        # forward. The student is kept on CPU while each teacher is swapped in.
+        if self.fused_teacher_enabled:
+            with marked_timer("teacher_scoring", timing_raw, color="purple"):
+                batch = self._compute_fused_teacher_log_probs(batch, metrics=metrics)
+
         # 2. [OPTIONAL] compute reward score with colocated reward model
         if self.reward_loop_manager.reward_loop_worker_handles is None:
             with marked_timer("reward", timing_raw, color="yellow"):
@@ -521,6 +540,79 @@ class PPOTrainer(ABC):
             with marked_timer("update_actor", timing_raw, color="red"):
                 batch = self._update_actor(batch, metrics=metrics)
 
+        return batch
+
+    def _compute_fused_teacher_log_probs(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        """Compute trainer-colocated multi-teacher log-probs for a V1 TQ batch.
+
+        V1 currently supports the nonrouter fused ablation: every teacher scores
+        every trajectory, then ``teacher_key`` selects one result per row.
+        """
+        if not self.distillation_config.nonrouter:
+            raise NotImplementedError("V1 trainer-colocated multi-teacher OPD currently requires nonrouter=True.")
+        if not self.config.actor_rollout_ref.actor.megatron.param_offload:
+            raise RuntimeError(
+                "V1 fused teacher scoring requires "
+                "actor_rollout_ref.actor.megatron.param_offload=True."
+            )
+
+        # NCCL get_per_tensor_param may leave actor parameters on GPU. Keep the
+        # student on CPU; its next eval/train context restores it on demand.
+        self.actor_rollout_wg.to(device="cpu", model=True, optimizer=False, grad=True)
+
+        teacher_keys = list(self.distillation_config.teacher_models)
+        route_to_teacher = {
+            teacher_config.key: teacher_key
+            for teacher_key, teacher_config in self.distillation_config.teacher_models.items()
+        }
+        routed_field = self.distillation_config.teacher_key
+        routing_data = tq.kv_batch_get(
+            keys=batch.keys,
+            partition_id=batch.partition_id,
+            select_fields=[routed_field, "response_mask"],
+        )
+        route_values = list(routing_data[routed_field])
+        response_mask = routing_data["response_mask"]
+        teacher_results = []
+
+        for teacher_key in teacher_keys:
+            batch.extra_info.update(
+                {
+                    "calculate_entropy": False,
+                    "compute_loss": False,
+                    "temperature": self.config.actor_rollout_ref.rollout.temperature,
+                    "teacher_key": teacher_key,
+                }
+            )
+            output = self.actor_rollout_wg.compute_teacher_log_prob(batch)
+            assert len(output) == len(batch)
+            result = tq.kv_batch_get(
+                keys=batch.keys,
+                partition_id=batch.partition_id,
+                select_fields=["log_probs"],
+            )["log_probs"]
+            teacher_results.append(response_from_nested(result, response_mask))
+            metrics[f"distillation/teacher_route/{teacher_key}/trajectories"] = len(batch)
+
+        selected = []
+        for row, route_value in enumerate(route_values):
+            if hasattr(route_value, "item"):
+                route_value = route_value.item()
+            try:
+                teacher_idx = teacher_keys.index(route_to_teacher[route_value])
+            except KeyError as exc:
+                raise ValueError(
+                    f"No fused teacher matches {routed_field}={route_value!r}; "
+                    f"configured route keys are {sorted(route_to_teacher)}."
+                ) from exc
+            selected.append(teacher_results[teacher_idx][row])
+
+        teacher_logprobs = torch.nested.as_nested_tensor(selected, layout=torch.jagged)
+        tq.kv_batch_put(
+            keys=batch.keys,
+            partition_id=batch.partition_id,
+            fields=TensorDict({"teacher_logprobs": teacher_logprobs}, batch_size=len(batch)),
+        )
         return batch
 
     # ------------------------------ abstract methods ------------------------------
@@ -687,7 +779,10 @@ class PPOTrainer(ABC):
         ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
 
         role = Role.ActorRolloutRef if need_reference_policy(config) and not ref_in_actor else Role.ActorRollout
-        self.role_worker_mapping[role] = ray.remote(ActorRolloutRefWorker)
+        distillation_config = config.get("distillation")
+        fused_teacher_enabled = is_fused_teacher_enabled(distillation_config)
+        actor_worker_cls = FusedTeacherActorRolloutRefWorker if fused_teacher_enabled else ActorRolloutRefWorker
+        self.role_worker_mapping[role] = ray.remote(actor_worker_cls)
         self.mapping[role] = "global_pool"
 
         # Add critic worker to mapping.
@@ -716,8 +811,7 @@ class PPOTrainer(ABC):
             config.reward.reward_model.n_gpus_per_node = config.trainer.n_gpus_per_node
             self.mapping[Role.RewardModel] = "global_pool"
 
-        distillation_config = config.get("distillation")
-        if is_distillation_enabled(distillation_config):
+        if is_distillation_enabled(distillation_config) and not fused_teacher_enabled:
             if distillation_config.n_gpus_per_node <= 0:
                 raise ValueError("config.distillation.n_gpus_per_node must be greater than 0")
             if distillation_config.nnodes <= 0:

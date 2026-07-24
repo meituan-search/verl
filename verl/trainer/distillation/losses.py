@@ -381,7 +381,31 @@ def compute_distillation_loss_reverse_kl_estimator(
     - distillation_metrics: Dictionary of metrics.
     """
     student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
-    teacher_log_probs = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
+    teacher_log_probs = data["teacher_logprobs"]
+    if teacher_log_probs.is_nested:
+        response_mask = data["response_mask"]
+        is_response_aligned = response_mask.is_nested and torch.equal(
+            teacher_log_probs.offsets().diff().cpu(), response_mask.offsets().diff().cpu()
+        )
+        if is_response_aligned:
+            # V1 trainer-colocated scoring stores response-only jagged values.
+            # Pad them directly instead of treating them as full-sequence model
+            # output, which would make no_padding_2_padding expect prompt tokens.
+            padded_teacher_log_probs = student_log_probs.new_zeros(student_log_probs.shape)
+            teacher_values = teacher_log_probs.values()
+            for row, (start, end) in enumerate(
+                zip(teacher_log_probs.offsets()[:-1], teacher_log_probs.offsets()[1:], strict=True)
+            ):
+                row_values = teacher_values[start:end]
+                padded_teacher_log_probs[row, : row_values.shape[0]] = row_values
+            teacher_log_probs = padded_teacher_log_probs
+        else:
+            # Dedicated rollout teachers may provide full-sequence jagged output.
+            teacher_log_probs = no_padding_2_padding(teacher_log_probs, data)
+    # Dedicated rollout teachers provide full-sequence nested values, while
+    # trainer-colocated scoring injects response-aligned values.
+    if teacher_log_probs.ndim == 3 and teacher_log_probs.shape[-1] == 1:
+        teacher_log_probs = teacher_log_probs.squeeze(-1)
     if data["response_mask"].is_nested:
         response_mask_bool = data["response_mask"].bool().to_padded_tensor(False)
     else:
