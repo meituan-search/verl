@@ -147,7 +147,6 @@ Base (no prefix-tree) vs MAGI prefix-tree, on two workloads — `longreason` (a 
 
 ## 7. Known limitations
 
-- **TP and SP are mutually exclusive.** When `tensor_model_parallel_size > 1`, sequence parallelism must be disabled (`actor_rollout_ref.actor.megatron.sequence_parallel=False`); the prefix-tree path does not support SP with TP.
 - **Linear attention is not supported yet.** Only the `magi` / `flex` / FA3-fallback attention backends work; linear-attention variants fall back to the standard path.
 - **Dispatch overhead can dominate at low sharing.** Building the trie and dispatching the packed layout has a fixed cost; when the shared-prefix length is very short the dedup saving may not cover it, giving a net negative gain.
 - **DP load balance is not fully optimized.** The current DFS + contiguous partition balances token counts across DP ranks, but does not yet optimally co-locate prefix-sharing samples across ranks in all cases.

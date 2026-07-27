@@ -63,10 +63,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=4096 \
     \
-    # NOTE: prefix-tree does NOT support sequence parallelism (SP) with TP>1.
-    # This run uses TP=1 (SP is auto-disabled). If you raise TP above 1, also
-    # disable SP explicitly:
-    #   actor_rollout_ref.actor.megatron.sequence_parallel=False
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=1 \
     actor_rollout_ref.actor.megatron.context_parallel_size=4 \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=2 \

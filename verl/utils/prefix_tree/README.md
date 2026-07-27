@@ -149,7 +149,7 @@ Flat packed layout (tokens processed once):
 
 ## Parallelism Support
 
-The prefix-tree (MAGI) path coexists with Megatron's TP, CP, SP, PP, and the
+The prefix-tree (MAGI) path coexists with Megatron's TP, CP, PP, and the
 fused-kernel switch.
 
 ### Tensor parallelism (TP)
@@ -184,15 +184,6 @@ and indexes by actual local `position_ids`.
 
 `flex` does **not** support CP: `_build_flex_key` builds a single full-layout
 `block_mask` with no CP slicing.
-
-### Sequence parallelism (SP)
-
-Supported automatically. The model uses `ColumnParallelLinear` for QKV plus
-`RowParallelLinear` + `gather_from_sequence_parallel_region` for the output
-projection; the prefix-tree path does not touch this. In the fused LCE path,
-`_run_lce` explicitly gathers hidden states out of the SP region before
-`linear_cross_entropy`. The unfused path runs `logits_processor` on already-
-gathered logits.
 
 ### Pipeline parallelism (PP)
 
