@@ -138,6 +138,8 @@ class PPOTrainer(ABC):
         self._rollout_moe_lb_metrics_accumulator = RolloutMoELoadBalanceMetricsAccumulator(
             model_config=self.config.actor_rollout_ref.model
         )
+        # track mini-batch index within a parameter_sync_step cycle for Decoupled PPO
+        self.local_trigger_step = 0
 
     def _build_replay_buffer(self) -> ReplayBuffer:
         """Instantiate the replay buffer (or a user-provided custom sampler).
@@ -520,7 +522,8 @@ class PPOTrainer(ABC):
         combined_keys: list = []
         combined_tags: list = []
         combined_partition_id = "train"
-        for _ in range(self.parameter_sync_step):
+        for trigger_idx in range(self.parameter_sync_step):
+            self.local_trigger_step = trigger_idx
             iter_metrics: dict = {}
             batch = self._step_once(iter_metrics, timing_raw, sample_batch_size)
             sample_count = sum(not tag.get("is_padding", False) for tag in batch.tags)
