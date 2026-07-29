@@ -19,11 +19,14 @@ import ray
 from omegaconf import DictConfig
 
 from verl.checkpoint_engine import CheckpointEngineManager
-from verl.trainer.ppo.utils import need_reward_model
+from verl.trainer.ppo.utils import Role, need_reward_model
 from verl.trainer.ppo.v1.trainer_base import PPOTrainer, register_trainer
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient, LLMServerManager
+from transfer_queue import KVBatchMeta
+from verl.experimental.separation.engine_workers import DetachActorWorker
+from verl.trainer.ppo.v1.utils import MetricsAggregator
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -66,8 +69,18 @@ class PPOTrainerSeparateAsync(PPOTrainer):
 
         super().__init__(config)
 
-        # TODO: Support Decoupled PPO: https://arxiv.org/abs/2505.24298
-        self.config.algorithm.rollout_correction.bypass_mode = True
+        # track mini-batch index within a parameter_sync_step cycle for Decoupled PPO
+        self.local_trigger_step = 1
+
+    def _init_resource_pool_mgr(self):
+        super()._init_resource_pool_mgr()
+        # Replace ActorRolloutRefWorker with DetachActorWorker to get CPU save/restore
+        # capability needed for Decoupled PPO when parameter_sync_step > 1.
+        # The base class adds exactly one of ActorRolloutRef or ActorRollout to the mapping.
+        if Role.ActorRolloutRef in self.role_worker_mapping:
+            self.role_worker_mapping[Role.ActorRolloutRef] = ray.remote(DetachActorWorker)
+        elif Role.ActorRollout in self.role_worker_mapping:
+            self.role_worker_mapping[Role.ActorRollout] = ray.remote(DetachActorWorker)
 
     def _setup(self):
         super()._setup()
@@ -90,6 +103,63 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         # hybrid engine is in rollout mode after initialization
         self.current_mode = HybridEngineMode.ROLLOUT
         self.add_replicas_to_balancer()
+
+    def step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
+        """Override step() to track local_trigger_step for Decoupled PPO weight management."""
+        train_batch_size = self.config.data.train_batch_size
+        assert train_batch_size % self.parameter_sync_step == 0, (
+            f"train_batch_size ({train_batch_size}) must be divisible by "
+            f"parameter_sync_step ({self.parameter_sync_step})"
+        )
+        sample_batch_size = train_batch_size // self.parameter_sync_step
+
+        self._add_batch_to_generate()
+
+        metrics_aggregator = MetricsAggregator()
+        combined_keys: list = []
+        combined_tags: list = []
+        combined_partition_id = "train"
+        for trigger_idx in range(self.parameter_sync_step):
+            self.local_trigger_step = trigger_idx + 1  # 1-indexed for _compute_old_log_prob
+            iter_metrics: dict = {}
+            batch = self._step_once(iter_metrics, timing_raw, sample_batch_size)
+            sample_count = sum(not tag.get("is_padding", False) for tag in batch.tags)
+            metrics_aggregator.add_step_metrics(iter_metrics, sample_count=sample_count)
+            # Strip padding entries added by _balance_batch → upsample_batch_to_divisible_size;
+            # they have no TQ data and would cause shape mismatches downstream (e.g., in
+            # _compute_metrics). Only real (non-padding) entries are combined.
+            combined_keys.extend(key for key, tag in zip(batch.keys, batch.tags) if not tag.get("is_padding", False))
+            combined_tags.extend(tag for tag in batch.tags if not tag.get("is_padding", False))
+            combined_partition_id = batch.partition_id
+
+        metrics.update(metrics_aggregator.get_aggregated_metrics())
+        return KVBatchMeta(partition_id=combined_partition_id, keys=combined_keys, tags=combined_tags)
+
+    def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        """Version-aware old_log_probs computation for Decoupled PPO.
+
+        In bypass mode, delegates to the base class (copies rollout_log_probs directly).
+        In Decoupled mode, uses save_model_to_cpu / restore_model_from_cpu to ensure
+        all mini-batches within a parameter_sync_step cycle use the same stable π_old.
+
+        - local_trigger_step == 1: Current weights are π_old → save to CPU, compute directly.
+        - local_trigger_step >= 2: Save current weights → restore π_old → compute → restore current.
+        """
+        rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+        bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+        if bypass_recomputing_logprobs:
+            return super()._compute_old_log_prob(batch, metrics)
+
+        if self.local_trigger_step == 1:
+            self.actor_rollout_wg.save_model_to_cpu(1)
+            return super()._compute_old_log_prob(batch, metrics)
+        else:
+            self.actor_rollout_wg.save_model_to_cpu(self.local_trigger_step)
+            self.actor_rollout_wg.restore_model_from_cpu(1)
+            result = super()._compute_old_log_prob(batch, metrics)
+            self.actor_rollout_wg.restore_model_from_cpu(self.local_trigger_step)
+            self.actor_rollout_wg.clear_cpu_model(self.local_trigger_step)
+            return result
 
     def get_llm_client(self):
         # get server client from standalone rollout
