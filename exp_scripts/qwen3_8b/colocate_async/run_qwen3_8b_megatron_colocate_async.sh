@@ -9,7 +9,8 @@ export PATH="/usr/local/miniconda3/bin:$PATH"
 
 ########################### user-adjustable ###########################
 INFER_BACKEND=${INFER_BACKEND:-sglang}
-DATASET=${DATASET:-gsm8k}   # gsm8k | dapo — picks per-dataset defaults below
+DATASET=${DATASET:-dapo}   # gsm8k | dapo — picks per-dataset defaults below
+NUM_WARMUP_BATCHES=${NUM_WARMUP_BATCHES:-1}   # pre-fill pipeline for rollout/training overlap
 
 MODEL_PATH=${MODEL_PATH:-/mnt/dolphinfs/ssd_pool/docker/user/hadoop-xt-ai-search/ai-search/deepsearch_files_xtssd/LLMbasemodels/huggingface.co/Qwen/Qwen3-8B}
 GSM8K_DIR=${GSM8K_DIR:-/mnt/dolphinfs/ssd_pool/docker/user/hadoop-friday-studio/FTI/houzhenggang/wangshulin02/data/gsm8k}
@@ -28,6 +29,7 @@ case "$DATASET" in
         max_prompt_length=${MAX_PROMPT_LENGTH:-1024}
         max_response_length=${MAX_RESPONSE_LENGTH:-2048}
         ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}
+        rollout_n=${ROLLOUT_N:-5}
         ;;
     dapo)
         train_files=${TRAIN_FILES:-"['$DAPO_DIR/dapo-math-17k.parquet']"}
@@ -36,7 +38,8 @@ case "$DATASET" in
         ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-16}
         max_prompt_length=${MAX_PROMPT_LENGTH:-2048}
         max_response_length=${MAX_RESPONSE_LENGTH:-8192}
-        ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-30720}
+        ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}
+        rollout_n=${ROLLOUT_N:-8}
         ;;
     *)
         echo "Unknown DATASET=$DATASET (expected: gsm8k | dapo)" >&2
@@ -48,14 +51,13 @@ actor_lr=${ACTOR_LR:-1e-6}
 kl_loss_coef=${KL_LOSS_COEF:-0.001}
 entropy_coeff=${ENTROPY_COEFF:-0}
 project_name=${PROJECT_NAME:-verl_grpo_${DATASET}_math}
-experiment_name=${EXPERIMENT_NAME:-qwen3_8b_${INFER_BACKEND}_megatron_${DATASET}}
+experiment_name=${EXPERIMENT_NAME:-qwen3_8b_${INFER_BACKEND}_megatron_${DATASET}_colocate_async}
 
 actor_tp=${ACTOR_TP:-2}
 actor_pp=${ACTOR_PP:-2}
 
 rollout_tp=${ROLLOUT_TP:-2}
 rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.6}
-rollout_n=${ROLLOUT_N:-5}
 
 total_epochs=${TOTAL_EPOCHS:-15}
 save_freq=${SAVE_FREQ:--1}
@@ -73,6 +75,7 @@ DATA=(
     data.max_prompt_length=${max_prompt_length}
     data.max_response_length=${max_response_length}
     data.filter_overlong_prompts=True
+    data.filter_overlong_prompts_workers=16
     data.truncation='error'
 )
 
@@ -124,7 +127,11 @@ TRAINER=(
     trainer.nnodes=${NNODES}
     trainer.save_freq=${save_freq}
     trainer.test_freq=${test_freq}
+    trainer.val_before_train=False
     trainer.total_epochs=${total_epochs}
+    trainer.v1.trainer_mode=colocate_async
+    trainer.v1.colocate_async.num_warmup_batches=${NUM_WARMUP_BATCHES}
+    transfer_queue.enable=True
 )
 
 EXTRA=(
