@@ -1,0 +1,14 @@
+env_vars:
+  HYDRA_FULL_ERROR: "1"
+  NCCL_NVLS_ENABLE: "0"
+  NCCL_SOCKET_IFNAME: "eth0"
+  CUDA_CACHE_PATH: "/tmp/cuda_cache"
+  TMPDIR: "/tmp"
+  CUDA_TMPDIR: "/tmp"
+  CUDA_CACHE_PATH: "/tmp/cuda_cache"
+  PATH: "/usr/local/miniconda3/bin:$PATH"
+  TENSORBOARD_DIR: "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-xt-ai-search/ai-search/deepsearch_files_xtssd/wangshulin02/tensorboard/v1_test/qwen3_8B_gsm8k_colocate_sync_t0"
+
+excludes:
+  - ".git/"
+  - "third_party/"

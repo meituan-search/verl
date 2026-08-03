@@ -405,7 +405,7 @@ class SGLangHttpServer:
         server_args = ServerArgs(**args)
         # For SGLang main branch or version >= 0.5.10
         # The latest main branch of SGLang has wrapped the _launch_subprocesses function inside the Engine class
-        if version.parse(sglang.__version__) >= version.parse("0.5.10"):
+        if sglang.__version__.startswith("0.0.0.") or version.parse(sglang.__version__) >= version.parse("0.5.10"):
             from sglang.srt.entrypoints.http_server import Engine
 
             self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = Engine._launch_subprocesses(
