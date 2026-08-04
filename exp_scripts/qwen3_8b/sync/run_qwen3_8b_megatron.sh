@@ -33,10 +33,10 @@ case "$DATASET" in
     dapo)
         train_files=${TRAIN_FILES:-"['$DAPO_DIR/dapo-math-17k.parquet']"}
         val_files=${VAL_FILES:-"['$DAPO_DIR/aime-2024.parquet']"}
-        train_batch_size=${TRAIN_BATCH_SIZE:-512}
-        ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-16}
+        train_batch_size=${TRAIN_BATCH_SIZE:-128}
+        ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-32}
         max_prompt_length=${MAX_PROMPT_LENGTH:-2048}
-        max_response_length=${MAX_RESPONSE_LENGTH:-8192}
+        max_response_length=${MAX_RESPONSE_LENGTH:-20480}
         ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}
         rollout_n=${ROLLOUT_N:-8}
         ;;
@@ -52,7 +52,7 @@ entropy_coeff=${ENTROPY_COEFF:-0}
 project_name=${PROJECT_NAME:-verl_grpo_${DATASET}_math}
 experiment_name=${EXPERIMENT_NAME:-qwen3_8b_${INFER_BACKEND}_megatron_${DATASET}}
 
-actor_tp=${ACTOR_TP:-2}
+actor_tp=${ACTOR_TP:-4}
 actor_pp=${ACTOR_PP:-2}
 
 rollout_tp=${ROLLOUT_TP:-2}
