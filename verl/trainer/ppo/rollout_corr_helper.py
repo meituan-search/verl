@@ -60,6 +60,7 @@ tracking metrics to diagnose and correct off-policy issues.
 - Off-policy RL (theoretical basis for IS): https://fengyao.notion.site/off-policy-rl
 """
 
+import logging
 import math
 from typing import Any, Optional
 
@@ -69,6 +70,8 @@ import verl.utils.torch_functional as verl_F
 from verl.protocol import DataProto
 from verl.trainer.config.algorithm import RolloutCorrectionConfig
 from verl.workers.config.actor import PolicyLossConfig
+
+logger = logging.getLogger(__name__)
 
 # Safety bound to prevent numerical overflow/underflow when exponentiating
 # exp(20) ≈ 485 million (upper limit for stable weights), exp(-20) ≈ 2e-9 (lower limit)
@@ -792,6 +795,7 @@ def compute_rollout_correction_and_rejection_mask(
     rollout_is_batch_normalize: bool = False,
     rollout_rs: Optional[str] = None,
     rollout_rs_threshold: Optional[str | float] = None,
+    new_rollout_log_prob: Optional[torch.Tensor] = None,
 ) -> tuple[Optional[DataProto], torch.Tensor, dict[str, float]]:
     """Unified interface for computing IS weights and rejection masks.
 
@@ -846,8 +850,30 @@ def compute_rollout_correction_and_rejection_mask(
         )
 
     # Step 1: Compute log ratio (log(π_train / π_rollout))
+    # Combined ratio used by IS/RS (Phase 1 backward compat; Phase 2 will split).
     log_ratio: torch.Tensor = old_log_prob - rollout_log_prob
     metrics: dict[str, float] = {}
+
+    # 4policy Phase 1: decompose into staleness + mismatch for diagnostics.
+    # log_ratio_stale = log(π_new-rollout / π_rollout): drift from weight staleness
+    # log_ratio_mis  = log(π_old / π_new-rollout): T/R engine mismatch
+    # Identity: log_ratio_stale + log_ratio_mis == log_ratio (combined)
+    if new_rollout_log_prob is not None:
+        if new_rollout_log_prob.shape != old_log_prob.shape:
+            raise ValueError(
+                f"new_rollout_log_prob shape {new_rollout_log_prob.shape} does not match "
+                f"old_log_prob shape {old_log_prob.shape}."
+            )
+        log_ratio_stale = new_rollout_log_prob - rollout_log_prob
+        log_ratio_mis = old_log_prob - new_rollout_log_prob
+        # Sanity check: identity should hold within numerical tolerance.
+        identity_err = (log_ratio_stale + log_ratio_mis - log_ratio).abs().max().item()
+        if identity_err > 1e-5:
+            logger.warning(
+                "4policy log_ratio identity violation: max err=%s (expected <1e-5). "
+                "Staleness/mismatch decomposition may be inconsistent.",
+                identity_err,
+            )
 
     # Step 2: Compute IS weights (if enabled)
     rollout_is_weights: Optional[torch.Tensor] = None
@@ -878,10 +904,13 @@ def compute_rollout_correction_and_rejection_mask(
         metrics.update(rs_metrics)
 
     # Step 4: Compute off-policy metrics (KL, PPL, χ², etc.)
+    # When new_rollout_log_prob is provided, also emit staleness/* and mismatch/*
+    # groups for 4policy Phase 1 diagnostics.
     offpolicy_metrics: dict[str, float] = compute_offpolicy_metrics(
         old_log_prob=old_log_prob,
         rollout_log_prob=rollout_log_prob,
         response_mask=response_mask,
+        new_rollout_log_prob=new_rollout_log_prob,
     )
     metrics.update(offpolicy_metrics)
 
@@ -905,6 +934,7 @@ def compute_offpolicy_metrics(
     old_log_prob: torch.Tensor,
     rollout_log_prob: Optional[torch.Tensor],
     response_mask: torch.Tensor,
+    new_rollout_log_prob: Optional[torch.Tensor] = None,
 ) -> dict[str, Any]:
     """Compute off-policy diagnostic metrics (helper function).
 
@@ -1007,6 +1037,108 @@ def compute_offpolicy_metrics(
         chi2_seq = rho_squared_seq.mean() - 1.0
         metrics["chi2_seq"] = chi2_seq.detach().item()
 
+    # 3. 4policy Phase 1: decompose into staleness + mismatch groups.
+    # staleness/* compares π_new-rollout (current weights) vs π_rollout (decode-time
+    #   weights) — quantifies how stale the rollout data is.
+    # mismatch/* compares π_old (training engine) vs π_new-rollout (rollout engine)
+    #   at the same weights — quantifies T/R numerical mismatch.
+    # Combined group above remains the canonical metrics; these are diagnostic only.
+    if new_rollout_log_prob is not None and rollout_log_prob is not None:
+        # log_ratio_stale = log(π_new-rollout / π_rollout); r = π_new-rollout / π_rollout
+        log_ratio_stale = new_rollout_log_prob - rollout_log_prob
+        # log_ratio_mis = log(π_old / π_new-rollout); r = π_old / π_new-rollout
+        log_ratio_mis = old_log_prob - new_rollout_log_prob
+
+        for prefix, lr in (("staleness", log_ratio_stale), ("mismatch", log_ratio_mis)):
+            # --- KL / χ² point estimates (existing) ---
+            # Direct KL estimator: E[log(π_q) - log(π_p)] = -E[log_ratio] where r = π_p/π_q
+            # Here r = π_p/π_q, log_ratio = log r, so KL(π_q || π_p) = -E[log_ratio].
+            metrics[f"{prefix}/kl"] = verl_F.masked_mean(-lr, response_mask).detach().item()
+            # K3 KL estimator: E[exp(log_ratio) - log_ratio - 1] for r = π_p/π_q,
+            # estimating KL(π_p || π_q).
+            k3_matrix = torch.exp(lr) - lr - 1
+            metrics[f"{prefix}/k3_kl"] = verl_F.masked_mean(k3_matrix, response_mask).detach().item()
+            # Token-level χ²: E[ρ²] - 1 where ρ = r
+            lr_safe = torch.clamp(lr, min=-SAFETY_BOUND, max=SAFETY_BOUND)
+            rho_token = torch.exp(lr_safe)
+            chi2_token_decomp = verl_F.masked_mean(rho_token.square(), response_mask) - 1.0
+            metrics[f"{prefix}/chi2_token"] = chi2_token_decomp.detach().item()
+            # Sequence-level χ²: E[(Π ρ_t)²] - 1 = E[exp(2 * Σ log_ratio)] - 1
+            lr_sum = verl_F.masked_sum(lr, response_mask, axis=-1)
+            lr_sum_safe = torch.clamp(lr_sum, min=-SAFETY_BOUND, max=SAFETY_BOUND)
+            rho_squared_seq_decomp = torch.exp(2.0 * lr_sum_safe)
+            chi2_seq_decomp = rho_squared_seq_decomp.mean() - 1.0
+            metrics[f"{prefix}/chi2_seq"] = chi2_seq_decomp.detach().item()
+
+            # --- Per-token distribution stats (Phase 1.5 observability) ---
+            # Signed mean: positive = π_q (new-rollout/old) > π_p (rollout/new-rollout),
+            # i.e., the "reference" policy underestimates relative to the comparison.
+            metrics[f"{prefix}/mean"] = verl_F.masked_mean(lr, response_mask).detach().item()
+            # L1 magnitude — robust to sign cancellation, better signal for "how far off".
+            metrics[f"{prefix}/abs_mean"] = verl_F.masked_mean(lr.abs(), response_mask).detach().item()
+            # Std across tokens — spread of the per-token log-ratio.
+            mean_lr = verl_F.masked_mean(lr, response_mask)
+            var_lr = verl_F.masked_mean((lr - mean_lr).square(), response_mask)
+            metrics[f"{prefix}/std"] = torch.sqrt(var_lr.clamp(min=0.0)).detach().item()
+            # Min/max — extreme token deviations; useful for detecting outlier tokens
+            # (e.g., tokenizer mismatch, OOD token ids).
+            mask_bool = response_mask.bool()
+            metrics[f"{prefix}/min"] = lr.masked_fill(~mask_bool, float("inf")).min().item()
+            metrics[f"{prefix}/max"] = lr.masked_fill(~mask_bool, float("-inf")).max().item()
+            # Fraction of tokens with |log_ratio| > 0.5 (significant deviation;
+            # 0.5 in log-space ≈ r > 1.65 or r < 0.6).
+            metrics[f"{prefix}/fraction_high"] = verl_F.masked_mean(
+                (lr.abs() > 0.5).float(), response_mask
+            ).detach().item()
+            # Fraction of tokens with |log_ratio| < 0.1 (well-aligned; r ∈ (0.9, 1.1)).
+            metrics[f"{prefix}/fraction_low"] = verl_F.masked_mean(
+                (lr.abs() < 0.1).float(), response_mask
+            ).detach().item()
+            # Sign distribution: positive = rollout underestimates vs comparison
+            # policy; negative = overestimates. Together they explain the mean.
+            metrics[f"{prefix}/positive_fraction"] = verl_F.masked_mean(
+                (lr > 0).float(), response_mask
+            ).detach().item()
+            metrics[f"{prefix}/negative_fraction"] = verl_F.masked_mean(
+                (lr < 0).float(), response_mask
+            ).detach().item()
+
+            # --- Per-sequence distribution stats ---
+            # Per-seq sum of log_ratio (proxy for sequence-level importance weight).
+            # Mean across seqs gives the average per-seq log-importance.
+            seq_has_tokens = response_mask.any(dim=-1)  # (N,) bool
+            seq_lr_sum = verl_F.masked_sum(lr, response_mask, axis=-1)  # (N,)
+            if seq_has_tokens.any():
+                seq_lr_sum_valid = seq_lr_sum[seq_has_tokens]
+                metrics[f"{prefix}/seq_mean"] = seq_lr_sum_valid.mean().detach().item()
+                # Worst sequence by absolute per-seq sum — surfaces the most off-policy seq.
+                metrics[f"{prefix}/seq_abs_max"] = seq_lr_sum_valid.abs().max().detach().item()
+                # Std across seqs — variability of per-seq importance.
+                metrics[f"{prefix}/seq_std"] = (
+                    seq_lr_sum_valid.std().detach().item()
+                    if seq_lr_sum_valid.numel() > 1
+                    else 0.0
+                )
+            else:
+                metrics[f"{prefix}/seq_mean"] = 0.0
+                metrics[f"{prefix}/seq_abs_max"] = 0.0
+                metrics[f"{prefix}/seq_std"] = 0.0
+
+            # --- Effective sample size (Kish's ESS) ---
+            # ESS = (Σw)² / Σw² where w = exp(log_ratio) = r. Lower ESS relative
+            # to the actual token count means more off-policy — useful for IS/RS
+            # decision-making in Phase 2.0.
+            w_token = torch.exp(lr_safe)
+            w_sum = verl_F.masked_sum(w_token, response_mask).sum()
+            w_sq_sum = verl_F.masked_sum(w_token.square(), response_mask).sum()
+            ess = (w_sum * w_sum / w_sq_sum).item() if w_sq_sum > 0 else 0.0
+            metrics[f"{prefix}/eff_sample_size"] = float(ess)
+            # ESS ratio = ESS / actual token count — normalized to [0, 1].
+            token_count = response_mask.sum().item()
+            metrics[f"{prefix}/eff_sample_size_ratio"] = (
+                float(ess) / float(token_count) if token_count > 0 else 0.0
+            )
+
     return metrics
 
 
@@ -1045,6 +1177,10 @@ def compute_rollout_correction_and_add_to_batch(
     rollout_rs = rollout_corr_config.get("rollout_rs", None)
     rollout_rs_threshold = rollout_corr_config.get("rollout_rs_threshold", None)
 
+    # 4policy Phase 1: optional π_new-rollout logprob for staleness/mismatch
+    # decomposition. None → baseline combined-ratio path (backward compatible).
+    new_rollout_log_prob = batch.batch.get("new_rollout_log_probs", None)
+
     # Compute IS weights and get modified response_mask
     rollout_is_weights, modified_response_mask, rollout_corr_metrics = compute_rollout_correction_and_rejection_mask(
         old_log_prob=batch.batch["old_log_probs"],
@@ -1055,6 +1191,7 @@ def compute_rollout_correction_and_add_to_batch(
         rollout_is_batch_normalize=rollout_is_batch_normalize,
         rollout_rs=rollout_rs,
         rollout_rs_threshold=rollout_rs_threshold,
+        new_rollout_log_prob=new_rollout_log_prob,
     )
 
     # ALWAYS update response_mask with rejection applied

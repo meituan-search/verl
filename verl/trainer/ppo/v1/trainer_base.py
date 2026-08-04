@@ -547,6 +547,7 @@ class PPOTrainer(ABC):
             )
             metrics.update(off_policy_metrics)
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+            batch = self.on_sampled(batch, metrics=metrics)
             self.on_sample_end()
 
         # 2. [OPTIONAL] compute reward score with colocated reward model
@@ -628,6 +629,26 @@ class PPOTrainer(ABC):
     def on_sample_begin(self):
         """Called at the beginning of sampling batch from replay buffer."""
         return
+
+    def on_sampled(self, batch: "KVBatchMeta", metrics: dict) -> "KVBatchMeta":
+        """Called after replay_buffer.sample and before on_sample_end.
+
+        Override to inject custom pre-processing on the sampled batch while the
+        rollout engine is still awake (e.g., compute π_new-rollout logprobs via
+        selective re-prefill before on_sample_end aborts+sleeps the engine).
+        Default: no-op.
+        """
+        return batch
+
+    def _debug_log_prob_extra_fields(self) -> list[str]:
+        """Extra TQ fields to fetch alongside old_log_prob for debug metrics.
+
+        Override in subclasses that write extra logprob fields in ``on_sampled``
+        (e.g., staleness_sweep writes ``new_rollout_log_probs``). Fetched fields
+        become visible to ``calculate_debug_metrics`` so pairwise diff metrics
+        beyond rollout-vs-old can be emitted.
+        """
+        return []
 
     @abstractmethod
     def on_sample_end(self):
@@ -1513,6 +1534,7 @@ class PPOTrainer(ABC):
         fields = ["entropy", "log_probs", "response_mask"]
         if self.config.actor_rollout_ref.rollout.calculate_log_probs:
             fields.extend(["responses", "rollout_log_probs"])
+        fields.extend(self._debug_log_prob_extra_fields())
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         # 2. write old_log_probs and entropy back to TransferQueue

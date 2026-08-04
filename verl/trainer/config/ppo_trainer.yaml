@@ -242,6 +242,17 @@ trainer:
       # Frequency of parameter synchronization between trainer and rollout
       parameter_sync_step: 4
 
+    # Staleness sweep trainer: one-shot rollout of N*train_batch at W_0,
+    # then N train steps consuming one train_batch each. At step k (k=1..N
+    # within a cycle), samples are (k-1)-step stale; sweep staleness 0..N-1.
+    # Cycles repeat: after N steps, submit another N*train_batch with the
+    # updated weights.
+    staleness_sweep:
+
+      # Number of train steps per sweep cycle. Each cycle submits
+      # N*train_batch prompts for one-shot rollout.
+      num_steps: 8
+
     # Replay buffer sampling strategy
     sampler:
 

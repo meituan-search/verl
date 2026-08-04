@@ -62,13 +62,24 @@ def calculate_log_prob_diff(log_probs1: torch.Tensor, log_probs2: torch.Tensor, 
 
 def calculate_debug_metrics(data: DataProto) -> dict:
     """
-    calculate rollout vs actor logprobs diff, for debugging purpose
+    calculate pairwise logprobs diff between rollout / new_rollout / old (actor),
+    for debugging purpose. Three pairwise comparisons when new_rollout_log_probs
+    is available (staleness_sweep / 4policy Phase 1):
+
+    - rollout vs old           → training/rollout_probs_diff_*           (combined)
+    - new_rollout vs rollout   → training/new_rollout_vs_rollout_probs_diff_*  (staleness)
+    - old vs new_rollout       → training/old_vs_new_rollout_probs_diff_*      (mismatch)
+
+    When new_rollout_log_probs is absent, only the combined comparison is emitted
+    (backward compatible with the original behavior).
 
     Args:
         data: DataProto
             the data batch to calculate
             rollout_log_probs: log_probs record when rollout forward tokens
             old_log_probs(actor log probs): log_probs record when actor forward tokens
+            new_rollout_log_probs (optional): log_probs from re-prefill at current
+                rollout engine weight (π_new-rollout); enables staleness/mismatch
             loss_mask or attention_mask: to mask unrelated token
             responses: the response tokens, for calculating size
     Returns:
@@ -77,11 +88,18 @@ def calculate_debug_metrics(data: DataProto) -> dict:
             "training/rollout_probs_diff_max": max value of logprob diff of rollout vs. actor
             "training/rollout_probs_diff_mean": mean value of logprob diff of rollout vs. actor
             "training/rollout_probs_diff_std": std value of logprob diff of rollout vs. actor
-            "training/rollout_actor_probs_pearson_corr": logprob's pearson corrcoef of rollout vs. actor, reference to https://arxiv.org/pdf/2506.13585
+            "training/rollout_actor_probs_pearson_corr": logprob's pearson corrcoef of rollout vs. actor
+            (when new_rollout_log_probs present, also:)
+            "training/new_rollout_vs_rollout_probs_diff_{valid,max,mean,std}"
+            "training/new_rollout_rollout_probs_pearson_corr"
+            "training/old_vs_new_rollout_probs_diff_{valid,max,mean,std}"
+            "training/old_new_rollout_probs_pearson_corr"
     """
 
     rollout_old_log_probs = data.batch["rollout_log_probs"]
     actor_old_log_probs = data.batch["old_log_probs"]
+    has_new_rollout = "new_rollout_log_probs" in data.batch
+    new_rollout_log_probs = data.batch.get("new_rollout_log_probs", None) if has_new_rollout else None
     if "response_mask" in data.batch:
         logger.debug("response mask found, use it to mask log probs")
         log_prob_mask = data.batch["response_mask"]
@@ -97,25 +115,67 @@ def calculate_debug_metrics(data: DataProto) -> dict:
     # calculate pearson corrcoef
     actor_probs = torch.exp(actor_old_log_probs)
     rollout_probs = torch.exp(rollout_old_log_probs)
+    new_rollout_probs = torch.exp(new_rollout_log_probs) if new_rollout_log_probs is not None else None
     response_mask_bool = response_mask.bool()
 
     # check if there are any valid tokens before computing metrics
     if not response_mask_bool.any():
         logger.warning("response_mask is all False, returning default metrics")
-        return {
+        metrics = {
             "training/rollout_probs_diff_valid": 0,
             "training/rollout_probs_diff_max": float("nan"),
             "training/rollout_probs_diff_mean": float("nan"),
             "training/rollout_probs_diff_std": float("nan"),
             "training/rollout_actor_probs_pearson_corr": float("nan"),
         }
+        if new_rollout_probs is not None:
+            metrics.update({
+                "training/new_rollout_vs_rollout_probs_diff_valid": 0,
+                "training/new_rollout_vs_rollout_probs_diff_max": float("nan"),
+                "training/new_rollout_vs_rollout_probs_diff_mean": float("nan"),
+                "training/new_rollout_vs_rollout_probs_diff_std": float("nan"),
+                "training/new_rollout_rollout_probs_pearson_corr": float("nan"),
+                "training/old_vs_new_rollout_probs_diff_valid": 0,
+                "training/old_vs_new_rollout_probs_diff_max": float("nan"),
+                "training/old_vs_new_rollout_probs_diff_mean": float("nan"),
+                "training/old_vs_new_rollout_probs_diff_std": float("nan"),
+                "training/old_new_rollout_probs_pearson_corr": float("nan"),
+            })
+        return metrics
 
+    # Pair 1: rollout vs old (actor) — combined off-policy gap (always emitted)
     pearson_corrcoef = pearson_correlation_coefficient(actor_probs, rollout_probs, response_mask_bool)
     rollout_probs_diff = calculate_log_prob_diff(actor_probs, rollout_probs, response_mask_bool)
-    return {
+    metrics = {
         "training/rollout_probs_diff_valid": 1,
         "training/rollout_probs_diff_max": torch.max(rollout_probs_diff).detach().item(),
         "training/rollout_probs_diff_mean": torch.mean(rollout_probs_diff).detach().item(),
         "training/rollout_probs_diff_std": torch.std(rollout_probs_diff).detach().item(),
         "training/rollout_actor_probs_pearson_corr": pearson_corrcoef,
     }
+
+    # Pair 2 & 3: only when π_new-rollout (new_rollout_log_probs) is available
+    if new_rollout_probs is not None:
+        # Pair 2: new_rollout vs rollout — staleness (weight drift since decode time)
+        new_rollout_rollout_diff = calculate_log_prob_diff(new_rollout_probs, rollout_probs, response_mask_bool)
+        new_rollout_rollout_pearson = pearson_correlation_coefficient(
+            new_rollout_probs, rollout_probs, response_mask_bool
+        )
+        metrics["training/new_rollout_vs_rollout_probs_diff_valid"] = 1
+        metrics["training/new_rollout_vs_rollout_probs_diff_max"] = torch.max(new_rollout_rollout_diff).detach().item()
+        metrics["training/new_rollout_vs_rollout_probs_diff_mean"] = torch.mean(new_rollout_rollout_diff).detach().item()
+        metrics["training/new_rollout_vs_rollout_probs_diff_std"] = torch.std(new_rollout_rollout_diff).detach().item()
+        metrics["training/new_rollout_rollout_probs_pearson_corr"] = new_rollout_rollout_pearson
+
+        # Pair 3: old vs new_rollout — T/R engine mismatch at same weight
+        old_new_rollout_diff = calculate_log_prob_diff(actor_probs, new_rollout_probs, response_mask_bool)
+        old_new_rollout_pearson = pearson_correlation_coefficient(
+            actor_probs, new_rollout_probs, response_mask_bool
+        )
+        metrics["training/old_vs_new_rollout_probs_diff_valid"] = 1
+        metrics["training/old_vs_new_rollout_probs_diff_max"] = torch.max(old_new_rollout_diff).detach().item()
+        metrics["training/old_vs_new_rollout_probs_diff_mean"] = torch.mean(old_new_rollout_diff).detach().item()
+        metrics["training/old_vs_new_rollout_probs_diff_std"] = torch.std(old_new_rollout_diff).detach().item()
+        metrics["training/old_new_rollout_probs_pearson_corr"] = old_new_rollout_pearson
+
+    return metrics
