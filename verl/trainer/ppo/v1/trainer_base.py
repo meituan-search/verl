@@ -155,7 +155,14 @@ class PPOTrainer(ABC):
         if has_custom_sampler:
             sampler_cls = load_extern_type(custom_sampler.path, custom_sampler.name)
         else:
-            sampler_cls = ReplayBuffer if self.trainer_mode == "sync" else ReplayBufferAsync
+            # staleness_sweep extends PPOTrainerSync (sleep_replicas in
+            # on_sample_end, no in-flight requests during training) and
+            # manages its own cycle submission via _wait_for_cycle_rollout_complete,
+            # so it uses the sync ReplayBuffer. ReplayBufferAsync's unconditional
+            # eviction+refill of failure_keys would submit new prompts mid-cycle,
+            # breaking the "all at W_0" assumption.
+            sync_modes = ("sync", "staleness_sweep")
+            sampler_cls = ReplayBuffer if self.trainer_mode in sync_modes else ReplayBufferAsync
 
         replay_buffer_kwargs = dict(
             trainer_mode=self.trainer_mode,
