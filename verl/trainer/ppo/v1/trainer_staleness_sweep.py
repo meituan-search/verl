@@ -106,11 +106,11 @@ class PPOTrainerStalenessSweep(PPOTrainerSync):
     def _compute_new_rollout_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         # Reprefill all trajectories with current rollout engine weight.
         resume_version = self.global_steps - 1
-        prompt_ids_list, real_lens = self._build_reprefill_inputs(
+        prompt_ids_list, real_lens, data = self._build_reprefill_inputs(
             keys=batch.keys, partition_id=batch.partition_id
         )
         sampling_params_list = [
-            {"prompt_logprobs": 0, "logprobs": True, "max_new_tokens": 0}
+            {"prompt_logprobs": 0, "max_new_tokens": 0}
         ] * len(batch.keys)
         results = self._reprefill_trajectories_async(prompt_ids_list, sampling_params_list)
 
@@ -122,10 +122,19 @@ class PPOTrainerStalenessSweep(PPOTrainerSync):
                 self._slice_response_logprobs(prompt_logprobs_ls, prompt_len, response_len)
             )
 
+        # Store as nested jagged tensor (same format as rollout_log_probs /
+        # old_log_probs in TQ) so KVBatch.to_padded_tensor() converts it
+        # correctly downstream. NonTensorStack (from tu.get_tensordict) is
+        # not recognized by to_padded_tensor, breaking torch.exp in
+        # calculate_debug_metrics.
+        data["new_rollout_log_probs"] = torch.nested.as_nested_tensor(
+            [torch.tensor(lst, dtype=torch.float32) for lst in new_rollout_log_probs_nested],
+            layout=torch.jagged,
+        )
         tq.kv_batch_put(
             keys=batch.keys,
             partition_id=batch.partition_id,
-            fields={"new_rollout_log_probs": new_rollout_log_probs_nested},
+            fields=data.select("new_rollout_log_probs"),
         )
         for i in range(len(batch.keys)):
             if batch.tags[i] is None:
@@ -166,7 +175,7 @@ class PPOTrainerStalenessSweep(PPOTrainerSync):
             response_ids = [int(x) for x in responses_padded[i].tolist() if x != pad_id]
             prompt_ids_list.append(prompt_ids + response_ids)
             real_lens.append((len(prompt_ids), len(response_ids)))
-        return prompt_ids_list, real_lens
+        return prompt_ids_list, real_lens, data
 
     def _slice_response_logprobs(self, prompt_logprobs_ls, prompt_len, response_len):
         # sglang prompt_logprobs_ls has length S = prompt_len + response_len.
@@ -199,13 +208,13 @@ class PPOTrainerStalenessSweep(PPOTrainerSync):
             logger.warning(f"staleness_sweep: failed to fetch logprobs for metrics: {e}")
             return
 
-        response_mask = data["response_mask"]
         from verl import DataProto
         data = DataProto(batch=data.to_padded_tensor())
 
         rollout_lp = data.batch["rollout_log_probs"]
         new_rollout_lp = data.batch["new_rollout_log_probs"]
         old_lp = data.batch["old_log_probs"]
+        response_mask = data.batch["response_mask"]
 
         # resume_version (set in on_sampled) vs implicit consume_version
         # (= global_steps, since _compute_old_log_prob runs at this step).
