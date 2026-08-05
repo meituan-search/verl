@@ -80,6 +80,12 @@ class PPOTrainerStalenessSweep(PPOTrainerSync):
             num_steps = self.config.trainer.v1.staleness_sweep.num_steps
             for _ in range(num_steps):
                 self._add_batch_to_generate()
+            # Block until all N*train_batch trajectories are in TQ (decoded
+            # at W_0). Subsequent steps then run normal sync PPO semantics:
+            # sample chunk → on_sampled (reprefill at W_{k-1}) →
+            # on_sample_end (sleep SGLang, safe because all generation is
+            # done) → train → on_step_end (update weights to W_k).
+            self._wait_for_cycle_rollout_complete()
             self._steps_since_rollout = num_steps
         self._steps_since_rollout -= 1
 
@@ -96,6 +102,38 @@ class PPOTrainerStalenessSweep(PPOTrainerSync):
         with marked_timer("new_rollout_log_prob", self.timing_raw, color="blue"):
             batch = self._compute_new_rollout_log_prob(batch, metrics)
         return batch
+
+    def _wait_for_cycle_rollout_complete(self) -> None:
+        # Block until every prompt submitted at cycle start has finished (or
+        # failed) generation. Without this, on_sample_end would call
+        # sleep_replicas while SGLang still has N-1 chunks in-flight, hitting
+        # sglang's "release_memory_occupation should be called only when no
+        # ongoing request" assertion. After the wait, all N*train_batch
+        # trajectories are in TQ at W_0, SGLang is idle, and the parent's
+        # on_sample_end can safely sleep the engine each step.
+        import time
+        rb = self.replay_buffer
+        last_debug = time.time()
+        while True:
+            rb._sync_metadata_from_transfer_queue()
+            pending = len(rb.pending_keys.get("train", set()))
+            running = len(rb.running_keys.get("train", set()))
+            if pending == 0 and running == 0:
+                break
+            now = time.time()
+            if now - last_debug > 30:
+                logger.info(
+                    f"staleness_sweep: waiting for cycle rollout to finish "
+                    f"(pending={pending}, running={running})"
+                )
+                last_debug = now
+            time.sleep(rb.poll_interval)
+        finished = len(rb.finished_keys.get("train", set()))
+        failure = len(rb.failure_keys.get("train", set()))
+        logger.info(
+            f"staleness_sweep: cycle rollout complete — "
+            f"finished={finished}, failure={failure}, pending=0, running=0"
+        )
 
     def _debug_log_prob_extra_fields(self) -> list[str]:
         # Expose new_rollout_log_probs (written in on_sampled) to
