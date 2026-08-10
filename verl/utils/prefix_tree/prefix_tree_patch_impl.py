@@ -103,9 +103,9 @@ def magi_attn_forward(
     Returns ``(local_tokens, 1, num_heads*head_dim)``.
     """
 
-    q = query.squeeze(1)
-    k = key.squeeze(1)
-    v = value.squeeze(1)
+    q = query.squeeze(1).contiguous()
+    k = key.squeeze(1).contiguous()
+    v = value.squeeze(1).contiguous()
 
     out, _ = calc_attn(q, k, v, magi_attention_key)
 

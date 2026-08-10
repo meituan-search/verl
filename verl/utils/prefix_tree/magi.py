@@ -50,6 +50,37 @@ from verl.utils.prefix_tree.utils import build_layout_from_tree_node
 
 
 @dataclass
+class PackRestorationParam:
+    """Per-micro-batch layout info for restoring flat tensors to per-sample.
+
+    Computed by build_layout_from_tree_node, consumed by restore_flat_to_nested.
+    Separate from PrefixTreeMagiBatch (forward-pass data) — this is only for
+    unpacking model output back to per-sample tensors.
+    """
+    # Per-leaf flat token range in the packed layout.
+    segment_ranges: list[tuple[int, int]]
+    # Shared prefix range (start, end) in flat layout.
+    prefix_range: tuple[int, int]
+    # Per-leaf ancestor ranges: ancestor_segment_ranges[i] = [(start,end), ...]
+    # None for single-level trees (use prefix_range directly).
+    ancestor_segment_ranges: Optional[list[list[tuple[int, int]]]] = None
+    # Boundary registry for LCE boundary-patch. None when no branching.
+    boundary_registry: Optional[object] = None
+
+    def segment_to_sample(self, subtrie) -> list[int]:
+        """Fetch leaf-to-sample mapping from the subtrie (live, not stored)."""
+        return subtrie.leaf_to_sample
+
+    def original_batch_size(self, subtrie) -> int:
+        """Number of unique samples (from subtrie)."""
+        return len(subtrie.global_sample_ids)
+
+    def real_tokens(self, pt_batch: PrefixTreeMagiBatch) -> int:
+        """Real token count (from packed input_ids shape)."""
+        return pt_batch.tree_packed_input_ids.shape[0]
+
+
+@dataclass
 class PrefixTreeMagiBatch:
     """Holds the tree-packed layout and MAGI key for one prefix-tree micro-batch."""
 
@@ -61,50 +92,14 @@ class PrefixTreeMagiBatch:
     magi_key: object  # MAGI key (None when using flex)
     flex_key: object  # flex_attention block_mask (None when using magi)
 
-    # mapping needed for output restoration
-    # segment_to_sample[i] = original sample index for leaf i
-    segment_to_sample: list[int]
-    # segment_ranges[i] = (start, end) token offset in flat layout for leaf i
-    segment_ranges: list[tuple[int, int]]
-    prefix_range: tuple[int, int]
-
-    # original batch size (= number of leaves for single-level tree)
-    original_batch_size: int
-
-    # per-token labels derived from tree_packed_tokens via within-segment shift
+    # Per-token labels derived from tree_packed_tokens via within-segment shift
     tree_packed_labels: Optional[Tensor] = None  # (total_tokens,)
 
-    # number of real (non-padding) tokens; may be < tree_packed_input_ids.shape[0]
-    # when tp_size > 1 padding was added for sequence-parallel divisibility
-    real_tokens: int = 0
+    # Restoration params for unpacking model output to per-sample tensors
+    restoration: Optional[PackRestorationParam] = None
 
-    # ancestor_segment_ranges[i] = list of (start,end) flat ranges that precede leaf i
-    # For single-level: None (use prefix_range directly)
-    # For multilevel: [(0, root_end), (turn2_start, turn2_end)] etc.
-    ancestor_segment_ranges: Optional[list[list[tuple[int, int]]]] = None
-
-    # CP-local tensors: after magi dispatch, each CP rank only processes its assigned tokens.
-    # When CP=1, these equal tree_packed_input_ids/tree_packed_position_ids.
-    # Shape: (local_tokens, ...) where local_tokens = total_tokens / cp_effective
-    local_tree_packed_input_ids: Optional[Tensor] = None
-    local_tree_packed_position_ids: Optional[Tensor] = None
-
-    # Boundary registry for the LCE boundary-patch fix (see
-    # ``prepare_packed_label`` in utils.py).  Built driver-side in
-    # ``build_layout_from_tree_node``, consumed worker-side in
-    # ``post_processing_packed_lce`` (forward.py).  Plain Python — RPC-safe.
-    # None when no branching exists.  Typed as ``object`` to avoid importing
-    # ``BoundaryRegistry`` (a plain list of tuples of ints) here.
-    boundary_registry: Optional[object] = None
-
-    def __post_init__(self):
-        if self.real_tokens == 0:
-            self.real_tokens = int(self.tree_packed_input_ids.shape[0])
-        # Default local to full when not set (CP=1 or flex path)
-        if self.local_tree_packed_input_ids is None:
-            self.local_tree_packed_input_ids = self.tree_packed_input_ids
-        if self.local_tree_packed_position_ids is None:
-            self.local_tree_packed_position_ids = self.tree_packed_position_ids
+    # Live subtrie reference for restoration lookups (leaf_to_sample, etc.)
+    subtrie: Optional[object] = None
 
 
 def build_prefix_tree_micro_batch(
@@ -232,15 +227,15 @@ def _build_sample_tensors(
     tensors pass ``None`` (entropy at the boundary is distribution-level — same
     for all leaves sharing the hidden state — so no per-leaf patch needed).
     """
-    prefix_start, prefix_end = pt_batch.prefix_range
+    prefix_start, prefix_end = pt_batch.restoration.prefix_range
     prefix_slice = flat_tensor[prefix_start:prefix_end]
-    n = pt_batch.original_batch_size
+    n = len(pt_batch.subtrie.leaves)
     sample_tensors: list[Optional[Tensor]] = [None] * n
-    for leaf_idx, sample_idx in enumerate(pt_batch.segment_to_sample):
-        s, e = pt_batch.segment_ranges[leaf_idx]
+    for leaf_idx, sample_idx in enumerate(pt_batch.subtrie.leaf_to_sample):
+        s, e = pt_batch.restoration.segment_ranges[leaf_idx]
         leaf_slice = flat_tensor[s:e]
-        if pt_batch.ancestor_segment_ranges is not None:
-            ranges = pt_batch.ancestor_segment_ranges[leaf_idx]
+        if pt_batch.restoration.ancestor_segment_ranges is not None:
+            ranges = pt_batch.restoration.ancestor_segment_ranges[leaf_idx]
             parts: list[Tensor] = []
             for a, b in ranges:
                 part = flat_tensor[a:b]
@@ -411,11 +406,9 @@ def prefix_tree_decoder_key_context(model, magi_attention_key=None, flex_attenti
 
 _PREFIX_TREE_KEYS = frozenset(
     {
-        "loss_mask",
         "use_prefix_tree",
         "prefix_tree_attention",
         "prefix_tree_subtree",
-        "response_attention_mask",
     }
 )
 

@@ -15,9 +15,9 @@
 
 Class hierarchy:
 
-    TrieNode:       compressed trie node; root holds flat DFS-ordered ``nodes``
-                      list; ``nodes[i].node_idx == i`` for O(1) lookup and future
-                      KV-cache indexing.
+    TrieNode:       compressed trie node.  No tree-level metadata — ``nodes``,
+                      ``leaves``, ``node_idx`` assignment and ``finalize()`` are
+                      managed by :class:`PrefixTrie` (the container).
 
     PrefixTrie:     common interface for navigating a prefix trie.
                       Both the global trie and per-micro-batch view expose this
@@ -43,21 +43,19 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(eq=False)
 class TrieNode:
     """Compressed-trie node.
 
     Each non-root node represents a contiguous run of tokens shared by the same
     set of sequences.  The root has no tokens and no parent (``ancestor=None``).
 
-    Build phase (before ``finalize()``): ``input_ids``, ``children``,
-    ``sequence_ids``, ``ancestor`` are set by insert/split.
+    Pure node — no tree-level metadata. ``node_idx``, ``nodes``, ``leaves``
+    are managed by ``PrefixTrie`` (the container), not by the node itself.
 
-    After ``finalize()``: ``node_idx``, ``nodes``, ``leaves`` are assigned once
-    and the tree becomes immutable.
-
-    ``nodes`` (root-only): flat DFS-ordered list of all non-root nodes.
-    ``nodes[i].node_idx == i`` for O(1) lookup.
+    Transient layout attributes set externally by ``build_layout_from_tree_node``
+    (not part of the node's identity): ``_flat_start``, ``_flat_end``,
+    ``_owner_offset``, ``_owner_sample``.
     """
 
     input_ids: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
@@ -66,20 +64,13 @@ class TrieNode:
     sequence_ids: list[int] = field(default_factory=list)
     # Direct parent reference: single hop upward; None on root.
     ancestor: Optional[TrieNode] = None
-    # Root-only: flat DFS list; nodes[i].node_idx == i.
-    nodes: list[TrieNode] = field(default_factory=list)
-    # Root-only: leaves[sample_idx] = leaf TrieNode for that sample.
-    # Direct O(1) index → leaf map; populated during finalize().
-    leaves: list[Optional[TrieNode]] = field(default_factory=list)
-    # DFS index in root.nodes: -1 until finalize().
-    node_idx: int = -1
 
     @property
     def is_root(self) -> bool:
-        return self.node_idx == -1
+        return self.ancestor is None
 
     def _add_child(self, input_ids: np.ndarray, sequence_ids: list[int] | None = None) -> TrieNode:
-        """Add a new child node. Must only be called before ``finalize()``."""
+        """Add a new child node. Must only be called before finalize()."""
         child = TrieNode(
             input_ids=input_ids,
             sequence_ids=sequence_ids or [],
@@ -147,20 +138,85 @@ class TrieNode:
         # sequence_ids stays (prefix node keeps its seq_ids + caller appends).
         return suffix
 
+
+# ---------------------------------------------------------------------------
+# PrefixTrie: common interface (global trie + subtrie view)
+# ---------------------------------------------------------------------------
+
+
+class PrefixTrie:
+    """Common interface for navigating and building a prefix trie.
+
+    Concrete subclasses:
+      - PrefixTrie itself:  wraps the global TrieNode root for a full batch
+      - PrefixSubTrie:      filtered view for one micro-batch
+
+    Both expose the same interface so downstream code (layout builder, MAGI
+    key construction, KV-cache lookup) works identically on either.
+
+    Tree-level metadata (``nodes``, ``leaves``, ``_finalized``) lives here,
+    not on TrieNode. ``node_idx`` is assigned by ``finalize()`` as a
+    transient attribute on each TrieNode.
+    """
+
+    def __init__(self, root: TrieNode | None = None) -> None:
+        if root is None:
+            root = TrieNode()  # empty root for building
+        self.root = root
+        self.nodes: list[TrieNode] = []
+        self.leaves: list[Optional[TrieNode]] = []
+        self._finalized: bool = False
+
+    # ── root delegation (backward compat for callers that use trie.children) ─
+
+    @property
+    def children(self) -> dict[int, TrieNode]:
+        """Delegate to root's children so callers can use trie.children."""
+        return self.root.children
+
+    @property
+    def is_root(self) -> bool:
+        """Always True — PrefixTrie wraps the root node."""
+        return True
+
+    # ── navigation ────────────────────────────────────────────────────────
+
+    def __getitem__(self, node_idx: int) -> TrieNode:
+        """O(1) node lookup by node_idx."""
+        return self.nodes[node_idx]
+
+    def __iter__(self):
+        """Iterate all nodes in DFS order."""
+        return iter(self.nodes)
+
+    @property
+    def leaf_nodes(self) -> list[TrieNode]:
+        """Leaf nodes (no children) in DFS order."""
+        return [n for n in self.nodes if not n.children]
+
+    # ── build ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _unfinalized(method):
+        """Decorator: raise if the tree is finalized."""
+        @functools.wraps(method)
+        def wrapper(self, *args, **kwargs):
+            if self._finalized:
+                raise RuntimeError(f"{method.__name__}() called after finalize() — tree is immutable.")
+            return method(self, *args, **kwargs)
+        return wrapper
+
+    @_unfinalized
+    def insert(self, sequence, seq_id: int) -> None:
+        """Insert a full token sequence. Must be called before finalize()."""
+        self.root.insert(sequence, seq_id)
+
     def finalize(self) -> None:
-        """Assign node_idx, populate nodes and leaves (root-only).
+        """Assign node_idx, populate nodes and leaves. Tree is immutable after.
 
         Walks the tree in DFS pre-order (sorted by first token for deterministic,
-        insertion-order-independent output), assigning ``node_idx`` to each
-        node and collecting them into root's ``nodes`` list.
-
-        Also re-sorts each node's ``children`` dict to match the DFS order, so
-        that ``children.values()`` yields the same order as ``trie.nodes`` —
-        all downstream code gets one consistent traversal regardless of
-        whether it iterates ``trie.nodes`` or walks ``children``.
-
-        After finalize, the tree is immutable — do not call ``insert()`` or
-        ``split()``.
+        insertion-order-independent output). Also re-sorts each node's
+        ``children`` dict so ``children.values()`` matches ``trie.nodes`` order.
         """
         self.nodes = []
         self.leaves = []
@@ -182,77 +238,11 @@ class TrieNode:
                     _walk(child, node)
 
         # Root's children: also sort for consistency.
-        self.children = dict(sorted(self.children.items()))
-        for child in self.children.values():
+        self.root.children = dict(sorted(self.root.children.items()))
+        for child in self.root.children.values():
             _walk(child, None)
 
-
-# ---------------------------------------------------------------------------
-# PrefixTrie: common interface (global trie + subtrie view)
-# ---------------------------------------------------------------------------
-
-
-class PrefixTrie:
-    """Common interface for navigating and building a prefix trie.
-
-    Concrete subclasses:
-      - PrefixTrie itself:  wraps the global TrieNode root for a full batch
-      - PrefixSubTrie:      filtered view for one micro-batch
-
-    Both expose the same interface so downstream code (layout builder, MAGI
-    key construction, KV-cache lookup) works identically on either.
-    """
-
-    nodes: list[TrieNode]  # flat DFS list; nodes[i].node_idx == i
-    root: TrieNode  # virtual root (is_root=True)
-
-    def __init__(self, root: TrieNode | None = None) -> None:
-        if root is None:
-            root = TrieNode()  # empty root for building
-        self.root = root
-        self.nodes = root.nodes  # shared reference, no copy
-
-    # ── navigation ────────────────────────────────────────────────────────
-
-    def __getitem__(self, node_idx: int) -> TrieNode:
-        """O(1) node lookup by node_idx."""
-        return self.nodes[node_idx]
-
-    def __iter__(self):
-        """Iterate all nodes in DFS order (same as trie.nodes)."""
-        return iter(self.nodes)
-
-    @property
-    def leaf_nodes(self) -> list[TrieNode]:
-        """Leaf nodes (no children) in DFS order from trie.nodes.
-
-        Single source of truth — replaces per-consumer tree walking.
-        """
-        return [n for n in self.nodes if not n.children]
-
-    # ── build ─────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _unfinalized(method):
-        """Decorator: raise if the tree is finalized."""
-
-        @functools.wraps(method)
-        def wrapper(self, *args, **kwargs):
-            if self.nodes:
-                raise RuntimeError(f"{method.__name__}() called after finalize() — tree is immutable.")
-            return method(self, *args, **kwargs)
-
-        return wrapper
-
-    @_unfinalized
-    def insert(self, sequence, seq_id: int) -> None:
-        """Insert a full token sequence. Must be called before finalize()."""
-        self.root.insert(sequence, seq_id)
-
-    def finalize(self) -> None:
-        """Assign node_idx, populate nodes and leaves. Tree is immutable after."""
-        self.root.finalize()
-        self.nodes = self.root.nodes  # update shared reference
+        self._finalized = True
 
     # ── metrics ───────────────────────────────────────────────────────────
 
@@ -306,7 +296,8 @@ class PrefixSubTrie(PrefixTrie):
         self.leaf_node_ids = leaf_node_ids
         self.leaf_to_sample = leaf_to_sample
         self.root = source.root
-        self.nodes = self._collect_nodes(source, leaf_node_ids)
+        self._finalized = True  # subtries are always finalized (read-only views)
+        self.nodes, self.leaves = self._collect_nodes(source, leaf_node_ids)
         # Build shard-local leaf_ids: indexed by local position (0..shard_size-1).
         # global_sample_ids[i] is the global sample index for local position i.
         self.global_sample_ids = sorted(set(leaf_to_sample))
@@ -317,10 +308,14 @@ class PrefixSubTrie(PrefixTrie):
             self.leaf_ids[_global_to_local[sample_idx]] = leaf_node_ids[i]
 
     @staticmethod
-    def _collect_nodes(source: PrefixTrie, leaf_node_ids: list[int]) -> list[TrieNode]:
-        """Collect nodes reachable from the given leaves (leaves + all ancestors)."""
+    def _collect_nodes(source: PrefixTrie, leaf_node_ids: list[int]) -> tuple[list[TrieNode], list[Optional[TrieNode]]]:
+        """Collect nodes reachable from the given leaves (leaves + all ancestors).
+
+        Returns (nodes, leaves): the flat DFS node list and sample→leaf map.
+        Reassigns local ``node_idx`` on each node (subtrie-local indexing).
+        """
         seen: set[int] = set()
-        result: list[TrieNode] = []
+        nodes: list[TrieNode] = []
         for idx in leaf_node_ids:
             node = source[idx]
             path: list[TrieNode] = []
@@ -331,8 +326,18 @@ class PrefixSubTrie(PrefixTrie):
             for n in reversed(path):
                 if n.node_idx not in seen:
                     seen.add(n.node_idx)
-                    result.append(n)
-        return result
+                    nodes.append(n)
+
+        # Assign local node_idx and collect leaves.
+        leaves: list[Optional[TrieNode]] = []
+        for local_idx, node in enumerate(nodes):
+            node.node_idx = local_idx
+            if not node.children:
+                for sid in node.sequence_ids:
+                    while len(leaves) <= sid:
+                        leaves.append(None)
+                    leaves[sid] = node
+        return nodes, leaves
 
     def __getstate__(self) -> dict:
         """Pickle without the full trie back-references.
@@ -363,8 +368,9 @@ class PrefixSubTrie(PrefixTrie):
         by_node_idx: dict[int, TrieNode] = {}
         for node_idx, input_ids, _anc, sequence_ids in state["nodes_data"]:
             node = TrieNode(
-                input_ids=np.array(input_ids, dtype=np.int64), sequence_ids=list(sequence_ids), node_idx=node_idx
+                input_ids=np.array(input_ids, dtype=np.int64), sequence_ids=list(sequence_ids)
             )
+            node.node_idx = node_idx
             by_node_idx[node_idx] = node
 
         for node_idx, input_ids, ancestor_node_idx, _seq in state["nodes_data"]:
@@ -389,11 +395,11 @@ def build_global_tree_from_segments(
     samples: list,
     segment_hashes,
     segment_lengths,
-) -> Optional[TrieNode]:
-    """Build a global TrieNode from segment metadata, supporting multilevel trees.
+) -> Optional[PrefixTrie]:
+    """Build a global PrefixTrie from segment metadata, supporting multilevel trees.
 
     O(N) construction using known prefix structure, no token-by-token
-    comparison.  Returns a TrieNode root compatible with ``mbs_groups_from_trie``
+    comparison.  Returns a :class:`PrefixTrie` compatible with ``mbs_groups_from_trie``
     and ``subtrie_view``.
 
     Recurses through every segment level: samples sharing levels 0..k get an
@@ -403,7 +409,8 @@ def build_global_tree_from_segments(
     after the last shared segment.
 
     Children of the root are keyed by level-0 hash (deterministic DFS order).
-    Children of intermediate nodes are keyed by ``node_idx`` (unique).
+    Children of intermediate nodes are keyed by a unique counter (avoids
+    collision when two siblings start with the same token).
 
     Args:
         samples: List of 1-D token tensors or lists (one per sequence).
@@ -411,7 +418,7 @@ def build_global_tree_from_segments(
         segment_lengths: (N,) object-dtype numpy array of length lists.
 
     Returns:
-        TrieNode root, or None if fewer than 2 samples.
+        PrefixTrie, or None if fewer than 2 samples.
     """
     if not samples or len(samples) < 2:
         return None
@@ -425,8 +432,11 @@ def build_global_tree_from_segments(
     groups = group_by_segment_hash(segment_hashes, segment_lengths, level=0)
 
     trie_root = TrieNode()
-    trie_root.nodes = []
-    trie_root.leaves = [None] * len(samples)
+    _key_counter = [0]
+
+    def _next_key() -> int:
+        _key_counter[0] += 1
+        return _key_counter[0]
 
     for uid_hash in sorted(groups.keys()):
         group = groups[uid_hash]
@@ -437,12 +447,10 @@ def build_global_tree_from_segments(
             prefix_tokens = samples[first_idx][:prefix_len]
 
             prefix_node = TrieNode(
-                input_ids=prefix_tokens,
+                input_ids=np.array(prefix_tokens),
                 sequence_ids=list(all_seq_ids),
                 ancestor=None,
-                node_idx=len(trie_root.nodes),
             )
-            trie_root.nodes.append(prefix_node)
             trie_root.children[uid_hash] = prefix_node
 
             _build_segment_subtree(
@@ -453,22 +461,24 @@ def build_global_tree_from_segments(
                 level=1,
                 accumulated_len=prefix_len,
                 parent_node=prefix_node,
-                trie_root=trie_root,
+                next_key=_next_key,
             )
         else:
             seq_idx = group[0][0]
             all_tokens = samples[seq_idx]
             leaf = TrieNode(
-                input_ids=all_tokens,
+                input_ids=np.array(all_tokens),
                 sequence_ids=[seq_idx],
                 ancestor=None,
-                node_idx=len(trie_root.nodes),
             )
-            trie_root.nodes.append(leaf)
             trie_root.children[uid_hash] = leaf
-            trie_root.leaves[seq_idx] = leaf
 
-    return trie_root if trie_root.nodes else None
+    if not trie_root.children:
+        return None
+
+    trie = PrefixTrie(root=trie_root)
+    trie.finalize()
+    return trie
 
 
 def _build_segment_subtree(
@@ -479,7 +489,7 @@ def _build_segment_subtree(
     level: int,
     accumulated_len: int,
     parent_node: TrieNode,
-    trie_root: TrieNode,
+    next_key,
 ) -> None:
     """Recursively build ancestor nodes for shared segments at ``level`` >= 1.
 
@@ -492,14 +502,11 @@ def _build_segment_subtree(
         if level >= len(segment_hashes[sid]):
             remaining = samples[sid][accumulated_len:]
             leaf = TrieNode(
-                input_ids=remaining,
+                input_ids=np.array(remaining),
                 sequence_ids=[sid],
                 ancestor=parent_node,
-                node_idx=len(trie_root.nodes),
             )
-            trie_root.nodes.append(leaf)
-            parent_node.children[leaf.node_idx] = leaf
-            trie_root.leaves[sid] = leaf
+            parent_node.children[next_key()] = leaf
 
     # Subgroup remaining samples by hash at this level.
     subgroups: dict[int, list[int]] = {}
@@ -514,13 +521,11 @@ def _build_segment_subtree(
             seg_len = int(segment_lengths[subgroup[0]][level])
             seg_tokens = samples[subgroup[0]][accumulated_len : accumulated_len + seg_len]
             node = TrieNode(
-                input_ids=seg_tokens,
+                input_ids=np.array(seg_tokens),
                 sequence_ids=list(subgroup),
                 ancestor=parent_node,
-                node_idx=len(trie_root.nodes),
             )
-            trie_root.nodes.append(node)
-            parent_node.children[node.node_idx] = node
+            parent_node.children[next_key()] = node
             _build_segment_subtree(
                 samples,
                 segment_hashes,
@@ -529,20 +534,17 @@ def _build_segment_subtree(
                 level=level + 1,
                 accumulated_len=accumulated_len + seg_len,
                 parent_node=node,
-                trie_root=trie_root,
+                next_key=next_key,
             )
         else:
             sid = subgroup[0]
             remaining = samples[sid][accumulated_len:]
             leaf = TrieNode(
-                input_ids=remaining,
+                input_ids=np.array(remaining),
                 sequence_ids=[sid],
                 ancestor=parent_node,
-                node_idx=len(trie_root.nodes),
             )
-            trie_root.nodes.append(leaf)
-            parent_node.children[leaf.node_idx] = leaf
-            trie_root.leaves[sid] = leaf
+            parent_node.children[next_key()] = leaf
 
 
 def trie_ancestors(node: TrieNode) -> list[TrieNode]:

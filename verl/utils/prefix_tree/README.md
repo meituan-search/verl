@@ -110,8 +110,8 @@ Flat packed layout (tokens processed once):
 ### Key components
 
 **Data structures** (`tree.py`):
-- `TrieNode`: compressed trie node with `flat_idx`, `input_ids`, `ancestor`, `children`.
-- `PrefixTrie`: full batch view with flat `nodes` list indexed by `flat_idx`.
+- `TrieNode`: compressed trie node with `node_idx`, `input_ids`, `ancestor`, `children`.
+- `PrefixTrie`: full batch view with flat `nodes` list indexed by `node_idx`.
 - `PrefixSubTrie`: per-micro-batch serializable view (`__getstate__`/`__setstate__` for pickle across PP ranks).
 
 **Layout building** (`utils.py`):
@@ -260,10 +260,10 @@ The trie's `sequence_ids` and `leaves[]` are indexed by **original** sample
 position and go stale after `DataProto.reorder` (inside `_balance_batch`).
 `leaf_idx` (numpy array in `non_tensor_batch`) is fancy-indexed by reorder
 automatically and stays correct: `leaf_idx[new_pos]` always holds the leaf
-`flat_idx` for the sample now at `new_pos`. `build_global_trie` (`trainer.py`)
+`node_idx` for the sample now at `new_pos`. `build_global_trie` (`trainer.py`)
 attaches both `meta_info["prefix_tree"]` (the `TrieNode` root) and
-`non_tensor_batch["leaf_idx"]` (np.int64, sample → leaf `flat_idx`). The trie is
-**not** reordered (its `flat_idx` space is immutable); only the per-sample
+`non_tensor_batch["leaf_idx"]` (np.int64, sample → leaf `node_idx`). The trie is
+**not** reordered (its `node_idx` space is immutable); only the per-sample
 mapping moves with the batch.
 
 The sort order is **tree-then-sort**: build the trie, then `_balance_batch`
@@ -307,7 +307,7 @@ survives pickle across PP ranks without dragging the full trie.
 ### The `leaf_idx` contract
 
 1. `build_global_trie` attaches `non_tensor_batch["leaf_idx"]` (np.int64, sample →
-   leaf `flat_idx`; `-1` if no leaf).
+   leaf `node_idx`; `-1` if no leaf).
 2. `_balance_batch` reorders; `leaf_idx` follows via numpy fancy-indexing.
 3. `prepare_prefix_tree_micro_batches` calls `mbs_groups_from_leaf_idx` (dynbsz)
    or `trie_dfs_leaf_order_from_leaf_idx` (fixed mbs).
@@ -353,7 +353,7 @@ When `PrefixTreeParams.__post_init__` raises `last leaf range must end at total
 sequence length`, the cause is `_assign_offsets` (uses `len(node.input_ids)`)
 disagreeing with `_emit` (slices actual samples). The per-node trace log (emitted
 in `build_layout_from_tree_node` when `last_leaf_end != total_tokens`) prints each
-node's `flat_idx`, `iid_len`, `start`, `end`, `donated_in`, `donated_out`,
+node's `node_idx`, `iid_len`, `start`, `end`, `donated_in`, `donated_out`,
 `n_children`.
 
 Invariant per node: `end - start == (1 if donated_in else 0) + iid_len - (1 if donated_out else 0)`.

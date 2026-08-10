@@ -314,7 +314,7 @@ def build_layout_from_tree_node(
 
     # Walk nodes in BFS order for attention rect emission (matches position layout).
     for node in bfs_order:
-        if not node.input_ids or node._flat_start >= node._flat_end:
+        if len(node.input_ids) == 0 or node._flat_start >= node._flat_end:
             # No tokens, or a zero-length duplicate leaf (a sample sharing a leaf
             # node with another sample): skip rects.
             continue
@@ -327,7 +327,7 @@ def build_layout_from_tree_node(
         if not children:
             continue
         for desc in _collect_descendants(node):
-            if not desc.input_ids:
+            if len(desc.input_ids) == 0:
                 continue
             q_ranges.append((desc._flat_start, desc._flat_end))
             k_ranges.append(node_range)
@@ -384,7 +384,7 @@ def build_layout_from_tree_node(
     rolled_samples = [torch.cat([s[1:], torch.zeros(1, dtype=s.dtype, device=s.device)]) for s in samples]
 
     def _emit(node: TrieNode) -> None:
-        if node.input_ids:
+        if len(node.input_ids) > 0:
             children = _subtrie_children(node)
             s = node._owner_offset
             e = s + len(node.input_ids)

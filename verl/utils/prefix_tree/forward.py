@@ -32,6 +32,7 @@ Public entry points:
 from __future__ import annotations
 
 import logging as _log
+from collections import Counter
 from typing import Optional
 
 import torch
@@ -52,6 +53,7 @@ from torch.nn.attention.flex_attention import create_block_mask
 
 from verl.utils.megatron_utils import unwrap_model
 from verl.utils.prefix_tree.magi import (
+    PackRestorationParam,
     PrefixTreeMagiBatch,
     build_prefix_tree_micro_batch,
     prefix_tree_decoder_key_context,
@@ -82,8 +84,8 @@ def _prepare_attn_inputs(
         local_input_ids, local_position_ids = dispatch_magi(pb)
         attn_kwargs = {"magi_attention_key": pb.magi_key}
     else:
-        local_input_ids = pb.local_tree_packed_input_ids.unsqueeze(0)
-        local_position_ids = pb.local_tree_packed_position_ids.unsqueeze(0)
+        local_input_ids = pb.tree_packed_input_ids.unsqueeze(0)
+        local_position_ids = pb.tree_packed_position_ids.unsqueeze(0)
         attn_kwargs = {"flex_attention_key": pb.flex_key}
     return local_input_ids, local_position_ids, attn_kwargs
 
@@ -130,18 +132,18 @@ def _expand_temperature(t, pt_batch: PrefixTreeMagiBatch, total_flat: int, devic
         # Missing the internal ancestor tokens shrinks the cat below total_flat.
         temp_by_sample = t.values()  # (batch_size,)
         tree_packed_t = torch.ones(total_flat, 1, dtype=torch.float32, device=device)
-        for leaf_idx, sample_idx in enumerate(pt_batch.segment_to_sample):
+        for leaf_idx, sample_idx in enumerate(pt_batch.subtrie.leaf_to_sample):
             t_val = temp_by_sample[sample_idx].item()
-            if pt_batch.ancestor_segment_ranges is not None:
-                for a, b in pt_batch.ancestor_segment_ranges[leaf_idx]:
+            if pt_batch.restoration.ancestor_segment_ranges is not None:
+                for a, b in pt_batch.restoration.ancestor_segment_ranges[leaf_idx]:
                     if b > a:
                         tree_packed_t[a:b] = t_val
-            s, e = pt_batch.segment_ranges[leaf_idx]
+            s, e = pt_batch.restoration.segment_ranges[leaf_idx]
             if e > s:
                 tree_packed_t[s:e] = t_val
         # Shared prefix keeps sample[0]'s temp (prior convention); refill
         # last so ancestor writes from other leaves don't override it.
-        prefix_start, prefix_end = pt_batch.prefix_range
+        prefix_start, prefix_end = pt_batch.restoration.prefix_range
         if prefix_end > prefix_start:
             tree_packed_t[prefix_start:prefix_end] = temp_by_sample[0].item()
         return tree_packed_t
@@ -301,9 +303,11 @@ def _finalize_prefix_tree_batch(
             if subtrie is not None:
                 subtrie._cached_magi_key = magi_key
         flex_key = None
-    else:
+    elif attention_type == "flex":
         flex_key = _build_flex_key(params, params.tree_packed_tokens.device)
         magi_key = None
+    else:
+        raise ValueError(f"Unknown attention_type: {attention_type!r} (expected 'magi' or 'flex')")
 
     return PrefixTreeMagiBatch(
         tree_packed_input_ids=params.tree_packed_tokens,
@@ -311,15 +315,13 @@ def _finalize_prefix_tree_batch(
         tree_packed_labels=params.tree_packed_labels,
         magi_key=magi_key,
         flex_key=flex_key,
-        segment_to_sample=params.leaf_to_sample,
-        segment_ranges=params.leaf_ranges,
-        prefix_range=params.prefix_range,
-        original_batch_size=num_samples,
-        real_tokens=real_tokens,
-        ancestor_segment_ranges=getattr(params, "_leaf_ancestor_ranges", None),
-        local_tree_packed_input_ids=params.tree_packed_tokens,
-        local_tree_packed_position_ids=params.tree_packed_position_ids,
-        boundary_registry=getattr(params, "boundary_registry", None),
+        restoration=PackRestorationParam(
+            segment_ranges=params.leaf_ranges,
+            prefix_range=params.prefix_range,
+            ancestor_segment_ranges=getattr(params, "_leaf_ancestor_ranges", None),
+            boundary_registry=getattr(params, "boundary_registry", None),
+        ),
+        subtrie=subtrie,
     )
 
 
@@ -377,11 +379,11 @@ def unfuse_forward_prefix_tree(
     model, pt_batch, prefix_tree_attention, logits_processor, logits_processor_args, post_process, model_kwargs
 ):
     """Unfused-path: forward pass for prefix-tree batches using magi or flex attention."""
-    tree_packed_input_ids = pt_batch.local_tree_packed_input_ids.unsqueeze(0)
+    tree_packed_input_ids = pt_batch.tree_packed_input_ids.unsqueeze(0)
     # Use the layout builder's per-sample position IDs (resets within each sample,
     # stays within max_position_embeddings).  torch.arange(flat_tokens) would produce
     # monotonic IDs up to 172437+ which OOB the RoPE embedding table on large batches.
-    tree_packed_position_ids = pt_batch.local_tree_packed_position_ids.unsqueeze(0)
+    tree_packed_position_ids = pt_batch.tree_packed_position_ids.unsqueeze(0)
 
     strip_prefix_tree_args(logits_processor_args)
 
@@ -406,7 +408,7 @@ def unfuse_forward_prefix_tree(
             **model_kwargs,
         )
 
-    real_tokens = pt_batch.real_tokens
+    real_tokens = pt_batch.tree_packed_input_ids.shape[0]
     if output_orig.shape[0] == 1:
         output_orig = output_orig[:, :real_tokens]
     else:
@@ -592,86 +594,39 @@ def _run_lce(
     )
 
     if magi_key is not None:
-        logprobs = undispatch(logprobs.reshape(-1), magi_key)[: pt_batch.real_tokens]
-        entropy = undispatch(entropy.reshape(-1), magi_key)[: pt_batch.real_tokens]
+        logprobs = undispatch(logprobs.reshape(-1), magi_key)[: pt_batch.tree_packed_input_ids.shape[0]]
+        entropy = undispatch(entropy.reshape(-1), magi_key)[: pt_batch.tree_packed_input_ids.shape[0]]
     return logprobs, entropy
 
 
 def post_processing_packed_lce(
     pt_batch: PrefixTreeMagiBatch,
     hidden_flat: Optional[Tensor] = None,
-    weight: Optional[Tensor] = None,
+    model=None,
     logits_flat: Optional[Tensor] = None,
     temperature=1.0,
     magi_key=None,
 ) -> None:
     """Compute per-leaf boundary log-probs and store on ``pt_batch._boundary_logps``.
 
-    WHY THIS EXISTS — the dedup → one-slot → LCE-1:1 → copy-to-all-leaves bug:
-    -------------------------------------------------------------------------
-
-    In the deduplicated flat layout, a shared ancestor's last token (the
-    *boundary predictor position*) occupies ONE flat slot.  LCE is strictly
-    1:1 (one label per slot → one log-prob per slot), and the label there is
-    the OWNER's next-token id (from ``rolled_samples[owner]``).  So the flat
-    logp at the boundary is ``log p(owner's next token | shared hidden)``.
-    ``restore_flat_to_nested`` then copies that single scalar into every leaf
-    sharing the ancestor — non-owner leaves receive the OWNER's log-prob
-    instead of their own (a ~19-nat error at every shared-segment junction).
-
-    This function runs AFTER LCE / logits_processor and BEFORE
-    ``restore_flat_to_nested``.  For each boundary (identified by its flat
-    position in ``pt_batch.boundary_registry``, built by
-    ``prepare_packed_label`` in utils.py):
-
-      1. Materialise ONE vocab-row of logits at the boundary:
-         - Fused path: ``logits_b = weight @ hidden_flat[b_pos]``
-           (one matvec — vs donation's N duplicated hidden slots which made
-           LCE recompute ``W·hidden[b]`` N times; N× fewer boundary matvecs).
-         - Unfused path: ``logits_b = logits_flat[b_pos]`` (already materialised).
-      2. ``logp_all = log_softmax(logits_b / temperature)`` — the full
-         next-token distribution at the shared hidden state.
-      3. For each leaf: ``leaf_logp = logp_all[leaf_next_token]`` — the leaf's
-         OWN next-token log-prob.
-
-    The results are stored as ``pt_batch._boundary_logps``:
-    ``dict[sample_idx -> [(boundary_flat_pos, leaf_logp), ...]]``.
-    ``restore_flat_to_nested`` (via ``_build_sample_tensors``) reads this and
-    patches each sample's boundary position during the cat — split-and-cat,
-    autograd-safe, no layout surgery.
-
-    MAGI / CP handling:
-    -------------------
-    When ``magi_key`` is set, ``hidden_flat`` / ``logits_flat`` are in
-    CP-local (magi-dispatched) order, NOT flat order.  ``b_pos`` is a flat
-    position.  We map flat → local via ``local_indices = get_position_ids(magi_key)``
-    (``local_indices[i] = flat_pos``), then index by the matching local index.
-    For CP>1, a boundary not on this rank is skipped (no patch — the leaf's
-    sample is on a different rank).  For CP=1, every boundary is local.
-
-    Only ``log_probs`` should be patched (entropy at the boundary is
-    distribution-level — same for all leaves — so no per-leaf patch needed).
-    The caller passes ``apply_boundary_patch=True`` only for the ``log_probs``
-    restore.
-
-    Args:
-        pt_batch: The prefix-tree micro-batch (carries ``boundary_registry``).
-        hidden_flat: ``(tokens, hidden_dim)`` decoder output — fused path.
-        weight: ``(vocab, hidden_dim)`` vocab-projection weight — fused path.
-        logits_flat: ``(tokens, vocab)`` materialised logits — unfused path.
-        temperature: Scalar float or ``(tokens,)`` tensor.  The fused path
-            always uses scalar (LCE asserts this); the unfused path may use
-            per-token temperature.
-        magi_key: When set, ``hidden_flat`` / ``logits_flat`` are CP-local.
+    Fixes the dedup→LCE-1:1 bug where non-owner leaves inherit the owner's
+    log-prob at shared boundaries.  Runs after LCE, before
+    ``restore_flat_to_nested``.  Handles MAGI/CP by all-gathering tagged
+    triples across CP ranks.
     """
-    registry = getattr(pt_batch, "boundary_registry", None)
+    registry = pt_batch.restoration.boundary_registry if pt_batch.restoration else None
     if not registry:
         return
 
-    # Normalise hidden_flat / logits_flat to 2-D (tokens, dim).  The decoder may
-    # return (1, tokens, H), (tokens, 1, H), (tokens, H), etc. depending on the
-    # data format (thd vs bshd) and PP/CP layout — squeeze ALL size-1 dims except
-    # the last two, so we robustly get (tokens, dim).
+    # SP gather: restore full token dimension so boundary positions are valid.
+    # _run_lce gathers internally but only in its local scope; we need the
+    # full hidden here too.
+    if hidden_flat is not None and model is not None and getattr(model.config, "sequence_parallel", False):
+        from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+
+        hidden_flat = gather_from_sequence_parallel_region(hidden_flat)
+
+    # Normalise hidden_flat / logits_flat to 2-D (tokens, dim).
     if hidden_flat is not None and hidden_flat.dim() != 2:
         hidden_flat = hidden_flat.reshape(-1, hidden_flat.shape[-1])
     if logits_flat is not None and logits_flat.dim() != 2:
@@ -684,58 +639,51 @@ def post_processing_packed_lce(
 
     boundary_logps: dict[int, list[tuple[int, Tensor]]] = {}
 
-    # ---- Compute the per-leaf patch value for each registry entry whose
-    # boundary hidden is on THIS CP rank, emitting a TAGGED triple
-    # (b_pos, sample_idx, logp).  The tag is the safety check: every rank has
-    # the identical global registry (built once on the driver, replicated), so
-    # after the cross-CP all_gather each (b_pos, sample_idx) must arrive from
-    # exactly ONE owner rank — we assert that, catching any registry/ownership
-    # divergence loudly instead of silently producing wrong patches.
+    # ---- Compute per-leaf patch value for each registry entry whose boundary
+    # hidden is on THIS CP rank.  Each rank emits tagged triples
+    # (boundary_position, sample_idx, log_prob); the tag lets receivers assert
+    # every (boundary_position, sample_idx) arrives from exactly one owner rank
+    # after the cross-CP all_gather, catching any registry/ownership divergence.
     #
-    # WHY a comm is needed: the patch for leaf c at boundary a is
-    # ``log p(c_token | hidden[a])``.  ``hidden[a]`` lives on the CP rank that
-    # holds flat position a; leaf c is restored (post-undispatch, global) on
-    # every rank.  So the patch is computed on a's rank but needed on c's
-    # restore rank -> the value must cross CP.  We move ONLY the tagged scalars
-    # (3 ints/float per owned entry) — far cheaper than gathering hidden.
-    #
-    # sample_idx (the leaf i) is sent explicitly even though every rank already
-    # knows it from the registry: it lets the receiver ASSERT that the arriving
-    # (b_pos, sample_idx) matches its own registry, confirming the registries
-    # really are identical across ranks (no silent misrouting).
+    # The patch for leaf c at boundary a is log p(c_token | hidden[a]).
+    # hidden[a] lives on the CP rank holding flat position a; leaf c is restored
+    # on every rank, so the patch value must cross CP.  We move only tagged
+    # scalars (3 floats per owned entry) — far cheaper than gathering hidden.
+    # sample_idx is sent explicitly so the receiver can confirm the arriving
+    # triple matches its own registry (no silent misrouting).
     device = (
         hidden_flat.device
         if hidden_flat is not None
         else (logits_flat.device if logits_flat is not None else torch.device("cpu"))
     )
-    _loc_bpos: list[int] = []
-    _loc_sid: list[int] = []
-    _loc_logp: list[Tensor] = []
+    local_boundary_positions: list[int] = []
+    local_sample_indices: list[int] = []
+    local_log_probs: list[Tensor] = []
 
-    for b_pos, leaves in registry:
-        # Resolve the local index for this flat boundary position.
+    for boundary_position, leaves in registry:
+        # Resolve the local index for this flat boundary position (MAGI/CP).
         if local_indices is not None:
-            matches = (local_indices == b_pos).nonzero()
+            matches = (local_indices == boundary_position).nonzero()
             if matches.shape[0] == 0:
                 # Boundary hidden is on another CP rank — that rank emits this
                 # entry's triple; we receive it via the all_gather below.
                 continue
             local_idx = int(matches[0, 0].item())
         else:
-            local_idx = b_pos
+            local_idx = boundary_position
 
         # Materialise one vocab-row of logits at the boundary.
-        # weight is the output_layer weight (vocab, hidden); use F.linear (= h @ weight.T)
-        # for correct orientation, robust to h being (hidden,) or (1, hidden).
+        # Unfused: logits_flat already materialised (full vocab, TP-gathered).
+        # Fused: call model.output_layer(h_b) — handles TP gather + bias +
+        # tied embeddings.  Grad flows naturally for PPO policy update.
         if logits_flat is not None:
             logits_b = logits_flat[local_idx]
-        elif hidden_flat is not None and weight is not None:
-            h_b = hidden_flat[local_idx]  # (hidden,) or (1, hidden)
-            if h_b.dim() == 1:
-                h_b = h_b.unsqueeze(0)  # (1, hidden)
-            logits_b = torch.nn.functional.linear(h_b, weight).squeeze(0)  # (vocab,)
+        elif hidden_flat is not None and model is not None:
+            h_b = hidden_flat[local_idx]
+            # output_layer expects (seq, batch, hidden) = (1, 1, hidden).
+            logits_b, _ = model.output_layer(h_b.reshape(1, 1, -1))
+            logits_b = logits_b.squeeze(0).squeeze(0)  # (vocab,)
         else:
-            # Nothing to compute from — skip patching (no logits available).
             return
 
         # Temperature at the boundary: scalar or per-token.
@@ -749,73 +697,89 @@ def post_processing_packed_lce(
 
         # Emit a tagged triple per leaf sharing this boundary.
         for sample_idx, next_token in leaves:
-            _loc_bpos.append(b_pos)
-            _loc_sid.append(sample_idx)
-            _loc_logp.append(logp_all[next_token])
+            local_boundary_positions.append(boundary_position)
+            local_sample_indices.append(sample_idx)
+            local_log_probs.append(logp_all[next_token])
 
-    # ---- Cross-CP all_gather of the tagged triples so every rank has the FULL
-    # patch set (restore runs globally post-undispatch).  Fixed-size padded
-    # tensors + per-rank counts; the b_pos/sample_idx tags route + assert.
+    # ---- Cross-CP all_gather of the tagged triples so every rank has the full
+    # patch set (restore runs globally post-undispatch).  Pack
+    # (boundary_position, sample_idx, log_prob) into one (max_n, 3) float32
+    # tensor and gather once instead of 3 separate all_gathers.  Padding rows
+    # use sample_idx = -1 as a sentinel (real sample indices are ≥ 0).
     cp_world = mpu.get_context_parallel_world_size()
     if cp_world > 1 and magi_key is not None:
         cp_group = mpu.get_context_parallel_group()
-        n_loc = len(_loc_logp)
-        counts = torch.tensor([n_loc], dtype=torch.long, device=device)
-        counts_all = [torch.zeros(1, dtype=torch.long, device=device) for _ in range(cp_world)]
-        _dist.all_gather(counts_all, counts, group=cp_group)
-        counts_list = [int(c.item()) for c in counts_all]
-        max_n = max(counts_list) if counts_list else 0
-        local_bpos_t = torch.zeros(max_n, dtype=torch.long, device=device)
-        local_sid_t = torch.zeros(max_n, dtype=torch.long, device=device)
-        local_logp_t = torch.zeros(max_n, dtype=torch.float32, device=device)
-        if n_loc > 0:
-            local_bpos_t[:n_loc] = torch.tensor(_loc_bpos, dtype=torch.long, device=device)
-            local_sid_t[:n_loc] = torch.tensor(_loc_sid, dtype=torch.long, device=device)
-            local_logp_t[:n_loc] = torch.stack(_loc_logp).to(torch.float32)
-        bpos_all = [torch.zeros_like(local_bpos_t) for _ in range(cp_world)]
-        sid_all = [torch.zeros_like(local_sid_t) for _ in range(cp_world)]
-        logp_all = [torch.zeros_like(local_logp_t) for _ in range(cp_world)]
-        _dist.all_gather(bpos_all, local_bpos_t, group=cp_group)
-        _dist.all_gather(sid_all, local_sid_t, group=cp_group)
-        _dist.all_gather(logp_all, local_logp_t, group=cp_group)
+        local_count = len(local_log_probs)
 
-        # SAFETY CHECK: each (b_pos, sample_idx) must arrive from exactly one
-        # rank (the owner).  A duplicate or a tag not in our registry means the
-        # registries diverged across ranks — fail loudly, do NOT silently patch.
-        reg_keys = {(bp, sid) for bp, leaves in registry for sid, _ in leaves}
-        seen: set[tuple[int, int]] = set()
+        # Get max entry count across ranks via all_reduce(MAX) — we only need
+        # the pad size, not individual per-rank counts.
+        count_tensor = torch.tensor([local_count], dtype=torch.long, device=device)
+        _dist.all_reduce(count_tensor, op=_dist.ReduceOp.MAX)
+        max_n = int(count_tensor.item())
+
+        # Pack (boundary_position, sample_idx, log_prob) into one tensor.
+        local_packed = torch.zeros(max_n, 3, dtype=torch.float32, device=device)
+        local_packed[:, 1] = -1  # sentinel for padding rows
+        if local_count > 0:
+            local_packed[:local_count, 0] = torch.tensor(
+                local_boundary_positions, dtype=torch.float32, device=device
+            )
+            local_packed[:local_count, 1] = torch.tensor(
+                local_sample_indices, dtype=torch.float32, device=device
+            )
+            local_packed[:local_count, 2] = torch.stack(local_log_probs).to(torch.float32)
+
+        # Single all_gather instead of 3 separate ones.
+        all_packed = [torch.zeros_like(local_packed) for _ in range(cp_world)]
+        _dist.all_gather(all_packed, local_packed, group=cp_group)
+
+        # ---- Unpack and validate: each (boundary_position, sample_idx) must
+        # arrive from exactly one owner rank.  Unexpected, duplicate, or
+        # missing entries mean the registries diverged across ranks.
+        registry_keys = {
+            (boundary_position, sample_idx)
+            for boundary_position, leaves in registry
+            for sample_idx, _ in leaves
+        }
+        key_counts: Counter[tuple[int, int]] = Counter()
+
         for r in range(cp_world):
-            for i in range(counts_list[r]):
-                bp = int(bpos_all[r][i].item())
-                sid = int(sid_all[r][i].item())
-                key = (bp, sid)
-                if key not in reg_keys:
-                    raise AssertionError(
-                        f"post_processing_packed_lce: received boundary patch (b_pos={bp}, "
-                        f"sample_idx={sid}) from rank {r} that is NOT in this rank's registry "
-                        f"— registries diverged across CP ranks. Aborting to avoid silent "
-                        f"wrong patches."
-                    )
-                if key in seen:
-                    raise AssertionError(
-                        f"post_processing_packed_lce: boundary patch (b_pos={bp}, "
-                        f"sample_idx={sid}) arrived from MULTIPLE ranks — ownership collision. "
-                        f"Aborting to avoid silent wrong patches."
-                    )
-                seen.add(key)
-                boundary_logps.setdefault(sid, []).append((bp, logp_all[r][i]))
-        # Every registry entry must have been filled by exactly one owner.
-        if seen != reg_keys:
-            missing = reg_keys - seen
+            for i in range(max_n):
+                sample_idx = int(all_packed[r][i, 1].item())
+                if sample_idx == -1:
+                    continue  # padding
+                boundary_position = int(all_packed[r][i, 0].item())
+                log_prob = all_packed[r][i, 2]
+                key = (boundary_position, sample_idx)
+                key_counts[key] += 1
+                boundary_logps.setdefault(sample_idx, []).append(
+                    (boundary_position, log_prob)
+                )
+
+        # Single validation pass: unexpected, duplicate, or missing entries.
+        unexpected = set(key_counts) - registry_keys
+        duplicates = {k for k, v in key_counts.items() if v > 1}
+        missing = registry_keys - set(key_counts)
+        if unexpected or duplicates or missing:
+            parts = []
+            if unexpected:
+                parts.append(f"{len(unexpected)} unexpected (e.g. {next(iter(unexpected))})")
+            if duplicates:
+                parts.append(f"{len(duplicates)} duplicate (e.g. {next(iter(duplicates))})")
+            if missing:
+                parts.append(f"{len(missing)} missing (e.g. {next(iter(missing))})")
             raise AssertionError(
-                f"post_processing_packed_lce: {len(missing)} registry entries received NO patch "
-                f"from any CP rank (e.g. {next(iter(missing))}) — a boundary's hidden was on no "
-                f"rank. Aborting to avoid silent wrong patches."
+                f"post_processing_packed_lce: registry mismatch across CP ranks — "
+                f"{', '.join(parts)}. Aborting to avoid silent wrong patches."
             )
     else:
         # CP=1 (or non-magi): local triples ARE the full set, no comm/assert.
-        for bp, sid, lp in zip(_loc_bpos, _loc_sid, _loc_logp, strict=False):
-            boundary_logps.setdefault(sid, []).append((bp, lp))
+        for boundary_position, sample_idx, log_prob in zip(
+            local_boundary_positions, local_sample_indices, local_log_probs, strict=False
+        ):
+            boundary_logps.setdefault(sample_idx, []).append(
+                (boundary_position, log_prob)
+            )
 
     pt_batch._boundary_logps = boundary_logps
 
@@ -950,7 +914,7 @@ def fuse_forward_body(
     post_processing_packed_lce(
         pt_batch,
         hidden_flat=hidden_states,
-        weight=output_weight,
+        model=model,
         temperature=temperature,
         magi_key=magi_key,
     )
@@ -1058,7 +1022,7 @@ def fuse_try_forward_prefix_tree(
 
     # Only the last PP stage (post_process=True) needs labels for LCE.
     # Non-last stages pass labels=None; fuse_forward_body returns before LCE.
-    real_tokens = pb.real_tokens
+    real_tokens = pb.tree_packed_input_ids.shape[0]
     if post_process:
         if pb.tree_packed_labels is None:
             _log.getLogger(__name__).warning(

@@ -103,7 +103,7 @@ def _get_mbs_metric() -> dict:
 
 def greedy_build_tries(
     sequences: list[list[int]],
-) -> tuple[list[TrieNode], list[int]]:
+) -> tuple[list[PrefixTrie], list[int]]:
     """Build a compressed trie from token sequences via insert-with-split.
 
     Uses ``PrefixTrie.insert`` (single-pass, compressed) — no per-token objects,
@@ -113,7 +113,7 @@ def greedy_build_tries(
         sequences: per-sample token lists.
 
     Returns:
-        (tries, num_tokens_list): list of TrieNode roots (always length 1) +
+        (tries, num_tokens_list): list of PrefixTrie (always length 1) +
         total uncompressed node count.
     """
     import numpy as np
@@ -122,11 +122,11 @@ def greedy_build_tries(
     for seq_id, seq in enumerate(sequences):
         trie.insert(np.array(seq, dtype=np.int64), seq_id)
     trie.finalize()
-    return [trie.root], [len(trie.root.nodes)]
+    return [trie], [len(trie.nodes)]
 
 
 def convert_trie_to_tree_node(
-    trie: TrieNode,
+    trie: PrefixTrie,
 ) -> Optional[PrefixSubTrie]:
     """Convert a compressed trie to a :class:`PrefixSubTrie`.
 
@@ -177,7 +177,7 @@ def _trie_seq_ids(node: TrieNode) -> list[int]:
     return ids
 
 
-def trie_group_flat_tokens(group: list[int], trie: TrieNode) -> int:
+def trie_group_flat_tokens(group: list[int], trie: PrefixTrie) -> int:
     """Flat (deduplicated) token count for a subset of sequences within a trie.
 
     Counts tokens on the minimal sub-trie spanning exactly the sequences in
@@ -186,7 +186,7 @@ def trie_group_flat_tokens(group: list[int], trie: TrieNode) -> int:
 
     Args:
         group: Sequence indices as stored in ``TrieNode.sequence_ids``.
-        trie: Root of the compressed trie (``trie.is_root == True``).
+        trie: Global :class:`PrefixTrie`.
 
     Returns:
         Total number of unique tokens required to process this group.
@@ -209,7 +209,7 @@ def trie_group_flat_tokens(group: list[int], trie: TrieNode) -> int:
 
 def dfs_leaf_order(
     sequences: list[list[int]],
-    trie: TrieNode,
+    trie: PrefixTrie,
 ) -> list[int]:
     """Return sample indices in DFS pre-order from a pre-built trie.
 
@@ -244,11 +244,11 @@ def dfs_leaf_order(
     return ordered
 
 
-def _trie_dfs_leaf_order(trie: TrieNode, leaf_positions_fn) -> list[int]:
+def _trie_dfs_leaf_order(trie: PrefixTrie, leaf_positions_fn) -> list[int]:
     """Shared DFS pre-order walk over trie leaves.
 
     Args:
-        trie: root node (``is_root`` handled).
+        trie: :class:`PrefixTrie` (``is_root`` always True, handled via property).
         leaf_positions_fn: called with each leaf ``TrieNode``; returns the
             list of positions to emit for that leaf.
     """
@@ -269,7 +269,7 @@ def _trie_dfs_leaf_order(trie: TrieNode, leaf_positions_fn) -> list[int]:
     return ordered
 
 
-def trie_dfs_leaf_order_from_leaf_idx(leaf_idx, trie: TrieNode) -> list[int]:
+def trie_dfs_leaf_order_from_leaf_idx(leaf_idx, trie: PrefixTrie) -> list[int]:
     """Return batch positions in DFS leaf order, reading from ``leaf_idx``.
 
     Reorder-aware counterpart of :func:`dfs_leaf_order` — reads from ``leaf_idx``
@@ -334,7 +334,7 @@ def _mbs_groups_dfs(
 
 
 def mbs_groups_from_trie(
-    trie: TrieNode,
+    trie: PrefixTrie,
     max_token_len: int,
 ) -> list[list[int]]:
     """Group sequences into micro-batches from an existing trie.
@@ -367,7 +367,7 @@ def mbs_groups_from_trie(
 
 def mbs_groups_from_leaf_idx(
     leaf_idx,
-    trie: TrieNode,
+    trie: PrefixTrie,
     max_token_len: int,
 ) -> list[list[int]]:
     """Group reordered-batch positions into micro-batches using ``leaf_idx``.
@@ -400,7 +400,7 @@ def mbs_groups_from_leaf_idx(
 
 
 def subtrie_view(
-    trie: TrieNode,
+    trie: PrefixTrie,
     keep_leaf_ids: set[int],
     source: Optional[PrefixTrie] = None,
 ) -> Optional[PrefixSubTrie]:
@@ -414,7 +414,7 @@ def subtrie_view(
     if not keep_leaf_ids:
         return None
     if source is None:
-        source = PrefixTrie(root=trie)
+        source = trie
 
     def _collect(node: TrieNode) -> bool:
         """Walk node, collecting matching leaves."""
@@ -462,7 +462,7 @@ def compute_prefix_tree_metrics(
     attention_mask=None,
     max_token_len_per_gpu: int | None = None,
     micro_batch_size: int = 0,
-    trie: Optional[TrieNode] = None,
+    trie: Optional[PrefixTrie] = None,
     leaf_idx=None,
 ) -> dict:
     """Compute prefix-tree metrics as a ``prefix_tree/`` namespace dict.
@@ -640,7 +640,7 @@ def create_and_attach_subtrie_views(micro_batches, batch_idx_list, trie) -> None
     """
     if trie is None or batch_idx_list is None:
         return
-    pt_global = PrefixTrie(root=trie)
+    pt_global = trie
     for idx, mb in zip(batch_idx_list, micro_batches, strict=False):
         mb_leaf_idx = mb.get("leaf_idx", None) if hasattr(mb, "get") else mb["leaf_idx"]
         if mb_leaf_idx is None:
