@@ -45,7 +45,6 @@ import torch
 from torch import Tensor
 from torch.nested._internal.nested_tensor import NestedTensor
 
-from verl.utils.prefix_tree.dynamic import build_tree_dynamic
 from verl.utils.prefix_tree.tree import PrefixSubTrie
 from verl.utils.prefix_tree.utils import build_layout_from_tree_node
 
@@ -89,6 +88,14 @@ class PrefixTreeMagiBatch:
     # Shape: (local_tokens, ...) where local_tokens = total_tokens / cp_effective
     local_tree_packed_input_ids: Optional[Tensor] = None
     local_tree_packed_position_ids: Optional[Tensor] = None
+
+    # Boundary registry for the LCE boundary-patch fix (see
+    # ``prepare_packed_label`` in utils.py).  Built driver-side in
+    # ``build_layout_from_tree_node``, consumed worker-side in
+    # ``post_processing_packed_lce`` (forward.py).  Plain Python — RPC-safe.
+    # None when no branching exists.  Typed as ``object`` to avoid importing
+    # ``BoundaryRegistry`` (a plain list of tuples of ints) here.
+    boundary_registry: Optional[object] = None
 
     def __post_init__(self):
         if self.real_tokens == 0:
@@ -195,10 +202,35 @@ def build_prefix_tree_micro_batch(
         return None
 
 
-def _build_sample_tensors(flat_tensor: Tensor, pt_batch: PrefixTreeMagiBatch) -> list:
+def _build_sample_tensors(
+    flat_tensor: Tensor,
+    pt_batch: PrefixTreeMagiBatch,
+    boundary_logps: Optional[dict[int, list[tuple[int, Tensor]]]] = None,
+) -> list:
     """Build a per-sample list of tensors from a flat deduplicated tensor.
 
     Returns sample_tensors[sample_idx] = cat(ancestor_slices..., leaf_slice).
+
+    WHY boundary_logps EXISTS — the dedup → one-slot → copy-to-all-leaves bug:
+    In the deduplicated flat layout, a shared ancestor's last token (the
+    *boundary predictor position*) occupies ONE flat slot.  ``restore_to_nested``
+    copies that single scalar into every leaf sharing the ancestor (all read
+    the same ``flat_tensor[a:b]`` ancestor slice).  So every leaf gets the
+    OWNER's next-token log-prob, not its own — a ~19-nat error at every
+    shared-segment junction.
+
+    FIX (applied here): ``boundary_logps`` (computed by
+    ``post_processing_packed_lce`` in forward.py) maps ``sample_idx →
+    [(boundary_flat_pos, per_leaf_logp), ...]``.  When building each sample's
+    tensor via ``torch.cat``, we replace the boundary element with the leaf's
+    OWN per-leaf value using split-and-cat (``cat([t[:b], val, t[b+1:]])``).
+    This is autograd-safe (new tensor via cat — NOT in-place) and requires no
+    layout surgery (unlike donation, which broke the
+    ``max leaf_range end == total_seqlen_q`` invariant).
+
+    Only ``log_probs`` restore passes ``boundary_logps``; ``entropy`` and other
+    tensors pass ``None`` (entropy at the boundary is distribution-level — same
+    for all leaves sharing the hidden state — so no per-leaf patch needed).
     """
     prefix_start, prefix_end = pt_batch.prefix_range
     prefix_slice = flat_tensor[prefix_start:prefix_end]
@@ -208,17 +240,48 @@ def _build_sample_tensors(flat_tensor: Tensor, pt_batch: PrefixTreeMagiBatch) ->
         s, e = pt_batch.segment_ranges[leaf_idx]
         leaf_slice = flat_tensor[s:e]
         if pt_batch.ancestor_segment_ranges is not None:
-            parts = [flat_tensor[a:b] for a, b in pt_batch.ancestor_segment_ranges[leaf_idx]]
+            ranges = pt_batch.ancestor_segment_ranges[leaf_idx]
+            parts: list[Tensor] = []
+            for a, b in ranges:
+                part = flat_tensor[a:b]
+                # If boundary_logps is active, patch any boundary falling inside
+                # this ancestor range (a, b).  A boundary at flat position b_pos
+                # splits the slice: cat([flat[a:b_pos], leaf_val, flat[b_pos+1:b]]).
+                # At most one boundary per range (each ancestor has one last token).
+                if boundary_logps is not None:
+                    for b_pos, leaf_val in boundary_logps.get(sample_idx, []):
+                        if a <= b_pos < b:
+                            part = torch.cat(
+                                [flat_tensor[a:b_pos], leaf_val.unsqueeze(0), flat_tensor[b_pos + 1 : b]],
+                                dim=0,
+                            )
+                            break
+                parts.append(part)
             parts.append(leaf_slice)
             sample_tensors[sample_idx] = torch.cat(parts, dim=0)
         else:
-            sample_tensors[sample_idx] = torch.cat([prefix_slice, leaf_slice], dim=0)
+            # Single-level: prefix_slice contains the boundary (if any).
+            prefix_part = prefix_slice
+            if boundary_logps is not None:
+                for b_pos, leaf_val in boundary_logps.get(sample_idx, []):
+                    if prefix_start <= b_pos < prefix_end:
+                        prefix_part = torch.cat(
+                            [
+                                flat_tensor[prefix_start:b_pos],
+                                leaf_val.unsqueeze(0),
+                                flat_tensor[b_pos + 1 : prefix_end],
+                            ],
+                            dim=0,
+                        )
+                        break
+            sample_tensors[sample_idx] = torch.cat([prefix_part, leaf_slice], dim=0)
     return sample_tensors
 
 
 def restore_flat_to_nested(
     flat_tensor: Tensor,
     pt_batch: PrefixTreeMagiBatch,
+    apply_boundary_patch: bool = False,
 ) -> NestedTensor:
     """Restore a flat (total_tokens, ...) tensor to a per-sample NestedTensor.
 
@@ -228,11 +291,19 @@ def restore_flat_to_nested(
     Args:
         flat_tensor: Tensor with first dimension == total_tokens.
         pt_batch: PrefixTreeMagiBatch from build_prefix_tree_micro_batch.
+        apply_boundary_patch: When True, read ``pt_batch._boundary_logps`` (set
+            by ``post_processing_packed_lce``) and patch each leaf's boundary
+            log-prob with its OWN next-token value during the cat.  Only the
+            ``log_probs`` restore should pass True (see ``_build_sample_tensors``
+            for the WHY).  False for entropy and other tensors.
 
     Returns:
         NestedTensor of shape (batch_size, variable_seqlen, ...).
     """
-    sample_tensors = _build_sample_tensors(flat_tensor, pt_batch)
+    boundary_logps = None
+    if apply_boundary_patch:
+        boundary_logps = getattr(pt_batch, "_boundary_logps", None)
+    sample_tensors = _build_sample_tensors(flat_tensor, pt_batch, boundary_logps=boundary_logps)
     assert all(t is not None for t in sample_tensors), (
         "restore_flat_to_nested: some sample indices were not covered by segment_to_sample"
     )

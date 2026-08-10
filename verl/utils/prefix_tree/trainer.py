@@ -20,6 +20,7 @@ the caller never needs to gate on ``use_prefix_tree``.
 
 from __future__ import annotations
 
+import os
 import time
 
 import numpy as np
@@ -93,6 +94,12 @@ def attach_segment_metadata(batch, rollout_n: int) -> None:
     Creates segment_hashes and segment_lengths from the batch's prompt UIDs and
     prompt lengths, storing them in non_tensor_batch as numpy object arrays so
     they survive reorder()/chunk()/to_tensordict() round-trips.
+
+    NOTE: treerl's prefix_tree_patch.py wraps this function with a guard that
+    skips it when branch-aware segment_hashes are already set (by
+    _attach_branch_segment_metadata in tree_search_manager). In that case the
+    branch-aware segments (prompt + response-branch deltas) are used; this
+    function only runs as the prompt-only fallback when segment_hashes is None.
     """
     if rollout_n < 2:
         return
@@ -117,7 +124,7 @@ def build_global_trie(batch, *, metrics=None, rollout_n=None) -> float:
     and attach to batch. Mutates batch in-place.
 
     - trie -> batch.meta_info["prefix_tree"] (TrieNode root, shared across samples)
-    - leaf_idx -> batch.batch["leaf_idx"] (torch.long tensor, sample -> leaf flat_idx)
+    - leaf_idx -> batch.batch["leaf_idx"] (torch.long tensor, sample -> leaf node_idx)
 
     Both survive DataProto.reorder/chunk/slice/concat/repeat natively:
     batch tensors propagate via torch indexing; meta_info wraps as NonTensorData.
@@ -147,12 +154,13 @@ def build_global_trie(batch, *, metrics=None, rollout_n=None) -> float:
 
     seg_hashes = batch.non_tensor_batch.get("segment_hashes", None)
     seg_lengths = batch.non_tensor_batch.get("segment_lengths", None)
+    _force_greedy = os.environ.get("MAGI_FORCE_GREEDY_TRIE", "0") == "1"
     _t0 = time.perf_counter()
     trie = None
-    if seg_hashes is not None and seg_lengths is not None:
+    if not _force_greedy and seg_hashes is not None and seg_lengths is not None:
         trie = build_global_tree_from_segments(seqs, seg_hashes, seg_lengths)
     if trie is None:
-        tries, _ = greedy_build_tries(seqs, max_tokens_per_tree=total_raw * 10)
+        tries, _ = greedy_build_tries(seqs)
         if tries and total_raw > 0:
             trie = tries[0]
     _t1 = time.perf_counter()
@@ -163,10 +171,23 @@ def build_global_trie(batch, *, metrics=None, rollout_n=None) -> float:
         return 0.0
 
     leaf_idx = np.full(len(seqs), -1, dtype=np.int64)
-    for flat_idx, node in enumerate(trie.nodes):
-        if not node.children:  # leaf
-            for seq_id in node.sequence_ids:
-                leaf_idx[seq_id] = flat_idx
+    # A sequence's leaf is the deepest node on its root->leaf path, i.e. the max
+    # node_idx among nodes whose sequence_ids include it (along any path DFS
+    # pre-order node_idx strictly increases with depth, so the max is the
+    # sequence's end node). This correctly handles sequences that are strict
+    # prefixes of others, which terminate at an internal (non-childless) node --
+    # the previous childless-only scan orphaned those. Safe for the segment path
+    # too (there every sequence ends at a childless leaf, which is also its max).
+    for node_idx, node in enumerate(trie.nodes):
+        for seq_id in node.sequence_ids:
+            if node_idx > leaf_idx[seq_id]:
+                leaf_idx[seq_id] = node_idx
+    if (leaf_idx < 0).any():
+        missing = np.where(leaf_idx < 0)[0].tolist()
+        raise ValueError(
+            f"build_global_trie: {len(missing)} samples have no leaf assigned "
+            f"(first {missing[:8]}). The trie did not cover every sequence."
+        )
 
     batch.meta_info["prefix_tree"] = trie
     batch.batch["leaf_idx"] = torch.from_numpy(leaf_idx)

@@ -28,7 +28,7 @@ Algorithm originally derived from AReaL
 from __future__ import annotations
 
 import logging as _logging
-from typing import Any, Optional
+from typing import Optional
 
 import torch
 from torch import Tensor
@@ -45,7 +45,6 @@ from verl.utils.seqlen_balancing import (
 __all__ = [
     "build_tree_dynamic",
     "dfs_leaf_order",
-    "dfs_micro_batch_groups",
     # Lower-level helpers exposed for testing / benchmarking
     "TrieNode",
     "greedy_build_tries",
@@ -102,140 +101,28 @@ def _get_mbs_metric() -> dict:
     }
 
 
-class _BuildNode:
-    """Internal: temporary uncompressed node used during insertion."""
-
-    __slots__ = ("tree_id", "token_id", "node_id", "children", "is_end", "sequence_ids")
-
-    def __init__(self, tree_id: int, token_id: int, node_id: int):
-        self.tree_id = tree_id
-        self.token_id = token_id
-        self.node_id = node_id
-        self.children: dict[int, _BuildNode] = {}
-        self.is_end = False
-        self.sequence_ids: list[int] = []
-
-
-def _count_additional_nodes(root: _BuildNode, sequence: list[int]) -> int:
-    current = root
-    for idx, token in enumerate(sequence):
-        child = current.children.get(token)
-        if child is None:
-            return len(sequence) - idx
-        current = child
-    return 0
-
-
-def _insert_sequence(
-    root: _BuildNode,
-    all_nodes: list[_BuildNode],
-    sequence: list[int],
-    tree_id: int,
-    sequence_id: int,
-) -> int:
-    """Insert sequence into tree. Returns number of NEW nodes created."""
-    current = root
-    new_nodes = 0
-    for token in sequence:
-        if token not in current.children:
-            node_id = len(all_nodes)
-            current.children[token] = _BuildNode(tree_id, token, node_id)
-            all_nodes.append(current.children[token])
-            new_nodes += 1
-        current.children[token].sequence_ids.append(sequence_id)
-        current = current.children[token]
-    current.is_end = True
-    return new_nodes
-
-
-def _compress_trie(root: _BuildNode) -> TrieNode:
-    trie_root = TrieNode(tree_id=root.tree_id)
-
-    def _compress_chain(node: _BuildNode, parent: Optional[TrieNode]) -> TrieNode:
-        tokens: list[int] = []
-        current = node
-        start_id = node.node_id
-        while True:
-            tokens.append(current.token_id)
-            if len(current.children) != 1 or current.is_end:
-                break
-            next_child = next(iter(current.children.values()))
-            if current.sequence_ids != next_child.sequence_ids:
-                raise ValueError("Sequence IDs mismatch along chain")
-            if next_child.node_id != current.node_id + 1:
-                raise ValueError("Node IDs not consecutive along chain")
-            current = next_child
-
-        flat_idx = len(trie_root.nodes)
-        trie_node = TrieNode(
-            tree_id=root.tree_id,
-            start_idx=start_id,
-            end_idx=current.node_id,
-            input_ids=tokens,
-            sequence_ids=current.sequence_ids.copy(),
-            ancestor=parent,
-            flat_idx=flat_idx,
-        )
-        trie_root.nodes.append(trie_node)
-        if current.children:
-            for token, child in sorted(current.children.items()):
-                trie_node.children[token] = _compress_chain(child, trie_node)
-        return trie_node
-
-    if root.children:
-        for token, child in sorted(root.children.items()):
-            trie_root.children[token] = _compress_chain(child, None)
-    return trie_root
-
-
 def greedy_build_tries(
     sequences: list[list[int]],
-    max_tokens_per_tree: int,
 ) -> tuple[list[TrieNode], list[int]]:
-    """Token-by-token greedy trie packing across samples.
+    """Build a compressed trie from token sequences via insert-with-split.
+
+    Uses ``PrefixTrie.insert`` (single-pass, compressed) — no per-token objects,
+    no separate compress pass.
 
     Args:
         sequences: per-sample token lists.
-        max_tokens_per_tree: upper bound on uncompressed nodes per tree (set to
-            a huge value when you want a single forest).
 
     Returns:
-        (tries, num_tokens_list): list of compressed TrieNode roots + total
-        uncompressed nodes per tree.
+        (tries, num_tokens_list): list of TrieNode roots (always length 1) +
+        total uncompressed node count.
     """
-    # Fast path: when max_tokens_per_tree is huge (e.g., sum*10), build single tree
-    total_tokens = sum(len(s) for s in sequences)
-    if max_tokens_per_tree >= total_tokens and sequences:
-        root = _BuildNode(0, -1, -1)
-        all_nodes: list[_BuildNode] = []
-        for seq_id, seq in enumerate(sequences):
-            _insert_sequence(root, all_nodes, seq, 0, seq_id)
-        forests = [{"root": root, "all_nodes": all_nodes, "nodes": len(all_nodes)}]
-    else:
-        # Greedy packing: try to fit sequences into existing trees
-        forests: list[dict[str, Any]] = []
-        for seq_id, seq in enumerate(sequences):
-            inserted = False
-            for tree_id, tree in enumerate(forests):
-                additional = _count_additional_nodes(tree["root"], seq)
-                if tree["nodes"] + additional <= max_tokens_per_tree:
-                    actual_new = _insert_sequence(tree["root"], tree["all_nodes"], seq, tree_id, seq_id)
-                    tree["nodes"] += actual_new
-                    inserted = True
-                    break
-            if inserted:
-                continue
-            if len(seq) > max_tokens_per_tree:
-                raise ValueError(f"Sequence length {len(seq)} exceeds max_tokens_per_tree {max_tokens_per_tree}")
-            new_tree_id = len(forests)
-            new_root = _BuildNode(new_tree_id, -1, -1)
-            all_nodes: list[_BuildNode] = []
-            _insert_sequence(new_root, all_nodes, seq, new_tree_id, seq_id)
-            forests.append({"root": new_root, "all_nodes": all_nodes, "nodes": len(seq)})
+    import numpy as np
 
-    tries = [_compress_trie(f["root"]) for f in forests]
-    num_tokens_list = [f["nodes"] for f in forests]
-    return tries, num_tokens_list
+    trie = PrefixTrie()
+    for seq_id, seq in enumerate(sequences):
+        trie.insert(np.array(seq, dtype=np.int64), seq_id)
+    trie.finalize()
+    return [trie.root], [len(trie.root.nodes)]
 
 
 def convert_trie_to_tree_node(
@@ -270,8 +157,7 @@ def build_tree_dynamic(samples: list[Tensor]) -> Optional[PrefixSubTrie]:
     if not samples:
         return None
     sequences = [t.tolist() for t in samples]
-    max_tokens_per_tree = sum(len(s) for s in sequences) * 10  # one forest
-    tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=max_tokens_per_tree)
+    tries, _ = greedy_build_tries(sequences)
     if not tries or len(tries) > 1:
         _logging.getLogger(__name__).warning(
             "prefix_tree: build_tree_dynamic: multi-forest or empty tries (len=%d), returning None",
@@ -323,65 +209,39 @@ def trie_group_flat_tokens(group: list[int], trie: TrieNode) -> int:
 
 def dfs_leaf_order(
     sequences: list[list[int]],
-    trie: Optional[TrieNode] = None,
+    trie: TrieNode,
 ) -> list[int]:
-    """Return sample indices in DFS pre-order.
-
-    If ``trie`` is provided (pre-built), walks it directly, no rebuild.
-    Otherwise builds one via greedy token-by-token insertion.
+    """Return sample indices in DFS pre-order from a pre-built trie.
 
     Args:
-        sequences: per-sample token lists.
-        trie: optional pre-built TrieNode root.
+        sequences: per-sample token lists (used only for length check).
+        trie: pre-built TrieNode root (from ``build_global_trie``).
 
     Returns:
         List of sample indices in DFS pre-order (length == len(sequences)).
     """
     if not sequences:
         return []
-
-    if trie is not None:
-        return trie_dfs_leaf_order(trie)
-
-    max_tokens = sum(len(s) for s in sequences) * 10
-    tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=max_tokens)
+    if trie is None:
+        raise RuntimeError(
+            "dfs_leaf_order: trie is None. The driver must call build_global_trie "
+            "and pass trie=... Per-call rebuild is disabled."
+        )
     ordered: list[int] = []
-    for trie_root in tries:
-        ordered.extend(trie_dfs_leaf_order(trie_root))
+
+    def _walk(node: TrieNode) -> None:
+        if not node.children:
+            ordered.extend(node.sequence_ids)
+        else:
+            for child in node.children.values():
+                _walk(child)
+
+    if trie.is_root:
+        for child in trie.children.values():
+            _walk(child)
+    else:
+        _walk(trie)
     return ordered
-
-
-def dfs_micro_batch_groups(
-    sequences: list[list[int]],
-    max_token_len: int,
-) -> list[list[int]]:
-    """Group sequences into micro-batches in DFS trie order, budgeted by flat trie tokens.
-
-    Builds ONE trie over all sequences (a forest in the rare greedy-split case),
-    then delegates per-trie grouping to :func:`mbs_groups_from_trie`.  The
-    budget is flat (deduplicated) trie tokens: prefix counted once + unique
-    branch tokens; not raw sequence lengths.  This means a micro-batch of k
-    sequences that share a long common prefix uses far fewer budget tokens than
-    k × seq_len, allowing more sequences per batch.
-
-    Args:
-        sequences: per-sample token lists (the full mini-batch).
-        max_token_len: flat-token budget per micro-batch.
-
-    Returns:
-        List of micro-batch groups; each group is a list of sample indices in
-        DFS pre-order.
-    """
-    if not sequences:
-        return []
-
-    max_tokens = sum(len(s) for s in sequences) * 10  # one big forest
-    tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=max_tokens)
-
-    all_groups: list[list[int]] = []
-    for trie_root in tries:
-        all_groups.extend(mbs_groups_from_trie(trie_root, max_token_len))
-    return all_groups
 
 
 def _trie_dfs_leaf_order(trie: TrieNode, leaf_positions_fn) -> list[int]:
@@ -409,17 +269,12 @@ def _trie_dfs_leaf_order(trie: TrieNode, leaf_positions_fn) -> list[int]:
     return ordered
 
 
-def trie_dfs_leaf_order(trie: TrieNode) -> list[int]:
-    """Return sample indices in DFS pre-order from an existing trie."""
-    return _trie_dfs_leaf_order(trie, lambda n: list(n.sequence_ids))
-
-
 def trie_dfs_leaf_order_from_leaf_idx(leaf_idx, trie: TrieNode) -> list[int]:
     """Return batch positions in DFS leaf order, reading from ``leaf_idx``.
 
-    Counterpart of :func:`trie_dfs_leaf_order` that reads from ``leaf_idx``
-    (reorder-aware) instead of the trie's ``sequence_ids`` (stale after
-    reorder).
+    Reorder-aware counterpart of :func:`dfs_leaf_order` — reads from ``leaf_idx``
+    (a tensor, fancy-indexed on reorder) instead of the trie's ``sequence_ids``
+    (stale after reorder).
 
     ``leaf_idx`` may be a numpy array or a ``torch.long`` tensor; both support
     ``.tolist()``.
@@ -430,7 +285,7 @@ def trie_dfs_leaf_order_from_leaf_idx(leaf_idx, trie: TrieNode) -> list[int]:
             raise ValueError(f"leaf_idx[{new_pos}]={leaf_fid}; sample has no leaf assigned.")
         leaf_to_positions.setdefault(int(leaf_fid), []).append(new_pos)
 
-    return _trie_dfs_leaf_order(trie, lambda n: leaf_to_positions.get(n.flat_idx, []))
+    return _trie_dfs_leaf_order(trie, lambda n: leaf_to_positions.get(n.node_idx, []))
 
 
 def _mbs_groups_dfs(
@@ -460,7 +315,7 @@ def _mbs_groups_dfs(
 
     for node, positions in leaf_entries:
         path = trie_ancestors(node) + [node]
-        new_nodes = [n for n in path if n.flat_idx not in covered]
+        new_nodes = [n for n in path if n.node_idx not in covered]
         inc = sum(len(n.input_ids) for n in new_nodes)
         if current_group and current_eff + inc > max_token_len:
             all_groups.append(current_group[:])
@@ -470,7 +325,7 @@ def _mbs_groups_dfs(
             new_nodes = path
             inc = sum(len(n.input_ids) for n in new_nodes)
         current_group.extend(positions)
-        covered.update(n.flat_idx for n in new_nodes)
+        covered.update(n.node_idx for n in new_nodes)
         current_eff += inc
 
     if current_group:
@@ -535,11 +390,11 @@ def mbs_groups_from_leaf_idx(
     for node in trie.nodes:
         if node.children:
             continue
-        if node.flat_idx not in leaf_to_positions:
+        if node.node_idx not in leaf_to_positions:
             raise ValueError(
-                f"trie leaf flat_idx={node.flat_idx} has no sample in leaf_idx: trie and leaf_idx are out of sync."
+                f"trie leaf node_idx={node.node_idx} has no sample in leaf_idx: trie and leaf_idx are out of sync."
             )
-        leaf_entries.append((node, leaf_to_positions[node.flat_idx]))
+        leaf_entries.append((node, leaf_to_positions[node.node_idx]))
 
     return _mbs_groups_dfs(leaf_entries, max_token_len)
 
@@ -567,11 +422,11 @@ def subtrie_view(
             kept = [s for s in node.sequence_ids if s in keep_leaf_ids]
             if not kept:
                 return True
-            # All samples (including duplicates) map to the same flat_idx.
+            # All samples (including duplicates) map to the same node_idx.
             # build_layout_from_tree_node handles duplicates via ancestor_segment_ranges.
             for sid in kept:
                 leaf_to_sample.append(sid)
-                leaf_node_ids.append(node.flat_idx)
+                leaf_node_ids.append(node.node_idx)
             return True
         for child in node.children.values():
             if keep_leaf_ids.isdisjoint(child.sequence_ids):
@@ -840,8 +695,7 @@ def get_dfs_balanced_partitions(
     else:
         seqs = [_ids[i].tolist() for i in range(batch_size)]
 
-    # Reuse globally-built trie if attached (built once in ray_trainer._build_global_trie).
-    # Falls back to building a throwaway trie inside dfs_leaf_order when absent.
+    # Reuse globally-built trie (built once on the driver via build_global_trie).
     if hasattr(data, "batch"):
         attached_trie = data.meta_info.get("prefix_tree", None)
     else:
