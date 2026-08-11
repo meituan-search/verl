@@ -25,10 +25,7 @@ from verl.utils.prefix_tree.tree import PrefixSubTrie, TrieNode
 
 RangeSpec = tuple[int, int]
 
-# Type alias for the boundary registry (see prepare_packed_label for the full WHY).
-# Each entry is (boundary_flat_position, [(sample_idx, next_token), ...]).
-# sample_idx is the index into the original samples list; next_token is the leaf's
-# OWN next token at the boundary (int), NOT the owner's.
+# Boundary registry: (boundary_flat_position, [(sample_idx, next_token), ...]).
 BoundaryRegistry = list[tuple[int, list[tuple[int, int]]]]
 
 
@@ -125,59 +122,9 @@ def prepare_packed_label(
     subtrie_valid_ids: set[int],
     leaf_node_id_to_samples: dict[int, list[int]],
 ) -> BoundaryRegistry:
-    """Build the boundary registry for the LCE boundary-patch fix.
+    """Build boundary registry for LCE boundary-patch: maps flat positions with ≥2 branching children to per-leaf
+    (sample_idx, next_token) pairs, so restore_flat_to_nested can patch non-owner leaf boundary log-probs after LCE."""
 
-    WHY THIS EXISTS — the dedup → one-slot → LCE 1:1 → copy-to-all-leaves chain:
-    -------------------------------------------------------------------------
-
-    In the deduplicated flat layout, a shared ancestor's last token (the
-    *boundary predictor position* — the position whose hidden state predicts
-    the first divergent token of each leaf) occupies exactly ONE flat slot.
-    The tree-packed labels place the OWNER's next-token id there (from
-    ``rolled_samples[owner]``), and ``linear_cross_entropy`` (LCE) is strictly
-    1:1 — one label per slot → one log-prob per slot.  So the flat logp at the
-    boundary is ``log p(owner's next token | shared hidden)``.
-
-    ``restore_flat_to_nested`` then reconstructs each sample's per-token logp
-    by concatenating flat slices.  Every leaf sharing the ancestor reads the
-    SAME ancestor slice (``flat_tensor[a:b]``), so the single boundary scalar
-    is copied verbatim into every leaf's nested tensor.  Non-owner leaves
-    receive the OWNER's next-token log-prob instead of their own — a
-    ~19-nat error at every shared-segment junction.
-
-    Donation (the previous fix) re-packed the boundary token per-leaf via
-    layout offset surgery, but that broke the ``max leaf_range end ==
-    total_seqlen_q`` invariant → 14% FA3 fallback.  This registry enables a
-    cleaner fix: run LCE normally (owner's label at the boundary — temporarily
-    "wrong" for non-owner leaves), then patch each leaf's boundary log-prob
-    AFTER LCE with its OWN next-token log-prob computed from the shared hidden
-    state (see ``post_processing_packed_lce`` in forward.py).
-
-    BOUNDARY DETECTION:
-    ------------------
-    A flat position is a boundary iff its node has ≥2 children in the subtrie
-    (≥2 descendant leaves diverge at that node's last token).  In a trie,
-    children of the same node always start with distinct tokens, so ≥2
-    children → ≥2 distinct next-tokens → the owner's next-token is wrong for
-    non-owner leaves.  The boundary flat position is ``node._flat_end - 1``
-    (the last token of the ancestor — the predictor for the divergent token).
-
-    For each boundary, we collect every leaf in the subtree and its OWN next
-    token: ``samples[leaf_sample][node._owner_offset + len(node.input_ids)]``
-    — the token in the leaf's original sample right after the shared prefix.
-
-    Args:
-        samples: Original per-sample token tensors (1-D, variable length).
-        root_nodes: Root nodes of the subtrie (from ``build_layout_from_tree_node``).
-        subtrie_valid_ids: ``set`` of ``node_idx`` values for nodes in the subtrie
-            (used to filter children).
-        leaf_node_id_to_samples: Maps leaf node ``node_idx → [sample_idx, ...]``
-            (representative first, then duplicate samples sharing the same leaf).
-
-    Returns:
-        ``list of (boundary_flat_pos, [(sample_idx, next_token), ...])``.
-        Empty when no branching exists.  Plain Python — RPC-safe.
-    """
 
     def _subtrie_children(node: TrieNode) -> list[TrieNode]:
         return [c for c in node.children.values() if c.node_idx in subtrie_valid_ids]
@@ -247,171 +194,107 @@ def build_layout_from_tree_node(
     loss_masks_by_sample: Optional[Sequence[Tensor]] = None,
     position_ids_by_sample: Optional[Sequence[Tensor]] = None,
 ) -> PrefixTreeParams:
-    """Build flat layout (PrefixTreeParams) from a PrefixSubTrie.
-
-    Walks only the nodes in ``subtrie``, emitting tokens in BFS order
-    (grouped by depth, with contiguous depth-level slices).
-    Leaf ordering matches ``subtrie.leaf_to_sample``.
-
-    Labels are computed per-sample (rolled) before packing: each node's labels
-    come from ``rolled_samples[src][s:e]`` (next-token, last->0 EOS), so they are
-    correct at prefix/leaf boundaries WITHOUT the donation mechanism.
-    """
-
-    valid_ids: set[int] = {n.node_idx for n in subtrie.nodes}
-    # Clear stale layout attributes on ALL subtrie nodes before re-annotating.
-    # TrieNode objects persist across micro-batches (shared via subtrie.node refs),
-    # so _flat_start/_flat_end/_owner_* carry over from the PREVIOUS build_layout
-    # call. Reset to None so any un-annotated node is detectable.
-    for n in subtrie.nodes:
-        n._flat_start = None
-        n._flat_end = None
-        n._owner_offset = None
-    # Map node_idx → ordered list of sample_ids (first = representative, rest = zero-len duplicates)
+    """Build flat layout (PrefixTreeParams) from a PrefixSubTrie via single BFS pass."""
+    # Map node_idx → ordered list of sample_ids (first = representative, rest = duplicates)
     leaf_node_id_to_samples: dict[int, list[int]] = {}
     for nid, sid in zip(subtrie.leaf_node_ids, subtrie.leaf_to_sample, strict=False):
         leaf_node_id_to_samples.setdefault(nid, []).append(sid)
     leaf_node_id_to_sample: dict[int, int] = {nid: sids[0] for nid, sids in leaf_node_id_to_samples.items()}
 
-    def _subtrie_children(node: TrieNode) -> list[TrieNode]:
-        return [c for c in node.children.values() if c.node_idx in valid_ids]
+    valid_ids: set[int] = {n.node_idx for n in subtrie.nodes}
 
     root_nodes = [n for n in subtrie.nodes if n.ancestor is None or n.ancestor.node_idx not in valid_ids]
+    device = samples[0].device
+    rolled_samples = [torch.cat([s[1:], torch.zeros(1, dtype=s.dtype, device=s.device)]) for s in samples]
 
-    # Assign flat positions, build attention spec rectangles.
+    # Single BFS: positions, owner annotation, pack tokens/labels/masks.
     q_ranges: list[RangeSpec] = []
     k_ranges: list[RangeSpec] = []
     mask_types: list[str] = []
-
-    # Collect all subtrie nodes in BFS order.
-    # No donation: each node emits its FULL input_ids (a branching parent keeps its
-    # last token; the child does NOT re-emit it). The child attends to the parent's
-    # shared last token via the FULL ancestor rectangle (q=child_range, k=parent_range),
-    # so this is correct for standard attention — no RNN state carry needed.
-    # Natural flat positions: every node's _flat_end - _flat_start == len(input_ids).
-    bfs_order: list[TrieNode] = []
-    for root in root_nodes:
-        queue = [root]
-        while queue:
-            node = queue.pop(0)
-            bfs_order.append(node)
-            for child in _subtrie_children(node):
-                queue.append(child)
-
-    # Assign flat positions sequentially in BFS order (natural: no donation).
-    pos = 0
-    for node in bfs_order:
-        node._flat_start = pos
-        node._flat_end = pos + len(node.input_ids)
-        pos = node._flat_end
-
-    def _collect_descendants(node: TrieNode) -> list[TrieNode]:
-        result: list[TrieNode] = []
-        for child in _subtrie_children(node):
-            result.append(child)
-            result.extend(_collect_descendants(child))
-        return result
-
-    # Walk nodes in BFS order for attention rect emission (matches position layout).
-    for node in bfs_order:
-        if len(node.input_ids) == 0 or node._flat_start >= node._flat_end:
-            # No tokens, or a zero-length duplicate leaf (a sample sharing a leaf
-            # node with another sample): skip rects.
-            continue
-        # Mask range == layout range (natural positions, no donation).
-        node_range: RangeSpec = (node._flat_start, node._flat_end)
-        q_ranges.append(node_range)
-        k_ranges.append(node_range)
-        mask_types.append("causal")
-        children = _subtrie_children(node)
-        if not children:
-            continue
-        for desc in _collect_descendants(node):
-            if len(desc.input_ids) == 0:
-                continue
-            q_ranges.append((desc._flat_start, desc._flat_end))
-            k_ranges.append(node_range)
-            mask_types.append("full")
-
-    # Build flat token layout.
-    leaves_in_dfs: list[TrieNode] = []
-    parent_of: dict[int, TrieNode] = {}
-
-    def _annotate(node: TrieNode, owner_offset: int) -> int:
-        node._owner_offset = owner_offset
-        children = _subtrie_children(node)
-        # A node is a "leaf" for layout purposes when the subtrie view maps some
-        # sample to it (leaf_node_id_to_sample), NOT only when it is childless.
-        # Under the greedy trie path a sample that is a strict prefix of another
-        # terminates at an INTERNAL node (which has children); registering only
-        # childless nodes dropped that sample -> segment_to_sample missed it ->
-        # magi.py:304 "not covered by segment_to_sample". The segment path makes
-        # every sample a childless leaf so this is a no-op there.
-        node_sample = leaf_node_id_to_sample.get(node.node_idx)
-        if not children:
-            sample_idx = node_sample if node_sample is not None else leaf_node_id_to_sample[node.node_idx]
-            node._owner_sample = sample_idx
-            leaves_in_dfs.append(node)
-            return sample_idx
-        child_offset = owner_offset + len(node.input_ids)
-        first_owner: Optional[int] = None
-        for i, child in enumerate(children):
-            parent_of[child.node_idx] = node
-            owner = _annotate(child, child_offset)
-            if i == 0:
-                first_owner = owner
-        # If this internal node is itself a sample's leaf (strict-prefix sample),
-        # register it as a leaf so its sample is covered by segment_to_sample.
-        if node_sample is not None:
-            node._owner_sample = node_sample
-            leaves_in_dfs.append(node)
-            return node_sample
-        node._owner_sample = first_owner
-        return first_owner
-
-    for root in root_nodes:
-        _annotate(root, 0)
-
-    device = samples[0].device
     flat_pieces: list[Tensor] = []
     flat_label_pieces: list[Tensor] = []
     flat_lm_pieces: Optional[list[Tensor]] = [] if loss_masks_by_sample is not None else None
     flat_pid_pieces: Optional[list[Tensor]] = [] if position_ids_by_sample is not None else None
     default_pid_pieces: list[Tensor] = []
-    # Pre-roll each sample for labels: next-token prediction, last token -> 0 (EOS).
-    # Per-sample roll (not global flat shift) makes labels correct at prefix/leaf
-    # boundaries WITHOUT the donation mechanism.
-    rolled_samples = [torch.cat([s[1:], torch.zeros(1, dtype=s.dtype, device=s.device)]) for s in samples]
+    leaves: list[TrieNode] = []
+    bfs_order: list[TrieNode] = []
 
-    def _emit(node: TrieNode) -> None:
-        if len(node.input_ids) > 0:
-            children = _subtrie_children(node)
-            s = node._owner_offset
-            e = s + len(node.input_ids)
+    pos = 0
+    for root in root_nodes:
+        queue = [root]
+        while queue:
+            node = queue.pop(0)
+            bfs_order.append(node)
+            children = list(node.children.values())
+
+            # Flat position + owner offset (sample-local offset of first token).
+            node._flat_start = pos
+            node._flat_end = pos + len(node.input_ids)
+            node._owner_offset = pos  # sample-local offset = flat position (natural: no donation)
+
+            # Owner: leaf gets its own sample; internal node gets node_sample or
+            # first child's owner (deferred — set in post-BFS pass below).
+            node_sample = leaf_node_id_to_sample.get(node.node_idx)
             if not children:
-                leaf_sample = leaf_node_id_to_sample.get(node.node_idx)
-                src = leaf_sample if leaf_sample is not None else node._owner_sample
-            else:
-                src = node._owner_sample
-            if s < e:
-                flat_pieces.append(samples[src][s:e])
-                flat_label_pieces.append(rolled_samples[src][s:e])
-                if flat_lm_pieces is not None:
-                    flat_lm_pieces.append(loss_masks_by_sample[src][s:e])
-                if flat_pid_pieces is not None:
-                    flat_pid_pieces.append(position_ids_by_sample[src][s:e])
-                else:
-                    default_pid_pieces.append(torch.arange(s, e, device=device, dtype=torch.long))
+                node._owner_sample = node_sample if node_sample is not None else leaf_node_id_to_sample[node.node_idx]
+                leaves.append(node)
+            elif node_sample is not None:
+                leaves.append(node)  # strict-prefix sample at internal node
 
-    # Emit in BFS order (same order as position assignment).
+            queue.extend(children)
+            pos = node._flat_end
+
+    # Post-BFS: set owner for internal nodes (first child's owner propagates up).
+    # Process in reverse BFS order so children are set before parents.
+    for node in reversed(bfs_order):
+        children = list(node.children.values())
+        if children and not hasattr(node, "_owner_sample"):
+            node._owner_sample = children[0]._owner_sample
+        elif children and node._owner_sample is None:
+            node._owner_sample = children[0]._owner_sample
+
+    # Pack tokens/labels/masks/position_ids (second pass, now owners are set).
     for node in bfs_order:
-        _emit(node)
+        if len(node.input_ids) == 0:
+            continue
+        s, e = node._flat_start, node._flat_end
+        if s < e:
+            src = node._owner_sample
+            flat_pieces.append(samples[src][s:e])
+            flat_label_pieces.append(rolled_samples[src][s:e])
+            if flat_lm_pieces is not None:
+                flat_lm_pieces.append(loss_masks_by_sample[src][s:e])
+            if flat_pid_pieces is not None:
+                flat_pid_pieces.append(position_ids_by_sample[src][s:e])
+            else:
+                default_pid_pieces.append(torch.arange(s, e, device=device, dtype=torch.long))
 
+            # Attention rectangles: causal self-rect + full rects for descendants.
+            node_range: RangeSpec = (s, e)
+            q_ranges.append(node_range)
+            k_ranges.append(node_range)
+            mask_types.append("causal")
+            if children:
+                for desc in _bfs_descendants(node):
+                    if len(desc.input_ids) > 0:
+                        q_ranges.append((desc._flat_start, desc._flat_end))
+                        k_ranges.append(node_range)
+                        mask_types.append("full")
+                if children:
+                    for desc in _bfs_descendants(node):
+                        if len(desc.input_ids) > 0:
+                            q_ranges.append((desc._flat_start, desc._flat_end))
+                            k_ranges.append(node_range)
+                            mask_types.append("full")
+
+            queue.extend(children)
+            pos = node._flat_end
+
+    # Assemble packed tensors.
     tree_packed_tokens = (
         torch.cat(flat_pieces) if flat_pieces else torch.empty(0, dtype=samples[0].dtype, device=device)
     )
     tree_packed_loss_mask = torch.cat(flat_lm_pieces) if flat_lm_pieces is not None else None
-    # Labels: per-sample rolled (next-token), packed in BFS order to match packed logits.
     tree_packed_labels_tensor = (
         torch.cat(flat_label_pieces) if flat_label_pieces else torch.zeros_like(tree_packed_tokens)
     )
@@ -422,35 +305,28 @@ def build_layout_from_tree_node(
             torch.cat(default_pid_pieces) if default_pid_pieces else torch.empty(0, dtype=torch.long, device=device)
         )
 
-    # Build leaf ranges and ancestor chains in DFS order, interleaving zero-length
-    # duplicate entries immediately after their representative so the last entry
-    # (the last real leaf) still ends at total_seqlen_q (satisfying PrefixTreeParams).
+    # Leaf ranges + ancestor chains.
     leaf_ranges: list[RangeSpec] = []
     leaf_to_sample_list: list[int] = []
     leaf_ancestor_ranges: list[list[RangeSpec]] = []
 
-    # BFS positions mean leaves_in_dfs (DFS annotate order) may not be in flat order;
-    # sort by _flat_start so leaf_ranges are in flat-position order (required by
-    # PrefixTreeParams.__post_init__ and restore_flat_to_nested).
-    leaves_sorted_by_flat = sorted(leaves_in_dfs, key=lambda l: l._flat_start)
-    for leaf in leaves_sorted_by_flat:
+    for leaf in sorted(leaves, key=lambda l: l._flat_start):
+        # Walk ancestor chain (set by finalize) — no parent_of dict needed.
         chain: list[RangeSpec] = []
-        cur = parent_of.get(leaf.node_idx)
-        while cur is not None:
+        cur = leaf.ancestor
+        while cur is not None and cur in subtrie.nodes:
             chain.append((cur._flat_start, cur._flat_end))
-            cur = parent_of.get(cur.node_idx)
-        chain.reverse()  # root first
+            cur = cur.ancestor
+        chain.reverse()
 
         rep_range: RangeSpec = (leaf._flat_start, leaf._flat_end)
         sids = leaf_node_id_to_samples[leaf.node_idx]
 
-        # Representative entry
         leaf_ranges.append(rep_range)
         leaf_to_sample_list.append(sids[0])
         leaf_ancestor_ranges.append(chain)
 
-        # Zero-length entries for duplicates: ancestor chain extended with the rep's
-        # leaf range so restore_flat_to_nested reconstructs the full sequence correctly.
+        # Zero-length entries for duplicate samples.
         zero_range: RangeSpec = (rep_range[1], rep_range[1])
         for dup_sid in sids[1:]:
             leaf_ranges.append(zero_range)
@@ -458,8 +334,6 @@ def build_layout_from_tree_node(
             leaf_ancestor_ranges.append(chain + [rep_range])
 
     sample_to_leaf_range = {s: r for s, r in zip(leaf_to_sample_list, leaf_ranges, strict=False)}
-
-    # prefix_range: the shared root segment (first root_node for single-prefix trees)
     prefix_range = (root_nodes[0]._flat_start, root_nodes[0]._flat_end)
 
     params = PrefixTreeParams(
@@ -481,3 +355,14 @@ def build_layout_from_tree_node(
     params._leaf_ancestor_ranges = leaf_ancestor_ranges
 
     return params
+
+
+def _bfs_descendants(node: TrieNode) -> list[TrieNode]:
+    """All descendants of node in BFS order (excluding node itself)."""
+    result: list[TrieNode] = []
+    queue = list(node.children.values())
+    while queue:
+        n = queue.pop(0)
+        result.append(n)
+        queue.extend(n.children.values())
+    return result

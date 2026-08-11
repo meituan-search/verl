@@ -11,27 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Prefix-tree + MAGI utilities for verl SFT training.
-
-Dispatches a micro-batch through either the hash-based
-(:mod:`verl.utils.prefix_tree.segment_grouper`) or dynamic-trie
-(:mod:`verl.utils.prefix_tree.dynamic`) detection path, materialises a flat
-layout via :func:`verl.utils.prefix_tree.utils.build_layout_from_tree_node`,
-and builds a MAGI / flex attention key for the result.
-
-Usage (inside gptmodel_forward_model_engine):
-
-    pt_batch = build_prefix_tree_micro_batch(model, input_ids, loss_mask, position_ids)
-    if pt_batch is not None:
-        output = model(
-            input_ids=pt_batch.tree_packed_input_ids,
-            attention_mask=None,
-            position_ids=pt_batch.tree_packed_position_ids,
-            packed_seq_params=None,
-            magi_attention_key=pt_batch.magi_key,
-        )
-        output = restore_flat_to_nested(output, pt_batch)
-"""
+"""Prefix-tree + MAGI utilities: flat layout packing, MAGI/flex keys, rope/decoder overrides, and flat→nested restore."""
 
 from __future__ import annotations
 
@@ -57,6 +37,7 @@ class PackRestorationParam:
     Separate from PrefixTreeMagiBatch (forward-pass data) — this is only for
     unpacking model output back to per-sample tensors.
     """
+
     # Per-leaf flat token range in the packed layout.
     segment_ranges: list[tuple[int, int]]
     # Shared prefix range (start, end) in flat layout.
@@ -112,35 +93,10 @@ def build_prefix_tree_micro_batch(
     cp_size: int = 1,
     subtrie: Optional[PrefixSubTrie] = None,
 ) -> Optional[PrefixTreeMagiBatch]:
-    """Build a PrefixTreeMagiBatch from a micro-batch using a per-mb subtrie.
+    """Build a PrefixTreeMagiBatch from a per-mb subtrie (built once per step in prepare_prefix_tree_micro_batches).
 
-    The subtrie is produced once per training step in
-    ``prepare_prefix_tree_micro_batches``:
-      1. ``greedy_build_tries`` builds a global trie from ALL batch samples.
-      2. ``subtrie_view`` prunes it to this mb's sample subset → the subtrie.
-
-    The subtrie is then reused across all forward passes (OLP + actor update)
-    for this mb without rebuilding.
-
-    Returns None when the subtrie is not available (prefix sharing not
-    detected or dynamic bsz disabled), signalling the caller to fall back
-    to standard attention.
-
-    Args:
-        model: Megatron model (used to read num_heads / head_dim from config).
-        input_ids: NestedTensor of shape (batch_size, variable_seqlen).
-        loss_mask: Optional NestedTensor matching input_ids shape.
-        position_ids: Optional NestedTensor matching input_ids shape.
-        attention_type: ``"flex"`` or ``"magi"``.
-        tp_size / cp_size: Tensor / context parallel world sizes.
-        subtrie: Per-mb subtrie from ``prepare_prefix_tree_micro_batches``.
-
-    Returns:
-        PrefixTreeMagiBatch or None.
-    """
-    # Lazy import: ``_unpack_nested_to_list`` and ``_finalize_prefix_tree_batch``
-    # live in :mod:`verl.utils.prefix_tree.forward`, which imports this module at
-    # load time; a top-level import here would create a cycle.
+    The subtrie is reused across OLP + actor update forwards. Returns None when subtrie absent."""
+    # Lazy import to avoid cycle with forward.py.
     from verl.utils.prefix_tree.forward import (
         _finalize_prefix_tree_batch,
         _unpack_nested_to_list,
@@ -169,32 +125,21 @@ def build_prefix_tree_micro_batch(
             "rebuild is disabled — fix the driver to attach the global trie."
         )
 
-    try:
-        params = build_layout_from_tree_node(
-            samples,
-            subtrie,
-            loss_masks_by_sample=loss_masks_by_sample,
-            position_ids_by_sample=position_ids_by_sample,
-        )
-        return _finalize_prefix_tree_batch(
-            params,
-            model=model,
-            num_samples=len(samples),
-            attention_type=attention_type,
-            tp_size=tp_size,
-            cp_size=cp_size,
-            subtrie=subtrie,
-        )
-    except (ValueError, KeyError, IndexError) as _e:
-        _log.getLogger(__name__).exception(
-            "build_prefix_tree_micro_batch: falling back to standard attention (%s: %s) "
-            "subtrie_nodes=%d subtrie_leaves=%d",
-            type(_e).__name__,
-            _e,
-            len(subtrie.nodes) if subtrie is not None else -1,
-            len(subtrie.leaf_node_ids) if subtrie is not None else -1,
-        )
-        return None
+    params = build_layout_from_tree_node(
+        samples,
+        subtrie,
+        loss_masks_by_sample=loss_masks_by_sample,
+        position_ids_by_sample=position_ids_by_sample,
+    )
+    return _finalize_prefix_tree_batch(
+        params,
+        model=model,
+        num_samples=len(samples),
+        attention_type=attention_type,
+        tp_size=tp_size,
+        cp_size=cp_size,
+        subtrie=subtrie,
+    )
 
 
 def _build_sample_tensors(
@@ -202,34 +147,14 @@ def _build_sample_tensors(
     pt_batch: PrefixTreeMagiBatch,
     boundary_logps: Optional[dict[int, list[tuple[int, Tensor]]]] = None,
 ) -> list:
-    """Build a per-sample list of tensors from a flat deduplicated tensor.
+    """Build per-sample tensor list from flat tensor, applying per-leaf boundary log-prob patches via split-and-cat.
 
-    Returns sample_tensors[sample_idx] = cat(ancestor_slices..., leaf_slice).
-
-    WHY boundary_logps EXISTS — the dedup → one-slot → copy-to-all-leaves bug:
-    In the deduplicated flat layout, a shared ancestor's last token (the
-    *boundary predictor position*) occupies ONE flat slot.  ``restore_to_nested``
-    copies that single scalar into every leaf sharing the ancestor (all read
-    the same ``flat_tensor[a:b]`` ancestor slice).  So every leaf gets the
-    OWNER's next-token log-prob, not its own — a ~19-nat error at every
-    shared-segment junction.
-
-    FIX (applied here): ``boundary_logps`` (computed by
-    ``post_processing_packed_lce`` in forward.py) maps ``sample_idx →
-    [(boundary_flat_pos, per_leaf_logp), ...]``.  When building each sample's
-    tensor via ``torch.cat``, we replace the boundary element with the leaf's
-    OWN per-leaf value using split-and-cat (``cat([t[:b], val, t[b+1:]])``).
-    This is autograd-safe (new tensor via cat — NOT in-place) and requires no
-    layout surgery (unlike donation, which broke the
-    ``max leaf_range end == total_seqlen_q`` invariant).
-
-    Only ``log_probs`` restore passes ``boundary_logps``; ``entropy`` and other
-    tensors pass ``None`` (entropy at the boundary is distribution-level — same
-    for all leaves sharing the hidden state — so no per-leaf patch needed).
-    """
+    boundary_logps maps sample_idx → [(boundary_flat_pos, per_leaf_logp), ...] to fix the
+    dedup→one-slot→copy-to-all-leaves bug where non-owner leaves inherit wrong boundary log-probs."""
     prefix_start, prefix_end = pt_batch.restoration.prefix_range
     prefix_slice = flat_tensor[prefix_start:prefix_end]
-    n = len(pt_batch.subtrie.leaves)
+    # n = local sample count. Use leaf_to_sample (picklable list), not subtrie.leaves (indexed by GLOBAL sequence_ids).
+    n = len(pt_batch.subtrie.leaf_to_sample)
     sample_tensors: list[Optional[Tensor]] = [None] * n
     for leaf_idx, sample_idx in enumerate(pt_batch.subtrie.leaf_to_sample):
         s, e = pt_batch.restoration.segment_ranges[leaf_idx]
@@ -278,23 +203,7 @@ def restore_flat_to_nested(
     pt_batch: PrefixTreeMagiBatch,
     apply_boundary_patch: bool = False,
 ) -> NestedTensor:
-    """Restore a flat (total_tokens, ...) tensor to a per-sample NestedTensor.
-
-    Each sample's view is ``[prefix_tokens || ancestor_tokens... || leaf_tokens]``
-    concatenated, matching the original per-sample sequence length.
-
-    Args:
-        flat_tensor: Tensor with first dimension == total_tokens.
-        pt_batch: PrefixTreeMagiBatch from build_prefix_tree_micro_batch.
-        apply_boundary_patch: When True, read ``pt_batch._boundary_logps`` (set
-            by ``post_processing_packed_lce``) and patch each leaf's boundary
-            log-prob with its OWN next-token value during the cat.  Only the
-            ``log_probs`` restore should pass True (see ``_build_sample_tensors``
-            for the WHY).  False for entropy and other tensors.
-
-    Returns:
-        NestedTensor of shape (batch_size, variable_seqlen, ...).
-    """
+    """Restore flat tensor to per-sample NestedTensor. Set apply_boundary_patch=True for log_probs."""
     boundary_logps = None
     if apply_boundary_patch:
         boundary_logps = getattr(pt_batch, "_boundary_logps", None)
@@ -308,28 +217,9 @@ def restore_flat_to_nested(
 
 @contextlib.contextmanager
 def prefix_tree_rope_context(model, position_ids: Optional[Tensor]):
-    """Override ``rotary_pos_emb.forward`` to use per-token *position_ids*.
+    """Override rope_mod.forward to use per-token position_ids instead of CP-rank sequential slicing.
 
-    Shared by both fused and unfused prefix-tree paths.  Megatron's default
-    RoPE slicing assumes each CP rank holds sequential positions
-    ``[r·T/CP .. (r+1)·T/CP]``; after MAGI dispatch each rank holds
-    non-sequential tokens whose ``position_ids`` are arbitrary.
-
-    Two RoPE families are handled:
-
-    - **Standard ``RotaryEmbedding``** (``forward(max_seq_len, ...)``): builds
-      a sequential table ``[0..max_seq_len-1]``.  The override builds the full
-      table (``cp_group=None``) and indexes it by ``position_ids``.
-    - **M-RoPE** (``Qwen3VLMultimodalRotaryEmbedding`` /
-      ``MultimodalRotaryEmbedding``: ``forward(position_ids, mrope_section)``):
-      builds freqs directly from ``position_ids``, so each token's RoPE is
-      whatever ``position_ids`` says.  The override broadcasts the 1D per-token
-      positions to 3D ``[3, 1, T]`` (text-only: all three dims identical) and
-      passes them to the original forward with ``cp_group=None`` (MAGI already
-      dispatched; no internal CP slicing).  No table indexing needed.
-
-    No-op when ``model`` has no ``rotary_pos_emb`` or ``position_ids`` is None.
-    """
+    Handles standard RotaryEmbedding (index full table by position_ids) and M-RoPE (broadcast 1D→3D text-only)."""
     rope_mod = getattr(model, "rotary_pos_emb", None)
     if rope_mod is None or position_ids is None:
         yield
@@ -372,14 +262,7 @@ def prefix_tree_rope_context(model, position_ids: Optional[Tensor]):
 
 @contextlib.contextmanager
 def prefix_tree_decoder_key_context(model, magi_attention_key=None, flex_attention_key=None):
-    """Override ``model.decoder.forward`` to inject the attention key.
-
-    Shared by both fused and unfused prefix-tree paths.  The decoder's forward
-    signature doesn't accept ``magi_attention_key`` / ``flex_attention_key``;
-    the patched TEDotProductAttention reads them from its module's forward
-    kwargs.  This context wraps ``decoder.forward`` to inject the keys for the
-    duration of one call.
-    """
+    """Override model.decoder.forward to inject magi/flex attention key into kwargs for one call."""
     if magi_attention_key is None and flex_attention_key is None:
         yield
         return

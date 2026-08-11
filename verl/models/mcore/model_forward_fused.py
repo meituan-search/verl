@@ -156,23 +156,21 @@ def fused_forward_model_engine(vision_model: bool = False):
         use_prefix_tree = _pt_args.get("use_prefix_tree", False)
 
         if use_prefix_tree:
-            # Prefix-tree (MAGI) fused path.
-            from verl.utils.prefix_tree.forward import fuse_try_forward_prefix_tree
+            from verl.utils.prefix_tree.forward import run_fused_prefix_tree
 
-            output = fuse_try_forward_prefix_tree(
-                model=model,
-                input_ids=input_ids,
-                labels=labels,
-                temperature=temperature,
-                logits_processor_args=_pt_args,
-                calculate_entropy=calculate_entropy,
+            output = run_fused_prefix_tree(
+                model,
+                input_ids,
+                _pt_args,
+                labels,
+                temperature,
+                calculate_entropy,
                 vision_model=vision_model,
                 has_vision_data="pixel_values" in multi_modal_inputs,
             )
             if output is not None:
                 return output
 
-        # Standard FA3 fused path (unchanged from upstream):
         fp8 = unwrap_model(model).config.fp8
         use_fp8_padding = fp8 in ["e4m3", "hybrid"]
         config = unwrap_model(model).config

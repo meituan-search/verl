@@ -13,17 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dynamic-trie prefix-tree builder.
+"""Dynamic-trie prefix-tree builder: token-by-token trie insertion, micro-batch grouping, leaf_idx reorder-safety, DFS balancing.
 
-Token-by-token trie insertion supporting arbitrary tree depth. Detects the
-shared-prefix tree directly from input tokens; no rollout-side metadata
-required. Invoked by
-:func:`verl.utils.prefix_tree.magi.build_prefix_tree_micro_batch` when
-when ``prefix_segments_batch`` is not provided.
-
-Algorithm originally derived from AReaL
-(https://github.com/inclusionAI/AReaL).
-"""
+Algorithm originally derived from AReaL (https://github.com/inclusionAI/AReaL)."""
 
 from __future__ import annotations
 
@@ -70,10 +62,8 @@ from verl.utils.prefix_tree.tree import (  # noqa: E402
 )
 
 # ---------------------------------------------------------------------------
-# Module-level collector for the post-micro-batch-build micro_batch_shared_ratio.
-# Populated by ``prepare_prefix_tree_micro_batches`` (the ACTUAL grouping the
-# engine dispatches) and pulled into engine output by
-# ``maybe_collect_mbs_metric`` in ``prefix_tree_patch_impl``.
+# Module-level collector for post-micro-batch-build micro_batch_shared_ratio.
+# Populated by prepare_prefix_tree_micro_batches, consumed by maybe_collect_mbs_metric.
 # ---------------------------------------------------------------------------
 _mbs_metric_state = {"shared_ratio_sum": 0.0, "count": 0}
 
@@ -103,26 +93,15 @@ def _get_mbs_metric() -> dict:
 
 def greedy_build_tries(
     sequences: list[list[int]],
-) -> tuple[list[PrefixTrie], list[int]]:
-    """Build a compressed trie from token sequences via insert-with-split.
-
-    Uses ``PrefixTrie.insert`` (single-pass, compressed) — no per-token objects,
-    no separate compress pass.
-
-    Args:
-        sequences: per-sample token lists.
-
-    Returns:
-        (tries, num_tokens_list): list of PrefixTrie (always length 1) +
-        total uncompressed node count.
-    """
+) -> tuple[PrefixTrie, int]:
+    """Build compressed trie via PrefixTrie.insert (single-pass, no separate compress)."""
     import numpy as np
 
     trie = PrefixTrie()
     for seq_id, seq in enumerate(sequences):
         trie.insert(np.array(seq, dtype=np.int64), seq_id)
     trie.finalize()
-    return [trie], [len(trie.nodes)]
+    return trie, len(trie.nodes)
 
 
 def convert_trie_to_tree_node(
@@ -157,14 +136,13 @@ def build_tree_dynamic(samples: list[Tensor]) -> Optional[PrefixSubTrie]:
     if not samples:
         return None
     sequences = [t.tolist() for t in samples]
-    tries, _ = greedy_build_tries(sequences)
-    if not tries or len(tries) > 1:
+    trie, _ = greedy_build_tries(sequences)
+    if not trie.nodes:
         _logging.getLogger(__name__).warning(
-            "prefix_tree: build_tree_dynamic: multi-forest or empty tries (len=%d), returning None",
-            len(tries),
+            "prefix_tree: build_tree_dynamic: empty trie, returning None",
         )
         return None
-    return convert_trie_to_tree_node(tries[0])
+    return convert_trie_to_tree_node(trie)
 
 
 def _trie_seq_ids(node: TrieNode) -> list[int]:
@@ -245,13 +223,7 @@ def dfs_leaf_order(
 
 
 def _trie_dfs_leaf_order(trie: PrefixTrie, leaf_positions_fn) -> list[int]:
-    """Shared DFS pre-order walk over trie leaves.
-
-    Args:
-        trie: :class:`PrefixTrie` (``is_root`` always True, handled via property).
-        leaf_positions_fn: called with each leaf ``TrieNode``; returns the
-            list of positions to emit for that leaf.
-    """
+    """DFS pre-order walk over trie leaves calling leaf_positions_fn per leaf."""
     ordered: list[int] = []
 
     def _walk(node: TrieNode) -> None:
@@ -270,15 +242,7 @@ def _trie_dfs_leaf_order(trie: PrefixTrie, leaf_positions_fn) -> list[int]:
 
 
 def trie_dfs_leaf_order_from_leaf_idx(leaf_idx, trie: PrefixTrie) -> list[int]:
-    """Return batch positions in DFS leaf order, reading from ``leaf_idx``.
-
-    Reorder-aware counterpart of :func:`dfs_leaf_order` — reads from ``leaf_idx``
-    (a tensor, fancy-indexed on reorder) instead of the trie's ``sequence_ids``
-    (stale after reorder).
-
-    ``leaf_idx`` may be a numpy array or a ``torch.long`` tensor; both support
-    ``.tolist()``.
-    """
+    """Return batch positions in DFS leaf order from leaf_idx (reorder-safe, unlike trie's sequence_ids)."""
     leaf_to_positions: dict[int, list[int]] = {}
     for new_pos, leaf_fid in enumerate(leaf_idx.tolist()):
         if leaf_fid < 0:
@@ -292,22 +256,9 @@ def _mbs_groups_dfs(
     leaf_entries: list[tuple[TrieNode, list[int]]],
     max_token_len: int,
 ) -> list[list[int]]:
-    """Shared DFS-budget walk for micro-batch grouping.
+    """DFS-budget walk: groups leaf samples into micro-batches by flat (deduplicated) token budget.
 
-    Args:
-        leaf_entries: ``(leaf_node, positions)`` pairs in DFS pre-order.
-            ``positions`` are the sample indices (or batch positions) to emit
-            for that leaf.
-        max_token_len: flat-token budget per micro-batch.
-
-    Budget is flat (deduplicated) tokens.  When a trie leaf holds multiple
-    positions (identical sequences), all stay in the same DFS group.
-    Duplicates are handled correctly: build_layout_from_tree_node includes the
-    representative's leaf range in the duplicate's ancestor_segment_ranges so
-    restore_flat_to_nested reconstructs the full sequence for each.
-    Keeping duplicates in-group avoids an extra singleton group that would
-    cause same_micro_num_in_dp to pad the other DP rank.
-    """
+    When a leaf holds multiple positions (identical sequences), all stay in the same DFS group to avoid singleton groups."""
     all_groups: list[list[int]] = []
     current_group: list[int] = []
     covered: set[int] = set()
@@ -337,16 +288,9 @@ def mbs_groups_from_trie(
     trie: PrefixTrie,
     max_token_len: int,
 ) -> list[list[int]]:
-    """Group sequences into micro-batches from an existing trie.
+    """Group sequences into micro-batches from an existing trie, budgeted by flat (deduplicated) tokens.
 
-    Budget is flat (deduplicated) tokens.  When a trie leaf holds multiple
-    sequence_ids (identical sequences), all IDs stay in the same DFS group.
-    Duplicates are handled correctly: build_layout_from_tree_node includes the
-    representative's leaf range in the duplicate's ancestor_segment_ranges so
-    restore_flat_to_nested reconstructs the full sequence for each.
-    Keeping duplicates in-group avoids an extra singleton group that would
-    cause same_micro_num_in_dp to pad the other DP rank.
-    """
+    Duplicate leaves stay in-group to prevent same_micro_num_in_dp padding."""
     leaf_entries: list[tuple[TrieNode, list[int]]] = []
 
     def _collect(node: TrieNode) -> None:
@@ -370,13 +314,7 @@ def mbs_groups_from_leaf_idx(
     trie: PrefixTrie,
     max_token_len: int,
 ) -> list[list[int]]:
-    """Group reordered-batch positions into micro-batches using ``leaf_idx``.
-
-    Counterpart of :func:`mbs_groups_from_trie` that reads from ``leaf_idx``
-    (a ``torch.long`` tensor in ``batch``, automatically reordered by
-    ``DataProto.reorder``) instead of the trie's ``sequence_ids`` (which go
-    stale after reorder).
-    """
+    """Group reordered batch positions into micro-batches from leaf_idx (reorder-safe counter-part of mbs_groups_from_trie)."""
     leaf_to_positions: dict[int, list[int]] = {}
     for new_pos, leaf_fid in enumerate(leaf_idx.tolist()):
         if leaf_fid < 0:
@@ -404,13 +342,7 @@ def subtrie_view(
     keep_leaf_ids: set[int],
     source: Optional[PrefixTrie] = None,
 ) -> Optional[PrefixSubTrie]:
-    """Extract a subtree containing only the given leaf sample indices.
-
-    Returns a :class:`PrefixSubTrie` ready for downstream use, or ``None``
-    if no leaves match.  When ``source`` is provided it is attached as the
-    global-trie back-reference on the returned ``PrefixSubTrie``; otherwise
-    one is constructed automatically from ``trie``.
-    """
+    """Extract subtree containing only given leaf sample indices. Returns PrefixSubTrie or None."""
     if not keep_leaf_ids:
         return None
     if source is None:
@@ -465,33 +397,9 @@ def compute_prefix_tree_metrics(
     trie: Optional[PrefixTrie] = None,
     leaf_idx=None,
 ) -> dict:
-    """Compute prefix-tree metrics as a ``prefix_tree/`` namespace dict.
+    """Compute prefix_tree/global_shared_ratio, prefix_tree/packed_tokens, prefix_tree/raw_tokens.
 
-    Returns a dict with keys:
-        ``prefix_tree/global_shared_ratio``      : fraction of tokens saved by deduplication
-        ``prefix_tree/packed_tokens``           : deduplicated packed trie token count
-        ``prefix_tree/raw_tokens``              : total raw token count across all sequences
-
-    Note: ``micro_batch_shared_ratio`` is no longer computed here. The trainer
-    previously computed it pre-forward on the full batch (before DP dispatch
-    and reorder), so it did not match what the engine actually dispatches. The
-    accurate post-micro-batch-build version is now computed inside
-    ``prepare_prefix_tree_micro_batches`` and surfaced by
-    ``maybe_collect_mbs_metric`` from the engine output.
-
-    Args:
-        input_ids: NestedTensor, padded 2-D Tensor, or list[list[int]].
-        attention_mask: Optional mask for padded 2-D case.
-        max_token_len_per_gpu: kept for backward-compat; no longer used here.
-        micro_batch_size: kept for backward-compat; no longer used here.
-        trie: Pre-built compressed TrieNode root. When provided, skips
-            ``greedy_build_tries`` entirely (the caller already built it).
-            ``input_ids`` is still needed for sequence lengths.
-        leaf_idx: kept for backward-compat; no longer used here.
-
-    Returns:
-        dict of float metrics, all zero if no sequences.
-    """
+    Uses caller-provided global trie (built once on driver). Per-call rebuild is disabled."""
     if isinstance(input_ids, Tensor) and input_ids.is_nested:
         sequences = [t.tolist() for t in input_ids.unbind()]
     elif isinstance(input_ids, Tensor) and input_ids.dim() == 2:
@@ -541,18 +449,9 @@ def prepare_prefix_tree_micro_batches(
     num_batches_divided_by: int | None = None,
     force_group_size: int = 1,
 ):
-    """Prepare micro-batches using prefix-tree grouping.
+    """Prepare micro-batches using prefix-tree grouping (dynamic bsz: flat-token budget; fixed: DFS chunk by seq count).
 
-    Works with both dynamic and fixed micro-batch sizes:
-    - ``use_dynamic_bsz=True``: reads ``max_token_len_per_gpu`` and groups by flat token budget.
-    - ``use_dynamic_bsz=False``: reads ``micro_batch_size_per_gpu`` and chunks by sequence count
-      using DFS trie order so same-prefix sequences stay together.
-
-    Expects a pre-built trie stored via ``tu.assign_non_tensor(data, prefix_tree=trie)``.
-    The global trie MUST be built once on the driver (build_global_trie) and transmitted
-    to workers; per-worker rebuild is disabled (it was wrong — local-only prefix sharing —
-    and cost ~13s/step starving the GPU).
-    """
+    Uses driver-built global trie. Per-worker rebuild is disabled."""
     trie = tu.get_non_tensor_data(data, "prefix_tree", default=None)
     leaf_idx = data.get("leaf_idx", None) if hasattr(data, "get") else data["leaf_idx"]
     if trie is None or leaf_idx is None:
@@ -595,8 +494,7 @@ def prepare_prefix_tree_micro_batches(
     if trie is not None:
         tokens_per_group = [trie_group_flat_tokens(g, trie) for g in batch_idx_list]
 
-        # Reorder micro-batches in inc-then-dec flat-token pattern to reduce PP bubble.
-        # Preserves prefix locality: samples within a group share prefixes and stay together.
+        # Reorder micro-batches inc-then-dec by flat-token count to reduce PP bubble.
         if use_dynamic_bsz_local and len(batch_idx_list) > 1:
             sorted_groups = sorted(zip(tokens_per_group, batch_idx_list, range(len(batch_idx_list)), strict=False))
             ordered_tokens = [t for t, _, _ in sorted_groups]
@@ -605,11 +503,7 @@ def prepare_prefix_tree_micro_batches(
             tokens_per_group = ordered_tokens[::2] + ordered_tokens[1::2][::-1]
             micro_batches = [tu.index_select_tensor_dict(data, idx) for idx in batch_idx_list]
 
-        # Compute the accurate per-micro-batch sharing ratio from the ACTUAL
-        # grouping the engine will dispatch (post-reorder, post-pad) and push
-        # it into the module-level collector.  ``maybe_collect_mbs_metric``
-        # pulls it into the engine output and resets the state.  Per-group
-        # ratio is 1 - flat_tokens / raw_tokens.
+        # Compute accurate per-mb sharing ratio from actual engine grouping and push to module collector.
         _input_ids = data["input_ids"]
         _is_nested = isinstance(_input_ids, Tensor) and _input_ids.is_nested
         if _is_nested:
@@ -631,13 +525,9 @@ def prepare_prefix_tree_micro_batches(
 
 
 def create_and_attach_subtrie_views(micro_batches, batch_idx_list, trie) -> None:
-    """Create a subtrie view per micro-batch and attach it (shared by dynbsz and fixed-mbs).
+    """Create a subtrie view per micro-batch and attach via tu.assign_non_tensor(prefix_tree_subtree=...).
 
-    Reads ``leaf_idx`` from each microbatch's ``batch`` (which survives
-    ``DataProto.reorder`` and ``chunk`` automatically via torch indexing)
-    to determine which leaf each local sample belongs to, no dependence
-    on the trie's ``sequence_ids`` (which go stale after reorder).
-    """
+    Reads leaf_idx from each mb (reorder-safe via torch indexing)."""
     if trie is None or batch_idx_list is None:
         return
     pt_global = trie

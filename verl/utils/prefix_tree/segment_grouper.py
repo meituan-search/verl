@@ -11,27 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Segment-based grouping for prefix-tree optimization.
-
-Provides a generic interface for building prefix trees from pre-computed
-segment metadata, avoiding expensive token-by-token detection when the
-grouping structure is known at data creation time.
-
-Segment Format:
-    Each sample is described as a list of segments: [(hash, length), ...]
-    - hash: Any hashable value (int, str, UUID) identifying the segment content
-    - length: Number of tokens in the segment
-
-Tree Building:
-    Samples sharing the same hash for segment i share that prefix path.
-    The tree is built by matching segment hashes level by level.
-
-Examples:
-    GRPO (single prompt, n rollouts):
-        Sample 0: [("uuid-p0", 100), ("resp-hash-0", 50)]
-        Sample 1: [("uuid-p0", 100), ("resp-hash-1", 45)]
-        -> Share first segment (uuid-p0), diverge at second
-"""
+"""Segment-based grouping for prefix-tree: build trie from pre-computed segment (hash, length) metadata, avoiding token-by-token detection."""
 
 from typing import Hashable
 
@@ -45,12 +25,7 @@ def _default_uid_hash(uid: str) -> int:
 def create_segment_metadata(
     segments: list[list[tuple[Hashable, int]]],
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Create segment metadata arrays for prefix-tree building.
-
-    Returns:
-        (segment_hashes, segment_lengths) numpy arrays with object dtype.
-        Supports fancy indexing during reorder.
-    """
+    """Create (segment_hashes, segment_lengths) numpy arrays (object dtype, reorder-safe)."""
     segment_hashes = []
     segment_lengths = []
     for sample_segments in segments:
@@ -75,16 +50,7 @@ def create_grpo_segment_metadata(
     prompt_lengths: list[int],
     rollout_n: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Create segment metadata for GRPO: one shared-prompt segment per sample.
-
-    Args:
-        prompt_uids: Per-sample UUID. Same UUID = same prompt prefix.
-        prompt_lengths: Prompt token length for each sample.
-        rollout_n: Number of rollouts per prompt (for validation only).
-
-    Returns:
-        (segment_hashes, segment_lengths) arrays.
-    """
+    """Create segment metadata for GRPO: one shared-prompt segment per sample. Validates batch_size % rollout_n."""
     batch_size = len(prompt_uids)
     if batch_size % rollout_n != 0:
         raise ValueError(f"batch_size {batch_size} not divisible by rollout_n {rollout_n}")
@@ -97,11 +63,7 @@ def group_by_segment_hash(
     segment_lengths: np.ndarray,
     level: int = 0,
 ) -> dict[int, list[tuple[int, int]]]:
-    """Group samples by their segment hash at a given level.
-
-    Returns:
-        Dict mapping hash → list of (sample_idx, segment_length).
-    """
+    """Group samples by segment hash at given level, returning hash → [(sample_idx, segment_length), ...]."""
     groups: dict[int, list[tuple[int, int]]] = {}
     for sample_idx in range(len(segment_hashes)):
         sample_hashes = segment_hashes[sample_idx]

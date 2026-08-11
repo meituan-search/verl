@@ -298,32 +298,32 @@ def gptmodel_forward_model_engine(
 
     if data_format == "thd":
         use_prefix_tree = (logits_processor_args or {}).get("use_prefix_tree", False)
-        prefix_tree_attention = (logits_processor_args or {}).get("prefix_tree_attention", "flex")
 
+        tree_ctx = None
         if use_prefix_tree:
-            from verl.utils.prefix_tree.forward import unfuse_try_forward_prefix_tree
+            from verl.utils.prefix_tree.forward import prepare_prefix_tree, tree_post_processing
 
-            output = unfuse_try_forward_prefix_tree(
+            tree_ctx = prepare_prefix_tree(
                 model,
                 input_ids,
                 logits_processor_args,
-                prefix_tree_attention,
-                logits_processor,
-                post_process,
                 model_kwargs,
-                vision_model,
-                mtp_enable_train,
+                vision_model=vision_model,
+                mtp_enable_train=mtp_enable_train,
             )
-            if output is not None:
-                return output
 
-        input_ids_rmpad, packed_seq_params, position_ids_rmpad = preprocess_thd_engine(
-            input_ids,
-            pre_process=pre_process or (post_process and mtp_enable_train),
-            use_fp8_padding=use_fp8_padding,
-            local_cp_size=local_cp_size,
-        )
-        input_ids_rmpad = input_ids_rmpad.contiguous()
+        if tree_ctx is None:
+            input_ids_rmpad, packed_seq_params, position_ids_rmpad = preprocess_thd_engine(
+                input_ids,
+                pre_process=pre_process or (post_process and mtp_enable_train),
+                use_fp8_padding=use_fp8_padding,
+                local_cp_size=local_cp_size,
+            )
+            input_ids_rmpad = input_ids_rmpad.contiguous()
+        else:
+            input_ids_rmpad = tree_ctx.input_ids
+            position_ids_rmpad = tree_ctx.position_ids
+            packed_seq_params = None
 
         args = {}
         if mtp_enable_train and post_process:
@@ -368,7 +368,9 @@ def gptmodel_forward_model_engine(
             **model_kwargs,
         )
 
-        if post_process and logits_processor is not None:
+        if tree_ctx is not None:
+            output = tree_post_processing(tree_ctx, output_orig, logits_processor, logits_processor_args, post_process)
+        elif post_process and logits_processor is not None:
             args = {
                 k: preprocess_thd_engine(
                     v,

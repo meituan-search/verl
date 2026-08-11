@@ -11,24 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Prefix-tree data structures.
-
-Class hierarchy:
-
-    TrieNode:       compressed trie node.  No tree-level metadata — ``nodes``,
-                      ``leaves``, ``node_idx`` assignment and ``finalize()`` are
-                      managed by :class:`PrefixTrie` (the container).
-
-    PrefixTrie:     common interface for navigating a prefix trie.
-                      Both the global trie and per-micro-batch view expose this
-                      interface so callers need not distinguish between them.
-                      Future: ``kv_cache: list[Tensor]`` indexed by ``node_idx``.
-
-    PrefixSubTrie:  per-micro-batch view into a PrefixTrie.  Inherits the
-                      PrefixTrie interface.  Serialisable: ``leaf_node_ids`` and
-                      ``leaf_to_sample`` are plain int lists; ``source`` is a
-                      local-only back-reference, never transmitted cross-node.
-"""
+"""Prefix-tree data structures: TrieNode (compressed trie), PrefixTrie (full batch), PrefixSubTrie (per-mb serializable view), segment-based tree builder."""
 
 from __future__ import annotations
 
@@ -38,25 +21,14 @@ from typing import Optional
 
 import numpy as np
 
-# ---------------------------------------------------------------------------
-# TrieNode: compressed trie node (mutable before finalize, immutable after)
-# ---------------------------------------------------------------------------
+# TrieNode: compressed trie node (mutable before finalize, immutable after).
 
 
 @dataclass(eq=False)
 class TrieNode:
-    """Compressed-trie node.
+    """Compressed-trie node with input_ids, children, sequence_ids, ancestor. No tree-level metadata (managed by PrefixTrie).
 
-    Each non-root node represents a contiguous run of tokens shared by the same
-    set of sequences.  The root has no tokens and no parent (``ancestor=None``).
-
-    Pure node — no tree-level metadata. ``node_idx``, ``nodes``, ``leaves``
-    are managed by ``PrefixTrie`` (the container), not by the node itself.
-
-    Transient layout attributes set externally by ``build_layout_from_tree_node``
-    (not part of the node's identity): ``_flat_start``, ``_flat_end``,
-    ``_owner_offset``, ``_owner_sample``.
-    """
+    Transient layout attrs set externally by build_layout_from_tree_node: _flat_start, _flat_end, _owner_offset, _owner_sample."""
 
     input_ids: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
     children: dict[int, TrieNode] = field(default_factory=dict)
@@ -80,12 +52,7 @@ class TrieNode:
         return child
 
     def insert(self, sequence: np.ndarray, seq_id: int) -> None:
-        """Insert a full token sequence. Must only be called before ``finalize()``.
-
-        Walks the trie matching prefixes. On full match, descends into child.
-        On partial match, splits the child and adds a divergent branch. On no
-        match, adds a new child. seq_id is appended to every node on the path.
-        """
+        """Insert token sequence: match prefix, split child on partial match, add divergent branch. Before finalize()."""
         if len(sequence) == 0:
             return
         token = int(sequence[0])
@@ -110,17 +77,7 @@ class TrieNode:
                 child._add_child(remaining, [seq_id])
 
     def _split(self, match_pos: int) -> TrieNode:
-        """Split this node's run at ``match_pos`` into prefix + suffix.
-
-        ``self`` keeps ``input_ids[:match_pos]`` (the shared prefix) and becomes
-        the parent.  A new suffix node is created for ``input_ids[match_pos:]``,
-        inheriting the old children, sequence_ids, and ancestor (for leaf nodes).
-
-        Only the child link and input_ids are modified — no re-allocation of
-        the node itself.  Must only be called before ``finalize()``.
-
-        Returns the suffix node.
-        """
+        """Split node at match_pos into prefix (self) + suffix (new child inheriting old children/seq_ids). Returns suffix."""
         old_run = self.input_ids
         old_children = self.children
         old_seq_ids = self.sequence_ids
@@ -139,25 +96,13 @@ class TrieNode:
         return suffix
 
 
-# ---------------------------------------------------------------------------
-# PrefixTrie: common interface (global trie + subtrie view)
-# ---------------------------------------------------------------------------
+# PrefixTrie: common interface for navigating a prefix trie (global + subtrie views).
 
 
 class PrefixTrie:
-    """Common interface for navigating and building a prefix trie.
+    """Common interface for prefix trie navigation/building. Classes: PrefixTrie (global), PrefixSubTrie (per-mb).
 
-    Concrete subclasses:
-      - PrefixTrie itself:  wraps the global TrieNode root for a full batch
-      - PrefixSubTrie:      filtered view for one micro-batch
-
-    Both expose the same interface so downstream code (layout builder, MAGI
-    key construction, KV-cache lookup) works identically on either.
-
-    Tree-level metadata (``nodes``, ``leaves``, ``_finalized``) lives here,
-    not on TrieNode. ``node_idx`` is assigned by ``finalize()`` as a
-    transient attribute on each TrieNode.
-    """
+    Manages nodes, leaves, _finalized, node_idx assignment. Same API for both."""
 
     def __init__(self, root: TrieNode | None = None) -> None:
         if root is None:
@@ -212,12 +157,7 @@ class PrefixTrie:
         self.root.insert(sequence, seq_id)
 
     def finalize(self) -> None:
-        """Assign node_idx, populate nodes and leaves. Tree is immutable after.
-
-        Walks the tree in DFS pre-order (sorted by first token for deterministic,
-        insertion-order-independent output). Also re-sorts each node's
-        ``children`` dict so ``children.values()`` matches ``trie.nodes`` order.
-        """
+        """Assign node_idx via DFS pre-order (sorted by first token), populate nodes/leaves. Immutable after."""
         self.nodes = []
         self.leaves = []
 
@@ -250,24 +190,17 @@ class PrefixTrie:
     # kv_cache: list[Optional[Tensor]]  # indexed by node_idx, same as nodes
 
 
-# ---------------------------------------------------------------------------
-# PrefixSubTrie: per-micro-batch view
-# ---------------------------------------------------------------------------
+# PrefixSubTrie: per-micro-batch view.
 
 
 class PrefixSubTrie(PrefixTrie):
-    """Per-micro-batch view into a PrefixTrie.
+    """Per-micro-batch PrefixTrie view with same interface. Serialisable via __getstate__/__setstate__.
 
-    Exposes the same PrefixTrie interface so callers treat it identically to
-    the global trie.  ``nodes`` contains only the TrieNodes relevant to this
-    micro-batch (leaves and their ancestor path).
-
-    Serialisation
-    -------------
-    ``leaf_node_ids`` and ``leaf_to_sample`` are plain int lists (tiny cross-
-    node footprint).  ``source`` is a local-only reference (not serialised);
-    re-attach after deserialisation to enable KV-cache lookup.
-    """
+    leaf_to_sample: leaf i → global sample index
+    leaf_node_ids: leaf i → node_idx in source
+    source: back-ref to global trie (not serialised)
+    leaf_ids: shard-local position → leaf node_idx (-1 if absent)
+    global_sample_ids: shard-local position → global sample index"""
 
     leaf_to_sample: list[int]  # leaf i → global sample index
     leaf_node_ids: list[int]  # leaf i → node_idx of its TrieNode in source
@@ -309,11 +242,7 @@ class PrefixSubTrie(PrefixTrie):
 
     @staticmethod
     def _collect_nodes(source: PrefixTrie, leaf_node_ids: list[int]) -> tuple[list[TrieNode], list[Optional[TrieNode]]]:
-        """Collect nodes reachable from the given leaves (leaves + all ancestors).
-
-        Returns (nodes, leaves): the flat DFS node list and sample→leaf map.
-        Reassigns local ``node_idx`` on each node (subtrie-local indexing).
-        """
+        """Collect leaves + all ancestors reachable from given leaf_node_ids. Reassigns local node_idx."""
         seen: set[int] = set()
         nodes: list[TrieNode] = []
         for idx in leaf_node_ids:
@@ -340,12 +269,7 @@ class PrefixSubTrie(PrefixTrie):
         return nodes, leaves
 
     def __getstate__(self) -> dict:
-        """Pickle without the full trie back-references.
-
-        TrieNode.children dicts point to siblings outside the subtrie, causing
-        pickle to serialise the entire global trie.  Store compact per-node data
-        and reconstruct detached nodes on __setstate__.
-        """
+        """Pickle compactly: store per-node data (node_idx, input_ids, ancestor, seq_ids) to avoid full trie serialisation."""
         nodes_data = [
             (n.node_idx, n.input_ids, n.ancestor.node_idx if n.ancestor else -1, n.sequence_ids) for n in self.nodes
         ]
@@ -386,9 +310,7 @@ class PrefixSubTrie(PrefixTrie):
         self._cached_magi_key = None
 
 
-# ---------------------------------------------------------------------------
-# Segment-based global trie construction (O(N), no token comparison)
-# ---------------------------------------------------------------------------
+# Segment-based global trie construction (O(N), no token comparison).
 
 
 def build_global_tree_from_segments(
@@ -396,30 +318,9 @@ def build_global_tree_from_segments(
     segment_hashes,
     segment_lengths,
 ) -> Optional[PrefixTrie]:
-    """Build a global PrefixTrie from segment metadata, supporting multilevel trees.
+    """Build global PrefixTrie from segment metadata (O(N), multilevel). Samples share segments with matching hashes.
 
-    O(N) construction using known prefix structure, no token-by-token
-    comparison.  Returns a :class:`PrefixTrie` compatible with ``mbs_groups_from_trie``
-    and ``subtrie_view``.
-
-    Recurses through every segment level: samples sharing levels 0..k get an
-    ancestor node at each shared level.  A sample bottoms out into a leaf when
-    its segments are exhausted, when its subgroup becomes a singleton, or when
-    no further sharing is found.  Leaf ``input_ids`` = all remaining tokens
-    after the last shared segment.
-
-    Children of the root are keyed by level-0 hash (deterministic DFS order).
-    Children of intermediate nodes are keyed by a unique counter (avoids
-    collision when two siblings start with the same token).
-
-    Args:
-        samples: List of 1-D token tensors or lists (one per sequence).
-        segment_hashes: (N,) object-dtype numpy array of hash lists.
-        segment_lengths: (N,) object-dtype numpy array of length lists.
-
-    Returns:
-        PrefixTrie, or None if fewer than 2 samples.
-    """
+    Leaf input_ids = all remaining tokens after last shared segment. Compatible with mbs_groups_from_trie/subtrie_view."""
     if not samples or len(samples) < 2:
         return None
 
@@ -491,12 +392,7 @@ def _build_segment_subtree(
     parent_node: TrieNode,
     next_key,
 ) -> None:
-    """Recursively build ancestor nodes for shared segments at ``level`` >= 1.
-
-    Samples in *group_sids* already share levels 0..level-1.  Subgroup by hash
-    at *level*: 2+ sharing → ancestor node + recurse on the suffix; singleton
-    subgroup or segment-exhausted sample → leaf with all remaining tokens.
-    """
+    """Recursively build ancestor nodes for shared segments at level >= 1: subgroup by hash, create ancestor/leaf nodes."""
     # Samples whose segment list ended before this level → leaves with remaining tokens.
     for sid in group_sids:
         if level >= len(segment_hashes[sid]):

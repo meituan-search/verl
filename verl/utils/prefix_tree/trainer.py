@@ -20,7 +20,6 @@ the caller never needs to gate on ``use_prefix_tree``.
 
 from __future__ import annotations
 
-import os
 import time
 
 import numpy as np
@@ -53,27 +52,10 @@ def pt_metrics(
     trie=None,
     leaf_idx=None,
 ) -> None:
-    """Compute prefix-sharing metrics if *use_prefix_tree* is enabled.
+    """Compute prefix_tree/global_shared_ratio, packed_tokens, raw_tokens if use_prefix_tree enabled.
 
-    Updates *metrics* in-place with the trie-structure-invariant metrics
-    ``prefix_tree/global_shared_ratio``, ``prefix_tree/packed_tokens`` and
-    ``prefix_tree/raw_tokens``.  Pass *attention_mask* to strip padding from
-    2-D padded tensors.  Pass *trie* to skip the internal
-    ``greedy_build_tries`` when the caller already built one (e.g. attached
-    to ``batch.meta_info["prefix_tree"]``).
-
-    Note: ``micro_batch_shared_ratio`` is NOT computed here.  The previous
-    pre-forward computation (on the full batch, before DP dispatch and
-    reorder) did not match the actual micro-batches the engine dispatches.
-    The accurate version is computed inside
-    ``prepare_prefix_tree_micro_batches`` (from the actual ``batch_idx_list``
-    grouping) and surfaced through the engine output via
-    ``maybe_collect_mbs_metric``; the PPO trainer threads it into the
-    ``actor/prefix_tree/micro_batch_shared_ratio`` metric from the OLP path.
-
-    The ``max_token_len_per_gpu``, ``micro_batch_size`` and ``leaf_idx``
-    parameters are kept for backward-compat callers but are no longer used.
-    """
+    Uses caller-provided trie (avoiding redundant greedy_build_tries). micro_batch_shared_ratio is NOT computed here
+    (accurate version in prepare_prefix_tree_micro_batches, surfaced via maybe_collect_mbs_metric)."""
     if not _is_prefix_tree_enabled(config_or_data):
         return
     metrics.update(
@@ -89,18 +71,9 @@ def pt_metrics(
 
 
 def attach_segment_metadata(batch, rollout_n: int) -> None:
-    """Attach segment metadata for prefix-tree fast path (GRPO).
+    """Attach segment_hashes/segment_lengths for prefix-tree fast path (GRPO), from prompt UIDs and lengths.
 
-    Creates segment_hashes and segment_lengths from the batch's prompt UIDs and
-    prompt lengths, storing them in non_tensor_batch as numpy object arrays so
-    they survive reorder()/chunk()/to_tensordict() round-trips.
-
-    NOTE: treerl's prefix_tree_patch.py wraps this function with a guard that
-    skips it when branch-aware segment_hashes are already set (by
-    _attach_branch_segment_metadata in tree_search_manager). In that case the
-    branch-aware segments (prompt + response-branch deltas) are used; this
-    function only runs as the prompt-only fallback when segment_hashes is None.
-    """
+    Skipped when branch-aware segment_hashes already set (e.g. tree_search_manager). Prompt-only fallback."""
     if rollout_n < 2:
         return
     prompt_uids = batch.non_tensor_batch.get("uid", None)
@@ -119,31 +92,10 @@ def attach_segment_metadata(batch, rollout_n: int) -> None:
     batch.non_tensor_batch["segment_lengths"] = segment_lengths
 
 
-def build_global_trie(batch, *, metrics=None, rollout_n=None) -> float:
-    """Build global prefix trie from segment metadata (or token-by-token fallback)
-    and attach to batch. Mutates batch in-place.
+def build_global_trie(batch, *, metrics=None, v1_tq=False) -> float:
+    """Build global prefix trie, attach trie + leaf_idx to batch. Uses segment fast path if available, else greedy.
 
-    - trie -> batch.meta_info["prefix_tree"] (TrieNode root, shared across samples)
-    - leaf_idx -> batch.batch["leaf_idx"] (torch.long tensor, sample -> leaf node_idx)
-
-    Both survive DataProto.reorder/chunk/slice/concat/repeat natively:
-    batch tensors propagate via torch indexing; meta_info wraps as NonTensorData.
-
-    Args:
-        batch: DataProto to mutate.
-        metrics: Optional metrics dict. When provided, sets
-            ``metrics["prefix_tree/timing_s"]`` and
-            ``batch.meta_info["prefix_tree_path_tag"]`` after the build.
-        rollout_n: Optional rollout.n. When provided, calls
-            :func:`attach_segment_metadata` first (no-op if rollout_n < 2 or
-            no uids).
-
-    Returns:
-        Wall-clock seconds spent building the trie (segment fast path or greedy
-        fallback), excluding input prep and leaf_idx assignment.
-    """
-    if rollout_n is not None:
-        attach_segment_metadata(batch, rollout_n)
+    Returns wall-clock seconds spent building trie (excluding input prep)."""
     input_ids = batch.batch["input_ids"]
     attention_mask = batch.batch.get("attention_mask", None)
     if attention_mask is not None:
@@ -152,23 +104,22 @@ def build_global_trie(batch, *, metrics=None, rollout_n=None) -> float:
         seqs = [input_ids[i].tolist() for i in range(len(input_ids))]
     total_raw = sum(len(s) for s in seqs)
 
+    # if the tree metainfo is avaliable, don't need to build from scratch
     seg_hashes = batch.non_tensor_batch.get("segment_hashes", None)
     seg_lengths = batch.non_tensor_batch.get("segment_lengths", None)
-    _force_greedy = os.environ.get("MAGI_FORCE_GREEDY_TRIE", "0") == "1"
     _t0 = time.perf_counter()
-    trie = None
-    if not _force_greedy and seg_hashes is not None and seg_lengths is not None:
+    if seg_hashes is not None and seg_lengths is not None:
         trie = build_global_tree_from_segments(seqs, seg_hashes, seg_lengths)
+    else:
+        trie = None
     if trie is None:
-        tries, _ = greedy_build_tries(seqs)
-        if tries and total_raw > 0:
-            trie = tries[0]
+        trie, _ = greedy_build_tries(seqs)
     _t1 = time.perf_counter()
     if metrics is not None:
-        metrics["prefix_tree/timing_s"] = _t1 - _t0
+        metrics["actor/prefix_tree/tree_build_time_s"] = _t1 - _t0
         batch.meta_info["prefix_tree_path_tag"] = "segment" if seg_hashes is not None else "uniform"
     if trie is None:
-        return 0.0
+        return -1
 
     leaf_idx = np.full(len(seqs), -1, dtype=np.int64)
     # A sequence's leaf is the deepest node on its root->leaf path, i.e. the max
@@ -189,6 +140,15 @@ def build_global_trie(batch, *, metrics=None, rollout_n=None) -> float:
             f"(first {missing[:8]}). The trie did not cover every sequence."
         )
 
-    batch.meta_info["prefix_tree"] = trie
-    batch.batch["leaf_idx"] = torch.from_numpy(leaf_idx)
+    if v1_tq:
+        import transfer_queue as tq
+
+        from verl.utils import tensordict_utils as tu
+
+        leaf_td = tu.get_tensordict({"leaf_idx": torch.from_numpy(leaf_idx)})
+        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=leaf_td)
+        batch.extra_info["prefix_tree"] = trie
+    else:
+        batch.meta_info["prefix_tree"] = trie
+        batch.batch["leaf_idx"] = torch.from_numpy(leaf_idx)
     return _t1 - _t0

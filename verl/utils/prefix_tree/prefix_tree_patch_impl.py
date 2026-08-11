@@ -11,26 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Monkey-patches for upstream Megatron-LM to support MAGI flex-attention.
-
-Upstream Megatron-LM does not have the ``magi_attention_key`` parameter in its
-forward call chain.  This module patches the five classes that need it so that
-verl can work with a stock (unmodified) Megatron installation.
-
-Call ``apply_prefix_tree_patch()`` once before model construction (e.g. from
-``verl/models/mcore/patch.py:apply_patch`` or from the engine initialiser).
-
-Patch chain (each wrapper accepts ``magi_attention_key``/``flex_attention_key`` and threads them):
-    GPTModel.forward
-    → TransformerBlock.forward  (both the checkpointed and normal variants)
-    → TransformerLayer.forward
-    → SelfAttention.forward     (both checkpointed and normal core-attention calls)
-    → TEDotProductAttention.forward  (early-return MAGI branch)
-
-The ``magi_attn_forward`` helper calls ``calc_attn`` directly on already-dispatched
-local Q/K/V (pre-dispatch happens in ``unfuse_forward_prefix_tree`` /
-``fuse_try_forward_prefix_tree`` before the model call).
-"""
+"""Monkey-patches for Megatron-LM: MAGI/flex attention via TEDotProductAttention.forward, SelfAttention,_checkpointed, TransformerLayer/Block, GPTModel + RoPE CP slicing override."""
 
 from __future__ import annotations
 
@@ -55,9 +36,7 @@ from torch.nn.attention.flex_attention import flex_attention
 _attn_key_stack: list = []
 
 
-# ---------------------------------------------------------------------------
-# flex_attention helper for prefix-tree
-# ---------------------------------------------------------------------------
+# flex_attention helper
 
 
 def flex_attn_forward(
@@ -66,14 +45,7 @@ def flex_attn_forward(
     value: Tensor,
     flex_attention_key: object,
 ) -> Tensor:
-    """Execute PyTorch flex_attention for prefix-tree batches.
-
-    Input tensors are in thd layout: ``(total_tokens, 1, num_heads, head_dim)``.
-    Returns ``(total_tokens, 1, num_heads*head_dim)``.
-
-    Uses torch.utils.checkpoint to avoid storing the O(T²) attention score
-    matrix for backward; recomputes the forward pass instead (O(T) memory).
-    """
+    """Execute PyTorch flex_attention for prefix-tree batches: THD→(1,H,T,D), flex_attention, back→THD."""
 
     T, _, H, D = query.shape
     q = query.squeeze(1).permute(1, 0, 2).unsqueeze(0)  # (1, H, T, D)
@@ -86,9 +58,7 @@ def flex_attn_forward(
     return out.reshape(T, 1, -1)  # (T, 1, Hq*D)
 
 
-# ---------------------------------------------------------------------------
-# MAGI attention kernel helper (verbatim from Megatron-LM-prefix-tree fork)
-# ---------------------------------------------------------------------------
+# MAGI attention kernel helper
 
 
 def magi_attn_forward(
@@ -97,11 +67,7 @@ def magi_attn_forward(
     value: Tensor,
     magi_attention_key: object,
 ) -> Tensor:
-    """Execute MAGI calc_attn for prefix-tree batches.
-
-    Input Q/K/V are already CP-local (pre-dispatched before the model call).
-    Returns ``(local_tokens, 1, num_heads*head_dim)``.
-    """
+    """Execute MAGI calc_attn for prefix-tree: squeeze pre-dispatched CP-local Q/K/V, call calc_attn, reshape."""
 
     q = query.squeeze(1).contiguous()
     k = key.squeeze(1).contiguous()
@@ -112,13 +78,11 @@ def magi_attn_forward(
     return out.reshape(out.shape[0], 1, -1)
 
 
-# ---------------------------------------------------------------------------
-# Per-batch attention-path counters (magi / flex / fa3-fallback)
-# ---------------------------------------------------------------------------
+# Per-batch attention-path counters (magi/flex/fa3)
 
 
 def _make_attn_counters():
-    """Return (reset, inc_fa3, inc_non_fa3, get_metrics) closures sharing one state dict."""
+    """Return (reset, inc_fa3, inc_non_fa3, get_metrics) closures tracking FA3 fallback ratio."""
     state = {"fa3": 0, "total": 0}
 
     def reset():
@@ -149,7 +113,7 @@ _reset_attn_counters, _inc_fa3, _inc_non_fa3, _get_attn_metrics = _make_attn_cou
 
 
 def maybe_collect_attn_metrics(engine_config, engine, output: dict) -> None:
-    """Collect attn metrics into output['metrics'] and clear counters for next batch."""
+    """Collect attn FA3 fallback ratio into output['metrics'] and reset counters."""
     if getattr(engine_config, "use_prefix_tree", False):
         attn_metrics = _get_attn_metrics()
         if attn_metrics and engine.is_mp_src_rank_with_outputs():
@@ -158,13 +122,7 @@ def maybe_collect_attn_metrics(engine_config, engine, output: dict) -> None:
 
 
 def maybe_collect_mbs_metric(engine_config, engine, output: dict) -> None:
-    """Collect the post-micro-batch-build micro_batch_shared_ratio into output['metrics'].
-
-    Pulls the accurate per-micro-batch sharing ratio (computed inside
-    ``prepare_prefix_tree_micro_batches`` from the ACTUAL grouping the engine
-    dispatches) into ``output['metrics']`` and clears the collector.  Mirrors
-    :func:`maybe_collect_attn_metrics` exactly.
-    """
+    """Collect post-micro-batch micro_batch_shared_ratio into output['metrics'] and reset."""
     if getattr(engine_config, "use_prefix_tree", False):
         from verl.utils.prefix_tree.dynamic import _get_mbs_metric, _reset_mbs_metric
 
@@ -174,24 +132,16 @@ def maybe_collect_mbs_metric(engine_config, engine, output: dict) -> None:
         _reset_mbs_metric()
 
 
-# ---------------------------------------------------------------------------
 # Patch application
-# ---------------------------------------------------------------------------
 
 
 def apply_prefix_tree_patch() -> None:
-    """Monkey-patch upstream Megatron-LM classes to support prefix-tree attention (flex and MAGI).
-
-    Safe to call multiple times: subsequent calls are no-ops (checks for the
-    ``_magi_patched`` sentinel attribute).
-    """
+    """Monkey-patch Megatron classes for prefix-tree attention (flex and MAGI). Safe to call multiple times."""
 
     if getattr(TEDotProductAttention, "_prefix_tree_patched", False):
         return  # skip the double-patching
 
-    # ------------------------------------------------------------------
-    # 1. TEDotProductAttention.forward: add early-return MAGI branch
-    # ------------------------------------------------------------------
+    # 1. TEDotProductAttention.forward: add early-return MAGI/flex branches.
     _orig_te_forward = TEDotProductAttention.forward
 
     @functools.wraps(_orig_te_forward)
@@ -233,9 +183,7 @@ def apply_prefix_tree_patch() -> None:
 
     TEDotProductAttention.forward = _te_forward
 
-    # ------------------------------------------------------------------
-    # 2. SelfAttention._checkpointed_attention_forward: thread kwarg
-    # ------------------------------------------------------------------
+    # 2. SelfAttention._checkpointed_attention_forward: capture patched core_attention.forward at closure-creation time.
     _orig_sa_ckpt = SelfAttention._checkpointed_attention_forward
 
     @functools.wraps(_orig_sa_ckpt)
@@ -253,10 +201,7 @@ def apply_prefix_tree_patch() -> None:
         flex_attention_key=None,
         **kwargs,
     ):
-        # Capture the MAGI-patched forward at closure-creation time (not lookup time).
-        # self.core_attention.forward is _ca_forward_with_key right now (set by _sa_forward).
-        # If we looked it up dynamically inside custom_forward, recomputation during backward
-        # would see the restored FA3 forward (the finally block already ran).
+        # Capture magi-patched core_attention.forward at closure time (not lookup time) for recompute safety.
         _captured_ca_forward = self.core_attention.forward
 
         def custom_forward(*inputs):
@@ -288,9 +233,7 @@ def apply_prefix_tree_patch() -> None:
 
     SelfAttention._checkpointed_attention_forward = _sa_ckpt_forward
 
-    # ------------------------------------------------------------------
-    # 3. SelfAttention.forward: accept and pass magi/flex attention key
-    # ------------------------------------------------------------------
+    # 3. SelfAttention.forward: accept and thread magi/flex attention key.
     _orig_sa_forward = SelfAttention.forward
 
     @functools.wraps(_orig_sa_forward)
@@ -319,9 +262,7 @@ def apply_prefix_tree_patch() -> None:
 
     SelfAttention.forward = _sa_forward
 
-    # ------------------------------------------------------------------
-    # 4. TransformerLayer.forward: accept and pass magi/flex attention key
-    # ------------------------------------------------------------------
+    # 4. TransformerLayer.forward: accept and pass magi/flex attention key, with recompute stack fallback.
     _orig_tl_forward = TransformerLayer.forward
 
     @functools.wraps(_orig_tl_forward)
@@ -352,9 +293,7 @@ def apply_prefix_tree_patch() -> None:
 
     TransformerLayer.forward = _tl_forward
 
-    # ------------------------------------------------------------------
-    # 5. TransformerBlock.forward: accept and pass magi/flex attention key
-    # ------------------------------------------------------------------
+    # 5. TransformerBlock.forward: accept and pass magi/flex attention key with checkpoint wrapper for recompute.
     _orig_tb_forward = TransformerBlock.forward
 
     @functools.wraps(_orig_tb_forward)
@@ -364,8 +303,7 @@ def apply_prefix_tree_patch() -> None:
         attn_key = magi_attention_key or flex_attention_key
         if attn_key is None:
             return _orig_tb_forward(self, hidden_states, attention_mask, **kwargs)
-        # (A) Layer-level patching: injects key via kwargs for the forward pass,
-        #     regardless of whether gradient checkpointing is enabled.
+        # (A) Layer-level patching: inject key via kwargs for forward pass.
         originals = []
         for layer in self.layers:
             originals.append(layer.forward)
@@ -381,9 +319,7 @@ def apply_prefix_tree_patch() -> None:
 
             layer.forward = _make_wrapper(layer.forward)
 
-        # (B) Stack via checkpoint wrapper: pushes key for backward recomputation.
-        #     During recompute the layer wrappers above are already restored (finally ran),
-        #     so _tl_forward falls back to _attn_key_stack pushed by _fn_with_key.
+        # (B) Checkpoint wrapper: push key onto _attn_key_stack for backward recompute.
         import megatron.core.tensor_parallel as _tp
 
         _real_tp_checkpoint = _tp.checkpoint
@@ -412,11 +348,7 @@ def apply_prefix_tree_patch() -> None:
 
     TransformerBlock.forward = _transformer_block_forward
 
-    # ------------------------------------------------------------------
-    # 6. GPTModel.forward: accept and pass magi/flex attention key.
-    #    Patches rope_mod.forward with _rope_fwd_with_pids for the duration
-    #    of the call so patch #7 uses correct per-token position indexing.
-    # ------------------------------------------------------------------
+    # 6. GPTModel.forward: accept and pass magi/flex attention key, patch RoPE for correct per-token position indexing.
     _orig_rope_fn = RotaryEmbedding.forward.__wrapped__  # actual impl, bypasses lru_cache
     _orig_gpt_forward = GPTModel.forward
 
@@ -437,9 +369,7 @@ def apply_prefix_tree_patch() -> None:
 
         self.decoder.forward = _decoder_forward_with_key
 
-        # Patch RotaryEmbedding using position_ids (= pt_batch.local_tree_packed_position_ids,
-        # per-sample positions that reset within each sample). Closure captures pids
-        # per-batch: no global state needed.
+        # Patch RoPE: use position_ids for per-token indexing (full table, cp_group=None).
         rope_mod = getattr(self, "rotary_pos_emb", None)
         pids = position_ids.reshape(-1) if (position_ids is not None and rope_mod is not None) else None
         _real_rope_fwd = rope_mod.forward if rope_mod is not None else None
@@ -457,8 +387,8 @@ def apply_prefix_tree_patch() -> None:
                 def _rope_fwd_with_pids(max_seq_len, offset=0, packed_seq=False, cp_group=None):
                     actual_seq_len = int(pids.max().item()) + 1
                     emb = _orig_rope_fn(rope_mod, actual_seq_len, offset=0, packed_seq=True, cp_group=None)
-                    # All PP stages use seq-first Q=(seq,1,H,D) because unfuse_forward_prefix_tree
-                    # returns (seq,1,hidden) for all intermediate stages (not batch-first).
+                    # All PP stages use seq-first Q=(seq,1,H,D) because prepare_prefix_tree
+                    # provides tree-dispatched inputs for all intermediate stages (not batch-first).
                     # freqs=(seq,1,1,dim) broadcasts correctly: Q×freqs→(seq,1,H,D) ✓
                     indexed = emb[pids.to(emb.device)]
                     return indexed
@@ -475,19 +405,6 @@ def apply_prefix_tree_patch() -> None:
 
     GPTModel.forward = _gpt_forward
 
-    # ------------------------------------------------------------------
-    # 7. RotaryEmbedding.forward: bypass CP-rank RoPE slicing for prefix-tree.
-    #
-    # Root cause of CP>1 bug: Megatron's get_pos_emb_on_this_cp_rank slices RoPE
-    # assuming rank r holds sequential positions [r*T/CP .. (r+1)*T/CP].  After
-    # MAGI dispatch, each CP rank holds non-sequential tokens (dispatch assigns by
-    # attention topology), so their position_ids are arbitrary, not rank-aligned.
-    # Using the rank-sliced frequencies produces wrong Q/K rotations.
-    #
-    # Fix: the closure _rope_fwd_with_pids (patch #6) replaces rope_mod.forward
-    # for the duration of each prefix-tree forward.  It builds the full RoPE table
-    # (cp_group=None) and indexes directly by the actual local position_ids, giving
-    # correct frequencies regardless of CP rank or dispatch ordering.
-    # ------------------------------------------------------------------
+    # 7. RotaryEmbedding.forward: CP>1 RoPE slicing bypass — patch #6 builds full table, indexes by actual position_ids.
 
     TEDotProductAttention._prefix_tree_patched = True
