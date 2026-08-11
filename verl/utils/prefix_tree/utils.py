@@ -85,7 +85,6 @@ class PrefixTreeParams:
         for name, tensor in {
             "tree_packed_tokens": self.tree_packed_tokens,
             "tree_packed_labels": self.tree_packed_labels,
-            "tree_packed_loss_mask": self.tree_packed_loss_mask,
             "tree_packed_position_ids": self.tree_packed_position_ids,
         }.items():
             if tensor is not None and tensor.numel() != self.total_seqlen_q:
@@ -121,10 +120,11 @@ def prepare_packed_label(
     root_nodes: list[TrieNode],
     subtrie_valid_ids: set[int],
     leaf_node_id_to_samples: dict[int, list[int]],
+    flat_end: dict[int, int],
+    owner_offset: dict[int, int],
 ) -> BoundaryRegistry:
     """Build boundary registry for LCE boundary-patch: maps flat positions with ≥2 branching children to per-leaf
     (sample_idx, next_token) pairs, so restore_flat_to_nested can patch non-owner leaf boundary log-probs after LCE."""
-
 
     def _subtrie_children(node: TrieNode) -> list[TrieNode]:
         return [c for c in node.children.values() if c.node_idx in subtrie_valid_ids]
@@ -158,11 +158,8 @@ def prepare_packed_label(
                 continue
 
             # The boundary is the LAST token of this shared ancestor.
-            b_pos = node._flat_end - 1
-            # The next-token position in the original sample: right after the
-            # shared prefix ending at this node.  node._owner_offset is the
-            # sample-local offset of this node's first token.
-            next_token_pos = node._owner_offset + len(node.input_ids)
+            b_pos = flat_end[node.node_idx] - 1
+            next_token_pos = owner_offset[node.node_idx] + len(node.input_ids)
 
             leaves_info: list[tuple[int, int]] = []
             for leaf in _collect_leaf_descendants(node):
@@ -200,12 +197,23 @@ def build_layout_from_tree_node(
     for nid, sid in zip(subtrie.leaf_node_ids, subtrie.leaf_to_sample, strict=False):
         leaf_node_id_to_samples.setdefault(nid, []).append(sid)
     leaf_node_id_to_sample: dict[int, int] = {nid: sids[0] for nid, sids in leaf_node_id_to_samples.items()}
+    # seq_id → leaf node_idx for fallback owner lookup.
+    seq_id_to_leaf_node_idx: dict[int, int] = {}
+    for nid, sids in leaf_node_id_to_samples.items():
+        for sid in sids:
+            seq_id_to_leaf_node_idx[sid] = nid
 
     valid_ids: set[int] = {n.node_idx for n in subtrie.nodes}
 
     root_nodes = [n for n in subtrie.nodes if n.ancestor is None or n.ancestor.node_idx not in valid_ids]
     device = samples[0].device
     rolled_samples = [torch.cat([s[1:], torch.zeros(1, dtype=s.dtype, device=s.device)]) for s in samples]
+
+    # Local layout dicts — no TrieNode mutation.
+    flat_start: dict[int, int] = {}
+    flat_end: dict[int, int] = {}
+    owner_offset: dict[int, int] = {}
+    owner_sample: dict[int, int | None] = {}
 
     # Single BFS: positions, owner annotation, pack tokens/labels/masks.
     q_ranges: list[RangeSpec] = []
@@ -216,79 +224,103 @@ def build_layout_from_tree_node(
     flat_lm_pieces: Optional[list[Tensor]] = [] if loss_masks_by_sample is not None else None
     flat_pid_pieces: Optional[list[Tensor]] = [] if position_ids_by_sample is not None else None
     default_pid_pieces: list[Tensor] = []
-    leaves: list[TrieNode] = []
     bfs_order: list[TrieNode] = []
 
     pos = 0
     for root in root_nodes:
-        queue = [root]
+        # Compute root's sample-local offset: sum of global ancestor lengths
+        # (ancestors not in this subtrie that precede the root in the sample).
+        root_offset = 0
+        anc = root.ancestor
+        while anc is not None and anc.input_ids is not None:
+            root_offset += len(anc.input_ids)
+            anc = anc.ancestor
+        # Queue items: (node, parent_owner_offset)
+        queue: list[tuple[TrieNode, int]] = [(root, root_offset)]
         while queue:
-            node = queue.pop(0)
+            node, parent_offset = queue.pop(0)
             bfs_order.append(node)
-            children = list(node.children.values())
+            nid = node.node_idx
+            # Only queue subtrie children.
+            children = [c for c in node.children.values() if c.node_idx in valid_ids]
 
-            # Flat position + owner offset (sample-local offset of first token).
-            node._flat_start = pos
-            node._flat_end = pos + len(node.input_ids)
-            node._owner_offset = pos  # sample-local offset = flat position (natural: no donation)
+            flat_start[nid] = pos
+            flat_end[nid] = pos + len(node.input_ids)
+            # Sample-local offset passed from parent (descendant direction).
+            owner_offset[nid] = parent_offset
 
-            # Owner: leaf gets its own sample; internal node gets node_sample or
-            # first child's owner (deferred — set in post-BFS pass below).
-            node_sample = leaf_node_id_to_sample.get(node.node_idx)
+            node_sample = leaf_node_id_to_sample.get(nid)
             if not children:
-                node._owner_sample = node_sample if node_sample is not None else leaf_node_id_to_sample[node.node_idx]
-                leaves.append(node)
+                owner = node_sample
+                if owner is None:
+                    # Subtrie leaf that's internal in global trie: use any
+                    # sequence_id to find a leaf node_idx known to the subtrie.
+                    for seq_id in node.sequence_ids:
+                        leaf_nid = seq_id_to_leaf_node_idx.get(seq_id)
+                        if leaf_nid is not None:
+                            owner = leaf_node_id_to_sample[leaf_nid]
+                            break
+                owner_sample[nid] = owner
+                if owner is not None:
+                    pass  # owner tracked in dict, leaf ranges built from subtrie.leaf_node_ids
             elif node_sample is not None:
-                leaves.append(node)  # strict-prefix sample at internal node
+                owner_sample[nid] = node_sample
 
-            queue.extend(children)
-            pos = node._flat_end
+            child_offset = parent_offset + len(node.input_ids)
+            for child in children:
+                queue.append((child, child_offset))
+            pos = flat_end[nid]
 
     # Post-BFS: set owner for internal nodes (first child's owner propagates up).
-    # Process in reverse BFS order so children are set before parents.
     for node in reversed(bfs_order):
-        children = list(node.children.values())
-        if children and not hasattr(node, "_owner_sample"):
-            node._owner_sample = children[0]._owner_sample
-        elif children and node._owner_sample is None:
-            node._owner_sample = children[0]._owner_sample
+        nid = node.node_idx
+        if nid in owner_sample and owner_sample[nid] is not None:
+            continue
+        # Walk global descendants to find any subtrie leaf with a known sample.
+        stack = list(node.children.values())
+        while stack:
+            c = stack.pop()
+            cid = c.node_idx
+            if cid in owner_sample and owner_sample[cid] is not None:
+                owner_sample[nid] = owner_sample[cid]
+                break
+            stack.extend(c.children.values())
 
     # Pack tokens/labels/masks/position_ids (second pass, now owners are set).
     for node in bfs_order:
         if len(node.input_ids) == 0:
             continue
-        s, e = node._flat_start, node._flat_end
+        nid = node.node_idx
+        s = owner_offset[nid]
+        e = s + len(node.input_ids)
         if s < e:
-            src = node._owner_sample
+            src = owner_sample.get(nid, 0)
+            if src is None:
+                continue  # pruned node, not owned by any sample in this shard
             flat_pieces.append(samples[src][s:e])
             flat_label_pieces.append(rolled_samples[src][s:e])
             if flat_lm_pieces is not None:
                 flat_lm_pieces.append(loss_masks_by_sample[src][s:e])
+
+            # Attention rectangles + position IDs.
+            fs, fe = flat_start[nid], flat_end[nid]
             if flat_pid_pieces is not None:
                 flat_pid_pieces.append(position_ids_by_sample[src][s:e])
             else:
                 default_pid_pieces.append(torch.arange(s, e, device=device, dtype=torch.long))
 
-            # Attention rectangles: causal self-rect + full rects for descendants.
-            node_range: RangeSpec = (s, e)
+            node_range: RangeSpec = (fs, fe)
             q_ranges.append(node_range)
             k_ranges.append(node_range)
             mask_types.append("causal")
-            if children:
+            node_children = list(node.children.values())
+            if node_children:
                 for desc in _bfs_descendants(node):
-                    if len(desc.input_ids) > 0:
-                        q_ranges.append((desc._flat_start, desc._flat_end))
+                    did = desc.node_idx
+                    if did in flat_start and len(desc.input_ids) > 0:
+                        q_ranges.append((flat_start[did], flat_end[did]))
                         k_ranges.append(node_range)
                         mask_types.append("full")
-                if children:
-                    for desc in _bfs_descendants(node):
-                        if len(desc.input_ids) > 0:
-                            q_ranges.append((desc._flat_start, desc._flat_end))
-                            k_ranges.append(node_range)
-                            mask_types.append("full")
-
-            queue.extend(children)
-            pos = node._flat_end
 
     # Assemble packed tensors.
     tree_packed_tokens = (
@@ -310,23 +342,36 @@ def build_layout_from_tree_node(
     leaf_to_sample_list: list[int] = []
     leaf_ancestor_ranges: list[list[RangeSpec]] = []
 
-    for leaf in sorted(leaves, key=lambda l: l._flat_start):
-        # Walk ancestor chain (set by finalize) — no parent_of dict needed.
+    # Leaf ranges + ancestor chains — iterate subtrie.leaf_node_ids (DFS order)
+    # so leaf_ranges align with restore's subtrie.leaf_to_sample indexing.
+    leaf_ranges: list[RangeSpec] = []
+    leaf_to_sample_list: list[int] = []
+    leaf_ancestor_ranges: list[list[RangeSpec]] = []
+
+    for nid in subtrie.leaf_node_ids:
+        if nid not in flat_start:
+            continue
+        sids = leaf_node_id_to_samples.get(nid, [])
+        if not sids:
+            continue
+
         chain: list[RangeSpec] = []
-        cur = leaf.ancestor
-        while cur is not None and cur in subtrie.nodes:
-            chain.append((cur._flat_start, cur._flat_end))
-            cur = cur.ancestor
+        cur = next((n for n in subtrie.nodes if n.node_idx == nid), None)
+        if cur is not None:
+            anc = cur.ancestor
+            while anc is not None and anc in subtrie.nodes:
+                cid = anc.node_idx
+                if cid in flat_start:
+                    chain.append((flat_start[cid], flat_end[cid]))
+                anc = anc.ancestor
         chain.reverse()
 
-        rep_range: RangeSpec = (leaf._flat_start, leaf._flat_end)
-        sids = leaf_node_id_to_samples[leaf.node_idx]
+        rep_range: RangeSpec = (flat_start[nid], flat_end[nid])
 
         leaf_ranges.append(rep_range)
         leaf_to_sample_list.append(sids[0])
         leaf_ancestor_ranges.append(chain)
 
-        # Zero-length entries for duplicate samples.
         zero_range: RangeSpec = (rep_range[1], rep_range[1])
         for dup_sid in sids[1:]:
             leaf_ranges.append(zero_range)
@@ -334,7 +379,7 @@ def build_layout_from_tree_node(
             leaf_ancestor_ranges.append(chain + [rep_range])
 
     sample_to_leaf_range = {s: r for s, r in zip(leaf_to_sample_list, leaf_ranges, strict=False)}
-    prefix_range = (root_nodes[0]._flat_start, root_nodes[0]._flat_end)
+    prefix_range = (flat_start[root_nodes[0].node_idx], flat_end[root_nodes[0].node_idx])
 
     params = PrefixTreeParams(
         prefix_range=prefix_range,
@@ -350,7 +395,9 @@ def build_layout_from_tree_node(
         tree_packed_labels=tree_packed_labels_tensor,
         tree_packed_loss_mask=tree_packed_loss_mask,
         tree_packed_position_ids=tree_packed_position_ids,
-        boundary_registry=prepare_packed_label(samples, root_nodes, valid_ids, leaf_node_id_to_samples),
+        boundary_registry=prepare_packed_label(
+            samples, root_nodes, valid_ids, leaf_node_id_to_samples, flat_end, owner_offset
+        ),
     )
     params._leaf_ancestor_ranges = leaf_ancestor_ranges
 

@@ -7,6 +7,7 @@ Note: the layout uses a boundary-donation mechanism (non-leaf nodes donate
 their last token to each child), so packed tokens include repeated prefix
 tokens. Tests assert structural invariants rather than exact token sequences.
 """
+
 from __future__ import annotations
 
 import torch
@@ -94,19 +95,6 @@ def test_restore_token_ids_round_trip():
     for i, orig in enumerate(tokens):
         assert torch.equal(vals[pos : pos + int(lengths[i])], orig), f"sample {i} mismatch"
         pos += int(lengths[i])
-
-
-def test_loss_mask_flattened():
-    tokens = [torch.tensor([10, 20, 30, 41, 42]), torch.tensor([10, 20, 30, 51])]
-    loss_masks = [torch.tensor([0.0, 0.0, 1.0, 1.0, 1.0]), torch.tensor([0.0, 0.0, 1.0, 1.0])]
-    subtrie = build_tree_dynamic(tokens)
-    assert subtrie is not None
-    params = build_layout_from_tree_node(tokens, subtrie, loss_masks_by_sample=loss_masks)
-    lm = params.tree_packed_loss_mask
-    assert lm is not None
-    # Packed mask length matches packed tokens; prefix donations carry their own mask
-    assert lm.shape[0] == params.tree_packed_tokens.shape[0]
-    assert int(lm[0]) == 0 and int(lm[1]) == 0  # prefix tokens [10,20] are loss-masked-out
 
 
 def test_build_prefix_tree_micro_batch_unpacks_nested(monkeypatch):

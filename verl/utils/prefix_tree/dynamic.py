@@ -42,7 +42,7 @@ __all__ = [
     "greedy_build_tries",
     "mbs_groups_from_trie",
     "convert_trie_to_tree_node",
-    "subtrie_view",
+    "build_subtrie_view",
     # Load balancing
     "trie_group_flat_tokens",
     "get_dfs_balanced_partitions",
@@ -110,7 +110,7 @@ def convert_trie_to_tree_node(
     """Convert a compressed trie to a :class:`PrefixSubTrie`.
 
     Returns ``None`` when there's no real sharing (no children or multi-root).
-    Delegates to :func:`subtrie_view` with all sequence IDs.
+    Delegates to :func:`build_subtrie_view` with all sequence IDs.
     """
     if not trie.children:
         _logging.getLogger(__name__).warning(
@@ -123,8 +123,15 @@ def convert_trie_to_tree_node(
             len(trie.children),
         )
         return None
-    all_seq_ids = {s for child in trie.children.values() for s in _trie_seq_ids(child)}
-    return subtrie_view(trie, all_seq_ids)
+    all_seq_ids: set[int] = set()
+    for child in trie.children.values():
+        for s in _trie_seq_ids(child):
+            all_seq_ids.add(s)
+    # Also collect from internal nodes (strict-prefix samples).
+    for child in trie.children.values():
+        for s in child.sequence_ids:
+            all_seq_ids.add(s)
+    return build_subtrie_view(trie, all_seq_ids)
 
 
 def build_tree_dynamic(samples: list[Tensor]) -> Optional[PrefixSubTrie]:
@@ -328,16 +335,21 @@ def mbs_groups_from_leaf_idx(
     for node in trie.nodes:
         if node.children:
             continue
-        if node.node_idx not in leaf_to_positions:
-            raise ValueError(
-                f"trie leaf node_idx={node.node_idx} has no sample in leaf_idx: trie and leaf_idx are out of sync."
-            )
-        leaf_entries.append((node, leaf_to_positions[node.node_idx]))
+        positions = leaf_to_positions.get(node.node_idx)
+        if positions is None:
+            continue  # leaf belongs to a different DP rank — skip
+        leaf_entries.append((node, positions))
+
+    if len(leaf_entries) != len(leaf_to_positions):
+        uncovered = set(leaf_to_positions) - {node.node_idx for node in trie.nodes if not node.children}
+        raise ValueError(
+            f"leaf_idx references {len(uncovered)} non-existent or non-leaf node(s): {sorted(uncovered)}"
+        )
 
     return _mbs_groups_dfs(leaf_entries, max_token_len)
 
 
-def subtrie_view(
+def build_subtrie_view(
     trie: PrefixTrie,
     keep_leaf_ids: set[int],
     source: Optional[PrefixTrie] = None,
@@ -349,17 +361,19 @@ def subtrie_view(
         source = trie
 
     def _collect(node: TrieNode) -> bool:
-        """Walk node, collecting matching leaves."""
+        """Walk node, collecting matching leaves (true leaves + strict-prefix internal nodes)."""
         if not node.children:
             kept = [s for s in node.sequence_ids if s in keep_leaf_ids]
-            if not kept:
-                return True
-            # All samples (including duplicates) map to the same node_idx.
-            # build_layout_from_tree_node handles duplicates via ancestor_segment_ranges.
-            for sid in kept:
+            if kept:
+                for sid in kept:
+                    leaf_to_sample.append(sid)
+                    leaf_node_ids.append(node.node_idx)
+            return True
+        # Strict-prefix: sample terminates at this internal node.
+        for sid in node.sequence_ids:
+            if sid in keep_leaf_ids and not any(sid in c.sequence_ids for c in node.children.values()):
                 leaf_to_sample.append(sid)
                 leaf_node_ids.append(node.node_idx)
-            return True
         for child in node.children.values():
             if keep_leaf_ids.isdisjoint(child.sequence_ids):
                 continue
@@ -377,7 +391,7 @@ def subtrie_view(
     if not leaf_to_sample:
         return None
     if set(leaf_to_sample) != keep_leaf_ids:
-        _logging.getLogger(__name__).warning("prefix_tree: subtrie_view: unmatched sequences: FA3 fallback")
+        _logging.getLogger(__name__).warning("prefix_tree: build_subtrie_view: unmatched sequences: FA3 fallback")
         return None
     batch_size = max(leaf_to_sample) + 1 if leaf_to_sample else 0
     subtrie = PrefixSubTrie(

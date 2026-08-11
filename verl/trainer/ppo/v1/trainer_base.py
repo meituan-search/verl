@@ -1455,7 +1455,7 @@ class PPOTrainer(ABC):
         proto.batch = TensorDict({"input_ids": input_ids}, batch_size=[len(input_ids)])
         if attn is not None:
             proto.batch["attention_mask"] = attn
-        build_global_trie(proto, metrics=metrics, rollout_n=None)
+        build_global_trie(proto, metrics=metrics)
         trie = proto.meta_info.get("prefix_tree", None)
         leaf_idx = proto.batch.get("leaf_idx", None)
         if trie is None or leaf_idx is None:

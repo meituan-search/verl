@@ -64,7 +64,7 @@ from verl.utils.megatron_utils import (
     unwrap_model,
 )
 from verl.utils.model import extract_multi_modal_inputs, load_mcore_dist_weights
-from verl.utils.prefix_tree.magi import get_prefix_tree_logits_args, read_prefix_tree_batch_config
+from verl.utils.prefix_tree.magi import get_prefix_tree_logits_args
 from verl.utils.seqlen_balancing import restore_dynamic_batch
 from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
 
@@ -995,10 +995,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
         if _pt_subtree is not None:
             tu.assign_non_tensor(batch, prefix_tree_subtree=_pt_subtree)
 
-        if self.engine_config.use_prefix_tree:
-            use_prefix_tree, _ = read_prefix_tree_batch_config(batch, tu, self.engine_config.use_remove_padding)
-        else:
-            use_prefix_tree = False
+        use_prefix_tree = self.engine_config.use_prefix_tree
 
         if calculate_sum_pi_squared and use_fused_kernels:
             raise NotImplementedError(

@@ -141,6 +141,24 @@ def apply_prefix_tree_patch() -> None:
     if getattr(TEDotProductAttention, "_prefix_tree_patched", False):
         return  # skip the double-patching
 
+    # 0. RoPE: patch globally once — set ._pids before forward, patch reads it.
+    _orig_rope_fn = RotaryEmbedding.forward.__wrapped__  # actual impl, bypasses lru_cache
+    _real_rope_forward = RotaryEmbedding.forward
+
+    @functools.wraps(_real_rope_forward)
+    def _rope_forward(self, max_seq_len, offset=0, packed_seq=False, cp_group=None):
+        pids = getattr(self, "_pids", None)
+        if pids is None:
+            return _real_rope_forward(self, max_seq_len, offset, packed_seq, cp_group)
+        if not hasattr(self, "get_emb"):  # M-RoPE
+            pids_3d = pids.reshape(-1).view(1, 1, -1).expand(3, 1, -1).contiguous()
+            return _real_rope_forward(self, pids_3d, getattr(self, "mrope_section", None), cp_group=None)
+        actual_seq_len = int(pids.reshape(-1).max().item()) + 1
+        emb = _orig_rope_fn(self, actual_seq_len, offset=0, packed_seq=True, cp_group=None)
+        return emb[pids.reshape(-1).to(emb.device)]
+
+    RotaryEmbedding.forward = _rope_forward
+
     # 1. TEDotProductAttention.forward: add early-return MAGI/flex branches.
     _orig_te_forward = TEDotProductAttention.forward
 
@@ -348,8 +366,7 @@ def apply_prefix_tree_patch() -> None:
 
     TransformerBlock.forward = _transformer_block_forward
 
-    # 6. GPTModel.forward: accept and pass magi/flex attention key, patch RoPE for correct per-token position indexing.
-    _orig_rope_fn = RotaryEmbedding.forward.__wrapped__  # actual impl, bypasses lru_cache
+    # 6. GPTModel.forward: accept and pass magi/flex attention key.
     _orig_gpt_forward = GPTModel.forward
 
     @functools.wraps(_orig_gpt_forward)
@@ -369,38 +386,17 @@ def apply_prefix_tree_patch() -> None:
 
         self.decoder.forward = _decoder_forward_with_key
 
-        # Patch RoPE: use position_ids for per-token indexing (full table, cp_group=None).
+        # Set position_ids for global RoPE patch.
         rope_mod = getattr(self, "rotary_pos_emb", None)
-        pids = position_ids.reshape(-1) if (position_ids is not None and rope_mod is not None) else None
-        _real_rope_fwd = rope_mod.forward if rope_mod is not None else None
-
-        if pids is not None:
-            _is_mrope = not hasattr(rope_mod, "get_emb")
-            if _is_mrope:
-                _mrope_section = getattr(self, "mrope_section", None)
-
-                def _rope_fwd_with_pids(*args, **kwargs):
-                    pids_3d = pids.view(1, 1, -1).expand(3, 1, -1).contiguous()
-                    return _real_rope_fwd(pids_3d, _mrope_section, cp_group=None)
-            else:
-
-                def _rope_fwd_with_pids(max_seq_len, offset=0, packed_seq=False, cp_group=None):
-                    actual_seq_len = int(pids.max().item()) + 1
-                    emb = _orig_rope_fn(rope_mod, actual_seq_len, offset=0, packed_seq=True, cp_group=None)
-                    # All PP stages use seq-first Q=(seq,1,H,D) because prepare_prefix_tree
-                    # provides tree-dispatched inputs for all intermediate stages (not batch-first).
-                    # freqs=(seq,1,1,dim) broadcasts correctly: Q×freqs→(seq,1,H,D) ✓
-                    indexed = emb[pids.to(emb.device)]
-                    return indexed
-
-            rope_mod.forward = _rope_fwd_with_pids
+        if rope_mod is not None and position_ids is not None:
+            rope_mod._pids = position_ids.reshape(-1)
 
         try:
             out = _orig_gpt_forward(self, input_ids, position_ids, attention_mask, **kwargs)
         finally:
+            if rope_mod is not None:
+                rope_mod._pids = None
             self.decoder.forward = _real_decoder_forward
-            if pids is not None:
-                rope_mod.forward = _real_rope_fwd
         return out
 
     GPTModel.forward = _gpt_forward

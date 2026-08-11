@@ -6,6 +6,7 @@ which survives ``DataProto.reorder``) and the end-to-end
 covers only the OLD ``mbs_groups_from_trie`` API whose ``sequence_ids`` go
 stale after reorder.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -15,6 +16,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.prefix_tree.dynamic import (
     greedy_build_tries,
     mbs_groups_from_leaf_idx,
+    mbs_groups_from_trie,
     prepare_prefix_tree_micro_batches,
     trie_group_flat_tokens,
 )
@@ -33,8 +35,8 @@ def _make_samples(n_prompts, rollout_n, prefix_len, resp_len, seed=0):
 
 def _build_trie(samples):
     seq_lists = [s.tolist() if hasattr(s, "tolist") else list(s) for s in samples]
-    tries, _ = greedy_build_tries(seq_lists)
-    return tries[0]
+    trie, _ = greedy_build_tries(seq_lists)
+    return trie
 
 
 def _leaf_idx_from_trie(trie, n_samples):
@@ -74,12 +76,8 @@ def test_mbs_groups_from_leaf_idx_reorder_safe():
     #     permuted-space group must equal the set of leaves in the
     #     corresponding canonical group (no perm remapping needed).
     canon = mbs_groups_from_leaf_idx(leaf_idx0, trie, max_token_len=budget)
-    canon_leaves = sorted(
-        sorted({int(leaf_idx0[i]) for i in mb}) for mb in canon
-    )
-    perm_leaves = sorted(
-        sorted({int(leaf_idx1[i]) for i in mb}) for mb in mbs
-    )
+    canon_leaves = sorted(sorted({int(leaf_idx0[i]) for i in mb}) for mb in canon)
+    perm_leaves = sorted(sorted({int(leaf_idx1[i]) for i in mb}) for mb in mbs)
     assert canon_leaves == perm_leaves
 
 
@@ -106,14 +104,35 @@ def test_mbs_groups_from_leaf_idx_raises_on_orphan():
         mbs_groups_from_leaf_idx(leaf_idx, trie, max_token_len=500)
 
 
-def test_mbs_groups_from_leaf_idx_raises_on_uncovered_trie_leaf():
+def test_mbs_groups_from_leaf_idx_raises_on_non_leaf_ref():
+    """leaf_idx pointing to a non-leaf trie node (has children) should raise."""
     samples = _make_samples(2, 2, prefix_len=10, resp_len=5, seed=1)
     trie = _build_trie(samples)
     leaf_idx = _leaf_idx_from_trie(trie, len(samples))
-    # Remap one sample onto another's leaf -> one trie leaf uncovered.
-    leaf_idx[0] = int(leaf_idx[1])
-    with pytest.raises(ValueError, match="out of sync"):
+    # Find an internal node (has children) and point leaf_idx at it.
+    internal_node = None
+    for node in trie.nodes:
+        if node.children:
+            internal_node = node
+            break
+    assert internal_node is not None, "trie needs at least one internal node for this test"
+    leaf_idx[0] = internal_node.node_idx
+    with pytest.raises(ValueError, match="non-leaf"):
         mbs_groups_from_leaf_idx(leaf_idx, trie, max_token_len=500)
+
+
+def test_mbs_groups_from_leaf_idx_skips_other_rank_leaves():
+    samples = _make_samples(4, 2, prefix_len=20, resp_len=10, seed=7)
+    trie = _build_trie(samples)
+    full_leaf_idx = _leaf_idx_from_trie(trie, len(samples))
+    n = len(samples)
+    rank0_leaf_idx = full_leaf_idx[: n // 2].clone()
+    rank1_leaf_idx = full_leaf_idx[n // 2 :].clone()
+    # Each rank processes its subset without error — 0-based within subset.
+    mbs0 = mbs_groups_from_leaf_idx(rank0_leaf_idx, trie, max_token_len=10_000)
+    mbs1 = mbs_groups_from_leaf_idx(rank1_leaf_idx, trie, max_token_len=10_000)
+    assert sorted(i for mb in mbs0 for i in mb) == list(range(len(rank0_leaf_idx)))
+    assert sorted(i for mb in mbs1 for i in mb) == list(range(len(rank1_leaf_idx)))
 
 
 def test_prepare_prefix_tree_micro_batches_attaches_subtrie():
@@ -151,3 +170,44 @@ def test_prepare_prefix_tree_micro_batches_attaches_subtrie():
         mb_leaves = sorted(int(x) for x in mb["leaf_idx"].tolist())
         sub_leaves = sorted(subtree.leaf_node_ids)
         assert sub_leaves == mb_leaves, f"{sub_leaves} != {mb_leaves}"
+
+
+def test_mbs_groups_from_trie_covers_all_and_respects_budget():
+    samples = _make_samples(4, 4, prefix_len=100, resp_len=20, seed=42)
+    trie = _build_trie(samples)
+    budget = 500
+    mbs = mbs_groups_from_trie(trie, max_token_len=budget)
+    # Every sample covered exactly once
+    assert sorted(i for mb in mbs for i in mb) == list(range(len(samples)))
+    # Flat tokens per mb respect budget (no single-sample atomicity exception here
+    # since mbs_groups_from_trie has no uid-atomicity constraint)
+    for mb in mbs:
+        assert trie_group_flat_tokens(mb, trie) <= budget
+
+
+def test_dfs_micro_batch_groups_flat_budget():
+    # 4 seqs sharing [1,2,3] (3 tokens) + 2 unique each = 5 raw; flat = 3+4*2 = 11
+    seqs = [[1, 2, 3, i, i + 10] for i in range(4)]
+    trie = _build_trie(seqs)
+    groups = mbs_groups_from_trie(trie, max_token_len=11)
+    assert len(groups) == 1 and sorted(groups[0]) == [0, 1, 2, 3]
+    # budget=9 -> first 3 fit (3+2+2+2=9), 4th splits
+    groups2 = mbs_groups_from_trie(trie, max_token_len=9)
+    assert sum(len(g) for g in groups2) == 4
+
+
+def test_trie_group_flat_tokens_subgroups_and_reorder_stable():
+    # root[1,2] -> [3] -> [10]/[11] ; [4,12] ; flat = 2+1+1+1+2 = 7
+    seqs = [[1, 2, 3, 10], [1, 2, 3, 11], [1, 2, 4, 12]]
+    trie = _build_trie(seqs)
+    assert trie_group_flat_tokens(list(range(len(seqs))), trie) == 7
+    # {0,1}: pays shared ancestor [1,2]+[3] -> 5; {2}: pays root [1,2] -> 4
+    assert trie_group_flat_tokens([0, 1], trie) == 5
+    assert trie_group_flat_tokens([2], trie) == 4
+    # Reorder-stable: sorting mbs by flat tokens preserves the multiset
+    seqs2 = [[1, 2, 3, i] for i in range(8)]
+    trie2 = _build_trie(seqs2)
+    mbs = mbs_groups_from_trie(trie2, max_token_len=10)
+    flats = [trie_group_flat_tokens(g, trie2) for g in mbs]
+    sorted_mbs = sorted(mbs, key=lambda g: trie_group_flat_tokens(g, trie2))
+    assert sorted(flats) == sorted(trie_group_flat_tokens(g, trie2) for g in sorted_mbs)

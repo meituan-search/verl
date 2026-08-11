@@ -31,26 +31,11 @@ from verl.utils.prefix_tree.utils import build_layout_from_tree_node
 
 @dataclass
 class PackRestorationParam:
-    """Per-micro-batch layout info for restoring flat tensors to per-sample.
-
-    Computed by build_layout_from_tree_node, consumed by restore_flat_to_nested.
-    Separate from PrefixTreeMagiBatch (forward-pass data) — this is only for
-    unpacking model output back to per-sample tensors.
-    """
-
-    # Per-leaf flat token range in the packed layout.
+    """Per-micro-batch layout info for restoring flat tensors to per-sample."""
     segment_ranges: list[tuple[int, int]]
-    # Shared prefix range (start, end) in flat layout.
     prefix_range: tuple[int, int]
-    # Per-leaf ancestor ranges: ancestor_segment_ranges[i] = [(start,end), ...]
-    # None for single-level trees (use prefix_range directly).
     ancestor_segment_ranges: Optional[list[list[tuple[int, int]]]] = None
-    # Boundary registry for LCE boundary-patch. None when no branching.
     boundary_registry: Optional[object] = None
-
-    def segment_to_sample(self, subtrie) -> list[int]:
-        """Fetch leaf-to-sample mapping from the subtrie (live, not stored)."""
-        return subtrie.leaf_to_sample
 
     def original_batch_size(self, subtrie) -> int:
         """Number of unique samples (from subtrie)."""
@@ -97,10 +82,7 @@ def build_prefix_tree_micro_batch(
 
     The subtrie is reused across OLP + actor update forwards. Returns None when subtrie absent."""
     # Lazy import to avoid cycle with forward.py.
-    from verl.utils.prefix_tree.forward import (
-        _finalize_prefix_tree_batch,
-        _unpack_nested_to_list,
-    )
+    from verl.utils.prefix_tree.forward import _finalize_prefix_tree_batch, _unpack_nested_to_list
 
     samples = _unpack_nested_to_list(input_ids, mask=loss_mask)
     if not samples:
@@ -110,14 +92,6 @@ def build_prefix_tree_micro_batch(
     position_ids_by_sample = _unpack_nested_to_list(position_ids, mask=loss_mask)
 
     if subtrie is None:
-        # The per-microbatch subtrie MUST be built once globally on the driver
-        # (build_global_trie -> create_and_attach_subtrie_views) and transmitted
-        # to workers via the batch's prefix_tree_subtree field. Rebuilding per
-        # micro-batch here (the old build_tree_dynamic fallback) is wrong: it
-        # sees only this mb's samples, so prefix-sharing detection is local
-        # instead of global, AND it costs ~13s/step (5x greedy_build_tries on
-        # the actor hot path, starving the GPU). Fail loudly instead of
-        # silently degrading correctness + perf.
         raise RuntimeError(
             "build_prefix_tree_micro_batch: prefix_tree_subtree is None. The global "
             "trie was not built/transmitted to this worker (build_global_trie not called "
@@ -142,7 +116,7 @@ def build_prefix_tree_micro_batch(
     )
 
 
-def _build_sample_tensors(
+def _build_per_sample_tensor(
     flat_tensor: Tensor,
     pt_batch: PrefixTreeMagiBatch,
     boundary_logps: Optional[dict[int, list[tuple[int, Tensor]]]] = None,
@@ -151,50 +125,28 @@ def _build_sample_tensors(
 
     boundary_logps maps sample_idx → [(boundary_flat_pos, per_leaf_logp), ...] to fix the
     dedup→one-slot→copy-to-all-leaves bug where non-owner leaves inherit wrong boundary log-probs."""
-    prefix_start, prefix_end = pt_batch.restoration.prefix_range
-    prefix_slice = flat_tensor[prefix_start:prefix_end]
-    # n = local sample count. Use leaf_to_sample (picklable list), not subtrie.leaves (indexed by GLOBAL sequence_ids).
     n = len(pt_batch.subtrie.leaf_to_sample)
     sample_tensors: list[Optional[Tensor]] = [None] * n
     for leaf_idx, sample_idx in enumerate(pt_batch.subtrie.leaf_to_sample):
         s, e = pt_batch.restoration.segment_ranges[leaf_idx]
         leaf_slice = flat_tensor[s:e]
-        if pt_batch.restoration.ancestor_segment_ranges is not None:
-            ranges = pt_batch.restoration.ancestor_segment_ranges[leaf_idx]
-            parts: list[Tensor] = []
-            for a, b in ranges:
-                part = flat_tensor[a:b]
-                # If boundary_logps is active, patch any boundary falling inside
-                # this ancestor range (a, b).  A boundary at flat position b_pos
-                # splits the slice: cat([flat[a:b_pos], leaf_val, flat[b_pos+1:b]]).
-                # At most one boundary per range (each ancestor has one last token).
-                if boundary_logps is not None:
-                    for b_pos, leaf_val in boundary_logps.get(sample_idx, []):
-                        if a <= b_pos < b:
-                            part = torch.cat(
-                                [flat_tensor[a:b_pos], leaf_val.unsqueeze(0), flat_tensor[b_pos + 1 : b]],
-                                dim=0,
-                            )
-                            break
-                parts.append(part)
-            parts.append(leaf_slice)
-            sample_tensors[sample_idx] = torch.cat(parts, dim=0)
-        else:
-            # Single-level: prefix_slice contains the boundary (if any).
-            prefix_part = prefix_slice
+        ranges = pt_batch.restoration.ancestor_segment_ranges
+        if ranges is None:
+            ranges = [[pt_batch.restoration.prefix_range] for _ in pt_batch.subtrie.leaf_to_sample]
+        parts: list[Tensor] = []
+        for a, b in ranges[leaf_idx]:
+            part = flat_tensor[a:b]
             if boundary_logps is not None:
                 for b_pos, leaf_val in boundary_logps.get(sample_idx, []):
-                    if prefix_start <= b_pos < prefix_end:
-                        prefix_part = torch.cat(
-                            [
-                                flat_tensor[prefix_start:b_pos],
-                                leaf_val.unsqueeze(0),
-                                flat_tensor[b_pos + 1 : prefix_end],
-                            ],
+                    if a <= b_pos < b:
+                        part = torch.cat(
+                            [flat_tensor[a:b_pos], leaf_val.unsqueeze(0), flat_tensor[b_pos + 1 : b]],
                             dim=0,
                         )
                         break
-            sample_tensors[sample_idx] = torch.cat([prefix_part, leaf_slice], dim=0)
+            parts.append(part)
+        parts.append(leaf_slice)
+        sample_tensors[sample_idx] = torch.cat(parts, dim=0)
     return sample_tensors
 
 
@@ -207,7 +159,8 @@ def restore_flat_to_nested(
     boundary_logps = None
     if apply_boundary_patch:
         boundary_logps = getattr(pt_batch, "_boundary_logps", None)
-    sample_tensors = _build_sample_tensors(flat_tensor, pt_batch, boundary_logps=boundary_logps)
+    # restore the tree packed-sample back to the normal batched tensor
+    sample_tensors = _build_per_sample_tensor(flat_tensor, pt_batch, boundary_logps=boundary_logps)
     assert all(t is not None for t in sample_tensors), (
         "restore_flat_to_nested: some sample indices were not covered by segment_to_sample"
     )
@@ -215,49 +168,17 @@ def restore_flat_to_nested(
     return torch.nested.as_nested_tensor(sample_tensors, layout=torch.jagged)
 
 
-@contextlib.contextmanager
-def prefix_tree_rope_context(model, position_ids: Optional[Tensor]):
-    """Override rope_mod.forward to use per-token position_ids instead of CP-rank sequential slicing.
-
-    Handles standard RotaryEmbedding (index full table by position_ids) and M-RoPE (broadcast 1D→3D text-only)."""
+def _set_rope_pids(model, position_ids: Optional[Tensor]) -> None:
+    """Set per-token position_ids on model.rotary_pos_emb for global RoPE patch to read."""
     rope_mod = getattr(model, "rotary_pos_emb", None)
-    if rope_mod is None or position_ids is None:
-        yield
-        return
+    if rope_mod is not None and position_ids is not None:
+        rope_mod._pids = position_ids.reshape(-1)
 
-    pids = position_ids.reshape(-1)
-    _real_rope_fwd = rope_mod.forward
 
-    # M-RoPE modules don't have get_emb; their forward takes position_ids (3D)
-    # instead of max_seq_len (int).  Qwen3.5 text-only uses this path.
-    _is_mrope = not hasattr(rope_mod, "get_emb")
-
-    if _is_mrope:
-        _mrope_section = getattr(model, "mrope_section", None)
-
-        def _rope_fwd_with_pids(*args, **kwargs):
-            # Broadcast 1D per-token positions to [3, 1, T]; text-only: all
-            # three M-RoPE dims (temporal/height/width) are identical.
-            pids_3d = pids.view(1, 1, -1).expand(3, 1, -1).contiguous()
-            return _real_rope_fwd(pids_3d, _mrope_section, cp_group=None)
-    else:
-        from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
-
-        _orig_rope_fn = RotaryEmbedding.forward.__wrapped__  # bypass lru_cache
-
-        def _rope_fwd_with_pids(max_seq_len, offset=0, packed_seq=False, cp_group=None):
-            actual_seq_len = int(pids.max().item()) + 1
-            emb = _orig_rope_fn(rope_mod, actual_seq_len, offset=0, packed_seq=True, cp_group=None)
-            # All PP stages use seq-first Q=(seq,1,H,D); freqs=(seq,1,1,dim)
-            # broadcasts correctly: Q×freqs → (seq,1,H,D).
-            indexed = emb[pids.to(emb.device)]
-            return indexed
-
-    rope_mod.forward = _rope_fwd_with_pids
-    try:
-        yield
-    finally:
-        rope_mod.forward = _real_rope_fwd
+def _clear_rope_pids(model) -> None:
+    rope_mod = getattr(model, "rotary_pos_emb", None)
+    if rope_mod is not None:
+        rope_mod._pids = None
 
 
 @contextlib.contextmanager
@@ -289,6 +210,7 @@ def prefix_tree_decoder_key_context(model, magi_attention_key=None, flex_attenti
 
 _PREFIX_TREE_KEYS = frozenset(
     {
+        "loss_mask",
         "use_prefix_tree",
         "prefix_tree_attention",
         "prefix_tree_subtree",
@@ -306,24 +228,6 @@ def strip_prefix_tree_args(logits_processor_args: dict | None) -> None:
         return
     for k in _PREFIX_TREE_KEYS:
         logits_processor_args.pop(k, None)
-
-
-def read_prefix_tree_batch_config(batch, tu, use_remove_padding: bool = True) -> tuple[bool, str]:
-    """Read and validate prefix-tree flags from a batch non-tensor dict.
-
-    Returns (use_prefix_tree, prefix_tree_attention).
-    """
-    use_prefix_tree = tu.get_non_tensor_data(batch, key="use_prefix_tree", default=False)
-    prefix_tree_attention = tu.get_non_tensor_data(batch, key="prefix_tree_attention", default="flex")
-    if use_prefix_tree:
-        assert use_remove_padding, (
-            "use_prefix_tree=True requires use_remove_padding=True (THD format). "
-            "Set model.use_remove_padding=True in your config."
-        )
-        assert prefix_tree_attention in ("flex", "magi"), (
-            f"prefix_tree_attention must be 'flex' or 'magi', got {prefix_tree_attention!r}"
-        )
-    return use_prefix_tree, prefix_tree_attention
 
 
 def get_prefix_tree_logits_args(batch, tu) -> dict:

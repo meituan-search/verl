@@ -8,14 +8,14 @@ verl.protocol (heavy deps). The local replica below mirrors production logic:
 - fallback to greedy_build_tries when segment metadata is absent
 - multilevel segments produce ancestor + intermediate + leaf nodes at each level
 """
+
 from __future__ import annotations
 
 import numpy as np
 import torch
 
-from verl.utils.prefix_tree import dynamic as _dyn
 from verl.utils.prefix_tree.segment_grouper import create_grpo_segment_metadata, create_segment_metadata
-from verl.utils.prefix_tree.tree import build_global_tree_from_segments
+from verl.utils.prefix_tree.tree import TrieNode, build_global_tree_from_segments
 
 
 def _build_global_trie_local(seqs_t, seg_hashes=None, seg_lengths=None):
@@ -25,9 +25,14 @@ def _build_global_trie_local(seqs_t, seg_hashes=None, seg_lengths=None):
     if seg_hashes is not None and seg_lengths is not None:
         trie = build_global_tree_from_segments(seqs_t, seg_hashes, seg_lengths)
     if trie is None:
-        tries, _ = _dyn.greedy_build_tries([s.tolist() for s in seqs_t])
-        if tries and total_raw > 0:
-            trie = tries[0]
+        from verl.utils.prefix_tree.tree import PrefixTrie
+
+        trie = PrefixTrie(root=TrieNode())
+        for seq_id, seq in enumerate(seqs_t):
+            trie.insert(np.array(seq if hasattr(seq, "tolist") else [int(x) for x in seq], dtype=np.int64), seq_id)
+        trie.finalize()
+        if total_raw <= 0:
+            trie = None
     if trie is None:
         return None, None
 
@@ -53,11 +58,16 @@ def _make_seqs(n_prompts=2, rollout_n=2, prompt_len=5, resp_len=3):
 
 def _make_multilevel_seqs():
     # 2 prompts x 2 rollouts; layout: [turn1(shared)|turn2(shared)|response(unique)]
-    seqs = [torch.tensor(t, dtype=torch.long) for t in [
-        [10, 11, 12, 20, 21, 30, 31], [10, 11, 12, 20, 21, 32, 33],
-        [50, 51, 52, 60, 61, 70, 71], [50, 51, 52, 60, 61, 72, 73],
-    ]]
-    segs = [[(f"p{i//2}_t1", 3), (f"p{i//2}_t2", 2)] for i in range(4)]
+    seqs = [
+        torch.tensor(t, dtype=torch.long)
+        for t in [
+            [10, 11, 12, 20, 21, 30, 31],
+            [10, 11, 12, 20, 21, 32, 33],
+            [50, 51, 52, 60, 61, 70, 71],
+            [50, 51, 52, 60, 61, 72, 73],
+        ]
+    ]
+    segs = [[(f"p{i // 2}_t1", 3), (f"p{i // 2}_t2", 2)] for i in range(4)]
     return (seqs,) + create_segment_metadata(segs)
 
 

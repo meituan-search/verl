@@ -144,11 +144,13 @@ class PrefixTrie:
     @staticmethod
     def _unfinalized(method):
         """Decorator: raise if the tree is finalized."""
+
         @functools.wraps(method)
         def wrapper(self, *args, **kwargs):
             if self._finalized:
                 raise RuntimeError(f"{method.__name__}() called after finalize() — tree is immutable.")
             return method(self, *args, **kwargs)
+
         return wrapper
 
     @_unfinalized
@@ -242,7 +244,11 @@ class PrefixSubTrie(PrefixTrie):
 
     @staticmethod
     def _collect_nodes(source: PrefixTrie, leaf_node_ids: list[int]) -> tuple[list[TrieNode], list[Optional[TrieNode]]]:
-        """Collect leaves + all ancestors reachable from given leaf_node_ids. Reassigns local node_idx."""
+        """Collect leaves + all ancestors reachable from given leaf_node_ids.
+
+        Returns nodes in DFS order with original (global) node_idx preserved.
+        Builds a _node_idx_to_local remapping for subtrie-local indexing.
+        """
         seen: set[int] = set()
         nodes: list[TrieNode] = []
         for idx in leaf_node_ids:
@@ -257,10 +263,9 @@ class PrefixSubTrie(PrefixTrie):
                     seen.add(n.node_idx)
                     nodes.append(n)
 
-        # Assign local node_idx and collect leaves.
+        # Build leaves indexed by sequence_id (global indexing).
         leaves: list[Optional[TrieNode]] = []
-        for local_idx, node in enumerate(nodes):
-            node.node_idx = local_idx
+        for node in nodes:
             if not node.children:
                 for sid in node.sequence_ids:
                     while len(leaves) <= sid:
@@ -291,9 +296,7 @@ class PrefixSubTrie(PrefixTrie):
         # Reconstruct detached TrieNode objects (subtrie-only children links).
         by_node_idx: dict[int, TrieNode] = {}
         for node_idx, input_ids, _anc, sequence_ids in state["nodes_data"]:
-            node = TrieNode(
-                input_ids=np.array(input_ids, dtype=np.int64), sequence_ids=list(sequence_ids)
-            )
+            node = TrieNode(input_ids=np.array(input_ids, dtype=np.int64), sequence_ids=list(sequence_ids))
             node.node_idx = node_idx
             by_node_idx[node_idx] = node
 

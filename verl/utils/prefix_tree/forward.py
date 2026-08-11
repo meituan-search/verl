@@ -43,13 +43,14 @@ from verl.utils.prefix_tree.magi import (
     PrefixTreeMagiBatch,
     build_prefix_tree_micro_batch,
     prefix_tree_decoder_key_context,
-    prefix_tree_rope_context,
+    _set_rope_pids,
+    _clear_rope_pids,
     restore_flat_to_nested,
     strip_prefix_tree_args,
 )
 
-TreeForwardCtx = namedtuple("TreeForwardCtx", ["pb", "input_ids", "position_ids", "attention", "_rope_exit"])
-"""Returned by :func:`prepare_prefix_tree`.  ``_rope_exit`` is a
+TreeForwardCtx = namedtuple("TreeForwardCtx", ["pb", "input_ids", "position_ids", "attention", "model"])
+"""Returned by :func:`prepare_prefix_tree`.  ``rope_exit`` is a
 callable to deactivate the MAGI rope context (``None`` for flex / non-tree)."""
 
 # Shared helpers
@@ -69,14 +70,7 @@ def _prepare_attn_inputs(
         attn_kwargs = {"flex_attention_key": pb.flex_key}
     return local_input_ids, local_position_ids, attn_kwargs
 
-
-def _restore_to_nested_per_sample(
-    flat_tensor: Tensor,
-    pb: PrefixTreeMagiBatch,
-    apply_boundary_patch: bool = False,
-) -> Tensor:
-    """Restore flat dedup tensor to per-sample nested (jagged) format. apply_boundary_patch=True only for log_probs."""
-    return restore_flat_to_nested(flat_tensor, pb, apply_boundary_patch=apply_boundary_patch)
+# ============================================================
 
 
 def _expand_temperature(t, pt_batch: PrefixTreeMagiBatch, total_flat: int, device) -> Tensor:
@@ -208,8 +202,8 @@ def _finalize_prefix_tree_batch(
 ) -> PrefixTreeMagiBatch:
     """Pad to TP/CP divisibility, build attention key, and wrap into PrefixTreeMagiBatch."""
     real_tokens = params.tree_packed_tokens.shape[0]
-    if tp_size > 1:
-        align_size = (tp_size * cp_size * 2) if cp_size > 1 else tp_size
+    align_size = (tp_size * cp_size * 2) if cp_size > 1 else tp_size
+    if align_size > 1:
         pad_len = (align_size - real_tokens % align_size) % align_size
         if pad_len > 0:
             params.tree_packed_tokens = torch.cat(
@@ -264,7 +258,6 @@ def dispatch_magi(pt_batch: PrefixTreeMagiBatch) -> tuple[Tensor, Tensor]:
 
 # Forward-path drivers
 
-
 def build_prefix_tree_batch(model, input_ids, logits_processor_args, vision_model, mtp_enable_train):
     """Build prefix-tree micro-batch from logits_processor_args. Returns PrefixTreeMagiBatch or None."""
     prefix_tree_attention = (logits_processor_args or {}).get("prefix_tree_attention", "flex")
@@ -298,13 +291,13 @@ def prepare_prefix_tree(
 
     Returns a :class:`TreeForwardCtx` or ``None`` when tree is not applicable.
     On success, merges attention kwargs into *model_kwargs* in-place and (for
-    MAGI) activates the rope context via ``ctx._rope_exit``.  The caller must
-    deactivate rope via ``ctx._rope_exit(None, None, None)`` after
+    MAGI) activates the rope context via ``ctx.rope_exit``.  The caller must
+    deactivate rope via ``ctx.rope_exit(None, None, None)`` after
     post-processing (or on the intermediate-PP path).
     """
     if vision_model or mtp_enable_train:
         _log.getLogger(__name__).warning(
-            "prefix_tree: skipping prefix-tree path (vision_model=%s, mtp_enable_train=%s)",
+            "prefix_tree: skipping prefix-tree path (vision_model=%s, mtp_enable_train=%s), not fully supported yet",
             vision_model,
             mtp_enable_train,
         )
@@ -325,13 +318,9 @@ def prepare_prefix_tree(
     strip_prefix_tree_args(logits_processor_args)
     model_kwargs.update(attn_kwargs)
 
-    _rope_exit = None
-    if prefix_tree_attention == "magi":
-        _rope = prefix_tree_rope_context(model, local_position_ids)
-        _rope.__enter__()
-        _rope_exit = _rope.__exit__
+    _set_rope_pids(model, local_position_ids)
 
-    return TreeForwardCtx(pb, local_input_ids, local_position_ids, prefix_tree_attention, _rope_exit)
+    return TreeForwardCtx(pb, local_input_ids, local_position_ids, prefix_tree_attention, model)
 
 
 def tree_post_processing(ctx, output_orig, logits_processor, logits_processor_args, post_process):
@@ -346,8 +335,6 @@ def tree_post_processing(ctx, output_orig, logits_processor, logits_processor_ar
 
     if not post_process or logits_processor is None:
         output = output_orig.permute(1, 0, 2)
-        if ctx._rope_exit is not None:
-            ctx._rope_exit(None, None, None)
         return output
 
     prefix_tree_attention = ctx.attention
@@ -398,11 +385,10 @@ def tree_post_processing(ctx, output_orig, logits_processor, logits_processor_ar
                     if prefix_tree_attention == "magi":
                         val_1d = undispatch(val_1d, pt_batch.magi_key)[:real_tokens]
                     is_log_probs = key == "log_probs"
-                    output[key] = _restore_to_nested_per_sample(val_1d, pt_batch, apply_boundary_patch=is_log_probs)
+                    output[key] = restore_flat_to_nested(val_1d, pt_batch, apply_boundary_patch=is_log_probs)
         return output
     finally:
-        if ctx._rope_exit is not None:
-            ctx._rope_exit(None, None, None)
+        _clear_rope_pids(ctx.model)
 
 
 # Fused-path
@@ -556,7 +542,7 @@ def post_processing_packed_lce(
         # Get max entry count across ranks via all_reduce(MAX) — we only need
         # the pad size, not individual per-rank counts.
         count_tensor = torch.tensor([local_count], dtype=torch.long, device=device)
-        _dist.all_reduce(count_tensor, op=_dist.ReduceOp.MAX)
+        _dist.all_reduce(count_tensor, op=_dist.ReduceOp.MAX, group=cp_group)
         max_n = int(count_tensor.item())
 
         # Pack (boundary_position, sample_idx, log_prob) into one tensor.
@@ -635,11 +621,10 @@ def fused_prefix_tree_forward(
     if _magi_key is None and _flex_key is None:
         return None
 
-    with (
-        prefix_tree_rope_context(model, position_ids),
-        prefix_tree_decoder_key_context(model, _magi_key, _flex_key),
-    ):
-        return fuse_forward_body(
+    _set_rope_pids(model, position_ids)
+    try:
+        with prefix_tree_decoder_key_context(model, _magi_key, _flex_key):
+            result = fuse_forward_body(
             model,
             input_ids=input_ids,
             position_ids=position_ids,
@@ -654,6 +639,9 @@ def fused_prefix_tree_forward(
             extra_block_kwargs=extra_block_kwargs,
             inference_context=inference_context,
         )
+    finally:
+        _clear_rope_pids(model)
+    return result
 
 
 def fuse_forward_body(
@@ -671,40 +659,69 @@ def fuse_forward_body(
     """Fused-path: preprocess → decoder → LCE (no logits tensor). Assumes rope+decoder-key contexts active."""
     from collections import OrderedDict as _OrderedDict
 
-    from megatron.core.config_logger import has_config_logger_enabled as _has_cfg_log
-    from megatron.core.config_logger import log_config_to_disk as _log_cfg
-    from megatron.core.utils import deprecate_inference_params as _dep_inf
+    from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+    from megatron.core.utils import deprecate_inference_params
 
-    from verl.utils.model import CausalLMOutputForPPO as _CLMOutput
+    from verl.utils.model import CausalLMOutputForPPO
 
     inference_context = kwargs.pop("inference_context", None)
     inference_params = kwargs.pop("inference_params", None)
-    inference_context = _dep_inf(inference_context, inference_params)
+    inference_context = deprecate_inference_params(inference_context, inference_params)
     decoder_input = kwargs.pop("decoder_input", None)
     packed_seq_params = kwargs.pop("packed_seq_params", None)
     extra_block_kwargs = kwargs.pop("extra_block_kwargs", None)
 
-    preproc_output = model._preprocess(
-        input_ids=input_ids,
-        position_ids=position_ids,
-        decoder_input=decoder_input,
-        inference_context=inference_context,
-        packed_seq_params=packed_seq_params,
+    # PP debug
+    import megatron.core.parallel_state as mpu_pt
+    pp_rank = mpu_pt.get_pipeline_model_parallel_rank()
+    pp_world = mpu_pt.get_pipeline_model_parallel_world_size()
+    pre = unwrap_model(model).pre_process
+    post = unwrap_model(model).post_process
+    _log.getLogger(__name__).warning(
+        f"PP[{pp_rank}/{pp_world}] fuse_forward_body: pre_process={pre}, post_process={post}, "
+        f"decoder_input={'None' if decoder_input is None else decoder_input.shape}, "
+        f"input_ids={input_ids.shape if input_ids is not None else 'None'}"
     )
-    (decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset) = preproc_output[:5]
+    try:
+        preproc_output = model._preprocess(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            decoder_input=decoder_input,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+        )
+        (decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset) = preproc_output[:5]
 
-    hidden_states = model.decoder(
-        hidden_states=decoder_input,
-        attention_mask=attention_mask,
-        inference_context=inference_context,
-        rotary_pos_emb=rotary_pos_emb,
-        rotary_pos_cos=rotary_pos_cos,
-        rotary_pos_sin=rotary_pos_sin,
-        packed_seq_params=packed_seq_params,
-        sequence_len_offset=sequence_len_offset,
-        **(extra_block_kwargs or {}),
-        **kwargs,
-    )
+        _log.getLogger(__name__).warning(
+            f"PP[{pp_rank}/{pp_world}] _preprocess done: decoder_input shape={decoder_input.shape if decoder_input is not None else 'None'}"
+        )
+
+        from megatron.core.pipeline_parallel.p2p_communication import deallocate_input_tensor
+        deallocate_input_tensor()
+
+        hidden_states = model.decoder(
+            hidden_states=decoder_input,
+            attention_mask=attention_mask,
+            inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            **(extra_block_kwargs or {}),
+            **kwargs,
+        )
+
+        _log.getLogger(__name__).warning(
+            f"PP[{pp_rank}/{pp_world}] decoder done: hidden_states shape={hidden_states.shape if isinstance(hidden_states, torch.Tensor) else 'tuple'}"
+        )
+    except Exception as e:
+        _log.getLogger(__name__).error(
+            f"PP[{pp_rank}/{pp_world}] CRASH in fuse_forward_body: {type(e).__name__}: {e}"
+        )
+        import traceback
+        traceback.print_exc()
+        raise
 
     if not model.post_process:
         return hidden_states
@@ -731,7 +748,7 @@ def fuse_forward_body(
         output_weight=output_weight,
     )
 
-    if _has_cfg_log(model.config):
+    if has_config_logger_enabled(model.config):
         payload = _OrderedDict(
             {
                 "input_ids": input_ids,
@@ -742,9 +759,9 @@ def fuse_forward_body(
                 "entropy": entropy,
             }
         )
-        _log_cfg(model.config, payload, prefix="input_and_logits")
+        log_config_to_disk(model.config, payload, prefix="input_and_logits")
 
-    output = _CLMOutput(
+    output = CausalLMOutputForPPO(
         loss=None,
         logits=None,
         past_key_values=None,
@@ -829,8 +846,8 @@ def _fused_core(model, pb, prefix_tree_attention, labels, temperature, calculate
     # entropy: no patch (entropy at the boundary is distribution-level, same
     #   for all leaves sharing the hidden state).
     output = {
-        "log_probs": _restore_to_nested_per_sample(output_orig.log_probs.reshape(-1), pb, apply_boundary_patch=True)
+        "log_probs": restore_flat_to_nested(output_orig.log_probs.reshape(-1), pb, apply_boundary_patch=True)
     }
     if calculate_entropy:
-        output["entropy"] = _restore_to_nested_per_sample(output_orig.entropy.reshape(-1), pb)
+        output["entropy"] = restore_flat_to_nested(output_orig.entropy.reshape(-1), pb)
     return output
