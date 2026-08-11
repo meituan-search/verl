@@ -492,17 +492,8 @@ class PPOTrainer(ABC):
                 batch = self._compute_reward_colocate(batch, metrics=metrics)
 
         # 3. balance batch across data parallel groups
-        batch = self._balance_batch(batch, metrics=metrics)
-
-        # 3b. build the global prefix trie ONCE on the driver and attach it to
-        # batch.extra_info so every worker reuses it (workers' prepare_prefix_tree_
-        # micro_batches reads prefix_tree + leaf_idx via NonTensorData). Without this,
-        # each worker rebuilds the trie per micro-batch (~13s/step, starving the GPU)
-        # — and per-mb rebuild is wrong (local-only prefix sharing). See
-        # verl/utils/prefix_tree/{dynamic,magi}.py (rebuild fallbacks removed -> raise).
-        if self.config.actor_rollout_ref.model.get("use_prefix_tree", False):
-            with marked_timer("build_global_trie", timing_raw, color="magenta"):
-                batch = self._build_and_attach_global_trie(batch, metrics=metrics)
+        # (prefix-tree: builds the global trie inside and balances whole trees)
+        batch = self._balance_batch(batch, metrics=metrics, timing_raw=timing_raw)
 
         # 4. compute old_log_prob
         with marked_timer("old_log_prob", timing_raw, color="blue"):
@@ -1404,7 +1395,9 @@ class PPOTrainer(ABC):
         # Notice lcm(a, b, c) == lcm(lcm(a, b), c), so it is optimal.
         return required_multiple
 
-    def _balance_batch(self, batch: KVBatchMeta, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
+    def _balance_batch(
+        self, batch: KVBatchMeta, metrics, logging_prefix="global_seqlen", keep_minibatch=False, timing_raw=None
+    ):
         """Reorder the data on single controller such that each dp rank gets similar total tokens."""
         # get actor dp size
         role, worker_group = "actor", self.actor_rollout_wg
@@ -1418,6 +1411,26 @@ class PPOTrainer(ABC):
         # Upsampling the batch with padding sequences
         batch_multiple = self._get_required_batch_multiple(dp_size)
         batch = upsample_batch_to_divisible_size(batch, batch_multiple, self.tokenizer.eos_token_id)
+
+        if self.config.actor_rollout_ref.model.get("use_prefix_tree", False):
+            batch = self._build_and_attach_global_trie(batch, metrics, timing_raw=timing_raw)
+            trie = batch.extra_info.get("prefix_tree", None)
+            if trie is not None:
+                from verl.utils.prefix_tree.dynamic import balance_prefix_tree_blocks
+
+                permutation, partitions, workloads = balance_prefix_tree_blocks(trie, dp_size)
+                if len(permutation) != len(batch.keys):
+                    raise RuntimeError(
+                        f"balance_prefix_tree_blocks covered {len(permutation)}/{len(batch.keys)} samples: "
+                        "trie does not cover every sample."
+                    )
+                batch.reorder(permutation)
+                stats = log_seqlen_unbalance(
+                    seqlen_list=workloads, partitions=partitions, prefix=logging_prefix
+                )
+                metrics.update(stats)
+            return batch
+
         global_seqlen_lst = torch.tensor([tag["seq_len"] for tag in batch.tags], dtype=torch.int64)
         workload_lst = calculate_workload(global_seqlen_lst)
 
@@ -1430,7 +1443,7 @@ class PPOTrainer(ABC):
         metrics.update(global_balance_stats)
         return batch
 
-    def _build_and_attach_global_trie(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+    def _build_and_attach_global_trie(self, batch: KVBatchMeta, metrics: dict, timing_raw=None) -> KVBatchMeta:
         """Build the global prefix trie once on the driver and attach to the batch.
 
         - prefix_tree (a shared Python TrieNode object) -> batch.extra_info, which the
@@ -1455,7 +1468,11 @@ class PPOTrainer(ABC):
         proto.batch = TensorDict({"input_ids": input_ids}, batch_size=[len(input_ids)])
         if attn is not None:
             proto.batch["attention_mask"] = attn
-        build_global_trie(proto, metrics=metrics)
+        if timing_raw is not None:
+            with marked_timer("build_global_trie", timing_raw, color="magenta"):
+                build_global_trie(proto, metrics=metrics)
+        else:
+            build_global_trie(proto, metrics=metrics)
         trie = proto.meta_info.get("prefix_tree", None)
         leaf_idx = proto.batch.get("leaf_idx", None)
         if trie is None or leaf_idx is None:

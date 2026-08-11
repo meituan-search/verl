@@ -14,6 +14,7 @@ import torch
 
 from verl.utils import tensordict_utils as tu
 from verl.utils.prefix_tree.dynamic import (
+    balance_prefix_tree_blocks,
     greedy_build_tries,
     mbs_groups_from_leaf_idx,
     mbs_groups_from_trie,
@@ -48,6 +49,28 @@ def _leaf_idx_from_trie(trie, n_samples):
                 leaf_idx[seq_id] = node.node_idx
     assert int(leaf_idx.min().item()) >= 0, "trie has samples with no leaf"
     return leaf_idx
+
+
+def test_balance_prefix_tree_blocks_keeps_trees_whole():
+    """Tree-level balance: no tree is split across ranks, all samples covered."""
+    samples = _make_samples(3, 4, prefix_len=20, resp_len=10, seed=3)
+    trie = _build_trie(samples)
+    n = len(samples)
+    permutation, partitions, workloads = balance_prefix_tree_blocks(trie, dp_size=2)
+    assert sorted(permutation) == list(range(n)), "permutation must cover every sample once"
+    # Every tree's samples appear contiguously in the permutation.
+    for child in trie.children.values():
+        tree_samples = set()
+        stack = [child]
+        while stack:
+            node = stack.pop()
+            tree_samples.update(node.sequence_ids)
+            stack.extend(node.children.values())
+        positions = [permutation.index(s) for s in sorted(tree_samples)]
+        assert positions == list(range(min(positions), max(positions) + 1)), (
+            f"tree split: samples {sorted(tree_samples)} not contiguous"
+        )
+    assert len(workloads) == len(trie.children)
 
 
 def test_mbs_groups_from_leaf_idx_covers_all_and_respects_budget():

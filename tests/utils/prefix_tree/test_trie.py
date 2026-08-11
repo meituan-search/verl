@@ -13,6 +13,7 @@ import pickle
 import torch
 
 from verl.utils.prefix_tree.dynamic import (
+    balance_prefix_tree_blocks,
     build_subtrie_view,
     build_tree_dynamic,
     convert_trie_to_tree_node,
@@ -142,6 +143,64 @@ def test_fuzz_random_tree_round_trip():
         assert len(restored) == len(samples)
         for i, (orig, rest) in enumerate(zip(samples, restored)):
             assert torch.equal(orig, rest), f"run {_}, sample {i}: {orig.tolist()} != {rest.tolist()}"
+
+
+def test_fuzz_tree_balance_reduces_imbalance():
+    """Fuzz: multiple random trees; tree-level KK balance must never worsen the
+    DP workload imbalance vs natural (insertion-order) contiguous split, and
+    must strictly improve it in at least some cases."""
+    import random
+    rng = random.Random(7)
+    improved = 0
+    checked = 0
+    for _ in range(50):
+        n_trees = rng.randint(3, 8)
+        seq_lists = []
+        for _t in range(n_trees):
+            base = [rng.randint(0, 10_000) for _ in range(rng.randint(1, 5))]
+            for _l in range(rng.randint(1, 5)):
+                suffix = [rng.randint(0, 10_000) for _ in range(rng.randint(0, 30))]
+                seq_lists.append(base + suffix)
+        trie = _build_trie(seq_lists)
+        flat_list = [
+            sum(len(n.input_ids) for n in _tree_nodes(child))
+            for child in trie.children.values()
+        ]
+        if len(flat_list) < 2:
+            continue
+        # Same workload formula as balance_prefix_tree_blocks (24576*n + n²).
+        workloads = [24576.0 * f + f * f for f in flat_list]
+        dp = rng.randint(2, min(4, len(workloads)))
+        permutation, partitions, _ = balance_prefix_tree_blocks(trie, dp)
+        assert sorted(permutation) == list(range(len(seq_lists)))
+        if len(partitions) < dp:
+            continue
+        balanced = sorted(sum(workloads[i] for i in part) for part in partitions)
+        per = len(workloads) // dp
+        natural = []
+        for i in range(dp):
+            lo = i * per
+            hi = (i + 1) * per if i < dp - 1 else len(workloads)
+            natural.append(sum(workloads[lo:hi]))
+        natural = sorted(natural)
+        b_imb = balanced[-1] - balanced[0]
+        n_imb = natural[-1] - natural[0]
+        checked += 1
+        assert b_imb <= n_imb, f"run {_}: balanced imbalance {b_imb} > natural {n_imb}"
+        if b_imb < n_imb:
+            improved += 1
+            print(f"run {_}: dp={dp} trees={len(workloads)} workload={workloads} "
+                  f"imbalance {n_imb} -> {b_imb} ({n_imb - b_imb} better)")
+    assert checked >= 40
+    assert improved > 0, "tree balance never strictly improved imbalance"
+
+
+def _tree_nodes(root):
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        yield node
+        stack.extend(node.children.values())
 
 
 def test_strict_prefix_zero_length_leaf_boundary_skipped():

@@ -630,6 +630,57 @@ def get_dfs_balanced_partitions(
     return partition_lst, global_seqlen_lst, data
 
 
+def balance_prefix_tree_blocks(
+    trie,
+    dp_size: int,
+) -> tuple[list[int], list[list[int]], list[int]]:
+    """Balance whole trees (trie root children) across DP ranks by flat-token workload.
+
+    Each tree is an atomic unit: its samples are never split across ranks, so
+    intra-rank prefix dedup is fully preserved. Karmarkar-Karp balances the flat
+    (deduplicated) token sums across ranks.
+
+    Returns:
+        permutation: new sample order, rank-major (rank 0's trees first, then rank 1's, ...).
+            ``permutation[new_pos]`` = original sample index.
+        partitions: ``partitions[r]`` = list of tree indices assigned to rank r.
+        workloads: flat-token count per tree (same indexing as ``trie.children`` order).
+    """
+    blocks: list[tuple[int, list[int]]] = []
+    flat_list: list[int] = []
+    for child in trie.children.values():
+        samples: set[int] = set()
+        flat_tokens = 0
+        stack = [child]
+        while stack:
+            node = stack.pop()
+            if node.input_ids is not None:
+                flat_tokens += len(node.input_ids)
+            samples.update(node.sequence_ids)
+            stack.extend(node.children.values())
+        blocks.append((flat_tokens, sorted(samples)))
+        flat_list.append(flat_tokens)
+
+    # Treat each tree as one sortable unit: apply the standard transformer
+    # workload formula (24576*n + n²) to its flat (deduplicated) token count.
+    workloads = calculate_workload(torch.tensor(flat_list, dtype=torch.float32)).tolist()
+
+    if dp_size <= 1:
+        permutation = [s for _, samples in blocks for s in samples]
+        return permutation, [list(range(len(blocks)))], workloads
+
+    if len(blocks) < dp_size:
+        partitions = [[i] for i in range(len(blocks))]
+    else:
+        partitions = get_seqlen_balanced_partitions(workloads, dp_size, equal_size=False)
+
+    permutation = []
+    for part in partitions:
+        for tree_idx in part:
+            permutation.extend(blocks[tree_idx][1])
+    return permutation, partitions, workloads
+
+
 def reorder_and_balance_for_prefix_tree(
     data,
     config_or_data: dict,
@@ -639,27 +690,44 @@ def reorder_and_balance_for_prefix_tree(
     metrics: dict | None = None,
     logging_prefix: str = "global_seqlen",
 ) -> bool:
-    """DFS-reorder batch and compute contiguous partitions for prefix-tree."""
+    """Reorder the batch so each DP rank receives whole trees balanced by flat-token workload.
+
+    Samples are permuted rank-major in tree-block units (``balance_prefix_tree_blocks``);
+    the reorder is KEPT (the caller's dispatch splits contiguously). Logs tree
+    flat-token unbalance stats under ``logging_prefix``.
+    """
     if not _is_prefix_tree_enabled(config_or_data):
         return False
 
-    result = get_dfs_balanced_partitions(
-        data,
-        config_or_data,
-        dp_size,
-        attention_mask=attention_mask,
-        contiguous_partitions=True,
-    )
-    if result is None:
+    trie = None
+    if hasattr(data, "meta_info"):
+        trie = data.meta_info.get("prefix_tree", None)
+    else:
+        trie = tu.get_non_tensor_data(data, "prefix_tree", default=None)
+    if trie is None:
         return False
 
-    global_partition_lst, global_seqlen_lst, _ = result
-    global_idx = torch.arange(global_seqlen_lst.shape[0])
-    data.reorder(global_idx)
+    if hasattr(data, "batch"):
+        n_samples = data.batch["input_ids"].shape[0]
+    else:
+        n_samples = len(data["input_ids"])
+
+    permutation, partitions, workloads = balance_prefix_tree_blocks(trie, dp_size)
+    if len(permutation) != n_samples:
+        raise RuntimeError(
+            f"balance_prefix_tree_blocks covered {len(permutation)}/{n_samples} samples: "
+            "trie does not cover every sample (build_global_trie bug?)."
+        )
+
+    if hasattr(data, "reorder"):
+        data.reorder(torch.tensor(permutation))
+    else:
+        data = tu.index_select_tensor_dict(data, torch.tensor(permutation))
+
     if metrics is not None:
         stats = log_seqlen_unbalance(
-            seqlen_list=global_seqlen_lst.tolist(),
-            partitions=global_partition_lst,
+            seqlen_list=workloads,
+            partitions=partitions,
             prefix=logging_prefix,
         )
         metrics.update(stats)
