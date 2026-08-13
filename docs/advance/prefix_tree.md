@@ -2,7 +2,7 @@
 
 **Author:** `https://github.com/meituan-search`
 
-Last updated: 07/22/2026.
+Last updated: 08/13/2026.
 
 This document covers the **design and usage** of the prefix-deduplicated attention system (MAGI). Implementation detail — parallelism internals, the full call/data-flow graph, dynamic micro-batching, diagnostics — lives in [`verl/utils/prefix_tree/README.md`](../../verl/utils/prefix_tree/README.md).
 
@@ -25,7 +25,7 @@ Do **not** enable when:
 - Each sample has a unique prompt (no sharing) — the trie build + dispatch overhead is pure cost (see Known limitations below).
 - `rollout.n == 1` and no multi-turn accumulation — no prefix sharing to exploit.
 
-> **Custom algorithms with known sharing structure.** The default tree build is token-by-token (`greedy_build_tries`, `dynamic.py`). If your algorithm already knows the prefix structure (e.g. tree-search branches sharing a parent prefix), attach per-sample `segment_hashes` + `segment_lengths` to `non_tensor_batch` (built via `create_segment_metadata` / `create_grpo_segment_metadata` in `segment_grouper.py`) so `build_global_trie` uses the O(N) `build_global_tree_from_segments` (`tree.py`) — which matches segment hashes level by level instead of comparing tokens — rather than the greedy by-token path. GRPO wires this via `attach_segment_metadata`.
+> **Custom algorithms with known sharing structure.** The default tree build is token-by-token (`greedy_build_tries`, `dynamic.py`). If your algorithm already knows the prefix structure (e.g. tree-search branches sharing a parent prefix), attach per-sample `segment_hashes` + `segment_lengths` to `non_tensor_batch` (built via `create_segment_metadata` in `segment_grouper.py`) so `build_global_trie` uses the O(N) `build_global_tree_from_segments` (`tree.py`) — which matches segment hashes level by level instead of comparing tokens — rather than the greedy by-token path.
 
 ## 3. Configuration
 
@@ -73,6 +73,10 @@ graph TD
         P --> L2["leaf"]
         P --> L3["leaf"]
     end
+    subgraph B["trainer: balance_prefix_tree_blocks"]
+        K["Karmarkar-Karp over prompt-identity blocks, weight = calculate_workload(flat_tokens)"]
+        O["rank-major reorder: whole blocks, never split"]
+    end
     subgraph W["actor"]
         V["full trie at actor node, each mini/micro-batch makes a subview of the tree"]
     end
@@ -83,7 +87,9 @@ graph TD
         M1["self-attn → causal"]
         M2["cross-attn → full"]
     end
-    T -.->|dispatch| W
+    T -->|"block by prompt identity"| K
+    K --> O
+    O -.->|dispatch| W
     W -.->|per-mb subview| F
     W -.->|build mask| M
 ```
@@ -91,6 +97,7 @@ graph TD
 Each box:
 
 - **Global trie** — one `TrieNode` root with a flat DFS-ordered `nodes` list; each non-root node holds its token run (`input_ids`), the samples sharing it (`sequence_ids`), and a stable `flat_idx`.
+- **Trainer balance** — blocks are prompt-identity groups (the GRPO advantage group); Karmarkar-Karp assigns whole blocks to ranks, samples reordered rank-major.
 - **Actor** — receives the full trie (dispatched once); each mini/micro-batch prunes it to a `PrefixSubTrie` covering only its own leaves.
 - **Flat input_ids** — the subview's nodes laid out in DFS order; shared `P` appears once, each response once.
 - **MAGI block mask** — self-attn blocks are causal, cross-attn blocks (response → shared prefix) are full.
@@ -115,6 +122,30 @@ R3 │   full   │   ·    │   ·    │   ·    │ causal │
 Shared-prefix blocks are full; each segment self-block is causal; cross-response blocks (R0↔R1, …) are masked.
 
 `P` is processed once instead of once per rollout. See the README for the full call/data-flow graph.
+
+### DP reorder & dispatch
+
+Before dispatch, the trainer reorders the batch so each DP rank receives **whole blocks**,
+never splitting a block across ranks. A block is defined by **prompt identity** — the
+same group GRPO advantage normalization uses (all `n` rollouts of one prompt belong to
+one block), so same-prompt rollouts stay together for both dedup and group-advantage
+correctness. Where that identity comes from is trainer-specific: v1 reads it from the
+TransferQueue sample keys, v0 from the batch's per-sample `uid`. The balance function
+itself only takes an opaque per-sample `block_ids` list.
+
+`balance_prefix_tree_blocks` (`dynamic.py`) then Karmarkar-Karp-partitions the blocks
+over DP ranks, weighted by `calculate_workload(flat_tokens)` — the standard
+`24576·n + n²` transformer-cost formula applied to each block's **deduplicated** token
+count. Tokens on trie nodes shared across blocks (e.g. a common system prompt) are
+excluded from per-block weight because every rank pays that prefix once, so it cancels
+out of the balance — and it is **not** used to merge blocks. Without prompt identity,
+a shared system prompt would merge all prompts into one root-child block and defeat
+DP balancing; with prompt identity each prompt's rollouts stay atomic.
+
+The resulting sample permutation is rank-major over blocks (`permutation[new_pos] =
+original sample index`), applied via `batch.reorder`. The actual tree pack (flat
+deduplicated layout) happens per worker afterwards, from the worker's subtrie — the
+reorder only guarantees that pack is lossless within a rank.
 
 ## 5. Metrics
 
@@ -149,7 +180,7 @@ Base (no prefix-tree) vs MAGI prefix-tree, on two workloads — `longreason` (a 
 
 - **Linear attention is not supported yet.** Only the `magi` / `flex` / FA3-fallback attention backends work; linear-attention variants fall back to the standard path.
 - **Dispatch overhead can dominate at low sharing.** Building the trie and dispatching the packed layout has a fixed cost; when the shared-prefix length is very short the dedup saving may not cover it, giving a net negative gain.
-- **DP load balance is not fully optimized.** The current DFS + contiguous partition balances token counts across DP ranks, but does not yet optimally co-locate prefix-sharing samples across ranks in all cases.
+- **DP load balance uses prompt-identity blocks.** `balance_prefix_tree_blocks` Karmarkar-Karp-partitions whole prompt/session blocks weighted by `calculate_workload(flat_tokens)`; a single block larger than the per-rank share still cannot be split without losing its dedup (accepted imbalance for that degenerate case).
 
 ## 8. Dependencies
 

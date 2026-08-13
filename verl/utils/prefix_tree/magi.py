@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Prefix-tree + MAGI utilities: flat layout packing, MAGI/flex keys, rope/decoder overrides, and flat→nested restore."""
+"""Prefix-tree + MAGI utilities: flat layout packing, MAGI/flex keys,
+rope/decoder overrides, and flat→nested restore."""
 
 from __future__ import annotations
 
@@ -28,22 +29,22 @@ from torch.nested._internal.nested_tensor import NestedTensor
 from verl.utils.prefix_tree.tree import PrefixSubTrie
 from verl.utils.prefix_tree.utils import build_layout_from_tree_node
 
+try:
+    from verl.utils.megatron_utils import unwrap_model
+except ImportError:  # local dev without megatron; tests monkeypatch this symbol
+
+    def unwrap_model(m):
+        return m
+
 
 @dataclass
 class PackRestorationParam:
     """Per-micro-batch layout info for restoring flat tensors to per-sample."""
+
     segment_ranges: list[tuple[int, int]]
     prefix_range: tuple[int, int]
     ancestor_segment_ranges: Optional[list[list[tuple[int, int]]]] = None
     boundary_registry: Optional[object] = None
-
-    def original_batch_size(self, subtrie) -> int:
-        """Number of unique samples (from subtrie)."""
-        return len(subtrie.global_sample_ids)
-
-    def real_tokens(self, pt_batch: PrefixTreeMagiBatch) -> int:
-        """Real token count (from packed input_ids shape)."""
-        return pt_batch.tree_packed_input_ids.shape[0]
 
 
 @dataclass
@@ -60,6 +61,11 @@ class PrefixTreeMagiBatch:
 
     # Per-token labels derived from tree_packed_tokens via within-segment shift
     tree_packed_labels: Optional[Tensor] = None  # (total_tokens,)
+
+    # Number of real (non-padding) tokens; may be < tree_packed_input_ids.shape[0]
+    # when _finalize pads to TP/CP divisibility. Use this (not shape[0]) to strip
+    # padding before restore/undispatch, else padding log-probs leak into samples.
+    real_tokens: int = 0
 
     # Restoration params for unpacking model output to per-sample tensors
     restoration: Optional[PackRestorationParam] = None
@@ -125,14 +131,14 @@ def _build_per_sample_tensor(
 
     boundary_logps maps sample_idx → [(boundary_flat_pos, per_leaf_logp), ...] to fix the
     dedup→one-slot→copy-to-all-leaves bug where non-owner leaves inherit wrong boundary log-probs."""
-    n = len(pt_batch.subtrie.leaf_to_sample)
+    n = (max(pt_batch.subtrie.leaf_to_sample) + 1) if pt_batch.subtrie.leaf_to_sample else 0
     sample_tensors: list[Optional[Tensor]] = [None] * n
     for leaf_idx, sample_idx in enumerate(pt_batch.subtrie.leaf_to_sample):
         s, e = pt_batch.restoration.segment_ranges[leaf_idx]
         leaf_slice = flat_tensor[s:e]
         ranges = pt_batch.restoration.ancestor_segment_ranges
         if ranges is None:
-            ranges = [[pt_batch.restoration.prefix_range] for _ in pt_batch.subtrie.leaf_to_sample]
+            ranges = [[pt_batch.restoration.prefix_range] for _ in range(n)]
         parts: list[Tensor] = []
         for a, b in ranges[leaf_idx]:
             part = flat_tensor[a:b]
@@ -159,24 +165,29 @@ def restore_flat_to_nested(
     boundary_logps = None
     if apply_boundary_patch:
         boundary_logps = getattr(pt_batch, "_boundary_logps", None)
-    # restore the tree packed-sample back to the normal batched tensor
     sample_tensors = _build_per_sample_tensor(flat_tensor, pt_batch, boundary_logps=boundary_logps)
-    assert all(t is not None for t in sample_tensors), (
-        "restore_flat_to_nested: some sample indices were not covered by segment_to_sample"
-    )
+    if not all(t is not None for t in sample_tensors):
+        raise RuntimeError("restore_flat_to_nested: some sample indices were not covered by segment_to_sample")
     # as_nested_tensor (not nested_tensor) preserves grad_fn through the cat ops.
     return torch.nested.as_nested_tensor(sample_tensors, layout=torch.jagged)
 
 
 def _set_rope_pids(model, position_ids: Optional[Tensor]) -> None:
-    """Set per-token position_ids on model.rotary_pos_emb for global RoPE patch to read."""
-    rope_mod = getattr(model, "rotary_pos_emb", None)
+    """Set per-token position_ids on model.rotary_pos_emb for global RoPE patch to read.
+
+    Unwrap the model first: ``model`` is the (Distributed)DataParallel-wrapped engine
+    whose ``__getattr__`` does NOT expose ``rotary_pos_emb``, so a bare ``getattr`` no-ops
+    and the patched ``_rope_forward`` falls back to megatron's sequential CP RoPE (wrong
+    for the deduplicated tree). ``unwrap_model`` drills to the GPTModel whose
+    ``rotary_pos_emb`` is the instance ``_rope_forward`` reads (via ``_preprocess``).
+    """
+    rope_mod = getattr(unwrap_model(model), "rotary_pos_emb", None)
     if rope_mod is not None and position_ids is not None:
         rope_mod._pids = position_ids.reshape(-1)
 
 
 def _clear_rope_pids(model) -> None:
-    rope_mod = getattr(model, "rotary_pos_emb", None)
+    rope_mod = getattr(unwrap_model(model), "rotary_pos_emb", None)
     if rope_mod is not None:
         rope_mod._pids = None
 

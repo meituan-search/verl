@@ -1,15 +1,25 @@
-"""Trie/dynamic-builder unit tests: greedy_build_tries, build_tree_dynamic,
-convert_trie_to_tree_node, trie_dfs_leaf_order, build_subtrie_view, and the
-flat layout / attention-spec output from build_layout_from_tree_node.
+# Copyright 2025 Meituan Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-Merges the former test_trie.py + test_dynamic.py + the dfs_leaf_order tests
-from test_mini_batch_prefix_groups.py.
-"""
+
+"""Trie/dynamic-builder unit tests: greedy_build_tries, build_tree_dynamic,"""
 
 from __future__ import annotations
 
 import pickle
 
+import numpy as np
 import torch
 
 from verl.utils.prefix_tree.dynamic import (
@@ -20,7 +30,12 @@ from verl.utils.prefix_tree.dynamic import (
     dfs_leaf_order,
     greedy_build_tries,
 )
-from verl.utils.prefix_tree.tree import PrefixSubTrie
+from verl.utils.prefix_tree.magi import PackRestorationParam, PrefixTreeMagiBatch, restore_flat_to_nested
+from verl.utils.prefix_tree.segment_grouper import (
+    create_segment_metadata,
+    group_by_segment_hash,
+)
+from verl.utils.prefix_tree.tree import PrefixSubTrie, PrefixTrie, TrieNode, build_global_tree_from_segments
 from verl.utils.prefix_tree.utils import build_layout_from_tree_node
 
 
@@ -35,7 +50,6 @@ def test_greedy_build_tries_and_dfs_leaf_order():
     assert trie.is_root
     order = dfs_leaf_order(seqs, trie)
     assert set(order) == {0, 1, 2} and len(order) == 3
-    # DFS places each prefix group adjacent: A1,B1,A2,B2 -> A's adjacent, B's adjacent
     raw = [[1, 2, 10], [5, 6, 20], [1, 2, 11], [5, 6, 21]]
     o2 = dfs_leaf_order(raw, _build_trie(raw))
     a = sorted([o2.index(0), o2.index(2)])
@@ -61,12 +75,9 @@ def test_build_subtrie_view_all_subset_and_empty():
 
 
 def test_build_tree_dynamic_and_none_cases():
-    # depth-2: 3 samples share [10,11]
     s2 = [torch.tensor([10, 11, 20, 21]), torch.tensor([10, 11, 30, 31]), torch.tensor([10, 11, 40, 41])]
     r2 = build_tree_dynamic(s2)
     assert r2 is not None and len(r2.nodes[0].input_ids) == 2 and sorted(r2.leaf_to_sample) == [0, 1, 2]
-    # None cases: no sharing (multiple roots) and empty.
-    # Single sample and duplicates now return a trie (not None) — source changed.
     assert build_tree_dynamic([torch.tensor([1, 2, 3]), torch.tensor([4, 5, 6])]) is None
     assert build_tree_dynamic([]) is None
 
@@ -75,23 +86,18 @@ def test_convert_trie_to_tree_node_normal_and_multi_root():
     trie = _build_trie([[1, 2, 3, 4], [1, 2, 3, 5], [1, 2, 6, 7]])
     r = convert_trie_to_tree_node(trie)
     assert r is not None and len(r.nodes[0].input_ids) == 2 and len(r.leaf_to_sample) == 3
-    # Multi-root (no shared prefix) → None
     multi = _build_trie([[1, 2], [3, 4]])
     assert convert_trie_to_tree_node(multi) is None
 
 
 def test_layout_token_conservation_and_zero_length_leaf_skipped():
-    # depth-2: 3 samples share [10,11]; donation repeats the last prefix token
-    # per child, so packed = 3 + 3*(1 + 2) = ... use invariant, not exact count.
     s2 = [torch.tensor([10, 11, 20, 21]), torch.tensor([10, 11, 30, 31]), torch.tensor([10, 11, 40, 41])]
     p2 = build_layout_from_tree_node(s2, build_tree_dynamic(s2))
     assert p2.tree_packed_tokens.shape[0] >= 8  # at least the raw 8 tokens
     assert p2.prefix_range[0] == 0 and p2.prefix_range[1] >= 1
     assert len(p2.leaf_ranges) == 3
-    # Nested A/AB/ABC prefixes -> packed contains all unique tokens in order
     nested = [torch.tensor([1, 2]), torch.tensor([1, 2, 3, 4]), torch.tensor([1, 2, 3, 4, 5, 6])]
     pn = build_layout_from_tree_node(nested, build_tree_dynamic(nested))
-    # All 6 unique tokens appear; prefix [1,2] is first
     assert list(pn.tree_packed_tokens[:2].tolist()) == [1, 2]
     assert set(pn.tree_packed_tokens.tolist()) == {1, 2, 3, 4, 5, 6}
 
@@ -100,9 +106,7 @@ def test_position_ids_are_sample_local():
     """Position IDs reset at branch points — sample-local, not flat 0..N-1."""
     s1 = [torch.tensor([10, 20, 30, 41, 42]), torch.tensor([10, 20, 30, 51])]
     p1 = build_layout_from_tree_node(s1, build_tree_dynamic(s1))
-    # Prefix [10,20,30] → [0,1,2]; leaf 0 [41,42] → [3,4]; leaf 1 [51] → [3]
     assert p1.tree_packed_position_ids.tolist() == [0, 1, 2, 3, 4, 3]
-    # Also test with custom position_ids_by_sample
     custom_pids = [
         torch.tensor([10, 11, 12, 13, 14]),
         torch.tensor([10, 11, 12, 15]),
@@ -120,13 +124,14 @@ def test_internal_node_owner_propagation():
         torch.tensor([1, 2, 3, 20, 22]),
     ]
     restored = _build_and_restore(samples)
-    for i, (orig, rest) in enumerate(zip(samples, restored)):
+    for i, (orig, rest) in enumerate(zip(samples, restored, strict=False)):
         assert torch.equal(orig, rest), f"sample {i}: {orig.tolist()} != {rest.tolist()}"
 
 
 def test_fuzz_random_tree_round_trip():
     """Fuzz: random tree topologies, verify full restore (includes token collisions)."""
     import random
+
     rng = random.Random(42)
     for _ in range(20):
         n_samples = rng.randint(3, 12)
@@ -141,37 +146,66 @@ def test_fuzz_random_tree_round_trip():
             samples.append(torch.tensor(parent[:split] + suffix))
         restored = _build_and_restore(samples)
         assert len(restored) == len(samples)
-        for i, (orig, rest) in enumerate(zip(samples, restored)):
+        for i, (orig, rest) in enumerate(zip(samples, restored, strict=False)):
             assert torch.equal(orig, rest), f"run {_}, sample {i}: {orig.tolist()} != {rest.tolist()}"
+
+    empty_count = 0
+    for run in range(8):
+        n_trees = 128
+        samples = []
+        for _t in range(n_trees):
+            prefix = [rng.randint(0, 10_000) for _ in range(rng.randint(2, 12))]
+            n_leaf = rng.randint(2, 5)
+            for _l in range(n_leaf - 1):
+                suffix = [rng.randint(0, 10_000) for _ in range(rng.randint(1, 16))]
+                samples.append(torch.tensor(prefix + suffix))
+            samples.append(torch.tensor(prefix))  # empty leaf: sample == prefix
+            empty_count += 1
+        subtrie = _make_subtrie([s.tolist() for s in samples], range(len(samples)))
+        restored = _build_and_restore(samples, subtrie=subtrie)
+        assert len(restored) == len(samples)
+        for i, (orig, rest) in enumerate(zip(samples, restored, strict=False)):
+            assert torch.equal(orig, rest), f"run {run}, sample {i}: {orig.tolist()} != {rest.tolist()}"
+
+        # Direct iterator-contract checks (regressions surface here, not as restore mismatches).
+        in_view = {n.node_idx for n in subtrie.nodes}
+        # children_of must yield only in-view children (subtrie view boundary).
+        for n in subtrie.nodes:
+            assert all(c.node_idx in in_view for c in subtrie.children_of(n)), (
+                f"run {run}: children_of leaked out-of-view child"
+            )
+        # bfs/dfs must visit exactly the subtrie's nodes, no more (no pruned leak).
+        assert {n.node_idx for n in subtrie.bfs()} == in_view, "bfs leaked past view"
+        assert {n.node_idx for n in subtrie.dfs()} == in_view, "dfs leaked past view"
+        # dfs(leaf_only=True) must visit only leaves (nodes with no in-view children).
+        bfs_leaves = {n.node_idx for n in subtrie.bfs() if not subtrie.children_of(n)}
+        assert {n.node_idx for n in subtrie.dfs(leaf_only=True)} == bfs_leaves, (
+            "dfs leaf_only disagrees with children_of-defined leaves"
+        )
+    assert empty_count == 8 * 128, "empty-leaf case must be exercised for every tree"
 
 
 def test_fuzz_tree_balance_reduces_imbalance():
-    """Fuzz: multiple random trees; tree-level KK balance must never worsen the
-    DP workload imbalance vs natural (insertion-order) contiguous split, and
-    must strictly improve it in at least some cases."""
+    """Fuzz: multiple random trees; tree-level KK balance must never worsen the"""
     import random
+
     rng = random.Random(7)
     improved = 0
     checked = 0
     for _ in range(50):
         n_trees = rng.randint(3, 8)
         seq_lists = []
+        block_ids = []
         for _t in range(n_trees):
             base = [rng.randint(0, 10_000) for _ in range(rng.randint(1, 5))]
-            for _l in range(rng.randint(1, 5)):
+            n_leaf = rng.randint(1, 5)
+            for _l in range(n_leaf):
                 suffix = [rng.randint(0, 10_000) for _ in range(rng.randint(0, 30))]
                 seq_lists.append(base + suffix)
+                block_ids.append(f"t{_t}")
         trie = _build_trie(seq_lists)
-        flat_list = [
-            sum(len(n.input_ids) for n in _tree_nodes(child))
-            for child in trie.children.values()
-        ]
-        if len(flat_list) < 2:
-            continue
-        # Same workload formula as balance_prefix_tree_blocks (24576*n + n²).
-        workloads = [24576.0 * f + f * f for f in flat_list]
-        dp = rng.randint(2, min(4, len(workloads)))
-        permutation, partitions, _ = balance_prefix_tree_blocks(trie, dp)
+        dp = rng.randint(2, min(4, n_trees))
+        permutation, partitions, workloads = balance_prefix_tree_blocks(trie, dp, block_ids)
         assert sorted(permutation) == list(range(len(seq_lists)))
         if len(partitions) < dp:
             continue
@@ -189,10 +223,30 @@ def test_fuzz_tree_balance_reduces_imbalance():
         assert b_imb <= n_imb, f"run {_}: balanced imbalance {b_imb} > natural {n_imb}"
         if b_imb < n_imb:
             improved += 1
-            print(f"run {_}: dp={dp} trees={len(workloads)} workload={workloads} "
-                  f"imbalance {n_imb} -> {b_imb} ({n_imb - b_imb} better)")
+            print(
+                f"run {_}: dp={dp} trees={len(workloads)} workload={workloads} "
+                f"imbalance {n_imb} -> {b_imb} ({n_imb - b_imb} better)"
+            )
     assert checked >= 40
     assert improved > 0, "tree balance never strictly improved imbalance"
+
+
+def test_balance_by_prompt_ids_keeps_prompt_blocks_whole():
+    """Cross-prompt shared prefix (system prompt) must NOT merge prompt blocks."""
+    seq_lists = []
+    block_ids = []
+    for p in range(6):
+        prompt = [10 + p, 20 + p]
+        for r in range(3):
+            seq_lists.append([1, 2, 3] + prompt + [100 + r])  # system + prompt + response
+            block_ids.append(f"uid_{p}_0")
+    trie = _build_trie(seq_lists)
+    permutation, partitions, workloads = balance_prefix_tree_blocks(trie, 2, block_ids)
+    assert sorted(permutation) == list(range(len(seq_lists)))
+    assert len(workloads) == 6, f"expected 6 prompt blocks, got {len(workloads)}"
+    for p in range(6):
+        positions = [permutation.index(i) for i in range(p * 3, p * 3 + 3)]
+        assert positions == list(range(min(positions), max(positions) + 1)), f"prompt {p} split"
 
 
 def _tree_nodes(root):
@@ -205,12 +259,9 @@ def _tree_nodes(root):
 
 def test_strict_prefix_zero_length_leaf_boundary_skipped():
     """Strict-prefix sample (zero-length response) should not appear in boundary registry."""
-    # Sample 0: [1,2,3,10,11]; Sample 1: [1,2,3] (strict prefix — zero-length at the branch)
-    # Boundary at flat position of last token of [1,2,3]; sample 1 has no next-token.
     samples = [torch.tensor([1, 2, 3, 10, 11]), torch.tensor([1, 2, 3])]
     p = build_layout_from_tree_node(samples, build_tree_dynamic(samples))
     registry = getattr(p, "boundary_registry", None)
-    # The boundary registry should exist but sample 1 should not appear (zero-length).
     if registry:
         for b_pos, leaves_info in registry:
             for sample_idx, _ in leaves_info:
@@ -243,7 +294,6 @@ def test_basic_and_duplicates_round_trip():
     assert p1.leaf_to_sample == p2.leaf_to_sample
     assert p1.q_ranges == p2.q_ranges
     assert p1.prefix_range == p2.prefix_range
-    # Duplicates case: set-equality on leaf_to_sample (order may differ)
     dup = [[1, 2, 3, 4], [1, 2, 3, 4], [1, 2, 5, 6]]
     st_dup = _make_subtrie(dup, [0, 1, 2])
     st_dup2 = pickle.loads(pickle.dumps(st_dup))
@@ -259,11 +309,6 @@ def test_children_reconstructed_after_unpickling():
     valid = {n.node_idx for n in st2.nodes}
     children = [c for c in st2.nodes[0].children.values() if c.node_idx in valid]
     assert len(children) > 0
-
-
-# --- e2e round-trip tests ---
-
-from verl.utils.prefix_tree.magi import PackRestorationParam, PrefixTreeMagiBatch, restore_flat_to_nested
 
 
 def _build_and_restore(samples: list[torch.Tensor], subtrie=None) -> list[torch.Tensor]:
@@ -346,3 +391,162 @@ def test_dp_shard_subtrie_round_trip():
     assert len(restored) == len(shard_samples)
     for orig, rest in zip(shard_samples, restored, strict=False):
         assert torch.equal(orig, rest)
+
+
+def test_duplicate_samples_leaf_alignment():
+    samples = [
+        torch.tensor([1, 2, 3, 4]),
+        torch.tensor([1, 2, 3, 4]),  # duplicate of sample 0
+        torch.tensor([1, 2, 5, 6]),
+    ]
+    seq_lists = [s.tolist() for s in samples]
+    trie, _ = greedy_build_tries(seq_lists)
+    subtrie = build_subtrie_view(trie, set(range(len(samples))))
+    params = build_layout_from_tree_node(samples, subtrie)
+    assert len(params.leaf_ranges) == len(params.leaf_to_sample) == 3, (
+        f"leaf_ranges={params.leaf_ranges} (len={len(params.leaf_ranges)}), "
+        f"leaf_to_sample={params.leaf_to_sample} (len={len(params.leaf_to_sample)})"
+    )
+    assert set(params.leaf_to_sample) == {0, 1, 2}
+
+
+def test_create_segment_metadata_dtypes_and_int_hashes():
+    hashes, lengths = create_segment_metadata([[("a", 3), ("b", 2)]])
+    assert hashes.dtype == object and lengths.dtype == object
+    assert hashes[0].tolist() == [hash("a") & 0xFFFFFFFF, hash("b") & 0xFFFFFFFF]
+    assert lengths[0].tolist() == [3, 2]
+    h2, l2 = create_segment_metadata([[(7, 3)]])  # accepts int hashes too
+    assert h2[0].tolist() == [7] and l2[0].tolist() == [3]
+
+
+def test_group_by_segment_hash_level0_and_out_of_range():
+    hashes, lengths = create_segment_metadata([[("p0", 3)], [("p0", 3)], [("p1", 5)]])
+    groups = group_by_segment_hash(hashes, lengths, level=0)
+    assert sorted(len(v) for v in groups.values()) == [1, 2]
+    big = next(v for v in groups.values() if len(v) == 2)
+    assert sorted(idx for idx, _ in big) == [0, 1]
+    h1, l1 = create_segment_metadata([[("p0", 3)]])  # out-of-range level -> empty
+    assert group_by_segment_hash(h1, l1, level=5) == {}
+
+
+def test_shared_hash_creates_trie_with_prefix_tokens():
+    shared = [10, 20, 30]
+    samples = [torch.tensor(shared + [1, 2]), torch.tensor(shared + [3, 4])]
+    hashes, lengths = create_segment_metadata([[("p", 3), ("a", 2)], [("p", 3), ("b", 2)]])
+    trie = build_global_tree_from_segments(samples, hashes, lengths)
+    assert isinstance(trie, PrefixTrie) and trie.is_root
+    tokens = [t for n in trie.nodes for t in n.input_ids]
+    assert all(tok in tokens for tok in shared)
+
+
+def test_no_sharing_single_and_empty_return_none():
+    hashes, lengths = create_segment_metadata([[("a", 3)], [("b", 3)], [("c", 3)]])
+    h1, l1 = create_segment_metadata([[("uid", 3)]])
+    assert build_global_tree_from_segments([torch.tensor([1, 2, 3])], h1, l1) is None
+    import numpy as np
+
+    assert build_global_tree_from_segments([], np.array([], dtype=object), np.array([], dtype=object)) is None
+
+
+def test_grpo_two_prompts_builds_leaf_per_sample():
+    p0, p1 = list(range(10, 15)), list(range(20, 25))
+    samples = [
+        torch.tensor(p0 + [100, 101, 102]),
+        torch.tensor(p0 + [200, 201, 202]),
+        torch.tensor(p1 + [300, 301, 302]),
+        torch.tensor(p1 + [400, 401, 402]),
+    ]
+    hashes, lengths = create_segment_metadata([[("p0", 5)], [("p0", 5)], [("p1", 5)], [("p1", 5)]])
+    trie = build_global_tree_from_segments(samples, hashes, lengths)
+    assert isinstance(trie, PrefixTrie)
+    assert len(trie.leaves) == 4 and all(leaf is not None for leaf in trie.leaves)
+
+
+def test_leaf_coverage_and_varying_segment_lengths():
+    prefix = [1, 2]
+    samples = [torch.tensor(prefix + [i]) for i in range(4)]
+    hashes, lengths = create_segment_metadata([[("uid", 2), (f"r{i}", 1)] for i in range(4)])
+    trie = build_global_tree_from_segments(samples, hashes, lengths)
+    assert len(trie.leaves) == 4 and all(leaf is not None for leaf in trie.leaves)
+    short = [torch.tensor([1] + list(range(100, 110))), torch.tensor([1] + list(range(200, 210)))]
+    h3, l3 = create_segment_metadata([[("u", 1), ("a", 10)], [("u", 1), ("b", 10)]])
+    trie2 = build_global_tree_from_segments(short, h3, l3)
+    assert isinstance(trie2, PrefixTrie) and len(trie2.leaves) == 2
+
+
+def _build_global_trie_local(seqs_t, seg_hashes=None, seg_lengths=None):
+    """Returns (trie, leaf_idx) mirroring ray_trainer._build_global_trie."""
+    total_raw = sum(int(s.numel()) for s in seqs_t)
+    trie = None
+    if seg_hashes is not None and seg_lengths is not None:
+        trie = build_global_tree_from_segments(seqs_t, seg_hashes, seg_lengths)
+    if trie is None:
+        from verl.utils.prefix_tree.tree import PrefixTrie
+
+        trie = PrefixTrie(root=TrieNode())
+        for seq_id, seq in enumerate(seqs_t):
+            trie.insert(np.array(seq if hasattr(seq, "tolist") else [int(x) for x in seq], dtype=np.int64), seq_id)
+        trie.finalize()
+        if total_raw <= 0:
+            trie = None
+    if trie is None:
+        return None, None
+
+    leaf_idx = np.full(len(seqs_t), -1, dtype=np.int64)
+    for node_idx, node in enumerate(trie.nodes):
+        if not node.children:
+            for seq_id in node.sequence_ids:
+                leaf_idx[seq_id] = node_idx
+    return trie, torch.from_numpy(leaf_idx)
+
+
+def _make_seqs(n_prompts=2, rollout_n=2, prompt_len=5, resp_len=3):
+    seqs, segments = [], []
+    for p in range(n_prompts):
+        prompt = list(range(100 + p * 10, 100 + p * 10 + prompt_len))
+        for r in range(rollout_n):
+            resp = list(range(200 + (p * rollout_n + r) * 10, 200 + (p * rollout_n + r) * 10 + resp_len))
+            seqs.append(torch.tensor(prompt + resp, dtype=torch.long))
+            segments.append([(f"p{p}", prompt_len)])
+    seg_hashes, seg_lengths = create_segment_metadata(segments)
+    return seqs, seg_hashes, seg_lengths
+
+
+def _make_multilevel_seqs():
+    seqs = [
+        torch.tensor(t, dtype=torch.long)
+        for t in [
+            [10, 11, 12, 20, 21, 30, 31],
+            [10, 11, 12, 20, 21, 32, 33],
+            [50, 51, 52, 60, 61, 70, 71],
+            [50, 51, 52, 60, 61, 72, 73],
+        ]
+    ]
+    segs = [[(f"p{i // 2}_t1", 3), (f"p{i // 2}_t2", 2)] for i in range(4)]
+    return (seqs,) + create_segment_metadata(segs)
+
+
+def test_build_global_trie_leaf_idx_valid_and_fallback():
+    seqs, seg_hashes, seg_lengths = _make_seqs()
+    trie, leaf_idx = _build_global_trie_local(seqs, seg_hashes, seg_lengths)
+    assert trie is not None and len(trie.nodes) > 0
+    assert isinstance(leaf_idx, torch.Tensor) and leaf_idx.dtype == torch.long
+    assert leaf_idx.shape == (4,) and (leaf_idx >= 0).all()
+    for i, node_idx in enumerate(leaf_idx.tolist()):
+        node = trie.nodes[node_idx]
+        assert not node.children and i in node.sequence_ids
+    trie_fb, leaf_fb = _build_global_trie_local(seqs, seg_hashes=None, seg_lengths=None)
+    assert trie_fb is not None and leaf_fb is not None and (leaf_fb >= 0).all()
+
+
+def test_multilevel_builds_three_node_levels():
+    seqs, seg_hashes, seg_lengths = _make_multilevel_seqs()
+    trie = build_global_tree_from_segments(seqs, seg_hashes, seg_lengths)
+    assert trie is not None and len(trie.nodes) == 8  # 2 prefix + 2 inter + 4 leaves
+    leaves = [n for n in trie.nodes if not n.children]
+    intermediates = [n for n in trie.nodes if n.children and n.ancestor is not None]
+    roots = [n for n in trie.nodes if n.ancestor is None]
+    assert len(leaves) == 4 and len(intermediates) == 2 and len(roots) == 2
+    assert all(leaf.ancestor in intermediates for leaf in leaves)
+    assert {(10, 11, 12), (50, 51, 52)} == {tuple(int(x) for x in n.input_ids) for n in roots}
+    assert list(trie.leaves[0].input_ids) == [30, 31] and list(trie.leaves[3].input_ids) == [72, 73]

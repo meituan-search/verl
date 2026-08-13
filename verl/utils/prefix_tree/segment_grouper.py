@@ -11,51 +11,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Segment-based grouping for prefix-tree: build trie from pre-computed segment (hash, length) metadata, avoiding token-by-token detection."""
+"""Segment-based grouping for prefix-tree: build trie from pre-computed segment
+(hash, length) metadata, avoiding token-by-token detection."""
 
 from typing import Hashable
 
 import numpy as np
 
 
-def _default_uid_hash(uid: str) -> int:
-    return hash(uid) & 0xFFFFFFFF
-
-
 def create_segment_metadata(
     segments: list[list[tuple[Hashable, int]]],
 ) -> tuple[np.ndarray, np.ndarray]:
     """Create (segment_hashes, segment_lengths) numpy arrays (object dtype, reorder-safe)."""
-    segment_hashes = []
-    segment_lengths = []
-    for sample_segments in segments:
-        hashes, lengths = [], []
-        for hash_val, length in sample_segments:
-            if isinstance(hash_val, str):
-                hash_val = _default_uid_hash(hash_val)
-            elif not isinstance(hash_val, int):
-                hash_val = hash(hash_val) & 0xFFFFFFFF
-            hashes.append(hash_val)
-            lengths.append(length)
-        segment_hashes.append(hashes)
-        segment_lengths.append(lengths)
+    segment_hashes = [[hash(h) & 0xFFFFFFFF for h, _ in segs] for segs in segments]
+    segment_lengths = [[length for _, length in segs] for segs in segments]
     return (
         np.array(segment_hashes, dtype=object),
         np.array(segment_lengths, dtype=object),
     )
-
-
-def create_grpo_segment_metadata(
-    prompt_uids: list[str],
-    prompt_lengths: list[int],
-    rollout_n: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Create segment metadata for GRPO: one shared-prompt segment per sample. Validates batch_size % rollout_n."""
-    batch_size = len(prompt_uids)
-    if batch_size % rollout_n != 0:
-        raise ValueError(f"batch_size {batch_size} not divisible by rollout_n {rollout_n}")
-    segments = [[(uid, p_len)] for uid, p_len in zip(prompt_uids, prompt_lengths, strict=False)]
-    return create_segment_metadata(segments)
 
 
 def group_by_segment_hash(
@@ -65,12 +38,10 @@ def group_by_segment_hash(
 ) -> dict[int, list[tuple[int, int]]]:
     """Group samples by segment hash at given level, returning hash → [(sample_idx, segment_length), ...]."""
     groups: dict[int, list[tuple[int, int]]] = {}
-    for sample_idx in range(len(segment_hashes)):
-        sample_hashes = segment_hashes[sample_idx]
-        sample_lengths = segment_lengths[sample_idx]
-        if level >= len(sample_hashes):
+    for sample_idx, (sh, sl) in enumerate(zip(segment_hashes, segment_lengths, strict=False)):
+        if level >= len(sh):
             continue
-        hash_val = int(sample_hashes[level])
-        length = int(sample_lengths[level])
+        hash_val = int(sh[level])
+        length = int(sl[level])
         groups.setdefault(hash_val, []).append((sample_idx, length))
     return groups

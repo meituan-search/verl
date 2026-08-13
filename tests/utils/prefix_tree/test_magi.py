@@ -1,17 +1,25 @@
-"""CPU tests for verl/utils/prefix_tree/magi.py: flat layout build,
-restore_flat_to_nested round-trip, loss-mask flattening, and the
-build_prefix_tree_micro_batch integration entrypoint. The MAGI-key
-construction itself requires GPU + distributed and is not covered here.
+# Copyright 2025 Meituan Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-Note: the layout uses a boundary-donation mechanism (non-leaf nodes donate
-their last token to each child), so packed tokens include repeated prefix
-tokens. Tests assert structural invariants rather than exact token sequences.
-"""
+
+"""CPU tests for verl/utils/prefix_tree/magi.py: flat layout build,"""
 
 from __future__ import annotations
 
 import torch
 
+from verl.utils.prefix_tree import magi as magi_mod
 from verl.utils.prefix_tree.dynamic import build_tree_dynamic
 from verl.utils.prefix_tree.magi import PrefixTreeMagiBatch, restore_flat_to_nested
 from verl.utils.prefix_tree.utils import build_layout_from_tree_node
@@ -66,13 +74,10 @@ def test_basic_shared_prefix_flat_layout_and_flex_rects():
         torch.tensor([10, 20, 30, 61, 62, 63]),
     ]
     params, _ = _build_params(tokens)
-    # Packed starts with the shared prefix [10,20,30]; prefix_range = retained
-    # prefix after donation (last token donated to children).
     assert list(params.tree_packed_tokens[:3].tolist()) == [10, 20, 30]
     assert params.prefix_range[0] == 0 and params.prefix_range[1] >= 1
     assert len(params.leaf_ranges) == 3  # one per sample
     assert params.total_seqlen_q >= max(t.numel() for t in tokens)
-    # Flex rectangles: causal self-rects + full rects (leaves attending to prefix)
     short = [torch.tensor([10, 20, 30, 41, 42]), torch.tensor([10, 20, 30, 51])]
     sp, _ = _build_params(short)
     rects = set(zip(sp.q_ranges, sp.k_ranges, sp.mask_types, strict=False))
@@ -98,13 +103,7 @@ def test_restore_token_ids_round_trip():
 
 
 def test_build_prefix_tree_micro_batch_unpacks_nested(monkeypatch):
-    """Integration: NestedTensor input -> flat layout via build_prefix_tree_micro_batch.
-    magi_attention is stubbed by conftest; _build_magi_key is monkeypatched out.
-
-    Skipped when the full verl dependency stack (codetiming, etc.) isn't
-    importable — forward.py transitively imports verl.workers.config which
-    needs real PyPI packages the CPU test env may lack.
-    """
+    """Integration: NestedTensor input -> flat layout via build_prefix_tree_micro_batch."""
     import types
 
     pytest = __import__("pytest")
@@ -117,7 +116,76 @@ def test_build_prefix_tree_micro_batch_unpacks_nested(monkeypatch):
     model = types.SimpleNamespace(config=cfg, pre_process=True, post_process=True)
     tensors = [torch.tensor(t) for t in [[10, 20, 30, 41, 42], [10, 20, 30, 51], [10, 20, 30, 61, 62, 63]]]
     input_ids = torch.nested.nested_tensor(tensors, layout=torch.jagged)
-    result = ptm.build_prefix_tree_micro_batch(model, input_ids)
+    subtrie = build_tree_dynamic(tensors)
+    assert subtrie is not None
+    result = ptm.build_prefix_tree_micro_batch(model, input_ids, subtrie=subtrie)
     assert result is not None and len(result.restoration.segment_ranges) == 3
-    # Packed starts with the shared prefix [10,20,30]
     assert list(result.tree_packed_input_ids[:3].tolist()) == [10, 20, 30]
+
+
+class _Rotary(torch.nn.Module):
+    """Stand-in for megatron RotaryEmbedding: just needs a ``_pids`` slot."""
+
+
+class _GPTModel(torch.nn.Module):
+    """Stand-in for megatron GPTModel: exposes ``rotary_pos_emb``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rotary_pos_emb = _Rotary()
+
+
+class _WrappedEngine(torch.nn.Module):
+    """Stand-in for the DDP/FSDP-wrapped engine passed to prepare_prefix_tree.
+
+    Critically, it does NOT expose ``rotary_pos_emb`` directly (mirrors the real
+    wrappers whose ``__getattr__`` does not delegate submodule attributes), so a
+    bare ``getattr(model, "rotary_pos_emb")`` returns None — the bug condition.
+    The inner GPTModel is reachable only via ``unwrap_model``.
+    """
+
+    def __init__(self, gpt: _GPTModel) -> None:
+        super().__init__()
+        self.module = gpt
+
+
+def test_set_rope_pids_sets_pids_on_inner_rotary_through_wrapper(monkeypatch):
+    """_set_rope_pids must reach the GPTModel's rotary even when the top-level"""
+    gpt = _GPTModel()
+    wrapped = _WrappedEngine(gpt)
+    assert not hasattr(wrapped, "rotary_pos_emb")
+    assert hasattr(gpt, "rotary_pos_emb")
+    assert getattr(gpt.rotary_pos_emb, "_pids", None) is None
+
+    monkeypatch.setattr(magi_mod, "unwrap_model", lambda m: gpt if m is wrapped else m)
+
+    pids = torch.tensor([0, 3, 1, 7], dtype=torch.long)
+    magi_mod._set_rope_pids(wrapped, pids)
+
+    assert gpt.rotary_pos_emb._pids is not None, (
+        "_set_rope_pids no-op'd: _pids was not set on the inner rotary "
+        "(wrapped model hides rotary_pos_emb -> fallback RoPE bug)"
+    )
+    assert torch.equal(gpt.rotary_pos_emb._pids, pids.reshape(-1))
+
+
+def test_clear_rope_pids_clears_inner_rotary(monkeypatch):
+    """_clear_rope_pids must clear _pids on the inner GPTModel's rotary."""
+    gpt = _GPTModel()
+    wrapped = _WrappedEngine(gpt)
+    gpt.rotary_pos_emb._pids = torch.tensor([1, 2, 3], dtype=torch.long)
+
+    monkeypatch.setattr(magi_mod, "unwrap_model", lambda m: gpt if m is wrapped else m)
+    magi_mod._clear_rope_pids(wrapped)
+
+    assert gpt.rotary_pos_emb._pids is None
+
+
+def test_set_rope_pids_noop_when_position_ids_none(monkeypatch):
+    """None position_ids must not set _pids (no false activation of the patch)."""
+    gpt = _GPTModel()
+    wrapped = _WrappedEngine(gpt)
+    monkeypatch.setattr(magi_mod, "unwrap_model", lambda m: gpt if m is wrapped else m)
+
+    magi_mod._set_rope_pids(wrapped, None)
+    assert getattr(gpt.rotary_pos_emb, "_pids", None) is None

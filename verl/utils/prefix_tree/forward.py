@@ -11,21 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Prefix-tree forward-path: tree build, MAGI dispatch, rope override, fused/unfused forward drivers, and LCE post-processing.
+"""Prefix-tree forward-path: tree build, MAGI dispatch, rope override,
+    fused/unfused forward drivers, and LCE post-processing.
 
 Public: prepare_prefix_tree, tree_post_processing, fuse_forward_body, dispatch_magi."""
 
 from __future__ import annotations
 
 import logging as _log
-from collections import Counter, namedtuple
+from collections import Counter, OrderedDict, namedtuple
 from typing import Optional
 
 import torch
 import torch.distributed as _dist
 from magi_attention.api import (
     DistAttnConfig,
-    OverlapConfig,
     get_position_ids,
     magi_attn_flex_key,
     undispatch,
@@ -41,13 +41,15 @@ from verl.utils.megatron_utils import unwrap_model
 from verl.utils.prefix_tree.magi import (
     PackRestorationParam,
     PrefixTreeMagiBatch,
+    _clear_rope_pids,
+    _set_rope_pids,
     build_prefix_tree_micro_batch,
     prefix_tree_decoder_key_context,
-    _set_rope_pids,
-    _clear_rope_pids,
     restore_flat_to_nested,
     strip_prefix_tree_args,
 )
+
+_logger = _log.getLogger(__name__)
 
 TreeForwardCtx = namedtuple("TreeForwardCtx", ["pb", "input_ids", "position_ids", "attention", "model"])
 """Returned by :func:`prepare_prefix_tree`.  ``rope_exit`` is a
@@ -60,7 +62,9 @@ def _prepare_attn_inputs(
     pb: PrefixTreeMagiBatch,
     prefix_tree_attention: str,
 ) -> tuple[Tensor, Tensor, dict]:
-    """Build local_input_ids, local_position_ids, and attention kwargs. MAGI path returns CP-local slices; flex returns full tree-packed."""
+    """Build local_input_ids, local_position_ids, and attention kwargs.
+
+    MAGI path returns CP-local slices; flex returns full tree-packed."""
     if prefix_tree_attention == "magi":
         local_input_ids, local_position_ids = dispatch_magi(pb)
         attn_kwargs = {"magi_attention_key": pb.magi_key}
@@ -69,6 +73,7 @@ def _prepare_attn_inputs(
         local_position_ids = pb.tree_packed_position_ids.unsqueeze(0)
         attn_kwargs = {"flex_attention_key": pb.flex_key}
     return local_input_ids, local_position_ids, attn_kwargs
+
 
 # ============================================================
 
@@ -110,7 +115,7 @@ def _expand_temperature(t, pt_batch: PrefixTreeMagiBatch, total_flat: int, devic
 # Low-level builders
 
 
-def _unpack_nested_to_list(x, pad_token_id=None, mask: Optional[Tensor] = None) -> Optional[list[Tensor]]:
+def _unpack_nested_to_list(x, mask: Optional[Tensor] = None) -> Optional[list[Tensor]]:
     """Unpack NestedTensor or padded 2-D Tensor into list of 1-D tensors. Returns None if cannot safely unpack."""
     if x is None:
         return None
@@ -124,23 +129,21 @@ def _unpack_nested_to_list(x, pad_token_id=None, mask: Optional[Tensor] = None) 
             out.append(vals[pos : pos + int(length)])
             pos += int(length)
         return out
-    if x.dim() == 2:
-        if mask is not None:
-            seqlens = mask.sum(dim=-1).tolist()
-            return [x[i, : int(seqlens[i])] for i in range(x.shape[0])]
-        return None
+    if x.dim() == 2 and mask is not None:
+        seqlens = mask.sum(dim=-1).tolist()
+        return [x[i, : int(seqlens[i])] for i in range(x.shape[0])]
     return None
 
 
 def _build_flex_key(params, device):
-    """Build torch flex_attention block_mask from PrefixTreeParams (prefix causal + per-leaf causal + cross-leaf blocked)."""
+    """Build torch flex_attention block_mask from PrefixTreeParams
+    (prefix causal + per-leaf causal + cross-leaf blocked)."""
     total = params.total_seqlen_q
     prefix_end = params.prefix_range[1]  # == prefix_len
 
-    leaf_id = torch.full((total,), -1, dtype=torch.int32)
-    for i, (s, e) in enumerate(params.segment_ranges):
+    leaf_id = torch.full((total,), -1, dtype=torch.int32, device=device)
+    for i, (s, e) in enumerate(params.leaf_ranges):
         leaf_id[s:e] = i
-    leaf_id = leaf_id.to(device)
 
     def prefix_tree_mask(b, h, q_idx, kv_idx):
         q_leaf = leaf_id[q_idx]
@@ -186,7 +189,6 @@ def _build_magi_key(model, params):
         cp_group_or_mesh=cp_group,
         dist_attn_config=DistAttnConfig(
             dispatch_config=DispatchConfig(uneven_shard=True),
-            overlap_config=OverlapConfig(degree=2, min_chunk_size=512),
         ),
     )
 
@@ -245,11 +247,13 @@ def _finalize_prefix_tree_batch(
             boundary_registry=getattr(params, "boundary_registry", None),
         ),
         subtrie=subtrie,
+        real_tokens=real_tokens,
     )
 
 
 def dispatch_magi(pt_batch: PrefixTreeMagiBatch) -> tuple[Tensor, Tensor]:
-    """Slice local_input_ids / local_position_ids via magi dispatch (get_position_ids). Each CP rank processes its assigned slice."""
+    """Slice local_input_ids / local_position_ids via magi dispatch
+    (get_position_ids). Each CP rank processes its assigned slice."""
     local_indices = get_position_ids(pt_batch.magi_key)
     local_input_ids = pt_batch.tree_packed_input_ids[local_indices].unsqueeze(0)
     local_position_ids = pt_batch.tree_packed_position_ids[local_indices].unsqueeze(0)
@@ -258,13 +262,15 @@ def dispatch_magi(pt_batch: PrefixTreeMagiBatch) -> tuple[Tensor, Tensor]:
 
 # Forward-path drivers
 
-def build_prefix_tree_batch(model, input_ids, logits_processor_args, vision_model, mtp_enable_train):
+
+def build_prefix_tree_batch(model, input_ids, logits_processor_args):
     """Build prefix-tree micro-batch from logits_processor_args. Returns PrefixTreeMagiBatch or None."""
-    prefix_tree_attention = (logits_processor_args or {}).get("prefix_tree_attention", "flex")
-    loss_mask_nested = (logits_processor_args or {}).get("loss_mask", None)
-    position_ids_nested = (logits_processor_args or {}).get("position_ids", None)
+    args = logits_processor_args or {}
+    prefix_tree_attention = args.get("prefix_tree_attention", "flex")
+    loss_mask_nested = args.get("loss_mask")
+    position_ids_nested = args.get("position_ids")
     # Per-mb subtrie from prepare_prefix_tree_micro_batches (global trie pruned to mb).
-    subtrie = (logits_processor_args or {}).get("prefix_tree_subtree")
+    subtrie = args.get("prefix_tree_subtree")
 
     return build_prefix_tree_micro_batch(
         model,
@@ -296,7 +302,7 @@ def prepare_prefix_tree(
     post-processing (or on the intermediate-PP path).
     """
     if vision_model or mtp_enable_train:
-        _log.getLogger(__name__).warning(
+        _logger.warning(
             "prefix_tree: skipping prefix-tree path (vision_model=%s, mtp_enable_train=%s), not fully supported yet",
             vision_model,
             mtp_enable_train,
@@ -306,11 +312,9 @@ def prepare_prefix_tree(
 
     prefix_tree_attention = (logits_processor_args or {}).get("prefix_tree_attention", "flex")
 
-    pb = build_prefix_tree_batch(model, input_ids, logits_processor_args, vision_model, mtp_enable_train)
+    pb = build_prefix_tree_batch(model, input_ids, logits_processor_args)
     if pb is None:
-        _log.getLogger(__name__).warning(
-            "prefix_tree: build_prefix_tree_batch returned None; falling back to standard THD path"
-        )
+        _logger.warning("prefix_tree: build_prefix_tree_batch returned None; falling back to standard THD path")
         strip_prefix_tree_args(logits_processor_args)
         return None
 
@@ -327,15 +331,14 @@ def tree_post_processing(ctx, output_orig, logits_processor, logits_processor_ar
     if ctx is None:
         return output_orig
     pt_batch = ctx.pb
-    real_tokens = pt_batch.tree_packed_input_ids.shape[0]
+    real_tokens = pt_batch.real_tokens
     if output_orig.shape[0] == 1:
         output_orig = output_orig[:, :real_tokens]
     else:
         output_orig = output_orig[:real_tokens].permute(1, 0, 2)
 
     if not post_process or logits_processor is None:
-        output = output_orig.permute(1, 0, 2)
-        return output
+        return output_orig.permute(1, 0, 2)
 
     prefix_tree_attention = ctx.attention
     try:
@@ -384,8 +387,7 @@ def tree_post_processing(ctx, output_orig, logits_processor, logits_processor_ar
                 if val_1d.shape[0] == n_logits:
                     if prefix_tree_attention == "magi":
                         val_1d = undispatch(val_1d, pt_batch.magi_key)[:real_tokens]
-                    is_log_probs = key == "log_probs"
-                    output[key] = restore_flat_to_nested(val_1d, pt_batch, apply_boundary_patch=is_log_probs)
+                    output[key] = restore_flat_to_nested(val_1d, pt_batch, apply_boundary_patch=(key == "log_probs"))
         return output
     finally:
         _clear_rope_pids(ctx.model)
@@ -394,18 +396,18 @@ def tree_post_processing(ctx, output_orig, logits_processor, logits_processor_ar
 # Fused-path
 
 
-def _run_lce(
+def _prepare_lce_inputs_with_boundary(
     hidden_states: Tensor,
-    output_weight: Tensor,
     labels: Tensor,
-    temperature: float,
     model,
-    magi_key=None,
-    pt_batch: Optional[PrefixTreeMagiBatch] = None,
-) -> tuple[Tensor, Tensor]:
-    """Fused LCE for MAGI/flex: SP gather, pad+squeeze labels for MAGI, call linear_cross_entropy, undispatch MAGI output."""
-    from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy as _lce
+    magi_key,
+    pt_batch: Optional[PrefixTreeMagiBatch],
+):
+    """Preprocess LCE inputs: SP gather, label pad+dispatch, boundary-pair resolution.
 
+    Returns (hidden_ext, labels_ext, n_local, boundary_tags) where boundary_tags
+    are [(boundary_position, sample_idx)] aligned with the appended tail rows.
+    """
     if model.config.sequence_parallel:
         from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 
@@ -419,20 +421,89 @@ def _run_lce(
         lce_labels = labels_full[local_indices]
     else:
         lce_labels = labels
+        local_indices = None
 
-    logprobs, entropy = _lce(
-        hidden_states,
+    hidden_2d = hidden_states.view(-1, hidden_states.shape[-1])
+    registry = pt_batch.restoration.boundary_registry if (pt_batch is not None and pt_batch.restoration) else None
+
+    # Boundary extension: append the same hidden token once per leaf label so a
+    # single LCE pass covers both main and boundary log-probs (no second LCE).
+    boundary_pairs: list[tuple[int, int]] = []
+    boundary_tags: list[tuple[int, int]] = []
+    if magi_key is not None and registry:
+        for boundary_position, leaves in registry:
+            matches = (local_indices == boundary_position).nonzero()
+            if matches.shape[0] == 0:
+                continue  # boundary hidden lives on another CP rank
+            local_idx = int(matches[0, 0].item())
+            for sample_idx, next_token in leaves:
+                boundary_pairs.append((local_idx, int(next_token)))
+                boundary_tags.append((boundary_position, sample_idx))
+
+    n_local = hidden_2d.shape[0]
+    if boundary_pairs:
+        idx, lbl = zip(*boundary_pairs, strict=False)
+        idx_t = torch.tensor(idx, device=hidden_2d.device)
+        hidden_ext = torch.cat([hidden_2d, hidden_2d[idx_t]], dim=0)
+        labels_ext = torch.cat(
+            [lce_labels.reshape(-1), torch.tensor(lbl, device=lce_labels.device, dtype=lce_labels.dtype)]
+        )
+    else:
+        hidden_ext, labels_ext = hidden_2d, lce_labels
+
+    return hidden_ext, labels_ext, n_local, boundary_tags
+
+
+def _run_lce_postprocess(
+    logprobs_ext: Tensor,
+    entropy_ext: Tensor,
+    n_local: int,
+    boundary_tags: list[tuple[int, int]],
+    magi_key,
+    pt_batch: Optional[PrefixTreeMagiBatch],
+) -> tuple[Tensor, Tensor]:
+    """Split boundary tail, stash _boundary_local_vals, undispatch + trim main output."""
+    if boundary_tags:
+        logprobs = logprobs_ext[:n_local]
+        entropy = entropy_ext[:n_local]
+        pt_batch._boundary_local_vals = [
+            (pos, sid, logprobs_ext[n_local + i]) for i, (pos, sid) in enumerate(boundary_tags)
+        ]
+    else:
+        logprobs, entropy = logprobs_ext, entropy_ext
+
+    if magi_key is not None:
+        logprobs = undispatch(logprobs.reshape(-1), magi_key)[: pt_batch.real_tokens]
+        entropy = undispatch(entropy.reshape(-1), magi_key)[: pt_batch.real_tokens]
+    return logprobs, entropy
+
+
+def _run_lce(
+    hidden_states: Tensor,
+    output_weight: Tensor,
+    labels: Tensor,
+    temperature: float,
+    model,
+    magi_key=None,
+    pt_batch: Optional[PrefixTreeMagiBatch] = None,
+) -> tuple[Tensor, Tensor]:
+    """Fused LCE for MAGI/flex: prepare → linear_cross_entropy → postprocess."""
+    from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
+
+    hidden_ext, labels_ext, n_local, boundary_tags = _prepare_lce_inputs_with_boundary(
+        hidden_states, labels, model, magi_key, pt_batch
+    )
+
+    logprobs_ext, entropy_ext = linear_cross_entropy(
+        hidden_ext,
         output_weight,
-        lce_labels,
+        labels_ext,
         temperature,
         "none",
         mpu.get_tensor_model_parallel_group(),
     )
 
-    if magi_key is not None:
-        logprobs = undispatch(logprobs.reshape(-1), magi_key)[: pt_batch.tree_packed_input_ids.shape[0]]
-        entropy = undispatch(entropy.reshape(-1), magi_key)[: pt_batch.tree_packed_input_ids.shape[0]]
-    return logprobs, entropy
+    return _run_lce_postprocess(logprobs_ext, entropy_ext, n_local, boundary_tags, magi_key, pt_batch)
 
 
 def post_processing_packed_lce(
@@ -445,7 +516,7 @@ def post_processing_packed_lce(
     output_weight: Optional[Tensor] = None,
 ) -> None:
     """Compute per-leaf boundary log-probs and store on pt_batch._boundary_logps for restore_flat_to_nested.
-    
+
     When output_weight given (fused): uses batched LCE for bit-identical values. Otherwise: per-boundary log_softmax.
     Cross-CP all_gather of tagged triples ensures every rank has full patch set.
     """
@@ -482,56 +553,42 @@ def post_processing_packed_lce(
     local_sample_indices: list[int] = []
     local_log_probs: list[Tensor] = []
 
-    # Resolve which (boundary_position, local_idx) pairs this CP rank owns.
-    use_lce = (
-        output_weight is not None
-        and hidden_flat is not None
-        and not torch.is_tensor(temperature)  # LCE takes a float; per-token temp falls back
-    )
-    owned_pairs: list[tuple[int, int, int, int]] = []  # (boundary_pos, local_idx, sample_idx, next_token)
-    for boundary_position, leaves in registry:
-        if local_indices is not None:
-            matches = (local_indices == boundary_position).nonzero()
-            if matches.shape[0] == 0:
-                # Boundary hidden is on another CP rank — that rank emits this
-                # entry's triple; we receive it via the all_gather below.
-                continue
-            local_idx = int(matches[0, 0].item())
-        else:
-            local_idx = boundary_position
-        for sample_idx, next_token in leaves:
-            owned_pairs.append((boundary_position, local_idx, sample_idx, int(next_token)))
-
-    if use_lce and owned_pairs:
-        # Batched LCE over all owned pairs for bit-identical patch values.
-        from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy as _lce
-
-        idx_t = torch.tensor([p[1] for p in owned_pairs], device=hidden_flat.device, dtype=torch.long)
-        H_gather = hidden_flat[idx_t].contiguous()  # (P, H)
-        L_gather = torch.tensor([p[3] for p in owned_pairs], device=hidden_flat.device, dtype=torch.long)
-        tp_group = mpu.get_tensor_model_parallel_group()
-        lp_pairs, _ = _lce(H_gather, output_weight, L_gather, float(temperature), "none", tp_group)
-        for (boundary_position, _local_idx, sample_idx, _tok), val in zip(owned_pairs, lp_pairs, strict=True):
-            local_boundary_positions.append(boundary_position)
-            local_sample_indices.append(sample_idx)
-            local_log_probs.append(val)
+    precomputed = getattr(pt_batch, "_boundary_local_vals", None)
+    if precomputed is not None:
+        # Fused path: _run_lce already computed boundary log-probs in its single
+        # LCE pass (appended duplicates). Only the cross-CP gather remains.
+        local_boundary_positions = [p for p, _, _ in precomputed]
+        local_sample_indices = [s for _, s, _ in precomputed]
+        local_log_probs = [v for _, _, v in precomputed]
+        if local_log_probs:
+            device = local_log_probs[0].device
     else:
-        # Unfused / per-token temp: per-boundary log_softmax recompute.
-        for boundary_position, local_idx, sample_idx, next_token in owned_pairs:
-            if logits_flat is not None:
-                logits_b = logits_flat[local_idx]
-            elif hidden_flat is not None and model is not None:
-                h_b = hidden_flat[local_idx]
-                # output_layer expects (seq, batch, hidden) = (1, 1, hidden).
-                logits_b, _ = model.output_layer(h_b.reshape(1, 1, -1))
-                logits_b = logits_b.squeeze(0).squeeze(0)  # (vocab,)
+        # Unfused path: per-boundary log_softmax from materialized logits.
+        for boundary_position, leaves in registry:
+            if local_indices is not None:
+                matches = (local_indices == boundary_position).nonzero()
+                if matches.shape[0] == 0:
+                    # Boundary hidden is on another CP rank — that rank emits this
+                    # entry's triple; we receive it via the all_gather below.
+                    continue
+                local_idx = int(matches[0, 0].item())
             else:
-                return
-            temp_b = temperature[local_idx] if torch.is_tensor(temperature) else temperature
-            logp_all = torch.log_softmax(logits_b / temp_b, dim=-1)
-            local_boundary_positions.append(boundary_position)
-            local_sample_indices.append(sample_idx)
-            local_log_probs.append(logp_all[next_token])
+                local_idx = boundary_position
+            for sample_idx, next_token in leaves:
+                if logits_flat is not None:
+                    logits_b = logits_flat[local_idx]
+                elif hidden_flat is not None and model is not None:
+                    h_b = hidden_flat[local_idx]
+                    # output_layer expects (seq, batch, hidden) = (1, 1, hidden).
+                    logits_b, _ = model.output_layer(h_b.reshape(1, 1, -1))
+                    logits_b = logits_b.squeeze(0).squeeze(0)  # (vocab,)
+                else:
+                    return
+                temp_b = temperature[local_idx] if torch.is_tensor(temperature) else temperature
+                logp_all = torch.log_softmax(logits_b / temp_b, dim=-1)
+                local_boundary_positions.append(boundary_position)
+                local_sample_indices.append(sample_idx)
+                local_log_probs.append(logp_all[int(next_token)])
 
     # Cross-CP all_gather: pack (boundary_position, sample_idx, log_prob) into (max_n, 3) float32 tensor.
     cp_world = mpu.get_context_parallel_world_size()
@@ -557,7 +614,7 @@ def post_processing_packed_lce(
         all_packed = [torch.zeros_like(local_packed) for _ in range(cp_world)]
         _dist.all_gather(all_packed, local_packed, group=cp_group)
 
-    # Validate: each (boundary_position, sample_idx) must arrive from exactly one rank.
+        # Validate: each (boundary_position, sample_idx) must arrive from exactly one rank.
         registry_keys = {
             (boundary_position, sample_idx) for boundary_position, leaves in registry for sample_idx, _ in leaves
         }
@@ -615,7 +672,8 @@ def fused_prefix_tree_forward(
     inference_context,
     kwargs: dict,
 ):
-    """Fused prefix-tree forward: pops attention key from kwargs, installs rope+decoder contexts, delegates to fuse_forward_body."""
+    """Fused prefix-tree forward: pops attention key from kwargs, installs
+    rope+decoder contexts, delegates to fuse_forward_body."""
     _magi_key = kwargs.pop("magi_attention_key", None)
     _flex_key = kwargs.pop("flex_attention_key", None)
     if _magi_key is None and _flex_key is None:
@@ -625,20 +683,20 @@ def fused_prefix_tree_forward(
     try:
         with prefix_tree_decoder_key_context(model, _magi_key, _flex_key):
             result = fuse_forward_body(
-            model,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            temperature=temperature,
-            pt_batch=pt_batch,
-            magi_key=_magi_key,
-            flex_key=_flex_key,
-            decoder_input=decoder_input,
-            packed_seq_params=packed_seq_params,
-            extra_block_kwargs=extra_block_kwargs,
-            inference_context=inference_context,
-        )
+                model,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                temperature=temperature,
+                pt_batch=pt_batch,
+                magi_key=_magi_key,
+                flex_key=_flex_key,
+                decoder_input=decoder_input,
+                packed_seq_params=packed_seq_params,
+                extra_block_kwargs=extra_block_kwargs,
+                inference_context=inference_context,
+            )
     finally:
         _clear_rope_pids(model)
     return result
@@ -657,8 +715,6 @@ def fuse_forward_body(
     **kwargs,
 ):
     """Fused-path: preprocess → decoder → LCE (no logits tensor). Assumes rope+decoder-key contexts active."""
-    from collections import OrderedDict as _OrderedDict
-
     from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
     from megatron.core.utils import deprecate_inference_params
 
@@ -671,57 +727,27 @@ def fuse_forward_body(
     packed_seq_params = kwargs.pop("packed_seq_params", None)
     extra_block_kwargs = kwargs.pop("extra_block_kwargs", None)
 
-    # PP debug
-    import megatron.core.parallel_state as mpu_pt
-    pp_rank = mpu_pt.get_pipeline_model_parallel_rank()
-    pp_world = mpu_pt.get_pipeline_model_parallel_world_size()
-    pre = unwrap_model(model).pre_process
-    post = unwrap_model(model).post_process
-    _log.getLogger(__name__).warning(
-        f"PP[{pp_rank}/{pp_world}] fuse_forward_body: pre_process={pre}, post_process={post}, "
-        f"decoder_input={'None' if decoder_input is None else decoder_input.shape}, "
-        f"input_ids={input_ids.shape if input_ids is not None else 'None'}"
+    preproc_output = model._preprocess(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        decoder_input=decoder_input,
+        inference_context=inference_context,
+        packed_seq_params=packed_seq_params,
     )
-    try:
-        preproc_output = model._preprocess(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            decoder_input=decoder_input,
-            inference_context=inference_context,
-            packed_seq_params=packed_seq_params,
-        )
-        (decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset) = preproc_output[:5]
+    (decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset) = preproc_output[:5]
 
-        _log.getLogger(__name__).warning(
-            f"PP[{pp_rank}/{pp_world}] _preprocess done: decoder_input shape={decoder_input.shape if decoder_input is not None else 'None'}"
-        )
-
-        from megatron.core.pipeline_parallel.p2p_communication import deallocate_input_tensor
-        deallocate_input_tensor()
-
-        hidden_states = model.decoder(
-            hidden_states=decoder_input,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-            **(extra_block_kwargs or {}),
-            **kwargs,
-        )
-
-        _log.getLogger(__name__).warning(
-            f"PP[{pp_rank}/{pp_world}] decoder done: hidden_states shape={hidden_states.shape if isinstance(hidden_states, torch.Tensor) else 'tuple'}"
-        )
-    except Exception as e:
-        _log.getLogger(__name__).error(
-            f"PP[{pp_rank}/{pp_world}] CRASH in fuse_forward_body: {type(e).__name__}: {e}"
-        )
-        import traceback
-        traceback.print_exc()
-        raise
+    hidden_states = model.decoder(
+        hidden_states=decoder_input,
+        attention_mask=attention_mask,
+        inference_context=inference_context,
+        rotary_pos_emb=rotary_pos_emb,
+        rotary_pos_cos=rotary_pos_cos,
+        rotary_pos_sin=rotary_pos_sin,
+        packed_seq_params=packed_seq_params,
+        sequence_len_offset=sequence_len_offset,
+        **(extra_block_kwargs or {}),
+        **kwargs,
+    )
 
     if not model.post_process:
         return hidden_states
@@ -749,7 +775,7 @@ def fuse_forward_body(
     )
 
     if has_config_logger_enabled(model.config):
-        payload = _OrderedDict(
+        payload = OrderedDict(
             {
                 "input_ids": input_ids,
                 "position_ids": position_ids,
@@ -794,11 +820,9 @@ def run_fused_prefix_tree(
 
     prefix_tree_attention = (logits_processor_args or {}).get("prefix_tree_attention", "flex")
 
-    pb = build_prefix_tree_batch(model, input_ids, logits_processor_args, vision_model=False, mtp_enable_train=False)
+    pb = build_prefix_tree_batch(model, input_ids, logits_processor_args)
     if pb is None:
-        _log.getLogger(__name__).warning(
-            "prefix_tree: build_prefix_tree_batch returned None; falling back to standard fused path"
-        )
+        _logger.warning("prefix_tree: build_prefix_tree_batch returned None; falling back to standard fused path")
         strip_prefix_tree_args(logits_processor_args)
         return None
 
@@ -814,12 +838,10 @@ def _fused_core(model, pb, prefix_tree_attention, labels, temperature, calculate
 
     # Only the last PP stage (post_process=True) needs labels for LCE.
     # Non-last stages pass labels=None; fuse_forward_body returns before LCE.
-    real_tokens = pb.tree_packed_input_ids.shape[0]
+    real_tokens = pb.real_tokens
     if post_process:
         if pb.tree_packed_labels is None:
-            _log.getLogger(__name__).warning(
-                "prefix_tree[fused]: tree_packed_labels is None; falling back to standard fused path"
-            )
+            _logger.warning("prefix_tree[fused]: tree_packed_labels is None; falling back to standard fused path")
             return None
         # Pass flat (deduped) labels; LCE runs on real_tokens, not total_expanded.
         labels_arg = pb.tree_packed_labels[:real_tokens]
@@ -845,9 +867,7 @@ def _fused_core(model, pb, prefix_tree_attention, labels, temperature, calculate
     #   (pt_batch._boundary_logps was set by post_processing_packed_lce above).
     # entropy: no patch (entropy at the boundary is distribution-level, same
     #   for all leaves sharing the hidden state).
-    output = {
-        "log_probs": restore_flat_to_nested(output_orig.log_probs.reshape(-1), pb, apply_boundary_patch=True)
-    }
+    output = {"log_probs": restore_flat_to_nested(output_orig.log_probs.reshape(-1), pb, apply_boundary_patch=True)}
     if calculate_entropy:
         output["entropy"] = restore_flat_to_nested(output_orig.entropy.reshape(-1), pb)
     return output

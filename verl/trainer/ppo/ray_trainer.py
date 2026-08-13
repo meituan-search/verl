@@ -1534,7 +1534,12 @@ class RayPPOTrainer:
                     batch = batch.union(gen_batch_output)
 
                     if self.config.actor_rollout_ref.model.get("use_prefix_tree", False):
-                        build_global_trie(batch, metrics=metrics)
+                        trie, leaf_idx, _ = build_global_trie(
+                            batch.batch["input_ids"], batch.batch.get("attention_mask", None), metrics=metrics
+                        )
+                        if trie is not None:
+                            batch.meta_info["prefix_tree"] = trie
+                            batch.batch["leaf_idx"] = leaf_idx
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.

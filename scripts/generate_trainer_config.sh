@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euox pipefail
 
+# Prefer python3.12 if available (hydra 1.3.x is incompatible with python 3.14).
+if command -v python3.12 >/dev/null 2>&1; then
+    PY=python3.12
+else
+    PY=python3
+fi
 
 # Define config specifications: "config_name:output_file:config_arg"
 CONFIG_SPECS=(
@@ -25,7 +31,7 @@ generate_config() {
     echo "# The file is usually only for reference and never used." >> "$tmp_header"
     echo "" >> "$tmp_header"
 
-    python3 scripts/print_cfg.py --cfg job ${config_arg} > "$tmp_cfg"
+    $PY scripts/print_cfg.py --cfg job ${config_arg} > "$tmp_cfg"
 
     cat "$tmp_header" > "$target_cfg"
     sed -n '/^actor_rollout_ref/,$p' "$tmp_cfg" >> "$target_cfg"

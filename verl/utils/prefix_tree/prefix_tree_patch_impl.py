@@ -11,13 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Monkey-patches for Megatron-LM: MAGI/flex attention via TEDotProductAttention.forward, SelfAttention,_checkpointed, TransformerLayer/Block, GPTModel + RoPE CP slicing override."""
+"""Monkey-patches for Megatron-LM: MAGI/flex attention via TEDotProductAttention.forward,
+SelfAttention._checkpointed, TransformerLayer/Block, GPTModel + RoPE CP slicing override."""
 
 from __future__ import annotations
 
 import functools
 import logging
 
+import megatron.core.tensor_parallel as tp
 import torch
 from magi_attention.api import calc_attn
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
@@ -112,24 +114,20 @@ def _make_attn_counters():
 _reset_attn_counters, _inc_fa3, _inc_non_fa3, _get_attn_metrics = _make_attn_counters()
 
 
-def maybe_collect_attn_metrics(engine_config, engine, output: dict) -> None:
-    """Collect attn FA3 fallback ratio into output['metrics'] and reset counters."""
-    if getattr(engine_config, "use_prefix_tree", False):
-        attn_metrics = _get_attn_metrics()
-        if attn_metrics and engine.is_mp_src_rank_with_outputs():
-            output.setdefault("metrics", {}).update(attn_metrics)
-        _reset_attn_counters()
+def maybe_collect_prefix_tree_metrics(engine_config, engine, output: dict) -> None:
+    """Collect prefix-tree metrics (FA3 fallback ratio, mb shared ratio) into output['metrics']."""
+    if not getattr(engine_config, "use_prefix_tree", False):
+        return
+    from verl.utils.prefix_tree.dynamic import _get_mbs_metric, _reset_mbs_metric
 
-
-def maybe_collect_mbs_metric(engine_config, engine, output: dict) -> None:
-    """Collect post-micro-batch micro_batch_shared_ratio into output['metrics'] and reset."""
-    if getattr(engine_config, "use_prefix_tree", False):
-        from verl.utils.prefix_tree.dynamic import _get_mbs_metric, _reset_mbs_metric
-
-        mbs_metric = _get_mbs_metric()
-        if mbs_metric and engine.is_mp_src_rank_with_outputs():
-            output.setdefault("metrics", {}).update(mbs_metric)
-        _reset_mbs_metric()
+    metrics = dict(_get_attn_metrics())
+    mbs_metric = _get_mbs_metric()
+    if mbs_metric:
+        metrics.update(mbs_metric)
+    if metrics and engine.is_mp_src_rank_with_outputs():
+        output.setdefault("metrics", {}).update(metrics)
+    _reset_attn_counters()
+    _reset_mbs_metric()
 
 
 # Patch application
@@ -322,25 +320,20 @@ def apply_prefix_tree_patch() -> None:
         if attn_key is None:
             return _orig_tb_forward(self, hidden_states, attention_mask, **kwargs)
         # (A) Layer-level patching: inject key via kwargs for forward pass.
-        originals = []
+        originals = [layer.forward for layer in self.layers]
+
+        def _make_wrapper(orig):
+            @functools.wraps(orig)
+            def _w(*args, **kw):
+                return orig(*args, magi_attention_key=magi_attention_key, flex_attention_key=flex_attention_key, **kw)
+
+            return _w
+
         for layer in self.layers:
-            originals.append(layer.forward)
-
-            def _make_wrapper(orig):
-                @functools.wraps(orig)
-                def _w(*args, **kw):
-                    return orig(
-                        *args, magi_attention_key=magi_attention_key, flex_attention_key=flex_attention_key, **kw
-                    )
-
-                return _w
-
             layer.forward = _make_wrapper(layer.forward)
 
         # (B) Checkpoint wrapper: push key onto _attn_key_stack for backward recompute.
-        import megatron.core.tensor_parallel as _tp
-
-        _real_tp_checkpoint = _tp.checkpoint
+        _real_tp_checkpoint = tp.checkpoint
 
         def _checkpoint_with_key(fn, distribute, *ck_args, **ck_kwargs):
             _cap_magi = magi_attention_key
@@ -355,13 +348,13 @@ def apply_prefix_tree_patch() -> None:
 
             return _real_tp_checkpoint(_fn_with_key, distribute, *ck_args, **ck_kwargs)
 
-        _tp.checkpoint = _checkpoint_with_key
+        tp.checkpoint = _checkpoint_with_key
         try:
             out = _orig_tb_forward(self, hidden_states, attention_mask, **kwargs)
         finally:
             for layer, orig_fwd in zip(self.layers, originals, strict=False):
                 layer.forward = orig_fwd
-            _tp.checkpoint = _real_tp_checkpoint
+            tp.checkpoint = _real_tp_checkpoint
         return out
 
     TransformerBlock.forward = _transformer_block_forward
@@ -400,7 +393,5 @@ def apply_prefix_tree_patch() -> None:
         return out
 
     GPTModel.forward = _gpt_forward
-
-    # 7. RotaryEmbedding.forward: CP>1 RoPE slicing bypass — patch #6 builds full table, indexes by actual position_ids.
 
     TEDotProductAttention._prefix_tree_patched = True

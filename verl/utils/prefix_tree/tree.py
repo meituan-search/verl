@@ -11,11 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Prefix-tree data structures: TrieNode (compressed trie), PrefixTrie (full batch), PrefixSubTrie (per-mb serializable view), segment-based tree builder."""
+"""Prefix-tree data structures: TrieNode (compressed trie), PrefixTrie (full batch),
+PrefixSubTrie (per-mb view), segment-based tree builder."""
 
 from __future__ import annotations
 
 import functools
+import itertools
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -26,9 +29,10 @@ import numpy as np
 
 @dataclass(eq=False)
 class TrieNode:
-    """Compressed-trie node with input_ids, children, sequence_ids, ancestor. No tree-level metadata (managed by PrefixTrie).
+    """Compressed-trie node: input_ids, children, sequence_ids, ancestor.
 
-    Transient layout attrs set externally by build_layout_from_tree_node: _flat_start, _flat_end, _owner_offset, _owner_sample."""
+    Layout attrs (_flat_start, _flat_end, _owner_offset, _owner_sample) are set
+    externally by build_layout_from_tree_node."""
 
     input_ids: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
     children: dict[int, TrieNode] = field(default_factory=dict)
@@ -52,7 +56,7 @@ class TrieNode:
         return child
 
     def insert(self, sequence: np.ndarray, seq_id: int) -> None:
-        """Insert token sequence: match prefix, split child on partial match, add divergent branch. Before finalize()."""
+        """Insert token sequence (match prefix, split child, add branch). Before finalize()."""
         if len(sequence) == 0:
             return
         token = int(sequence[0])
@@ -77,7 +81,7 @@ class TrieNode:
                 child._add_child(remaining, [seq_id])
 
     def _split(self, match_pos: int) -> TrieNode:
-        """Split node at match_pos into prefix (self) + suffix (new child inheriting old children/seq_ids). Returns suffix."""
+        """Split at match_pos into prefix (self) + suffix child. Returns suffix."""
         old_run = self.input_ids
         old_children = self.children
         old_seq_ids = self.sequence_ids
@@ -94,6 +98,65 @@ class TrieNode:
         self.children = {int(old_run[match_pos]): suffix}
         # sequence_ids stays (prefix node keeps its seq_ids + caller appends).
         return suffix
+
+
+class BFSIterator:
+    """BFS iterator over trie nodes, yielding nodes in level order.
+
+    Maintains a FIFO frontier (deque) and the current node. ``children_fn``
+    selects which children to descend into (default: all of
+    ``node.children.values()``); pass a subtrie filter for partial traversal.
+
+    BFS requires FIFO ordering, so the frontier is a deque popped from the
+    front — a LIFO stack would yield DFS (pre-order) instead.
+    """
+
+    def __init__(self, roots, children_fn=None):
+        self._frontier: deque = deque(roots)
+        self._children_fn = children_fn or (lambda n: n.children.values())
+        self.current: Optional[TrieNode] = None
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self._frontier:
+            raise StopIteration
+        self.current = self._frontier.popleft()
+        self._frontier.extend(self._children_fn(self.current))
+        return self.current
+
+
+class DFSIterator:
+    """DFS pre-order iterator over trie nodes.
+
+    LIFO stack (``list.pop`` is O(1)). ``children_fn`` selects which children
+    to descend into (default: all of ``node.children.values()``). When
+    ``leaf_only=True``, only leaf nodes (no children via ``children_fn``) are
+    yielded — matching the common pattern of collecting per-leaf data.
+
+    Children are pushed in reverse so iteration visits them in forward order
+    (matching recursive ``for child in node.children.values(): _walk(child)``).
+    """
+
+    def __init__(self, roots, children_fn=None, leaf_only: bool = False):
+        self._stack: list = list(reversed(roots))
+        self._children_fn = children_fn or (lambda n: n.children.values())
+        self._leaf_only = leaf_only
+        self.current: Optional[TrieNode] = None
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while self._stack:
+            self.current = self._stack.pop()
+            children = list(self._children_fn(self.current))
+            # Push reversed so forward-order children are visited first (LIFO).
+            self._stack.extend(reversed(children))
+            if not self._leaf_only or not children:
+                return self.current
+        raise StopIteration
 
 
 # PrefixTrie: common interface for navigating a prefix trie (global + subtrie views).
@@ -134,10 +197,35 @@ class PrefixTrie:
         """Iterate all nodes in DFS order."""
         return iter(self.nodes)
 
+    # ── traversal ────────────────────────────────────────────────────────
+
+    def children_of(self, node: TrieNode) -> list[TrieNode]:
+        """In-view children of *node*. Overridden by PrefixSubTrie to filter pruned nodes."""
+        return list(node.children.values())
+
     @property
-    def leaf_nodes(self) -> list[TrieNode]:
-        """Leaf nodes (no children) in DFS order."""
-        return [n for n in self.nodes if not n.children]
+    def roots(self) -> list[TrieNode]:
+        """Traversal roots: root's children for PrefixTrie; view-boundary nodes for SubTrie."""
+        valid_ids = {n.node_idx for n in self.nodes}
+        return [n for n in self.nodes if n.ancestor is None or n.ancestor.node_idx not in valid_ids]
+
+    def bfs(self, roots=None, children_fn=None) -> BFSIterator:
+        """BFS over this trie's nodes in level order. Respects the subtrie view boundary.
+
+        ``roots`` defaults to this trie's traversal roots; pass a node's children
+        to traverse just that subtree."""
+        rs = list(roots) if roots is not None else self.roots
+        fn = children_fn or self.children_of
+        return BFSIterator(rs, fn)
+
+    def dfs(self, roots=None, children_fn=None, leaf_only: bool = False) -> DFSIterator:
+        """DFS pre-order over this trie's nodes. Respects the subtrie view boundary.
+
+        ``roots`` defaults to this trie's traversal roots; pass a node's children
+        to traverse just that subtree."""
+        rs = list(roots) if roots is not None else self.roots
+        fn = children_fn or self.children_of
+        return DFSIterator(rs, fn, leaf_only)
 
     # ── build ─────────────────────────────────────────────────────────────
 
@@ -186,11 +274,6 @@ class PrefixTrie:
 
         self._finalized = True
 
-    # ── metrics ───────────────────────────────────────────────────────────
-
-    # ── future: KV cache ──────────────────────────────────────────────────
-    # kv_cache: list[Optional[Tensor]]  # indexed by node_idx, same as nodes
-
 
 # PrefixSubTrie: per-micro-batch view.
 
@@ -225,14 +308,13 @@ class PrefixSubTrie(PrefixTrie):
         leaf_to_sample: list[int],
         batch_size: int,
     ) -> None:
-        import numpy as np
-
         self.source = source
         self.leaf_node_ids = leaf_node_ids
         self.leaf_to_sample = leaf_to_sample
         self.root = source.root
         self._finalized = True  # subtries are always finalized (read-only views)
         self.nodes, self.leaves = self._collect_nodes(source, leaf_node_ids)
+        self._valid_ids = {n.node_idx for n in self.nodes}
         # Build shard-local leaf_ids: indexed by local position (0..shard_size-1).
         # global_sample_ids[i] is the global sample index for local position i.
         self.global_sample_ids = sorted(set(leaf_to_sample))
@@ -241,6 +323,10 @@ class PrefixSubTrie(PrefixTrie):
         self.leaf_ids = np.full(local_batch_size, -1, dtype=np.int64)
         for i, sample_idx in enumerate(leaf_to_sample):
             self.leaf_ids[_global_to_local[sample_idx]] = leaf_node_ids[i]
+
+    def children_of(self, node: TrieNode) -> list[TrieNode]:
+        """In-view children of *node* (filters pruned nodes from the global trie)."""
+        return [c for c in node.children.values() if c.node_idx in self._valid_ids]
 
     @staticmethod
     def _collect_nodes(source: PrefixTrie, leaf_node_ids: list[int]) -> tuple[list[TrieNode], list[Optional[TrieNode]]]:
@@ -259,9 +345,8 @@ class PrefixSubTrie(PrefixTrie):
                 path.append(cur)
                 cur = cur.ancestor
             for n in reversed(path):
-                if n.node_idx not in seen:
-                    seen.add(n.node_idx)
-                    nodes.append(n)
+                seen.add(n.node_idx)
+                nodes.append(n)
 
         # Build leaves indexed by sequence_id (global indexing).
         leaves: list[Optional[TrieNode]] = []
@@ -274,7 +359,7 @@ class PrefixSubTrie(PrefixTrie):
         return nodes, leaves
 
     def __getstate__(self) -> dict:
-        """Pickle compactly: store per-node data (node_idx, input_ids, ancestor, seq_ids) to avoid full trie serialisation."""
+        """Pickle compactly: store per-node data to avoid full trie serialisation."""
         nodes_data = [
             (n.node_idx, n.input_ids, n.ancestor.node_idx if n.ancestor else -1, n.sequence_ids) for n in self.nodes
         ]
@@ -310,6 +395,7 @@ class PrefixSubTrie(PrefixTrie):
                 by_node_idx[ancestor_node_idx].children[node_idx] = node
 
         self.nodes = [by_node_idx[fid] for fid, _, _, _ in state["nodes_data"]]
+        self._valid_ids = {n.node_idx for n in self.nodes}
         self._cached_magi_key = None
 
 
@@ -321,10 +407,11 @@ def build_global_tree_from_segments(
     segment_hashes,
     segment_lengths,
 ) -> Optional[PrefixTrie]:
-    """Build global PrefixTrie from segment metadata (O(N), multilevel). Samples share segments with matching hashes.
+    """Build global PrefixTrie from segment metadata (O(N), multilevel).
 
-    Leaf input_ids = all remaining tokens after last shared segment. Compatible with mbs_groups_from_trie/subtrie_view."""
-    if not samples or len(samples) < 2:
+    Samples share segments with matching hashes; leaf input_ids = remaining
+    tokens after last shared segment."""
+    if len(samples) < 2:
         return None
 
     from verl.utils.prefix_tree.segment_grouper import group_by_segment_hash
@@ -336,11 +423,7 @@ def build_global_tree_from_segments(
     groups = group_by_segment_hash(segment_hashes, segment_lengths, level=0)
 
     trie_root = TrieNode()
-    _key_counter = [0]
-
-    def _next_key() -> int:
-        _key_counter[0] += 1
-        return _key_counter[0]
+    key_gen = itertools.count(1)
 
     for uid_hash in sorted(groups.keys()):
         group = groups[uid_hash]
@@ -365,7 +448,7 @@ def build_global_tree_from_segments(
                 level=1,
                 accumulated_len=prefix_len,
                 parent_node=prefix_node,
-                next_key=_next_key,
+                next_key=key_gen.__next__,
             )
         else:
             seq_idx = group[0][0]
@@ -395,17 +478,21 @@ def _build_segment_subtree(
     parent_node: TrieNode,
     next_key,
 ) -> None:
-    """Recursively build ancestor nodes for shared segments at level >= 1: subgroup by hash, create ancestor/leaf nodes."""
+    """Recursively build ancestor nodes for shared segments at level >= 1."""
+
+    def _attach_leaf(parent: TrieNode, sid: int, accum_len: int, key: int) -> None:
+        remaining = samples[sid][accum_len:]
+        leaf = TrieNode(
+            input_ids=np.array(remaining),
+            sequence_ids=[sid],
+            ancestor=parent,
+        )
+        parent.children[key] = leaf
+
     # Samples whose segment list ended before this level → leaves with remaining tokens.
     for sid in group_sids:
         if level >= len(segment_hashes[sid]):
-            remaining = samples[sid][accumulated_len:]
-            leaf = TrieNode(
-                input_ids=np.array(remaining),
-                sequence_ids=[sid],
-                ancestor=parent_node,
-            )
-            parent_node.children[next_key()] = leaf
+            _attach_leaf(parent_node, sid, accumulated_len, next_key())
 
     # Subgroup remaining samples by hash at this level.
     subgroups: dict[int, list[int]] = {}
@@ -437,13 +524,7 @@ def _build_segment_subtree(
             )
         else:
             sid = subgroup[0]
-            remaining = samples[sid][accumulated_len:]
-            leaf = TrieNode(
-                input_ids=np.array(remaining),
-                sequence_ids=[sid],
-                ancestor=parent_node,
-            )
-            parent_node.children[next_key()] = leaf
+            _attach_leaf(parent_node, sid, accumulated_len, next_key())
 
 
 def trie_ancestors(node: TrieNode) -> list[TrieNode]:

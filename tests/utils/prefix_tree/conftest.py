@@ -1,4 +1,18 @@
-# conftest.py - stub unavailable C/GPU packages so prefix_tree tests run on CPU.
+# Copyright 2025 Meituan Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 import importlib.abc
 import importlib.util
 import sys
@@ -6,8 +20,7 @@ import types
 
 
 class _StubModule(types.ModuleType):
-    """Stub module: attribute access returns a callable child stub (also
-    registered in sys.modules so ``from pkg.sub import name`` works)."""
+    """Stub module: attribute access returns a callable child stub (also"""
 
     def __getattr__(self, item):
         if item.startswith("__"):
@@ -29,9 +42,7 @@ def _make_stub(name: str) -> _StubModule:
 
 
 class _StubFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
-    """Meta-path finder that auto-stubs any submodule of configured top-level
-    packages. Catches ``megatron.core.enums``, ``magi_attention.api``, etc.
-    without requiring each to be enumerated."""
+    """Meta-path finder that auto-stubs any submodule of configured top-level"""
 
     _prefixes: tuple[str, ...] = ()
 
@@ -53,14 +64,10 @@ class _StubFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
 
 def _install_stub_finder(prefixes: list[str]) -> None:
     _StubFinder._prefixes = tuple(prefixes)
-    # Remove any existing instance and prepend so we run before the default finders.
     sys.meta_path = [f for f in sys.meta_path if not isinstance(f, _StubFinder)]
     sys.meta_path.insert(0, _StubFinder)
 
 
-# Install the finder for packages whose real install isn't available on CPU.
-# Each top-level package is also registered as a stub so `import megatron`
-# succeeds even when the meta-path finder hasn't been queried for it yet.
 _STUB_PACKAGES = ["megatron", "magi_attention", "apex", "transformer_engine"]
 for _pkg in _STUB_PACKAGES:
     try:

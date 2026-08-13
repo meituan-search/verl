@@ -774,13 +774,9 @@ class MegatronEngine(BaseEngine):
             forward_only=forward_only,
         )
         if losses_reduced and self.is_mp_src_rank_with_outputs():
-            from verl.utils.prefix_tree.prefix_tree_patch_impl import (
-                maybe_collect_attn_metrics,
-                maybe_collect_mbs_metric,
-            )
+            from verl.utils.prefix_tree.prefix_tree_patch_impl import maybe_collect_prefix_tree_metrics
 
-            maybe_collect_attn_metrics(self.engine_config, self, losses_reduced[0])
-            maybe_collect_mbs_metric(self.engine_config, self, losses_reduced[0])
+            maybe_collect_prefix_tree_metrics(self.engine_config, self, losses_reduced[0])
 
         if self.model_config.mtp.enable and mpu.is_pipeline_last_stage(ignore_virtual=True):
             # All CP ranks must participate in the all_reduce inside get_megatron_mtp_loss,
@@ -980,22 +976,19 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 dp_rank=mpu.get_data_parallel_rank(),
             )
 
+        use_prefix_tree = self.engine_config.use_prefix_tree
+        _pt_subtree = (
+            tu.pop(batch, key="prefix_tree_subtree", default=None) if self.engine_config.use_prefix_tree else None
+        )
+        if _pt_subtree is not None:
+            tu.assign_non_tensor(batch, prefix_tree_subtree=_pt_subtree)
+
+        batch = batch.to(get_device_id())
         use_fused_kernels = tu.get_non_tensor_data(batch, key="use_fused_kernels", default=False)
         calculate_entropy = tu.get_non_tensor_data(batch, key="calculate_entropy", default=False)
         calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
         distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
         distillation_only = tu.get_non_tensor_data(batch, key="distillation_only", default=False)
-
-        _pt_subtree = (
-            tu.pop(batch, key="prefix_tree_subtree", default=None) if self.engine_config.use_prefix_tree else None
-        )
-
-        batch = batch.to(get_device_id())
-
-        if _pt_subtree is not None:
-            tu.assign_non_tensor(batch, prefix_tree_subtree=_pt_subtree)
-
-        use_prefix_tree = self.engine_config.use_prefix_tree
 
         if calculate_sum_pi_squared and use_fused_kernels:
             raise NotImplementedError(
