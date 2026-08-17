@@ -21,7 +21,7 @@ from typing import Optional
 import torch
 from torch import Tensor
 
-from verl.utils.prefix_tree.tree import PrefixSubTrie, TrieNode, trie_ancestors
+from verl.utils.prefix_tree.tree import PrefixSubTrie, TrieNode
 
 RangeSpec = tuple[int, int]
 
@@ -187,18 +187,14 @@ def build_layout_from_tree_node(
 
     bfs_order = list(subtrie.bfs())
 
-    # Pass 1: assign flat positions (forward BFS).
+    # Pass 1: assign flat positions (forward BFS). owner_offset (sample-space
+    # offset) is precomputed as node.sample_start during subtrie compression.
     pos = 0
     for node in bfs_order:
         nid = node.node_idx
-        parent = node.ancestor
-        if parent is None or parent.node_idx not in subtrie._valid_ids:
-            offset = sum(len(a.input_ids) for a in trie_ancestors(node))  # root
-        else:
-            offset = owner_offset[parent.node_idx] + len(parent.input_ids)
         flat_start[nid] = pos
         flat_end[nid] = pos + len(node.input_ids)
-        owner_offset[nid] = offset
+        owner_offset[nid] = node.sample_start
         pos = flat_end[nid]
 
     # Owners: leaf entries first (node_idx keyed — order-independent), then

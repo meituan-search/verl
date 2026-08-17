@@ -150,7 +150,7 @@ class _WrappedEngine(torch.nn.Module):
 
 
 def test_set_rope_pids_sets_pids_on_inner_rotary_through_wrapper(monkeypatch):
-    """_set_rope_pids must reach the GPTModel's rotary even when the top-level"""
+    """set_rope_pids must reach the GPTModel's rotary even when the top-level"""
     gpt = _GPTModel()
     wrapped = _WrappedEngine(gpt)
     assert not hasattr(wrapped, "rotary_pos_emb")
@@ -160,23 +160,23 @@ def test_set_rope_pids_sets_pids_on_inner_rotary_through_wrapper(monkeypatch):
     monkeypatch.setattr(magi_mod, "unwrap_model", lambda m: gpt if m is wrapped else m)
 
     pids = torch.tensor([0, 3, 1, 7], dtype=torch.long)
-    magi_mod._set_rope_pids(wrapped, pids)
+    magi_mod.set_rope_pids(wrapped, pids)
 
     assert gpt.rotary_pos_emb._pids is not None, (
-        "_set_rope_pids no-op'd: _pids was not set on the inner rotary "
+        "set_rope_pids no-op'd: _pids was not set on the inner rotary "
         "(wrapped model hides rotary_pos_emb -> fallback RoPE bug)"
     )
     assert torch.equal(gpt.rotary_pos_emb._pids, pids.reshape(-1))
 
 
 def test_clear_rope_pids_clears_inner_rotary(monkeypatch):
-    """_clear_rope_pids must clear _pids on the inner GPTModel's rotary."""
+    """clear_rope_pids must clear _pids on the inner GPTModel's rotary."""
     gpt = _GPTModel()
     wrapped = _WrappedEngine(gpt)
     gpt.rotary_pos_emb._pids = torch.tensor([1, 2, 3], dtype=torch.long)
 
     monkeypatch.setattr(magi_mod, "unwrap_model", lambda m: gpt if m is wrapped else m)
-    magi_mod._clear_rope_pids(wrapped)
+    magi_mod.clear_rope_pids(wrapped)
 
     assert gpt.rotary_pos_emb._pids is None
 
@@ -187,5 +187,5 @@ def test_set_rope_pids_noop_when_position_ids_none(monkeypatch):
     wrapped = _WrappedEngine(gpt)
     monkeypatch.setattr(magi_mod, "unwrap_model", lambda m: gpt if m is wrapped else m)
 
-    magi_mod._set_rope_pids(wrapped, None)
+    magi_mod.set_rope_pids(wrapped, None)
     assert getattr(gpt.rotary_pos_emb, "_pids", None) is None

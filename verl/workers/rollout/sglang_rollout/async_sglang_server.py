@@ -408,22 +408,12 @@ class SGLangHttpServer:
         if version.parse(sglang.__version__) >= version.parse("0.5.10"):
             from sglang.srt.entrypoints.http_server import Engine
 
-            try:
-                self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = Engine._launch_subprocesses(
-                    server_args=server_args,
-                    init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
-                    run_scheduler_process_func=sglang.srt.entrypoints.engine.run_scheduler_process,
-                    run_detokenizer_process_func=sglang.srt.entrypoints.engine.run_detokenizer_process,
-                )
-            except Exception:
-                from sglang.srt.entrypoints.http_server import _launch_subprocesses
-
-                self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
-                    server_args=server_args,
-                    init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
-                    run_scheduler_process_func=sglang.srt.entrypoints.engine.run_scheduler_process,
-                    run_detokenizer_process_func=sglang.srt.entrypoints.engine.run_detokenizer_process,
-                )
+            self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = Engine._launch_subprocesses(
+                server_args=server_args,
+                init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
+                run_scheduler_process_func=sglang.srt.entrypoints.engine.run_scheduler_process,
+                run_detokenizer_process_func=sglang.srt.entrypoints.engine.run_detokenizer_process,
+            )
         elif version.parse(sglang.__version__) >= version.parse("0.5.7"):
             from sglang.srt.entrypoints.http_server import _launch_subprocesses
 

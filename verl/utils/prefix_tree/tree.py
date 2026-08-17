@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Prefix-tree data structures: TrieNode (compressed trie), PrefixTrie (full batch),
-PrefixSubTrie (per-mb view), segment-based tree builder."""
+PrefixSubTrie (per-mb compressed view)."""
 
 from __future__ import annotations
 
 import functools
-import itertools
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
@@ -40,6 +39,10 @@ class TrieNode:
     sequence_ids: list[int] = field(default_factory=list)
     # Direct parent reference: single hop upward; None on root.
     ancestor: Optional[TrieNode] = None
+    # Sample-space offset of this node's first token. Set during PrefixSubTrie
+    # compression (view roots sum global ancestors outside the view; children
+    # inherit parent.sample_start + len(parent.input_ids)).
+    sample_start: int = 0
 
     @property
     def is_root(self) -> bool:
@@ -307,14 +310,14 @@ class PrefixSubTrie(PrefixTrie):
         leaf_node_ids: list[int],
         leaf_to_sample: list[int],
         batch_size: int,
+        fold_into_leaves: bool = True,
     ) -> None:
         self.source = source
         self.leaf_node_ids = leaf_node_ids
         self.leaf_to_sample = leaf_to_sample
         self.root = source.root
         self._finalized = True  # subtries are always finalized (read-only views)
-        self.nodes, self.leaves = self._collect_nodes(source, leaf_node_ids)
-        self._valid_ids = {n.node_idx for n in self.nodes}
+        self.nodes, self.leaves = self._compress_nodes(source, leaf_node_ids, fold_into_leaves)
         # Build shard-local leaf_ids: indexed by local position (0..shard_size-1).
         # global_sample_ids[i] is the global sample index for local position i.
         self.global_sample_ids = sorted(set(leaf_to_sample))
@@ -324,19 +327,30 @@ class PrefixSubTrie(PrefixTrie):
         for i, sample_idx in enumerate(leaf_to_sample):
             self.leaf_ids[_global_to_local[sample_idx]] = leaf_node_ids[i]
 
-    def children_of(self, node: TrieNode) -> list[TrieNode]:
-        """In-view children of *node* (filters pruned nodes from the global trie)."""
-        return [c for c in node.children.values() if c.node_idx in self._valid_ids]
+    @property
+    def flat_tokens(self) -> int:
+        """Deduplicated token count of this view: sum of merged node spans."""
+        return sum(len(n.input_ids) for n in self.nodes)
 
     @staticmethod
-    def _collect_nodes(source: PrefixTrie, leaf_node_ids: list[int]) -> tuple[list[TrieNode], list[Optional[TrieNode]]]:
-        """Collect leaves + all ancestors reachable from given leaf_node_ids.
+    def _compress_nodes(
+        source: PrefixTrie,
+        leaf_node_ids: list[int],
+        fold_into_leaves: bool = True,
+    ) -> tuple[list[TrieNode], list[Optional[TrieNode]]]:
+        """Build a compressed, fully-detached node set for this per-mb view.
 
-        Returns nodes in DFS order with original (global) node_idx preserved.
-        Builds a _node_idx_to_local remapping for subtrie-local indexing.
+        Every maximal single-child chain (node with exactly 1 in-view child whose
+        global node_idx is not an endpoint barrier) is folded into its bottom node
+        (branching node, leaf, or endpoint barrier). Merged nodes are NEW TrieNode
+        objects — nothing shared with the global trie. Leaf DFS order is preserved
+        (leaf_to_sample is positional and unchanged).
         """
+        endpoint_ids = set(leaf_node_ids)
+
+        # In-view node set: union of ancestor chains of each leaf, in DFS order.
         seen: set[int] = set()
-        nodes: list[TrieNode] = []
+        view_nodes: list[TrieNode] = []
         for idx in leaf_node_ids:
             node = source[idx]
             path: list[TrieNode] = []
@@ -346,22 +360,61 @@ class PrefixSubTrie(PrefixTrie):
                 cur = cur.ancestor
             for n in reversed(path):
                 seen.add(n.node_idx)
-                nodes.append(n)
+                view_nodes.append(n)
 
-        # Build leaves indexed by sequence_id (global indexing).
+        in_view_children: dict[int, list[TrieNode]] = {
+            n.node_idx: [c for c in n.children.values() if c.node_idx in seen] for n in view_nodes
+        }
+
+        root_global = [n for n in view_nodes if n.ancestor is None or n.ancestor.node_idx not in seen]
+
+        nodes: list[TrieNode] = []
         leaves: list[Optional[TrieNode]] = []
-        for node in nodes:
-            if not node.children:
-                for sid in node.sequence_ids:
+        root_tops: dict[TrieNode, TrieNode] = {}
+
+        def compress(global_node: TrieNode, parent: Optional[TrieNode]) -> tuple[TrieNode, TrieNode]:
+            kids = in_view_children[global_node.node_idx]
+            foldable = len(kids) == 1 and global_node.node_idx not in endpoint_ids
+            if foldable and not fold_into_leaves and not in_view_children[kids[0].node_idx]:
+                foldable = False  # stop one node above leaves
+            if foldable:
+                child = kids[0]
+                merged, _top = compress(child, parent)
+                merged.input_ids = np.concatenate([global_node.input_ids, merged.input_ids])
+                return merged, global_node
+            new = TrieNode(
+                input_ids=np.array(global_node.input_ids, copy=True),
+                sequence_ids=list(global_node.sequence_ids),
+                ancestor=parent,
+            )
+            new.node_idx = global_node.node_idx
+            new.children = {}
+            nodes.append(new)
+            for child in kids:
+                cnode, _top = compress(child, new)
+                new.children[cnode.node_idx] = cnode
+            if not new.children:
+                for sid in new.sequence_ids:
                     while len(leaves) <= sid:
                         leaves.append(None)
-                    leaves[sid] = node
+                    leaves[sid] = new
+            return new, global_node
+
+        for root in root_global:
+            croot, top = compress(root, None)
+            root_tops[croot] = top
+
+        for croot, top in root_tops.items():
+            croot.sample_start = sum(len(a.input_ids) for a in trie_ancestors(top) if a.node_idx not in seen)
+            _assign_sample_start(croot)
+
         return nodes, leaves
 
     def __getstate__(self) -> dict:
         """Pickle compactly: store per-node data to avoid full trie serialisation."""
         nodes_data = [
-            (n.node_idx, n.input_ids, n.ancestor.node_idx if n.ancestor else -1, n.sequence_ids) for n in self.nodes
+            (n.node_idx, n.input_ids, n.ancestor.node_idx if n.ancestor else -1, n.sequence_ids, n.sample_start)
+            for n in self.nodes
         ]
         return {
             "leaf_node_ids": self.leaf_node_ids,
@@ -380,12 +433,16 @@ class PrefixSubTrie(PrefixTrie):
         self.global_sample_ids = state.get("global_sample_ids", sorted(set(state["leaf_to_sample"])))
         # Reconstruct detached TrieNode objects (subtrie-only children links).
         by_node_idx: dict[int, TrieNode] = {}
-        for node_idx, input_ids, _anc, sequence_ids in state["nodes_data"]:
-            node = TrieNode(input_ids=np.array(input_ids, dtype=np.int64), sequence_ids=list(sequence_ids))
+        for node_idx, input_ids, _anc, sequence_ids, sample_start in state["nodes_data"]:
+            node = TrieNode(
+                input_ids=np.array(input_ids, dtype=np.int64),
+                sequence_ids=list(sequence_ids),
+                sample_start=sample_start,
+            )
             node.node_idx = node_idx
             by_node_idx[node_idx] = node
 
-        for node_idx, input_ids, ancestor_node_idx, _seq in state["nodes_data"]:
+        for node_idx, input_ids, ancestor_node_idx, _seq, _ss in state["nodes_data"]:
             node = by_node_idx[node_idx]
             if ancestor_node_idx != -1 and ancestor_node_idx in by_node_idx:
                 node.ancestor = by_node_idx[ancestor_node_idx]
@@ -394,137 +451,8 @@ class PrefixSubTrie(PrefixTrie):
                 # token (e.g. two rollout responses both begin with the same word).
                 by_node_idx[ancestor_node_idx].children[node_idx] = node
 
-        self.nodes = [by_node_idx[fid] for fid, _, _, _ in state["nodes_data"]]
-        self._valid_ids = {n.node_idx for n in self.nodes}
+        self.nodes = [by_node_idx[fid] for fid, _, _, _, _ in state["nodes_data"]]
         self._cached_magi_key = None
-
-
-# Segment-based global trie construction (O(N), no token comparison).
-
-
-def build_global_tree_from_segments(
-    samples: list,
-    segment_hashes,
-    segment_lengths,
-) -> Optional[PrefixTrie]:
-    """Build global PrefixTrie from segment metadata (O(N), multilevel).
-
-    Samples share segments with matching hashes; leaf input_ids = remaining
-    tokens after last shared segment."""
-    if len(samples) < 2:
-        return None
-
-    from verl.utils.prefix_tree.segment_grouper import group_by_segment_hash
-
-    # Normalize samples to list[list[int]]: production caller passes lists,
-    # tests may pass tensors.
-    samples = [s.tolist() if hasattr(s, "tolist") else list(s) for s in samples]
-
-    groups = group_by_segment_hash(segment_hashes, segment_lengths, level=0)
-
-    trie_root = TrieNode()
-    key_gen = itertools.count(1)
-
-    for uid_hash in sorted(groups.keys()):
-        group = groups[uid_hash]
-        all_seq_ids = [sid for sid, _ in group]
-
-        if len(group) >= 2:
-            first_idx, prefix_len = group[0]
-            prefix_tokens = samples[first_idx][:prefix_len]
-
-            prefix_node = TrieNode(
-                input_ids=np.array(prefix_tokens),
-                sequence_ids=list(all_seq_ids),
-                ancestor=None,
-            )
-            trie_root.children[uid_hash] = prefix_node
-
-            _build_segment_subtree(
-                samples,
-                segment_hashes,
-                segment_lengths,
-                group_sids=all_seq_ids,
-                level=1,
-                accumulated_len=prefix_len,
-                parent_node=prefix_node,
-                next_key=key_gen.__next__,
-            )
-        else:
-            seq_idx = group[0][0]
-            all_tokens = samples[seq_idx]
-            leaf = TrieNode(
-                input_ids=np.array(all_tokens),
-                sequence_ids=[seq_idx],
-                ancestor=None,
-            )
-            trie_root.children[uid_hash] = leaf
-
-    if not trie_root.children:
-        return None
-
-    trie = PrefixTrie(root=trie_root)
-    trie.finalize()
-    return trie
-
-
-def _build_segment_subtree(
-    samples,
-    segment_hashes,
-    segment_lengths,
-    group_sids: list[int],
-    level: int,
-    accumulated_len: int,
-    parent_node: TrieNode,
-    next_key,
-) -> None:
-    """Recursively build ancestor nodes for shared segments at level >= 1."""
-
-    def _attach_leaf(parent: TrieNode, sid: int, accum_len: int, key: int) -> None:
-        remaining = samples[sid][accum_len:]
-        leaf = TrieNode(
-            input_ids=np.array(remaining),
-            sequence_ids=[sid],
-            ancestor=parent,
-        )
-        parent.children[key] = leaf
-
-    # Samples whose segment list ended before this level → leaves with remaining tokens.
-    for sid in group_sids:
-        if level >= len(segment_hashes[sid]):
-            _attach_leaf(parent_node, sid, accumulated_len, next_key())
-
-    # Subgroup remaining samples by hash at this level.
-    subgroups: dict[int, list[int]] = {}
-    for sid in group_sids:
-        if level < len(segment_hashes[sid]):
-            h = int(segment_hashes[sid][level])
-            subgroups.setdefault(h, []).append(sid)
-
-    for hash_val in sorted(subgroups.keys()):
-        subgroup = subgroups[hash_val]
-        if len(subgroup) >= 2:
-            seg_len = int(segment_lengths[subgroup[0]][level])
-            seg_tokens = samples[subgroup[0]][accumulated_len : accumulated_len + seg_len]
-            node = TrieNode(
-                input_ids=np.array(seg_tokens),
-                sequence_ids=list(subgroup),
-                ancestor=parent_node,
-            )
-            parent_node.children[next_key()] = node
-            _build_segment_subtree(
-                samples,
-                segment_hashes,
-                segment_lengths,
-                group_sids=subgroup,
-                level=level + 1,
-                accumulated_len=accumulated_len + seg_len,
-                parent_node=node,
-                next_key=next_key,
-            )
-        else:
-            sid = subgroup[0]
-            _attach_leaf(parent_node, sid, accumulated_len, next_key())
 
 
 def trie_ancestors(node: TrieNode) -> list[TrieNode]:
@@ -536,6 +464,13 @@ def trie_ancestors(node: TrieNode) -> list[TrieNode]:
         cur = cur.ancestor
     chain.reverse()
     return chain
+
+
+def _assign_sample_start(node: TrieNode) -> None:
+    """Top-down: child.sample_start = parent.sample_start + len(parent.input_ids)."""
+    for child in node.children.values():
+        child.sample_start = node.sample_start + len(node.input_ids)
+        _assign_sample_start(child)
 
 
 def _is_prefix_tree_enabled(config_or_data) -> bool:

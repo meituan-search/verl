@@ -67,6 +67,11 @@ class PrefixTreeMagiBatch:
     # padding before restore/undispatch, else padding log-probs leak into samples.
     real_tokens: int = 0
 
+    # Per-sample rolled labels (each sample's tokens shifted left, 0-padded at the
+    # end) used by the unfused path to compute per-sample log-probs without the
+    # flat boundary patch.
+    per_sample_labels: Optional[list[Tensor]] = None
+
     # Restoration params for unpacking model output to per-sample tensors
     restoration: Optional[PackRestorationParam] = None
 
@@ -111,7 +116,7 @@ def build_prefix_tree_micro_batch(
         loss_masks_by_sample=loss_masks_by_sample,
         position_ids_by_sample=position_ids_by_sample,
     )
-    return _finalize_prefix_tree_batch(
+    pb = _finalize_prefix_tree_batch(
         params,
         model=model,
         num_samples=len(samples),
@@ -120,6 +125,8 @@ def build_prefix_tree_micro_batch(
         cp_size=cp_size,
         subtrie=subtrie,
     )
+    pb.per_sample_labels = [torch.cat([s[1:], torch.zeros(1, dtype=s.dtype, device=s.device)]) for s in samples]
+    return pb
 
 
 def _build_per_sample_tensor(
@@ -131,28 +138,33 @@ def _build_per_sample_tensor(
 
     boundary_logps maps sample_idx → [(boundary_flat_pos, per_leaf_logp), ...] to fix the
     dedup→one-slot→copy-to-all-leaves bug where non-owner leaves inherit wrong boundary log-probs."""
+    # One entry per sample (duplicates sharing a leaf included); output slot per sample, None until filled.
     n = (max(pt_batch.subtrie.leaf_to_sample) + 1) if pt_batch.subtrie.leaf_to_sample else 0
     sample_tensors: list[Optional[Tensor]] = [None] * n
+    # Packed-sequence ranges of the shared trie nodes on each leaf's root->parent path.
+    ancestor_ranges = pt_batch.restoration.ancestor_segment_ranges
+    if ancestor_ranges is None:
+        ancestor_ranges = [[pt_batch.restoration.prefix_range] for _ in range(n)]
+    # iterate each sample, from leaf
     for leaf_idx, sample_idx in enumerate(pt_batch.subtrie.leaf_to_sample):
-        s, e = pt_batch.restoration.segment_ranges[leaf_idx]
-        leaf_slice = flat_tensor[s:e]
-        ranges = pt_batch.restoration.ancestor_segment_ranges
-        if ranges is None:
-            ranges = [[pt_batch.restoration.prefix_range] for _ in range(n)]
-        parts: list[Tensor] = []
-        for a, b in ranges[leaf_idx]:
-            part = flat_tensor[a:b]
-            if boundary_logps is not None:
-                for b_pos, leaf_val in boundary_logps.get(sample_idx, []):
-                    if a <= b_pos < b:
-                        part = torch.cat(
-                            [flat_tensor[a:b_pos], leaf_val.unsqueeze(0), flat_tensor[b_pos + 1 : b]],
-                            dim=0,
-                        )
-                        break
-            parts.append(part)
-        parts.append(leaf_slice)
-        sample_tensors[sample_idx] = torch.cat(parts, dim=0)
+        leaf_start, leaf_end = pt_batch.restoration.segment_ranges[leaf_idx]
+        leaf_slice = flat_tensor[leaf_start:leaf_end]
+        pieces: list[Tensor] = []
+        boundary_tokens = boundary_logps.get(sample_idx, []) if boundary_logps is not None else []
+        # iterate the segment to build the entire sequence
+        for start, end in ancestor_ranges[leaf_idx]:
+            patched = False
+            for pos, leaf_val in boundary_tokens:
+                # find the correct boundary token apply here
+                if start <= pos < end:
+                    pieces.extend([flat_tensor[start:pos], leaf_val.reshape(1)])
+                    patched = True
+                    break
+            if not patched:
+                pieces.append(flat_tensor[start:end])
+        pieces.append(leaf_slice)
+        # torch cat the entire pieces togather
+        sample_tensors[sample_idx] = torch.cat(pieces, dim=0)
     return sample_tensors
 
 
@@ -172,21 +184,14 @@ def restore_flat_to_nested(
     return torch.nested.as_nested_tensor(sample_tensors, layout=torch.jagged)
 
 
-def _set_rope_pids(model, position_ids: Optional[Tensor]) -> None:
-    """Set per-token position_ids on model.rotary_pos_emb for global RoPE patch to read.
-
-    Unwrap the model first: ``model`` is the (Distributed)DataParallel-wrapped engine
-    whose ``__getattr__`` does NOT expose ``rotary_pos_emb``, so a bare ``getattr`` no-ops
-    and the patched ``_rope_forward`` falls back to megatron's sequential CP RoPE (wrong
-    for the deduplicated tree). ``unwrap_model`` drills to the GPTModel whose
-    ``rotary_pos_emb`` is the instance ``_rope_forward`` reads (via ``_preprocess``).
-    """
+def set_rope_pids(model, position_ids: Optional[Tensor]) -> None:
+    """Set per-token position_ids on model.rotary_pos_emb for global RoPE patch to read."""
     rope_mod = getattr(unwrap_model(model), "rotary_pos_emb", None)
     if rope_mod is not None and position_ids is not None:
         rope_mod._pids = position_ids.reshape(-1)
 
 
-def _clear_rope_pids(model) -> None:
+def clear_rope_pids(model) -> None:
     rope_mod = getattr(unwrap_model(model), "rotary_pos_emb", None)
     if rope_mod is not None:
         rope_mod._pids = None
@@ -230,11 +235,7 @@ _PREFIX_TREE_KEYS = frozenset(
 
 
 def strip_prefix_tree_args(logits_processor_args: dict | None) -> None:
-    """Remove prefix-tree keys from *logits_processor_args* (mutates dict).
-
-    Called after the prefix-tree path has consumed them so they don't
-    leak into the downstream logits processor.
-    """
+    """Remove prefix-tree specific keys"""
     if logits_processor_args is None:
         return
     for k in _PREFIX_TREE_KEYS:

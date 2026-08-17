@@ -65,7 +65,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import deprecated, load_class_from_fqn
 from verl.utils.metric import reduce_metrics
-from verl.utils.prefix_tree.dynamic import reorder_and_balance_for_prefix_tree
+from verl.utils.prefix_tree.dynamic import balance_prefix_tree_v0
 from verl.utils.prefix_tree.trainer import build_global_trie, pt_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
@@ -1196,13 +1196,15 @@ class RayPPOTrainer:
             )
 
         elif self.config.actor_rollout_ref.model.get("use_prefix_tree", False):
-            if reorder_and_balance_for_prefix_tree(
+            if balance_prefix_tree_v0(
                 batch,
                 self.config.actor_rollout_ref.model,
                 dp_size,
                 attention_mask=attention_mask,
                 metrics=metrics,
                 logging_prefix=logging_prefix,
+                keep_minibatch=keep_minibatch,
+                minibatch_size=self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size"),
             ):
                 return
 
@@ -1547,7 +1549,11 @@ class RayPPOTrainer:
                     # which won't affect the advantage calculation (since it's based on uid),
                     # but might affect the loss calculation (due to the change of mini-batching).
                     if self.config.trainer.balance_batch:
-                        self._balance_batch(batch, metrics=metrics)
+                        self._balance_batch(
+                            batch,
+                            metrics=metrics,
+                            keep_minibatch=getattr(self.config.trainer, "balance_keep_minibatch", False),
+                        )
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()

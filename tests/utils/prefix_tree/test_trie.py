@@ -31,11 +31,7 @@ from verl.utils.prefix_tree.dynamic import (
     greedy_build_tries,
 )
 from verl.utils.prefix_tree.magi import PackRestorationParam, PrefixTreeMagiBatch, restore_flat_to_nested
-from verl.utils.prefix_tree.segment_grouper import (
-    create_segment_metadata,
-    group_by_segment_hash,
-)
-from verl.utils.prefix_tree.tree import PrefixSubTrie, PrefixTrie, TrieNode, build_global_tree_from_segments
+from verl.utils.prefix_tree.tree import PrefixSubTrie, PrefixTrie, TrieNode
 from verl.utils.prefix_tree.utils import build_layout_from_tree_node
 
 
@@ -64,7 +60,7 @@ def test_build_subtrie_view_all_subset_and_empty():
     assert len(sub_all.leaf_to_sample) == 3 and len(sub_all.nodes[0].input_ids) == 2
 
     sub_one = build_subtrie_view(trie, {0})
-    assert sub_one.leaf_to_sample == [0] and len(sub_one.nodes) == 3  # [1,2]+[3]+[4]
+    assert sub_one.leaf_to_sample == [0] and len(sub_one.nodes) == 1  # [1,2,3,4] folded into one leaf
 
     sub_two = build_subtrie_view(trie, {0, 2})
     assert set(sub_two.leaf_to_sample) == {0, 2}
@@ -410,86 +406,14 @@ def test_duplicate_samples_leaf_alignment():
     assert set(params.leaf_to_sample) == {0, 1, 2}
 
 
-def test_create_segment_metadata_dtypes_and_int_hashes():
-    hashes, lengths = create_segment_metadata([[("a", 3), ("b", 2)]])
-    assert hashes.dtype == object and lengths.dtype == object
-    assert hashes[0].tolist() == [hash("a") & 0xFFFFFFFF, hash("b") & 0xFFFFFFFF]
-    assert lengths[0].tolist() == [3, 2]
-    h2, l2 = create_segment_metadata([[(7, 3)]])  # accepts int hashes too
-    assert h2[0].tolist() == [7] and l2[0].tolist() == [3]
-
-
-def test_group_by_segment_hash_level0_and_out_of_range():
-    hashes, lengths = create_segment_metadata([[("p0", 3)], [("p0", 3)], [("p1", 5)]])
-    groups = group_by_segment_hash(hashes, lengths, level=0)
-    assert sorted(len(v) for v in groups.values()) == [1, 2]
-    big = next(v for v in groups.values() if len(v) == 2)
-    assert sorted(idx for idx, _ in big) == [0, 1]
-    h1, l1 = create_segment_metadata([[("p0", 3)]])  # out-of-range level -> empty
-    assert group_by_segment_hash(h1, l1, level=5) == {}
-
-
-def test_shared_hash_creates_trie_with_prefix_tokens():
-    shared = [10, 20, 30]
-    samples = [torch.tensor(shared + [1, 2]), torch.tensor(shared + [3, 4])]
-    hashes, lengths = create_segment_metadata([[("p", 3), ("a", 2)], [("p", 3), ("b", 2)]])
-    trie = build_global_tree_from_segments(samples, hashes, lengths)
-    assert isinstance(trie, PrefixTrie) and trie.is_root
-    tokens = [t for n in trie.nodes for t in n.input_ids]
-    assert all(tok in tokens for tok in shared)
-
-
-def test_no_sharing_single_and_empty_return_none():
-    hashes, lengths = create_segment_metadata([[("a", 3)], [("b", 3)], [("c", 3)]])
-    h1, l1 = create_segment_metadata([[("uid", 3)]])
-    assert build_global_tree_from_segments([torch.tensor([1, 2, 3])], h1, l1) is None
-    import numpy as np
-
-    assert build_global_tree_from_segments([], np.array([], dtype=object), np.array([], dtype=object)) is None
-
-
-def test_grpo_two_prompts_builds_leaf_per_sample():
-    p0, p1 = list(range(10, 15)), list(range(20, 25))
-    samples = [
-        torch.tensor(p0 + [100, 101, 102]),
-        torch.tensor(p0 + [200, 201, 202]),
-        torch.tensor(p1 + [300, 301, 302]),
-        torch.tensor(p1 + [400, 401, 402]),
-    ]
-    hashes, lengths = create_segment_metadata([[("p0", 5)], [("p0", 5)], [("p1", 5)], [("p1", 5)]])
-    trie = build_global_tree_from_segments(samples, hashes, lengths)
-    assert isinstance(trie, PrefixTrie)
-    assert len(trie.leaves) == 4 and all(leaf is not None for leaf in trie.leaves)
-
-
-def test_leaf_coverage_and_varying_segment_lengths():
-    prefix = [1, 2]
-    samples = [torch.tensor(prefix + [i]) for i in range(4)]
-    hashes, lengths = create_segment_metadata([[("uid", 2), (f"r{i}", 1)] for i in range(4)])
-    trie = build_global_tree_from_segments(samples, hashes, lengths)
-    assert len(trie.leaves) == 4 and all(leaf is not None for leaf in trie.leaves)
-    short = [torch.tensor([1] + list(range(100, 110))), torch.tensor([1] + list(range(200, 210)))]
-    h3, l3 = create_segment_metadata([[("u", 1), ("a", 10)], [("u", 1), ("b", 10)]])
-    trie2 = build_global_tree_from_segments(short, h3, l3)
-    assert isinstance(trie2, PrefixTrie) and len(trie2.leaves) == 2
-
-
-def _build_global_trie_local(seqs_t, seg_hashes=None, seg_lengths=None):
-    """Returns (trie, leaf_idx) mirroring ray_trainer._build_global_trie."""
+def _build_global_trie_local(seqs_t):
+    """Greedy global trie + leaf_idx, mirroring trainer-side build_global_trie."""
     total_raw = sum(int(s.numel()) for s in seqs_t)
-    trie = None
-    if seg_hashes is not None and seg_lengths is not None:
-        trie = build_global_tree_from_segments(seqs_t, seg_hashes, seg_lengths)
-    if trie is None:
-        from verl.utils.prefix_tree.tree import PrefixTrie
-
-        trie = PrefixTrie(root=TrieNode())
-        for seq_id, seq in enumerate(seqs_t):
-            trie.insert(np.array(seq if hasattr(seq, "tolist") else [int(x) for x in seq], dtype=np.int64), seq_id)
-        trie.finalize()
-        if total_raw <= 0:
-            trie = None
-    if trie is None:
+    trie = PrefixTrie(root=TrieNode())
+    for seq_id, seq in enumerate(seqs_t):
+        trie.insert(np.array(seq if hasattr(seq, "tolist") else [int(x) for x in seq], dtype=np.int64), seq_id)
+    trie.finalize()
+    if total_raw <= 0:
         return None, None
 
     leaf_idx = np.full(len(seqs_t), -1, dtype=np.int64)
@@ -501,52 +425,21 @@ def _build_global_trie_local(seqs_t, seg_hashes=None, seg_lengths=None):
 
 
 def _make_seqs(n_prompts=2, rollout_n=2, prompt_len=5, resp_len=3):
-    seqs, segments = [], []
+    seqs = []
     for p in range(n_prompts):
         prompt = list(range(100 + p * 10, 100 + p * 10 + prompt_len))
         for r in range(rollout_n):
             resp = list(range(200 + (p * rollout_n + r) * 10, 200 + (p * rollout_n + r) * 10 + resp_len))
             seqs.append(torch.tensor(prompt + resp, dtype=torch.long))
-            segments.append([(f"p{p}", prompt_len)])
-    seg_hashes, seg_lengths = create_segment_metadata(segments)
-    return seqs, seg_hashes, seg_lengths
+    return seqs
 
 
-def _make_multilevel_seqs():
-    seqs = [
-        torch.tensor(t, dtype=torch.long)
-        for t in [
-            [10, 11, 12, 20, 21, 30, 31],
-            [10, 11, 12, 20, 21, 32, 33],
-            [50, 51, 52, 60, 61, 70, 71],
-            [50, 51, 52, 60, 61, 72, 73],
-        ]
-    ]
-    segs = [[(f"p{i // 2}_t1", 3), (f"p{i // 2}_t2", 2)] for i in range(4)]
-    return (seqs,) + create_segment_metadata(segs)
-
-
-def test_build_global_trie_leaf_idx_valid_and_fallback():
-    seqs, seg_hashes, seg_lengths = _make_seqs()
-    trie, leaf_idx = _build_global_trie_local(seqs, seg_hashes, seg_lengths)
+def test_build_global_trie_leaf_idx_valid():
+    seqs = _make_seqs()
+    trie, leaf_idx = _build_global_trie_local(seqs)
     assert trie is not None and len(trie.nodes) > 0
     assert isinstance(leaf_idx, torch.Tensor) and leaf_idx.dtype == torch.long
     assert leaf_idx.shape == (4,) and (leaf_idx >= 0).all()
     for i, node_idx in enumerate(leaf_idx.tolist()):
         node = trie.nodes[node_idx]
         assert not node.children and i in node.sequence_ids
-    trie_fb, leaf_fb = _build_global_trie_local(seqs, seg_hashes=None, seg_lengths=None)
-    assert trie_fb is not None and leaf_fb is not None and (leaf_fb >= 0).all()
-
-
-def test_multilevel_builds_three_node_levels():
-    seqs, seg_hashes, seg_lengths = _make_multilevel_seqs()
-    trie = build_global_tree_from_segments(seqs, seg_hashes, seg_lengths)
-    assert trie is not None and len(trie.nodes) == 8  # 2 prefix + 2 inter + 4 leaves
-    leaves = [n for n in trie.nodes if not n.children]
-    intermediates = [n for n in trie.nodes if n.children and n.ancestor is not None]
-    roots = [n for n in trie.nodes if n.ancestor is None]
-    assert len(leaves) == 4 and len(intermediates) == 2 and len(roots) == 2
-    assert all(leaf.ancestor in intermediates for leaf in leaves)
-    assert {(10, 11, 12), (50, 51, 52)} == {tuple(int(x) for x in n.input_ids) for n in roots}
-    assert list(trie.leaves[0].input_ids) == [30, 31] and list(trie.leaves[3].input_ids) == [72, 73]

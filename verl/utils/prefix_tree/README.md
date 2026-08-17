@@ -13,12 +13,11 @@ for the module; design and usage are covered in
 ```mermaid
 graph TD
     subgraph Trainer["Trainer (controller) -- ray_trainer.py"]
-        A1["attach_segment_metadata<br/>(segment_hashes + lengths)"]
-        A2["build_global_trie<br/>(build_global_tree_from_segments / greedy_build_tries)"]
-        A3["pt_metrics<br/>(global_shared_ratio, packed_tokens)"]
-        A4["_balance_batch<br/>(DFS reorder; leaf_idx stays correct)"]
-        A5["dispatch to DP ranks"]
-        A1 --> A2 --> A3 --> A4 --> A5
+        A1["build_global_trie<br/>(greedy_build_tries)"]
+        A2["pt_metrics<br/>(global_shared_ratio, packed_tokens)"]
+        A3["_balance_batch<br/>(DFS reorder; leaf_idx stays correct)"]
+        A4["dispatch to DP ranks"]
+        A1 --> A2 --> A3 --> A4
     end
 
     subgraph Worker["Worker (DP rank) -- engine/utils.py"]
@@ -68,7 +67,7 @@ graph TD
     classDef engine fill:#f3e5f5,stroke:#6a1b9a;
     classDef forward fill:#e8f5e9,stroke:#2e7d32;
     classDef attn fill:#fce4ec,stroke:#ad1457;
-    class A1,A2,A3,A4,A5 trainer;
+    class A1,A2,A3,A4 trainer;
     class B1,B2,B3,B4 worker;
     class C1,C2,C3 engine;
     class D1,D2,D3,D4,D5,D6,D7,D8 forward;
@@ -140,12 +139,8 @@ Flat packed layout (tokens processed once):
 - `prepare_prefix_tree_micro_batches`: splits the batch into micro-batches and attaches subtrie views.
 
 **Trainer helpers** (`trainer.py`):
-- `attach_segment_metadata` + `build_global_trie`: build the global trie at the trainer level (before DP dispatch).
+- `build_global_trie`: greedy token-by-token build of the global trie at the trainer level (before DP dispatch).
 - `pt_metrics`: compute prefix-sharing metrics (`global_shared_ratio`, `micro_batch_shared_ratio`, `packed_tokens`, `raw_tokens`, `avg_mbs`, `timing_s`).
-
-**Segment grouper** (`segment_grouper.py`):
-- `create_grpo_segment_metadata()`: fast hash-based segment metadata for GRPO.
-- `group_by_segment_hash()`: groups samples by shared prefix segment.
 
 ## Parallelism Support
 
@@ -379,6 +374,5 @@ actor_rollout_ref.model.prefix_tree_attention=magi  # or "flex"
 - `verl/utils/prefix_tree/utils.py`: layout builder
 - `verl/utils/prefix_tree/forward.py`: unfused/fused forward drivers
 - `verl/utils/prefix_tree/dynamic.py`: trie build + micro-batch grouping
-- `verl/utils/prefix_tree/segment_grouper.py`: fast segment metadata
 - `verl/utils/prefix_tree/trainer.py`: trainer-facing helpers
 - `verl/utils/prefix_tree/prefix_tree_patch_impl.py`: Megatron patches

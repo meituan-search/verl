@@ -25,8 +25,6 @@ Do **not** enable when:
 - Each sample has a unique prompt (no sharing) — the trie build + dispatch overhead is pure cost (see Known limitations below).
 - `rollout.n == 1` and no multi-turn accumulation — no prefix sharing to exploit.
 
-> **Custom algorithms with known sharing structure.** The default tree build is token-by-token (`greedy_build_tries`, `dynamic.py`). If your algorithm already knows the prefix structure (e.g. tree-search branches sharing a parent prefix), attach per-sample `segment_hashes` + `segment_lengths` to `non_tensor_batch` (built via `create_segment_metadata` in `segment_grouper.py`) so `build_global_trie` uses the O(N) `build_global_tree_from_segments` (`tree.py`) — which matches segment hashes level by level instead of comparing tokens — rather than the greedy by-token path.
-
 ## 3. Configuration
 
 Prefix-tree is controlled by two fields under `actor_rollout_ref.model`:

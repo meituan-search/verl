@@ -1431,22 +1431,9 @@ class PPOTrainer(ABC):
         if trie is None:
             return batch
 
-        from verl.utils.prefix_tree.dynamic import balance_prefix_tree_blocks
+        from verl.utils.prefix_tree.dynamic import balance_prefix_tree_v1
 
-        # Block by prompt identity: TQ keys are {uid}_{session_id}_{index};
-        # the {uid}_{session_id} prefix is the GRPO advantage group (same
-        # prompt's rollouts must stay together for group advantage norm).
-        block_ids = [k.rsplit("_", 1)[0] for k in batch.keys]
-        permutation, partitions, workloads = balance_prefix_tree_blocks(trie, dp_size, block_ids)
-        if len(permutation) != len(batch.keys):
-            raise RuntimeError(
-                f"balance_prefix_tree_blocks covered {len(permutation)}/{len(batch.keys)} samples: "
-                "trie does not cover every sample."
-            )
-        batch.reorder(permutation)
-        stats = log_seqlen_unbalance(seqlen_list=workloads, partitions=partitions, prefix=logging_prefix)
-        metrics.update(stats)
-        return batch
+        return balance_prefix_tree_v1(batch, trie, metrics, dp_size, logging_prefix)
 
     def _build_and_attach_global_trie(self, batch: KVBatchMeta, metrics: dict, timing_raw=None) -> KVBatchMeta:
         """Build the global prefix trie once on the driver and attach to the batch.

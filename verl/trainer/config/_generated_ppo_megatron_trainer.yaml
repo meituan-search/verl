@@ -928,6 +928,7 @@ distillation:
   teacher_key: data_source
 trainer:
   balance_batch: true
+  balance_keep_minibatch: false
   total_epochs: 30
   total_training_steps: null
   project_name: verl_examples

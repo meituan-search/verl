@@ -443,6 +443,7 @@ def gptmodel_forward_model_engine(
         if logits_processor_args and "response_attention_mask" in logits_processor_args:
             logits_processor_args.pop("response_attention_mask")
 
+        # For VLM model, need to pass bshd format `input_ids` and `attention_mask`.
         if vision_model:
             input_ids_bshd, attention_mask = build_vlm_attn_mask_bshd(
                 input_ids, batch_size, pad_token_id, forced_max_seqlen=forced_max_seqlen

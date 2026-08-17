@@ -81,8 +81,6 @@ def magi_attn_forward(
 
 
 # Per-batch attention-path counters (magi/flex/fa3)
-
-
 def _make_attn_counters():
     """Return (reset, inc_fa3, inc_non_fa3, get_metrics) closures tracking FA3 fallback ratio."""
     state = {"fa3": 0, "total": 0}
@@ -130,9 +128,7 @@ def maybe_collect_prefix_tree_metrics(engine_config, engine, output: dict) -> No
     _reset_mbs_metric()
 
 
-# Patch application
-
-
+# Patch
 def apply_prefix_tree_patch() -> None:
     """Monkey-patch Megatron classes for prefix-tree attention (flex and MAGI). Safe to call multiple times."""
 

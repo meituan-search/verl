@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import torch
 
-from verl.utils.prefix_tree.dynamic import mbs_groups_from_leaf_idx
+from verl.utils.prefix_tree.dynamic import build_tree_dynamic, mbs_groups_from_leaf_idx
 from verl.utils.prefix_tree.magi import PackRestorationParam, PrefixTreeMagiBatch, restore_flat_to_nested
 from verl.utils.prefix_tree.trainer import build_global_trie
 from verl.utils.prefix_tree.tree import PrefixSubTrie
@@ -172,3 +172,54 @@ def test_worker_restore_round_trip_full_batch():
         assert sorted(i for mb in groups for i in mb) == list(range(len(samples)))
         for idx in groups:
             _worker_restore(samples, trie, leaf_idx, idx)
+
+
+def test_unfused_expand_first_no_boundary_patch(monkeypatch):
+    """Unfused post-processing expands per-sample BEFORE the logits processor:
+    every sample's boundary position gets ITS OWN label's log-prob (no flat
+    boundary patch)."""
+    import verl.utils.prefix_tree.forward as pt_forward
+
+    # model=None makes the real clear_rope_pids crash via unwrap_model's
+    # isinstance against stub classnames; the rope context is unused here.
+    monkeypatch.setattr(pt_forward, "clear_rope_pids", lambda model: None)
+
+    tensors = [torch.tensor([1, 2, 3, 4]), torch.tensor([1, 2, 3, 5]), torch.tensor([1, 2, 3, 6])]
+    subtrie = build_tree_dynamic(tensors)
+    assert subtrie is not None
+    params = build_layout_from_tree_node(tensors, subtrie)
+    pb = _build_pb(tensors, subtrie, params)
+    pb.per_sample_labels = [torch.cat([s[1:], torch.zeros(1, dtype=torch.long)]) for s in tensors]
+
+    flat_len = pb.tree_packed_input_ids.shape[0]
+    logits = torch.zeros(flat_len, 8)
+    for i, lbl in enumerate(pb.tree_packed_labels.tolist()):
+        logits[i, lbl] = 100.0
+    # Boundary (flat pos 2, shared token 3): give every sample's OWN next token a
+    # high, distinct score so per-sample values are distinguishable.
+    for k, nxt in enumerate((4, 5, 6)):
+        logits[2, nxt] = 100.0 + 10.0 * k
+
+    def processor(logits_, label, temperature=1.0, **kw):
+        lp = torch.log_softmax(logits_.squeeze(1), dim=-1)
+        log_probs = lp.gather(1, label.long())
+        probs = torch.softmax(logits_.squeeze(1), dim=-1)
+        entropy = -(probs * lp).sum(-1)
+        return {"log_probs": log_probs.squeeze(-1), "entropy": entropy}
+
+    ctx = pt_forward.TreeForwardCtx(pb, None, None, "flex", model=None)
+    out = pt_forward.tree_post_processing(ctx, logits.unsqueeze(0), processor, {"temperature": 1.0}, post_process=True)
+
+    lengths = out["log_probs"].offsets().diff().tolist()
+    assert lengths == [4, 4, 4]
+    vals = out["log_probs"].values()
+    pos = 0
+    for j, s in enumerate(tensors):
+        rolled = torch.cat([s[1:], torch.zeros(1, dtype=torch.long)])
+        p_start, p_end = pb.restoration.prefix_range
+        s_start, s_end = pb.restoration.segment_ranges[j]
+        rows = list(range(p_start, p_end)) + list(range(s_start, s_end))
+        lp = torch.log_softmax(logits[rows], dim=-1)
+        expected = lp.gather(1, rolled.unsqueeze(1)).squeeze(-1)
+        assert torch.allclose(vals[pos : pos + 4], expected), f"sample {j} boundary log-prob mismatch"
+        pos += 4

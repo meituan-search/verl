@@ -39,17 +39,14 @@ _log = _logging.getLogger(__name__)
 
 __all__ = [
     "build_tree_dynamic",
-    "dfs_leaf_order",
     # Lower-level helpers exposed for testing / benchmarking
     "TrieNode",
     "greedy_build_tries",
-    "mbs_groups_from_trie",
     "convert_trie_to_tree_node",
     "build_subtrie_view",
     # Load balancing
     "trie_group_flat_tokens",
-    "reorder_and_balance_for_prefix_tree",
-    "create_and_attach_subtrie_views",
+    "balance_prefix_tree_v0",
 ]
 
 
@@ -160,33 +157,9 @@ def _trie_seq_ids(node: TrieNode) -> list[int]:
 
 
 def trie_group_flat_tokens(group: list[int], trie: PrefixTrie) -> int:
-    """Flat (deduplicated) token count for a subset of sequences within a trie.
-
-    Counts tokens on the minimal sub-trie spanning exactly the sequences in
-    ``group``, i.e. the effective forward-pass token budget when those
-    sequences are processed together with prefix sharing.
-
-    Args:
-        group: Sequence indices as stored in ``TrieNode.sequence_ids``.
-        trie: Global :class:`PrefixTrie`.
-
-    Returns:
-        Total number of unique tokens required to process this group.
-    """
-    keep = frozenset(group)
-
-    def _count(node: TrieNode) -> int:
-        if not node.children:
-            return len(node.input_ids) if any(s in keep for s in node.sequence_ids) else 0
-        has_relevant = False
-        relevant_total = 0
-        for child in node.children.values():
-            if any(s in keep for s in child.sequence_ids):
-                has_relevant = True
-                relevant_total += _count(child)
-        return relevant_total + len(node.input_ids) if has_relevant else 0
-
-    return sum(_count(c) for c in trie.children.values())
+    """Flat (deduplicated) token count for a subset of sequences within a trie."""
+    sub = build_subtrie_view(trie, frozenset(group))
+    return sub.flat_tokens if sub else 0
 
 
 def dfs_leaf_order(
@@ -212,48 +185,64 @@ def dfs_leaf_order(
     return [sid for node in trie.dfs(leaf_only=True) for sid in node.sequence_ids]
 
 
-def _trie_dfs_leaf_order(trie: PrefixTrie, leaf_positions_fn) -> list[int]:
-    """DFS pre-order walk over trie leaves calling leaf_positions_fn per leaf."""
-    return [p for node in trie.dfs(leaf_only=True) for p in leaf_positions_fn(node)]
-
-
 def trie_dfs_leaf_order_from_leaf_idx(leaf_idx, trie: PrefixTrie) -> list[int]:
-    """Return batch positions in DFS leaf order from leaf_idx (reorder-safe, unlike trie's sequence_ids)."""
+    """Return batch positions in DFS leaf order from leaf_idx (reorder-safe)."""
     leaf_to_positions: dict[int, list[int]] = {}
     for new_pos, leaf_fid in enumerate(leaf_idx.tolist()):
         if leaf_fid < 0:
             raise ValueError(f"leaf_idx[{new_pos}]={leaf_fid}; sample has no leaf assigned.")
         leaf_to_positions.setdefault(int(leaf_fid), []).append(new_pos)
-
-    return _trie_dfs_leaf_order(trie, lambda n: leaf_to_positions.get(n.node_idx, []))
+    return [p for node in trie.dfs(leaf_only=True) for p in leaf_to_positions.get(node.node_idx, [])]
 
 
 def _mbs_groups_dfs(
     leaf_entries: list[tuple[TrieNode, list[int]]],
     max_token_len: int,
+    block_ids: Optional[list] = None,
 ) -> list[list[int]]:
     """DFS-budget walk: groups leaf samples into micro-batches by flat (deduplicated) token budget.
 
-    When a leaf holds multiple positions (identical sequences), all stay in the same
-    DFS group to avoid singleton groups."""
+    Samples move in atomic blocks: positions of one leaf (duplicates) always stay
+    together; when ``block_ids`` is given, positions sharing a uid form a block that
+    is never split across groups (an oversized block forms its own group)."""
+    if block_ids is None:
+        blocks: list[list[tuple[TrieNode, list[int]]]] = [[entry] for entry in leaf_entries]
+    else:
+        pos_to_block = {p: bid for p, bid in enumerate(block_ids)}
+        blocks_by_id: dict = {}
+        block_order: list = []
+        for node, positions in leaf_entries:
+            for p in positions:
+                bid = pos_to_block[p]
+                if bid not in blocks_by_id:
+                    blocks_by_id[bid] = []
+                    block_order.append(bid)
+                blocks_by_id[bid].append((node, [p]))
+        blocks = [blocks_by_id[bid] for bid in block_order]
+
+    def block_increment(entries, covered: set[int]) -> tuple[int, set[int]]:
+        new_nodes: list[TrieNode] = []
+        for node, _ in entries:
+            for n in trie_ancestors(node) + [node]:
+                if n.node_idx not in covered:
+                    new_nodes.append(n)
+        return sum(len(n.input_ids) for n in new_nodes), {n.node_idx for n in new_nodes}
+
     all_groups: list[list[int]] = []
     current_group: list[int] = []
     covered: set[int] = set()
     current_eff = 0  # flat tokens accumulated in current group
 
-    for node, positions in leaf_entries:
-        path = trie_ancestors(node) + [node]
-        new_nodes = [n for n in path if n.node_idx not in covered]
-        inc = sum(len(n.input_ids) for n in new_nodes)
+    for entries in blocks:
+        inc, new_nodes = block_increment(entries, covered)
         if current_group and current_eff + inc > max_token_len:
             all_groups.append(current_group[:])
-            current_group.clear()
-            covered.clear()
+            current_group = []
+            covered = set()
             current_eff = 0
-            new_nodes = path
-            inc = sum(len(n.input_ids) for n in new_nodes)
-        current_group.extend(positions)
-        covered.update(n.node_idx for n in new_nodes)
+            inc, new_nodes = block_increment(entries, covered)
+        current_group.extend(p for _, positions in entries for p in positions)
+        covered.update(new_nodes)
         current_eff += inc
 
     if current_group:
@@ -261,25 +250,18 @@ def _mbs_groups_dfs(
     return all_groups
 
 
-def mbs_groups_from_trie(
-    trie: PrefixTrie,
-    max_token_len: int,
-) -> list[list[int]]:
-    """Group sequences into micro-batches from an existing trie, budgeted by flat (deduplicated) tokens.
-
-    Duplicate leaves stay in-group to prevent same_micro_num_in_dp padding."""
-    leaf_entries = [(node, list(node.sequence_ids)) for node in trie.dfs(leaf_only=True)]
-
-    return _mbs_groups_dfs(leaf_entries, max_token_len)
-
-
 def mbs_groups_from_leaf_idx(
     leaf_idx,
     trie: PrefixTrie,
     max_token_len: int,
+    block_ids: Optional[list] = None,
 ) -> list[list[int]]:
     """Group reordered batch positions into micro-batches from leaf_idx
-    (reorder-safe counter-part of mbs_groups_from_trie)."""
+    (reorder-safe: groups by leaf_idx rather than trie DFS order).
+
+    ``block_ids`` (optional, per-position uid) makes uid blocks atomic: a block
+    is never split across micro-batches.
+    """
     leaf_to_positions: dict[int, list[int]] = {}
     for new_pos, leaf_fid in enumerate(leaf_idx.tolist()):
         if leaf_fid < 0:
@@ -302,7 +284,7 @@ def mbs_groups_from_leaf_idx(
         uncovered = set(leaf_to_positions) - {node.node_idx for node in trie.nodes}
         raise ValueError(f"leaf_idx references {len(uncovered)} non-existent node(s): {sorted(uncovered)}")
 
-    return _mbs_groups_dfs(leaf_entries, max_token_len)
+    return _mbs_groups_dfs(leaf_entries, max_token_len, block_ids=block_ids)
 
 
 def build_subtrie_view(
@@ -428,6 +410,15 @@ def prepare_prefix_tree_micro_batches(
         )
 
     use_dynamic_bsz_local = tu.get_non_tensor_data(data, "use_dynamic_bsz", default=True)
+    # Per-position uid for atomic block grouping: never split a uid block
+    # (same prompt's rollouts) across micro-batches. v1 keys are
+    # {uid}_{session_id}_{index}; classic carries non_tensor_batch["uid"].
+    if hasattr(data, "non_tensor_batch") and data.non_tensor_batch.get("uid") is not None:
+        uid_list = list(data.non_tensor_batch["uid"])
+    elif hasattr(data, "keys") and not callable(data.keys):
+        uid_list = [k.rsplit("_", 1)[0] for k in data.keys]
+    else:
+        uid_list = None
     if use_dynamic_bsz_local and "max_token_len_per_gpu" in data.keys():
         # Dynamic bsz: group by flat-token budget.
         _log.warning_once(
@@ -435,7 +426,7 @@ def prepare_prefix_tree_micro_batches(
             "deduplicated (flat trie) token count, not raw sequence length."
         )
         max_token_len = data["max_token_len_per_gpu"] * sp_size
-        batch_idx_list = mbs_groups_from_leaf_idx(leaf_idx, trie, max_token_len)
+        batch_idx_list = mbs_groups_from_leaf_idx(leaf_idx, trie, max_token_len, block_ids=uid_list)
     else:
         # Fixed mbs: chunk by sequence count in DFS trie order so same-prefix
         # sequences land in the same micro-batch.
@@ -443,30 +434,58 @@ def prepare_prefix_tree_micro_batches(
         dfs_order = trie_dfs_leaf_order_from_leaf_idx(leaf_idx, trie)
         batch_idx_list = [dfs_order[i : i + mbs] for i in range(0, len(dfs_order), mbs)]
 
+    # Pad to the max micro-batch count across the DP group, then to divisibility.
+    target = len(batch_idx_list)
     if torch.distributed.is_initialized() and same_micro_num_in_dp and dp_group is not None:
         n_mb = torch.tensor([len(batch_idx_list)], device=get_torch_device().current_device())
         torch.distributed.all_reduce(n_mb, op=torch.distributed.ReduceOp.MAX, group=dp_group)
         while len(batch_idx_list) < n_mb.item():
-            batch_idx_list.append(batch_idx_list[-1])
+            idx = max(range(len(batch_idx_list)), key=lambda i: len(batch_idx_list[i]))
+            if len(batch_idx_list[idx]) <= 1:
+                break
+            g = batch_idx_list[idx]
+            batch_idx_list[idx] = g[:-1]
+            batch_idx_list.append([g[-1]])
 
     if num_batches_divided_by is not None:
         target = roundup_divisible(len(batch_idx_list), num_batches_divided_by)
         while len(batch_idx_list) < target:
-            batch_idx_list.append(batch_idx_list[-1])
+            idx = max(range(len(batch_idx_list)), key=lambda i: len(batch_idx_list[i]))
+            if len(batch_idx_list[idx]) <= 1:
+                break
+            g = batch_idx_list[idx]
+            batch_idx_list[idx] = g[:-1]
+            batch_idx_list.append([g[-1]])
 
-    micro_batches = [tu.index_select_tensor_dict(data, idx) for idx in batch_idx_list]
-    # Compute deduplicated (flat) token count per micro-batch, used for PP
-    # sort and for imbalance diagnostics.
-    tokens_per_group = [trie_group_flat_tokens(g, trie) for g in batch_idx_list]
+    # Build subtries ONCE with LOCAL leaf_to_sample (required by downstream
+    # restore in build_layout_from_tree_node). The cached flat_tokens
+    # property provides the flat token count without a separate rebuild.
+    _leaf_idx_list = leaf_idx.tolist()
+    subtries = []
+    for g in batch_idx_list:
+        leaf_node_ids = [_leaf_idx_list[j] for j in g]
+        subtries.append(
+            PrefixSubTrie(
+                source=trie,
+                leaf_node_ids=leaf_node_ids,
+                leaf_to_sample=list(range(len(g))),
+                batch_size=len(g),
+            )
+        )
+    tokens_per_group = [s.flat_tokens for s in subtries]
 
     # Reorder micro-batches inc-then-dec by flat-token count to reduce PP bubble.
     if use_dynamic_bsz_local and len(batch_idx_list) > 1:
-        sorted_groups = sorted(zip(tokens_per_group, batch_idx_list, range(len(batch_idx_list)), strict=False))
-        ordered_tokens = [t for t, _, _ in sorted_groups]
-        ordered_groups = [g for _, g, _ in sorted_groups]
+        indices = list(range(len(batch_idx_list)))
+        sorted_groups = sorted(zip(tokens_per_group, indices, batch_idx_list, subtries, strict=False))
+        ordered_tokens = [t for t, _, _, _ in sorted_groups]
+        ordered_groups = [g for _, _, g, _ in sorted_groups]
+        ordered_subtries = [s for _, _, _, s in sorted_groups]
         batch_idx_list = ordered_groups[::2] + ordered_groups[1::2][::-1]
         tokens_per_group = ordered_tokens[::2] + ordered_tokens[1::2][::-1]
-        micro_batches = [tu.index_select_tensor_dict(data, idx) for idx in batch_idx_list]
+        subtries = ordered_subtries[::2] + ordered_subtries[1::2][::-1]
+
+    micro_batches = [tu.index_select_tensor_dict(data, idx) for idx in batch_idx_list]
 
     # Compute accurate per-mb sharing ratio from actual engine grouping and push to module collector.
     _input_ids = data["input_ids"]
@@ -485,46 +504,13 @@ def prepare_prefix_tree_micro_batches(
             continue
         _push_mbs_shared_ratio(1.0 - flat / group_raw)
 
-    create_and_attach_subtrie_views(micro_batches, batch_idx_list, trie)
+    # Attach subtries (built once above, no rebuild).
+    for mb, sub in zip(micro_batches, subtries, strict=False):
+        tu.assign_non_tensor(mb, prefix_tree_subtree=sub)
     return micro_batches, batch_idx_list
 
 
-def create_and_attach_subtrie_views(micro_batches, batch_idx_list, trie) -> None:
-    """Create a subtrie view per micro-batch and attach via tu.assign_non_tensor(prefix_tree_subtree=...).
-
-    Reads leaf_idx from each mb (reorder-safe via torch indexing)."""
-    if trie is None or batch_idx_list is None:
-        return
-    for idx, mb in zip(batch_idx_list, micro_batches, strict=False):
-        mb_leaf_idx = mb.get("leaf_idx", None) if hasattr(mb, "get") else mb["leaf_idx"]
-        if mb_leaf_idx is None:
-            raise ValueError(
-                "create_and_attach_subtrie_views: microbatch has no leaf_idx in "
-                "batch.  _build_global_trie must attach leaf_idx and it "
-                "must survive reorder/chunk: this is a bug."
-            )
-        leaf_to_local: dict[int, int] = {}
-        leaf_node_ids: list[int] = []
-        leaf_to_sample: list[int] = []
-        for local_pos, leaf_fid in enumerate(mb_leaf_idx.tolist()):
-            if leaf_fid < 0:
-                raise ValueError(
-                    f"microbatch leaf_idx[{local_pos}]={leaf_fid}; no leaf assigned (bug in _build_global_trie)."
-                )
-            if leaf_fid not in leaf_to_local:
-                leaf_to_local[leaf_fid] = len(leaf_node_ids)
-            leaf_node_ids.append(leaf_fid)
-            leaf_to_sample.append(local_pos)
-        local_subtree = PrefixSubTrie(
-            source=trie,
-            leaf_node_ids=leaf_node_ids,
-            leaf_to_sample=leaf_to_sample,
-            batch_size=len(idx),
-        )
-        tu.assign_non_tensor(mb, prefix_tree_subtree=local_subtree)
-
-
-def _blocks_by_ids(trie, block_ids) -> tuple[list[tuple[int, list[int]]], list[int]]:
+def _blocks_by_ids(trie, block_ids, active_samples=None) -> tuple[list[tuple[int, list[int]]], list[int]]:
     """Group samples into blocks by an external identity (e.g. prompt session key).
 
     Returns (blocks, flat_list): blocks = [(flat_tokens, sorted_sample_ids)] in
@@ -532,15 +518,29 @@ def _blocks_by_ids(trie, block_ids) -> tuple[list[tuple[int, list[int]]], list[i
     only trie nodes whose sequence_ids lie ENTIRELY within the block — ancestors
     shared across blocks (system prompt) are excluded, and they cancel out in the
     per-rank workload comparison anyway.
+
+    When ``active_samples`` is given (a set of global sample indices), only those
+    samples form blocks, and a trie node is counted only if ALL its sequence_ids
+    are in the active set (per-minibatch balancing: the global trie is reused, but
+    block formation + token counting are restricted to the active minibatch).
     """
+    if active_samples is None:
+        active = None
+    else:
+        active = set(active_samples)
+
     blocks_by_id: dict = {}
     for i, bid in enumerate(block_ids):
+        if active is not None and i not in active:
+            continue
         blocks_by_id.setdefault(bid, []).append(i)
 
     flat_by_id = {bid: 0 for bid in list(blocks_by_id)}
     for node in trie.nodes:
         sids = node.sequence_ids
         if not sids:
+            continue
+        if active is not None and not all(s in active for s in sids):
             continue
         bid = block_ids[sids[0]]
         if all(block_ids[s] == bid for s in sids):
@@ -555,6 +555,7 @@ def balance_prefix_tree_blocks(
     trie,
     dp_size: int,
     block_ids,
+    active_samples=None,
 ) -> tuple[list[int], list[list[int]], list[int]]:
     """Balance whole trees across DP ranks by flat-token workload.
 
@@ -562,13 +563,17 @@ def balance_prefix_tree_blocks(
     identity): a block's samples are never split across ranks, so intra-rank
     prefix dedup (and same-prompt GRPO advantage grouping) is preserved.
 
+    When ``active_samples`` is given, only those samples (global indices) are
+    balanced — used for per-minibatch balancing (keep_minibatch), where the
+    global trie is reused but block formation is restricted to the minibatch.
+
     Returns:
         permutation: new sample order, rank-major (rank 0's blocks first, ...).
             ``permutation[new_pos]`` = original sample index.
         partitions: ``partitions[r]`` = list of block indices assigned to rank r.
         workloads: workload per block (same indexing as block order).
     """
-    blocks, flat_list = _blocks_by_ids(trie, block_ids)
+    blocks, flat_list = _blocks_by_ids(trie, block_ids, active_samples=active_samples)
 
     # Treat each block as one sortable unit: apply the standard transformer
     # workload formula (24576*n + n²) to its flat (deduplicated) token count.
@@ -590,7 +595,7 @@ def balance_prefix_tree_blocks(
     return permutation, partitions, workloads
 
 
-def reorder_and_balance_for_prefix_tree(
+def balance_prefix_tree_v0(
     data,
     config_or_data: dict,
     dp_size: int,
@@ -598,13 +603,10 @@ def reorder_and_balance_for_prefix_tree(
     attention_mask=None,
     metrics: dict | None = None,
     logging_prefix: str = "global_seqlen",
+    keep_minibatch: bool = False,
+    minibatch_size: int | None = None,
 ) -> bool:
-    """Reorder the batch so each DP rank receives whole trees balanced by flat-token workload.
-
-    Samples are permuted rank-major in tree-block units (``balance_prefix_tree_blocks``);
-    the reorder is KEPT (the caller's dispatch splits contiguously). Logs tree
-    flat-token unbalance stats under ``logging_prefix``.
-    """
+    """Reorder the batch so each DP rank receives whole trees balanced by per-tree deduped workload."""
     if not _is_prefix_tree_enabled(config_or_data):
         return False
 
@@ -627,13 +629,48 @@ def reorder_and_balance_for_prefix_tree(
     non_tensor = getattr(data, "non_tensor_batch", None)
     if non_tensor is None or "uid" not in non_tensor:
         raise ValueError(
-            "reorder_and_balance_for_prefix_tree: non_tensor_batch['uid'] is required "
-            "to block samples by prompt identity."
+            "balance_prefix_tree_v0: non_tensor_batch['uid'] is required to block samples by prompt identity."
         )
     uids = non_tensor["uid"]
     if len(uids) != n_samples:
         raise ValueError(f"uid count {len(uids)} != n_samples {n_samples}")
     block_ids = [str(u) for u in uids]
+
+    if keep_minibatch:
+        # Per-minibatch tree-block balancing: balance each minibatch's samples
+        # across DP ranks independently (sort NOT cross-minibatch), reusing the
+        # global trie via the active_samples filter. Mirrors _balance_batch's
+        # non-tree keep_minibatch branch (ray_trainer.py:1210).
+        if minibatch_size is None:
+            raise ValueError("balance_prefix_tree_v0: keep_minibatch=True requires minibatch_size.")
+        minibatch_num = n_samples // minibatch_size
+        permutation: list[int] = []
+        all_partitions: list[list[int]] = [[] for _ in range(dp_size)]
+        all_workloads: list[int] = []
+        for i in range(minibatch_num):
+            active = set(range(i * minibatch_size, (i + 1) * minibatch_size))
+            mb_perm, mb_parts, mb_workloads = balance_prefix_tree_blocks(
+                trie, dp_size, block_ids, active_samples=active
+            )
+            # mb_perm is already global indices (active_samples are global); concatenate.
+            permutation.extend(mb_perm)
+            for j, part in enumerate(mb_parts):
+                all_partitions[j].extend(part)
+            all_workloads.extend(mb_workloads)
+        if len(permutation) != n_samples:
+            raise RuntimeError(f"keep_minibatch permutation covered {len(permutation)}/{n_samples} samples.")
+        if hasattr(data, "reorder"):
+            data.reorder(torch.tensor(permutation))
+        else:
+            data = tu.index_select_tensor_dict(data, torch.tensor(permutation))
+        if metrics is not None:
+            stats = log_seqlen_unbalance(
+                seqlen_list=all_workloads,
+                partitions=all_partitions,
+                prefix=logging_prefix,
+            )
+            metrics.update(stats)
+        return True
 
     permutation, partitions, workloads = balance_prefix_tree_blocks(trie, dp_size, block_ids)
     if len(permutation) != n_samples:
@@ -655,3 +692,26 @@ def reorder_and_balance_for_prefix_tree(
         )
         metrics.update(stats)
     return True
+
+
+def balance_prefix_tree_v1(batch, trie, metrics: dict, dp_size: int, logging_prefix: str):
+    """v1 (KVBatchMeta) adapter over :func:`balance_prefix_tree_blocks`: reorder the
+    batch so each DP rank receives whole uid blocks balanced by flat-token workload.
+
+    Synthetic padding samples (``is_padding`` tag) are excluded from the balance and
+    re-appended after the permutation, mirroring v0's pure-batch balancing."""
+    block_ids = [k.rsplit("_", 1)[0] for k in batch.keys]
+    real_positions = [i for i, tag in enumerate(batch.tags) if not tag.get("is_padding", False)]
+    pad_positions = [i for i in range(len(batch.keys)) if batch.tags[i].get("is_padding", False)]
+    permutation, partitions, workloads = balance_prefix_tree_blocks(
+        trie, dp_size, block_ids, active_samples=real_positions
+    )
+    if len(permutation) != len(real_positions):
+        raise RuntimeError(
+            f"balance_prefix_tree_v1 covered {len(permutation)}/{len(real_positions)} real samples: "
+            "trie does not cover every sample."
+        )
+    batch.reorder(permutation + pad_positions)
+    stats = log_seqlen_unbalance(seqlen_list=workloads, partitions=partitions, prefix=logging_prefix)
+    metrics.update(stats)
+    return batch

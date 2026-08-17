@@ -89,6 +89,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.test_freq=10 \
     trainer.val_before_train=False \
     trainer.balance_batch=True \
+    trainer.balance_keep_minibatch=True \
     'trainer.logger=["console","tensorboard"]' \
     trainer.project_name=grpo_prefix_tree_magi \
     trainer.experiment_name="grpo_magi_${TS}" \
