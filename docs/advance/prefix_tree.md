@@ -100,26 +100,55 @@ Each box:
 - **Flat input_ids** — the subview's nodes laid out in DFS order; shared `P` appears once, each response once.
 - **MAGI block mask** — self-attn blocks are causal, cross-attn blocks (response → shared prefix) are full.
 
-The resulting block-sparse mask over `[ P | R0 | R1 | R2 | R3 ]` (`full` = attend, `causal` = lower-triangular, `·` = masked):
+Multi-level tree (P shared by all, A shared by R0/R1, B shared by R2/R3):
 
 ```
-        P        R0       R1       R2       R3
-   ┌──────────┬────────┬────────┬────────┬────────┐
- P │  causal  │   ·    │   ·    │   ·    │   ·    │   P sees only itself
-   ├──────────┼────────┼────────┼────────┼────────┤
-R0 │   full   │ causal │   ·    │   ·    │   ·    │   R0 sees P + itself
-   ├──────────┼────────┼────────┼────────┼────────┤
-R1 │   full   │   ·    │ causal │   ·    │   ·    │   R1 sees P + itself
-   ├──────────┼────────┼────────┼────────┼────────┤
-R2 │   full   │   ·    │   ·    │ causal │   ·    │
-   ├──────────┼────────┼────────┼────────┼────────┤
-R3 │   full   │   ·    │   ·    │   ·    │ causal │
-   └──────────┴────────┴────────┴────────┴────────┘
+Samples:
+  [P A R0]  [P A R1]  [P B R2]  [P B R3]
+
+Compressed trie:
+  root
+   └─ P (shared prefix)
+       ├─ A (shared by R0, R1)
+       │   ├─ leaf: R0
+       │   └─ leaf: R1
+       └─ B (shared by R2, R3)
+           ├─ leaf: R2
+           └─ leaf: R3
+
+Flat packed layout (tokens processed once):
+  ┌───┬───┬───┬────┬────┬────┬────┐
+  │ P │ A │ B │ R0 │ R1 │ R2 │ R3 │
+  └───┴───┴───┴────┴────┴────┴────┘
 ```
 
-Shared-prefix blocks are full; each segment self-block is causal; cross-response blocks (R0↔R1, …) are masked.
+The resulting block-sparse mask over `[ P | A | B | R0 | R1 | R2 | R3 ]`
+(`full` = attend, `causal` = lower-triangular, `·` = masked):
 
-`P` is processed once instead of once per rollout. See the README for the full call/data-flow graph.
+```
+        P        A        B        R0       R1       R2       R3
+   ┌────────┬────────┬────────┬────────┬────────┬────────┬────────┐
+ P │ causal │    ·   │    ·   │    ·   │    ·   │    ·   │    ·   │
+   ├────────┼────────┼────────┼────────┼────────┼────────┼────────┤
+ A │  full  │ causal │    ·   │    ·   │    ·   │    ·   │    ·   │
+   ├────────┼────────┼────────┼────────┼────────┼────────┼────────┤
+ B │  full  │    ·   │ causal │    ·   │    ·   │    ·   │    ·   │
+   ├────────┼────────┼────────┼────────┼────────┼────────┼────────┤
+R0 │  full  │  full  │    ·   │ causal │    ·   │    ·   │    ·   │
+   ├────────┼────────┼────────┼────────┼────────┼────────┼────────┤
+R1 │  full  │  full  │    ·   │    ·   │ causal │    ·   │    ·   │
+   ├────────┼────────┼────────┼────────┼────────┼────────┼────────┤
+R2 │  full  │    ·   │  full  │    ·   │    ·   │ causal │    ·   │
+   ├────────┼────────┼────────┼────────┼────────┼────────┼────────┤
+R3 │  full  │    ·   │  full  │    ·   │    ·   │    ·   │ causal │
+   └────────┴────────┴────────┴────────┴────────┴────────┴────────┘
+```
+
+The mask encodes the tree rules: every segment attends `full` to ALL its
+ancestors (R0 sees both P and A), siblings never see each other (A·B, R0·R1,
+R0·B), and ancestors never attend to descendants. Dedup happens at every
+level: P computed once (was 4x), A and B once each (was 2x each), only the
+leaves R0-R3 are computed per-sample. See the README for the full call/data-flow graph.
 
 ### DP reorder & dispatch
 
@@ -165,14 +194,16 @@ When enabled, the trainer emits a `prefix_tree/` metric group:
 
 Results and full curves on wandb: <https://wandb.ai/arvyanh-mt/verl_prefixtree>
 
-Base (no prefix-tree) vs MAGI prefix-tree, on two workloads — `longreason` (a long-prompt QA dataset) and `asearch` (multi-turn search implemented using uniagent). `ratio` is the prefix shared ratio (%); `update_actor` and `e2e` are the per-step actor-update and end-to-end times (s):
+Base (no prefix-tree) vs MAGI prefix-tree, on two workloads — `longreason` (a long-prompt QA dataset) and `asearch` (multi-turn search implemented using uniagent). `ratio` is the prefix shared ratio (%); `update_actor`, `olp` and `e2e` are the per-step actor-update, old-log-prob and end-to-end times (s):
 
-| Workload | ratio (%) | update_actor (s) | e2e (s) |
-|---|---|---|---|
-| base longreason | – | 82 | 186 |
-| magi longreason | 80 | 21 | 69 |
-| base asearch | – | 133 | 370 |
-| magi asearch | 35 | 82 | 300 |
+| Name | ratio (%) | update_actor (s) | olp (s) | e2e (s) |
+|---|---|---|---|---|
+| base longreason | – | 82 | 46 | 186 |
+| magi longreason | 80 | 21 | 14 | 69 |
+| base asearch | – | 133 | 46 | 370 |
+| magi asearch | 35 | 82 | 29 | 300 |
+| treegrpo-multihop-magi | 36 | 252 | 85 | 720 |
+| treegrpo-multihop-base | – | 170 | 63 | 594 |
 
 ## 7. Known limitations
 
