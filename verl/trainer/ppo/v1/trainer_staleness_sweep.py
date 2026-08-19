@@ -36,16 +36,20 @@ Extends PPOTrainerSync with two additions:
 Each step k within a cycle has staleness = k-1 (samples were decoded at W_0,
 current weights are W_{k-1}). Across N steps, sweep staleness 0..N-1.
 """
-import asyncio
 import logging
 import os
 
-import numpy as np
 import torch
 import transfer_queue as tq
 from transfer_queue import KVBatchMeta
 
-from verl.trainer.ppo.rollout_corr_helper import compute_offpolicy_metrics
+from verl.trainer.ppo.v1.reprefill_utils import (
+    build_reprefill_inputs,
+    compute_and_emit_staleness_metrics,
+    reprefill_trajectories,
+    slice_response_logprobs,
+    to_nested_jagged,
+)
 from verl.trainer.ppo.v1.trainer_base import register_trainer
 from verl.trainer.ppo.v1.trainer_sync import PPOTrainerSync
 from verl.utils.debug import marked_timer
@@ -144,20 +148,17 @@ class PPOTrainerStalenessSweep(PPOTrainerSync):
     def _compute_new_rollout_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         # Reprefill all trajectories with current rollout engine weight.
         resume_version = self.global_steps - 1
-        prompt_ids_list, real_lens, data = self._build_reprefill_inputs(
-            keys=batch.keys, partition_id=batch.partition_id
+        prompt_ids_list, real_lens, data = build_reprefill_inputs(
+            keys=batch.keys, partition_id=batch.partition_id, pad_id=self.tokenizer.pad_token_id
         )
-        sampling_params_list = [
-            {"prompt_logprobs": 0, "max_new_tokens": 0}
-        ] * len(batch.keys)
-        results = self._reprefill_trajectories_async(prompt_ids_list, sampling_params_list)
+        results = self._reprefill_trajectories_async(prompt_ids_list)
 
         new_rollout_log_probs_nested: list[list[float]] = []
         for i, result in enumerate(results):
             prompt_len, response_len = real_lens[i]
             prompt_logprobs_ls = result.extra_fields["prompt_logprobs"]
             new_rollout_log_probs_nested.append(
-                self._slice_response_logprobs(prompt_logprobs_ls, prompt_len, response_len)
+                slice_response_logprobs(prompt_logprobs_ls, prompt_len, response_len)
             )
 
         # Store as nested jagged tensor (same format as rollout_log_probs /
@@ -165,10 +166,7 @@ class PPOTrainerStalenessSweep(PPOTrainerSync):
         # correctly downstream. NonTensorStack (from tu.get_tensordict) is
         # not recognized by to_padded_tensor, breaking torch.exp in
         # calculate_debug_metrics.
-        data["new_rollout_log_probs"] = torch.nested.as_nested_tensor(
-            [torch.tensor(lst, dtype=torch.float32) for lst in new_rollout_log_probs_nested],
-            layout=torch.jagged,
-        )
+        data["new_rollout_log_probs"] = to_nested_jagged(new_rollout_log_probs_nested)
         tq.kv_batch_put(
             keys=batch.keys,
             partition_id=batch.partition_id,
@@ -184,48 +182,12 @@ class PPOTrainerStalenessSweep(PPOTrainerSync):
         return batch
 
     @auto_await
-    async def _reprefill_trajectories_async(self, prompt_ids_list, sampling_params_list):
-        client = self.get_llm_client()
-        results = await asyncio.gather(*[
-            client.generate(
-                request_id=f"staleness_sweep_reprefill_{i}",
-                prompt_ids=pids,
-                sampling_params=sp,
-            )
-            for i, (pids, sp) in enumerate(zip(prompt_ids_list, sampling_params_list))
-        ])
-        return results
-
-    def _build_reprefill_inputs(self, keys, partition_id):
-        data = tq.kv_batch_get(
-            keys=keys,
-            partition_id=partition_id,
-            select_fields=["prompts", "responses"],
+    async def _reprefill_trajectories_async(self, prompt_ids_list):
+        return await reprefill_trajectories(
+            client=self.get_llm_client(),
+            prompt_ids_list=prompt_ids_list,
+            request_prefix="staleness_sweep_reprefill",
         )
-        pad_id = self.tokenizer.pad_token_id
-        prompts_padded = data["prompts"].to_padded_tensor(padding=pad_id)
-        responses_padded = data["responses"].to_padded_tensor(padding=pad_id)
-
-        prompt_ids_list: list[list[int]] = []
-        real_lens: list[tuple[int, int]] = []
-        for i in range(len(keys)):
-            prompt_ids = [int(x) for x in prompts_padded[i].tolist() if x != pad_id]
-            response_ids = [int(x) for x in responses_padded[i].tolist() if x != pad_id]
-            prompt_ids_list.append(prompt_ids + response_ids)
-            real_lens.append((len(prompt_ids), len(response_ids)))
-        return prompt_ids_list, real_lens, data
-
-    def _slice_response_logprobs(self, prompt_logprobs_ls, prompt_len, response_len):
-        # sglang prompt_logprobs_ls has length S = prompt_len + response_len.
-        # Entry i is the logprob of the token at position i+1 predicted by
-        # tokens [0..i]. Response tokens occupy positions
-        # [prompt_len, prompt_len + response_len - 1]; their logprobs are at
-        # indices [prompt_len - 1, prompt_len + response_len - 2] of
-        # prompt_logprobs_ls. Each entry is a single-element list when
-        # prompt_logprobs=0.
-        start = max(prompt_len - 1, 0)
-        end = prompt_len + response_len - 1
-        return [float(entry[0]) for entry in prompt_logprobs_ls[start:end]]
 
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         # Emit staleness/mismatch/combined off-policy metrics from the three
@@ -235,46 +197,4 @@ class PPOTrainerStalenessSweep(PPOTrainerSync):
         return super()._compute_advantage(batch, metrics)
 
     def _compute_staleness_metrics(self, batch: KVBatchMeta, metrics: dict) -> None:
-        # Fetch all three logprobs + response_mask from TQ. new_rollout_log_probs
-        # was written in on_sampled; old_log_probs in _compute_old_log_prob.
-        fields = ["rollout_log_probs", "new_rollout_log_probs", "old_log_probs", "response_mask"]
-        try:
-            data = tq.kv_batch_get(
-                keys=batch.keys, partition_id=batch.partition_id, select_fields=fields,
-            )
-        except Exception as e:
-            logger.warning(f"staleness_sweep: failed to fetch logprobs for metrics: {e}")
-            return
-
-        from verl import DataProto
-        data = DataProto(batch=data.to_padded_tensor())
-
-        rollout_lp = data.batch["rollout_log_probs"]
-        new_rollout_lp = data.batch["new_rollout_log_probs"]
-        old_lp = data.batch["old_log_probs"]
-        response_mask = data.batch["response_mask"]
-
-        # resume_version (set in on_sampled) vs implicit consume_version
-        # (= global_steps, since _compute_old_log_prob runs at this step).
-        resume_versions = np.array(
-            [tag.get("resume_version", self.global_steps - 1) for tag in batch.tags],
-            dtype=np.int64,
-        )
-        staleness = (self.global_steps - 1) - resume_versions
-        metrics["staleness_sweep/sample_staleness_mean"] = float(staleness.mean())
-        metrics["staleness_sweep/sample_staleness_max"] = float(staleness.max())
-
-        corr_metrics = compute_offpolicy_metrics(
-            old_log_prob=old_lp,
-            rollout_log_prob=rollout_lp,
-            response_mask=response_mask,
-            new_rollout_log_prob=new_rollout_lp,
-        )
-        # Wrap with "offpolicy/" prefix to group all compute_offpolicy_metrics
-        # outputs (combined group + staleness/* + mismatch/*) under one
-        # namespace. staleness_sweep/* meta metrics stay unwrapped.
-        for key, value in corr_metrics.items():
-            if isinstance(value, torch.Tensor):
-                metrics[f"offpolicy/{key}"] = value.item()
-            else:
-                metrics[f"offpolicy/{key}"] = value
+        compute_and_emit_staleness_metrics(batch, metrics, self.global_steps)
