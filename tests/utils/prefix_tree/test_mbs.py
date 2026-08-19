@@ -120,19 +120,17 @@ def test_mbs_groups_from_leaf_idx_allows_non_leaf_ref():
     assert sorted(i for mb in mbs for i in mb) == list(range(len(samples)))
 
 
-def test_mbs_groups_from_leaf_idx_uid_blocks_atomic():
-    """Positions sharing a uid never split across micro-batches: budget 15 fits one
-    leaf but not a whole 2-rollout block, so the old leaf-by-leaf walk would split it."""
+def test_mbs_groups_from_leaf_idx_budget_overrides_uid():
+    """Uid atomicity is owned by DP balancing, not mbs grouping: rollouts of one
+    prompt may split across micro-batches so the flat-token budget is always
+    respected (budget 15 fits one leaf's path but not two rollouts of a prompt)."""
     samples = _make_samples(2, 2, prefix_len=10, resp_len=5, seed=1)
     trie = _build_trie(samples)
     leaf_idx = _leaf_idx_from_trie(trie, len(samples))
-    block_ids = ["A", "A", "B", "B"]
-    mbs = mbs_groups_from_leaf_idx(leaf_idx, trie, max_token_len=15, block_ids=block_ids)
+    mbs = mbs_groups_from_leaf_idx(leaf_idx, trie, max_token_len=15)
     assert sorted(i for mb in mbs for i in mb) == list(range(len(samples)))
-    pos_group = {p: gi for gi, mb in enumerate(mbs) for p in mb}
-    assert pos_group[0] == pos_group[1], "block A split across micro-batches"
-    assert pos_group[2] == pos_group[3], "block B split across micro-batches"
-    assert pos_group[0] != pos_group[2], "blocks A and B merged despite budget"
+    for mb in mbs:
+        assert trie_group_flat_tokens(mb, trie) <= 15, f"micro-batch over budget: {trie_group_flat_tokens(mb, trie)}"
 
 
 def test_mbs_groups_from_leaf_idx_skips_other_rank_leaves():

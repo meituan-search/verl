@@ -198,51 +198,31 @@ def trie_dfs_leaf_order_from_leaf_idx(leaf_idx, trie: PrefixTrie) -> list[int]:
 def _mbs_groups_dfs(
     leaf_entries: list[tuple[TrieNode, list[int]]],
     max_token_len: int,
-    block_ids: Optional[list] = None,
 ) -> list[list[int]]:
     """DFS-budget walk: groups leaf samples into micro-batches by flat (deduplicated) token budget.
 
-    Samples move in atomic blocks: positions of one leaf (duplicates) always stay
-    together; when ``block_ids`` is given, positions sharing a uid form a block that
-    is never split across groups (an oversized block forms its own group)."""
-    if block_ids is None:
-        blocks: list[list[tuple[TrieNode, list[int]]]] = [[entry] for entry in leaf_entries]
-    else:
-        pos_to_block = {p: bid for p, bid in enumerate(block_ids)}
-        blocks_by_id: dict = {}
-        block_order: list = []
-        for node, positions in leaf_entries:
-            for p in positions:
-                bid = pos_to_block[p]
-                if bid not in blocks_by_id:
-                    blocks_by_id[bid] = []
-                    block_order.append(bid)
-                blocks_by_id[bid].append((node, [p]))
-        blocks = [blocks_by_id[bid] for bid in block_order]
-
-    def block_increment(entries, covered: set[int]) -> tuple[int, set[int]]:
-        new_nodes: list[TrieNode] = []
-        for node, _ in entries:
-            for n in trie_ancestors(node) + [node]:
-                if n.node_idx not in covered:
-                    new_nodes.append(n)
-        return sum(len(n.input_ids) for n in new_nodes), {n.node_idx for n in new_nodes}
-
+    When a leaf holds multiple positions (identical sequences), all stay in the same
+    DFS group to avoid singleton groups. Uid atomicity is NOT enforced here - it is
+    owned by DP balancing (balance_prefix_tree_blocks); mbs grouping may freely
+    split a uid's rollouts across micro-batches to respect the budget."""
     all_groups: list[list[int]] = []
     current_group: list[int] = []
     covered: set[int] = set()
     current_eff = 0  # flat tokens accumulated in current group
 
-    for entries in blocks:
-        inc, new_nodes = block_increment(entries, covered)
+    for node, positions in leaf_entries:
+        path = trie_ancestors(node) + [node]
+        new_nodes = [n for n in path if n.node_idx not in covered]
+        inc = sum(len(n.input_ids) for n in new_nodes)
         if current_group and current_eff + inc > max_token_len:
             all_groups.append(current_group[:])
             current_group = []
             covered = set()
             current_eff = 0
-            inc, new_nodes = block_increment(entries, covered)
-        current_group.extend(p for _, positions in entries for p in positions)
-        covered.update(new_nodes)
+            new_nodes = path
+            inc = sum(len(n.input_ids) for n in new_nodes)
+        current_group.extend(positions)
+        covered.update(n.node_idx for n in new_nodes)
         current_eff += inc
 
     if current_group:
@@ -254,14 +234,9 @@ def mbs_groups_from_leaf_idx(
     leaf_idx,
     trie: PrefixTrie,
     max_token_len: int,
-    block_ids: Optional[list] = None,
 ) -> list[list[int]]:
     """Group reordered batch positions into micro-batches from leaf_idx
-    (reorder-safe: groups by leaf_idx rather than trie DFS order).
-
-    ``block_ids`` (optional, per-position uid) makes uid blocks atomic: a block
-    is never split across micro-batches.
-    """
+    (reorder-safe: groups by leaf_idx rather than trie DFS order)."""
     leaf_to_positions: dict[int, list[int]] = {}
     for new_pos, leaf_fid in enumerate(leaf_idx.tolist()):
         if leaf_fid < 0:
@@ -275,7 +250,7 @@ def mbs_groups_from_leaf_idx(
     for node in trie.nodes:
         positions = leaf_to_positions.get(node.node_idx)
         if positions is None:
-            continue  # node belongs to a different DP rank — skip
+            continue  # node belongs to a different DP rank - skip
         # True leaves AND internal nodes (strict-prefix samples end at an
         # internal node; their leaf_idx points there).
         leaf_entries.append((node, positions))
@@ -284,7 +259,7 @@ def mbs_groups_from_leaf_idx(
         uncovered = set(leaf_to_positions) - {node.node_idx for node in trie.nodes}
         raise ValueError(f"leaf_idx references {len(uncovered)} non-existent node(s): {sorted(uncovered)}")
 
-    return _mbs_groups_dfs(leaf_entries, max_token_len, block_ids=block_ids)
+    return _mbs_groups_dfs(leaf_entries, max_token_len)
 
 
 def build_subtrie_view(
@@ -410,15 +385,6 @@ def prepare_prefix_tree_micro_batches(
         )
 
     use_dynamic_bsz_local = tu.get_non_tensor_data(data, "use_dynamic_bsz", default=True)
-    # Per-position uid for atomic block grouping: never split a uid block
-    # (same prompt's rollouts) across micro-batches. v1 keys are
-    # {uid}_{session_id}_{index}; classic carries non_tensor_batch["uid"].
-    if hasattr(data, "non_tensor_batch") and data.non_tensor_batch.get("uid") is not None:
-        uid_list = list(data.non_tensor_batch["uid"])
-    elif hasattr(data, "keys") and not callable(data.keys):
-        uid_list = [k.rsplit("_", 1)[0] for k in data.keys]
-    else:
-        uid_list = None
     if use_dynamic_bsz_local and "max_token_len_per_gpu" in data.keys():
         # Dynamic bsz: group by flat-token budget.
         _log.warning_once(
@@ -426,7 +392,7 @@ def prepare_prefix_tree_micro_batches(
             "deduplicated (flat trie) token count, not raw sequence length."
         )
         max_token_len = data["max_token_len_per_gpu"] * sp_size
-        batch_idx_list = mbs_groups_from_leaf_idx(leaf_idx, trie, max_token_len, block_ids=uid_list)
+        batch_idx_list = mbs_groups_from_leaf_idx(leaf_idx, trie, max_token_len)
     else:
         # Fixed mbs: chunk by sequence count in DFS trie order so same-prefix
         # sequences land in the same micro-batch.

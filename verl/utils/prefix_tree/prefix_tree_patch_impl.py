@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Monkey-patches for Megatron-LM: MAGI/flex attention via TEDotProductAttention.forward,
-SelfAttention._checkpointed, TransformerLayer/Block, GPTModel + RoPE CP slicing override."""
+"""Monkey-patches for Megatron-LM: MAGI/flex key threaded to TEDotProductAttention.forward via
+TransformerLayer (core_attention wrap) + checkpointed-attention capture, TransformerBlock, GPTModel,
++ RoPE CP slicing override."""
 
 from __future__ import annotations
 
@@ -245,36 +246,7 @@ def apply_prefix_tree_patch() -> None:
 
     SelfAttention._checkpointed_attention_forward = _sa_ckpt_forward
 
-    # 3. SelfAttention.forward: accept and thread magi/flex attention key.
-    _orig_sa_forward = SelfAttention.forward
-
-    @functools.wraps(_orig_sa_forward)
-    def _sa_forward(self, hidden_states, attention_mask, magi_attention_key=None, flex_attention_key=None, **kwargs):
-        attn_key = magi_attention_key or flex_attention_key
-        _real_ca_forward = self.core_attention.forward
-
-        @functools.wraps(_real_ca_forward)
-        def _ca_forward_with_key(q, k, v, *args, **kw):
-            return _real_ca_forward(
-                q,
-                k,
-                v,
-                *args,
-                magi_attention_key=magi_attention_key if attn_key else None,
-                flex_attention_key=flex_attention_key if attn_key else None,
-                **kw,
-            )
-
-        self.core_attention.forward = _ca_forward_with_key
-        try:
-            out = _orig_sa_forward(self, hidden_states, attention_mask, **kwargs)
-        finally:
-            self.core_attention.forward = _real_ca_forward
-        return out
-
-    SelfAttention.forward = _sa_forward
-
-    # 4. TransformerLayer.forward: accept and pass magi/flex attention key, with recompute stack fallback.
+    # 3. TransformerLayer.forward: accept and pass magi/flex attention key, with recompute stack fallback.
     _orig_tl_forward = TransformerLayer.forward
 
     @functools.wraps(_orig_tl_forward)
@@ -284,28 +256,34 @@ def apply_prefix_tree_patch() -> None:
         if magi_attention_key is None and flex_attention_key is None and _attn_key_stack:
             magi_attention_key, flex_attention_key = _attn_key_stack[-1]
         attn_key = magi_attention_key or flex_attention_key
-        if attn_key is None:
+        # Inject the key at core_attention.forward — the one seam shared by stock
+        # SelfAttention and subclasses (e.g. Qwen3.5 Qwen3_5VLSelfAttention), all of
+        # which call self.core_attention(...) internally. Never wrap self_attention.forward:
+        # subclasses may not accept the key kwargs. Layers without core_attention (GDN/SSM)
+        # route through their own ssm_gdn_patch and skip the key entirely.
+        _core_attn = getattr(self.self_attention, "core_attention", None) if attn_key is not None else None
+        if _core_attn is None:
             out = _orig_tl_forward(self, hidden_states, attention_mask, **kwargs)
         else:
-            _real_sa_forward = self.self_attention.forward
+            _real_ca_forward = _core_attn.forward
 
-            @functools.wraps(_real_sa_forward)
-            def _sa_forward_with_key(*args, **kw):
-                return _real_sa_forward(
+            @functools.wraps(_real_ca_forward)
+            def _ca_forward_with_key(*args, **kw):
+                return _real_ca_forward(
                     *args, magi_attention_key=magi_attention_key, flex_attention_key=flex_attention_key, **kw
                 )
 
-            self.self_attention.forward = _sa_forward_with_key
+            _core_attn.forward = _ca_forward_with_key
             try:
                 out = _orig_tl_forward(self, hidden_states, attention_mask, **kwargs)
             finally:
-                self.self_attention.forward = _real_sa_forward
+                _core_attn.forward = _real_ca_forward
 
         return out
 
     TransformerLayer.forward = _tl_forward
 
-    # 5. TransformerBlock.forward: accept and pass magi/flex attention key with checkpoint wrapper for recompute.
+    # 4. TransformerBlock.forward: accept and pass magi/flex attention key with checkpoint wrapper for recompute.
     _orig_tb_forward = TransformerBlock.forward
 
     @functools.wraps(_orig_tb_forward)
@@ -355,7 +333,7 @@ def apply_prefix_tree_patch() -> None:
 
     TransformerBlock.forward = _transformer_block_forward
 
-    # 6. GPTModel.forward: accept and pass magi/flex attention key.
+    # 5. GPTModel.forward: accept and pass magi/flex attention key.
     _orig_gpt_forward = GPTModel.forward
 
     @functools.wraps(_orig_gpt_forward)
