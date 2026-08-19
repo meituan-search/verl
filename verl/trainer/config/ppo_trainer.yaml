@@ -253,6 +253,19 @@ trainer:
       # N*train_batch prompts for one-shot rollout.
       num_steps: 8
 
+    # Re-prefill Decoupled PPO trainer: colocate_async where π_b
+    # (old_log_probs) is computed by re-prefilling consumed trajectories on
+    # the rollout engine at its current weight W_{k-1}, replacing the
+    # trainer-side old_log_prob forward pass.
+    reprefill_decoupled:
+
+      # Number of warmup batches to add before training loop starts
+      num_warmup_batches: 1
+
+      # Pre-dispatch re-prefill for samples as they finish during the
+      # replay-buffer poll loop, overlapping with remaining generation.
+      enable_prefill_pipeline: false
+
     # Replay buffer sampling strategy
     sampler:
 
