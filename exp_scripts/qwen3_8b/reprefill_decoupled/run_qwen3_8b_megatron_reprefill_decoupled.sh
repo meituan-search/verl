@@ -40,7 +40,12 @@ NUM_WARMUP_BATCHES=${NUM_WARMUP_BATCHES:-1}
 # P2 pipelined pre-dispatch: overlap re-prefill with remaining generation as
 # samples finish during the replay-buffer poll loop. false = P1 (post-hoc
 # re-prefill); true = P2 (pipelined pre-dispatch).
-ENABLE_PREFILL_PIPELINE=${ENABLE_PREFILL_PIPELINE:-false}
+ENABLE_PREFILL_PIPELINE=${ENABLE_PREFILL_PIPELINE:-True}
+
+# A/B timing comparison: also run the original trainer-side old_log_prob
+# forward pass each step (old_log_prob timer) alongside the rollout-side
+# re-prefill (new_rollout_log_prob timer).
+COMPARE_TRAINER_OLD_LOG_PROB=${COMPARE_TRAINER_OLD_LOG_PROB:-False}
 
 # Per-dataset defaults. Any knob can still be overridden via its env var
 # (TRAIN_FILES, TRAIN_BATCH_SIZE, ACTOR_LR, ...). DATASET just picks the base.
@@ -158,6 +163,7 @@ TRAINER=(
     trainer.v1.trainer_mode=reprefill_decoupled
     trainer.v1.reprefill_decoupled.num_warmup_batches=${NUM_WARMUP_BATCHES}
     trainer.v1.reprefill_decoupled.enable_prefill_pipeline=${ENABLE_PREFILL_PIPELINE}
+    trainer.v1.reprefill_decoupled.compare_trainer_old_log_prob=${COMPARE_TRAINER_OLD_LOG_PROB}
 )
 
 EXTRA=(

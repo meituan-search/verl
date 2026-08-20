@@ -147,6 +147,51 @@ class TestComputeOldLogProb:
         padded = data["old_log_probs"].to_padded_tensor(padding=0.0)
         assert torch.allclose(padded, expected.to_padded_tensor(padding=0.0))
 
+    def test_compare_mode_runs_trainer_pass_and_overwrites(self, tq_init, partition_id, monkeypatch):
+        trainer_computed = to_nested_jagged([[-9.1, -9.2], [-9.3]])
+        reprefill = to_nested_jagged([[-0.5, -0.6], [-0.7]])
+        keys = [f"{uuid.uuid4().hex}_0_0" for _ in range(2)]
+        tq.kv_batch_put(
+            keys=keys,
+            partition_id=partition_id,
+            fields=TensorDict({"new_rollout_log_probs": reprefill}, batch_size=len(keys)),
+        )
+
+        def fake_parent(self, batch, metrics):
+            tq.kv_batch_put(
+                keys=batch.keys,
+                partition_id=batch.partition_id,
+                fields=TensorDict({"old_log_probs": trainer_computed}, batch_size=len(batch.keys)),
+            )
+            return batch
+
+        from verl.trainer.ppo.v1.trainer_base import PPOTrainer
+
+        monkeypatch.setattr(PPOTrainer, "_compute_old_log_prob", fake_parent)
+
+        trainer = _make_trainer()
+        trainer.config.trainer.v1.reprefill_decoupled.compare_trainer_old_log_prob = True
+        batch = _make_batch(keys, partition_id)
+        metrics = {}
+
+        trainer._compute_old_log_prob(batch, metrics)
+
+        data = tq.kv_batch_get(
+            keys=keys,
+            partition_id=partition_id,
+            select_fields=["old_log_probs", "trainer_old_log_probs"],
+        )
+        assert torch.allclose(
+            data["old_log_probs"].to_padded_tensor(padding=0.0),
+            reprefill.to_padded_tensor(padding=0.0),
+        )
+        assert torch.allclose(
+            data["trainer_old_log_probs"].to_padded_tensor(padding=0.0),
+            trainer_computed.to_padded_tensor(padding=0.0),
+        )
+        assert metrics["reprefill_decoupled/trainer_old_log_prob_computed"] == 1.0
+        assert metrics["reprefill_decoupled/old_log_prob_source"] == 1.0
+
 
 class TestPrefillDispatcher:
     def test_submit_runs_coroutine_and_returns_future(self):

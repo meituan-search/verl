@@ -340,11 +340,23 @@ class PPOTrainerReprefillDecoupled(PPOTrainerColocateAsync):
         if bypass:
             return super()._compute_old_log_prob(batch, metrics)
 
+        compare = self.config.trainer.v1.reprefill_decoupled.get("compare_trainer_old_log_prob", False)
+        if compare:
+            # Run the original trainer-side forward pass (timed under the
+            # old_log_prob timer by _step_once) so its cost can be compared
+            # against the re-prefill (new_rollout_log_prob timer). Keep its
+            # result as trainer_old_log_probs for mismatch diagnostics.
+            batch = super()._compute_old_log_prob(batch, metrics)
+            metrics["reprefill_decoupled/trainer_old_log_prob_computed"] = 1.0
+
+        select_fields = ["new_rollout_log_probs"] + (["old_log_probs"] if compare else [])
         data = tq.kv_batch_get(
             keys=batch.keys,
             partition_id=batch.partition_id,
-            select_fields=["new_rollout_log_probs"],
+            select_fields=select_fields,
         )
+        if compare:
+            data["trainer_old_log_probs"] = data.pop("old_log_probs")
         data["old_log_probs"] = data.pop("new_rollout_log_probs")
         tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data)
         metrics["reprefill_decoupled/old_log_prob_source"] = 1.0  # 1.0 = reprefill

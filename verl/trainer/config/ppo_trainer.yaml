@@ -266,6 +266,13 @@ trainer:
       # replay-buffer poll loop, overlapping with remaining generation.
       enable_prefill_pipeline: false
 
+      # A/B timing comparison: keep computing the trainer-side old_log_prob
+      # forward pass (timed under the old_log_prob timer) alongside the
+      # rollout-side re-prefill (timed under the new_rollout_log_prob timer).
+      # The trainer result is stored as trainer_old_log_probs; the reprefill
+      # result remains the old_log_probs used for training.
+      compare_trainer_old_log_prob: false
+
     # Replay buffer sampling strategy
     sampler:
 

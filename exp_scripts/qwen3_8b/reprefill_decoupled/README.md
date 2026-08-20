@@ -20,6 +20,7 @@ All knobs are passed to the trainer config (`verl/trainer/config/ppo_trainer.yam
 | `trainer.v1.trainer_mode=reprefill_decoupled` | — | Select this trainer. |
 | `trainer.v1.reprefill_decoupled.num_warmup_batches` | `1` | Number of warmup batches added before the training loop starts. Larger values deepen staleness (Arm 1 stress). |
 | `trainer.v1.reprefill_decoupled.enable_prefill_pipeline` | `false` | `false` = **P1** (post-hoc re-prefill after the replay-buffer poll loop returns). `true` = **P2** (pipelined pre-dispatch, overlap re-prefill with remaining generation). |
+| `trainer.v1.reprefill_decoupled.compare_trainer_old_log_prob` | `false` | A/B timing comparison: also run the original trainer-side `old_log_prob` forward pass each step (timed under the `old_log_prob` timer) alongside the rollout-side re-prefill (timed under the `new_rollout_log_prob` timer). The trainer result is stored as `trainer_old_log_probs`; training still consumes the re-prefill values as `old_log_probs`. |
 
 The run script exposes the last two as env vars so P1 vs P2 comparison uses a
 single script:
@@ -139,6 +140,11 @@ Watch these in tensorboard / prometheus:
 - `new_rollout_log_prob` timer — the re-prefill wall-clock. **P1 vs P2
   comparison**: P2 (pipelined pre-dispatch) should be faster than P1
   (post-hoc) because it overlaps re-prefill with remaining generation.
+- `old_log_prob` timer — with
+  `trainer.v1.reprefill_decoupled.compare_trainer_old_log_prob=true`, this
+  times the original trainer-side forward pass in the same run, so
+  `old_log_prob` vs `new_rollout_log_prob` directly measures whether the
+  re-prefill saves the π_b computation cost.
 - actor entropy, KL (`actor.kl_loss` / `actor.kl_coef`), reward — the
   training-health signals. Arm 2 must stay stable; Arm 1 should diverge.
 
