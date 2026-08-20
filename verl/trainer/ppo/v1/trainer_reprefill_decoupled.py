@@ -102,32 +102,80 @@ class PPOTrainerReprefillDecoupled(PPOTrainerColocateAsync):
             self.replay_buffer.set_on_new_finished_callback(self._on_new_finished)
             logger.info("reprefill_decoupled: pipelined re-prefill pre-dispatch enabled")
 
+    def on_train_end(self):
+        # I2: shut the prefill dispatcher down if it was started (pipeline-
+        # disabled path never sets `_prefill_dispatcher`).
+        dispatcher = getattr(self, "_prefill_dispatcher", None)
+        if dispatcher is not None:
+            self._cancel_pending_prefills(reason="on_train_end")
+            dispatcher.shutdown()
+            logger.info("reprefill_decoupled: prefill dispatcher shut down on_train_end")
+
     def _on_new_finished(self, partition_id, new_keys):
-        # Pre-dispatch a single-request re-prefill for each newly finished
-        # uid. `new_keys` is a set of prompt uids (the prompt key, not the
-        # trajectory key) — matches `_pending_prefill`'s uid keying.
+        # Pre-dispatch re-prefills for newly-finished prompt uids' trajectory
+        # keys. `new_keys` from ReprefillReplayBuffer are prompt **uids**
+        # (is_prompt: True) — they carry only prompt-level fields, NOT
+        # `prompts`/`responses`. Resolve each uid to its trajectory keys
+        # (`{uid}_{session}_{index}`) via the freshly-synced replay buffer
+        # partition snapshot, and pre-dispatch one request per trajectory
+        # key. The callback fires inside `_sync_metadata_from_transfer_queue`
+        # AFTER `partitions` is populated, so all trajectory keys for a
+        # finished uid are present (verified: agent_loop_tq flips the prompt
+        # status to finished/failure only after ALL session tasks settle, and
+        # each session writes its trajectory via `_agent_loop_postprocess`
+        # before the parent task completes — see agent_loop_tq.py:131-143).
         if partition_id != "train":
             return
-        for key in new_keys:
-            if key in self._pending_prefill:
+        # I3: bound pre-dispatch to what the imminent sample() could select —
+        # at most `train_batch_size` newly-finished uids per poll iteration,
+        # oldest-first (smallest prompt_global_steps). The replay buffer's
+        # `prompt_global_steps[partition_id]` is populated by the same sync
+        # that triggers this callback, so it is fresh here.
+        train_batch_size = self.config.data.train_batch_size
+        prompt_global_steps = self.replay_buffer.prompt_global_steps.get(partition_id, {})
+        ordered_uids = sorted(new_keys, key=lambda u: prompt_global_steps.get(u, 0))
+        bounded_uids = ordered_uids[:train_batch_size] if train_batch_size > 0 else ordered_uids
+        if len(bounded_uids) < len(new_keys):
+            logger.debug(
+                f"reprefill_decoupled: pre-dispatch bounded to {len(bounded_uids)} "
+                f"of {len(new_keys)} newly-finished uids (train_batch_size={train_batch_size})"
+            )
+
+        partition = self.replay_buffer.partitions.get(partition_id, {})
+        for uid in bounded_uids:
+            # Find this uid's trajectory keys. Cheap O(n) scan of the
+            # partition — partitions are bounded by inflight prompts.
+            traj_keys = [k for k in partition if k.split("_")[0] == uid]
+            if not traj_keys:
+                # Should not happen given the terminal-group contract, but
+                # skip defensively — on_sampled will re-issue synchronously.
+                logger.warning(
+                    f"reprefill_decoupled: no trajectory keys found for "
+                    f"finished uid {uid}; skipping pre-dispatch"
+                )
                 continue
-            try:
-                prompt_ids_list, _, _ = build_reprefill_inputs(
-                    keys=[key], partition_id=partition_id,
-                    pad_id=self.tokenizer.pad_token_id,
-                )
-                future = self._prefill_dispatcher.submit(
-                    reprefill_trajectories(
-                        client=self.get_llm_client(),
-                        prompt_ids_list=prompt_ids_list,
-                        request_prefix=f"reprefill_p2_{self.global_steps}_{key}",
+            for traj_key in traj_keys:
+                if traj_key in self._pending_prefill:
+                    continue
+                try:
+                    prompt_ids_list, _, _ = build_reprefill_inputs(
+                        keys=[traj_key], partition_id=partition_id,
+                        pad_id=self.tokenizer.pad_token_id,
                     )
-                )
-                self._pending_prefill[key] = _PendingPrefill(
-                    version=self.global_steps, future=future
-                )
-            except Exception as e:
-                logger.warning(f"reprefill_decoupled: pre-dispatch failed for {key}: {e}")
+                    future = self._prefill_dispatcher.submit(
+                        reprefill_trajectories(
+                            client=self.get_llm_client(),
+                            prompt_ids_list=prompt_ids_list,
+                            request_prefix=f"reprefill_p2_{self.global_steps}_{traj_key}",
+                        )
+                    )
+                    self._pending_prefill[traj_key] = _PendingPrefill(
+                        version=self.global_steps, future=future
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"reprefill_decoupled: pre-dispatch failed for {traj_key}: {e}"
+                    )
 
     def on_sampled(self, batch: "KVBatchMeta", metrics: dict) -> "KVBatchMeta":
         if getattr(self, "_pending_prefill", None) is not None:
@@ -171,36 +219,68 @@ class PPOTrainerReprefillDecoupled(PPOTrainerColocateAsync):
         metrics["reprefill_decoupled/resume_version"] = float(resume_version)
         return batch
 
+    def _cancel_pending_prefills(self, reason: str = "on_sampled") -> int:
+        """I1: cancel unconsumed pre-dispatched re-prefill futures.
+
+        `_pending_prefill.clear()` drops dict references, but the underlying
+        coroutines on the dispatcher loop keep running; for unselected keys
+        the request gets aborted by on_sample_end's abort_replicas, then the
+        client's retry loop (should_retry=True for V1) retries it at the NEW
+        weight and the result is silently discarded — holding engine
+        capacity and LB sticky-session slots.
+
+        `run_coroutine_threadsafe` returns a wrapper `Future` whose
+        `cancel()` is safe to call: it stops the wrapper from running the
+        coroutine's body if it hasn't started, and the coroutine (if
+        already running) gets `CancelledError` at its next await. The
+        abort_replicas call in on_sample_end remains the engine-side
+        backstop; cancellation stops the retry loop from persisting.
+
+        Returns the number of futures that were cancelled.
+        """
+        cancelled = 0
+        for key, entry in list(self._pending_prefill.items()):
+            if entry.future.done():
+                continue
+            try:
+                if entry.future.cancel():
+                    cancelled += 1
+                else:
+                    logger.debug(
+                        f"reprefill_decoupled: prefill future for {key} "
+                        f"could not be cancelled (already running/done) during {reason}"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"reprefill_decoupled: error cancelling prefill future for {key}: {e}"
+                )
+        if cancelled:
+            logger.info(
+                f"reprefill_decoupled: cancelled {cancelled} unconsumed "
+                f"pre-dispatched prefill futures during {reason}"
+            )
+        return cancelled
+
     def _compute_new_rollout_log_prob_pipelined(self, batch, metrics):
-        # `_pending_prefill` is keyed by prompt uid (what the callback
-        # delivers), but `batch.keys` are trajectory keys
-        # (`{uid}_{session}_{index}`). Derive the uid via `key.split("_")[0]`
-        # — the established convention in replay_buffer.py. A single
-        # pre-dispatched request's 1-element result only covers one
-        # trajectory; if a uid maps to multiple trajectory keys in this
-        # batch (multi-session or multi-turn), the pre-dispatched result
-        # can't be reused for both — re-issue those synchronously.
+        # `_pending_prefill` is keyed by **trajectory key** (what
+        # `_on_new_finished` resolves each uid to). `batch.keys` are also
+        # trajectory keys, so the lookup is direct — no uid-derivation or
+        # multi-trajectory guard needed (one pre-dispatched request per
+        # trajectory key → 1-element result list maps 1:1 to that key).
         resume_version = self.global_steps - 1
         prompt_ids_list, real_lens, data = build_reprefill_inputs(
             keys=batch.keys, partition_id=batch.partition_id,
             pad_id=self.tokenizer.pad_token_id,
         )
-        uid_to_indices: dict[str, list[int]] = {}
-        for i, key in enumerate(batch.keys):
-            uid_to_indices.setdefault(key.split("_")[0], []).append(i)
 
         results_by_index: dict[int, object] = {}
         reissue_indices: list[int] = []
         for i, key in enumerate(batch.keys):
-            uid = key.split("_")[0]
-            entry = self._pending_prefill.get(uid)
+            entry = self._pending_prefill.get(key)
             consumed = False
-            if (
-                entry is not None
-                and entry.version == self.global_steps
-                and len(uid_to_indices[uid]) == 1
-            ):
+            if entry is not None and entry.version == self.global_steps:
                 try:
+                    # One pre-dispatched request → 1-element result list.
                     result = entry.future.result(timeout=600)[0]
                     engine_version = result.extra_fields.get("global_steps", None)
                     if engine_version is not None and engine_version != resume_version:
@@ -245,8 +325,13 @@ class PPOTrainerReprefillDecoupled(PPOTrainerColocateAsync):
                 batch.tags[i] = {}
             batch.tags[i]["resume_version"] = int(resume_version)
         metrics["reprefill_decoupled/resume_version"] = float(resume_version)
-        # Entries for unselected keys would be wrong-version next step anyway;
-        # drop all.
+        # I1: cancel unconsumed pre-dispatched futures (unselected keys,
+        # stale-version entries, mismatched-engine entries) before clearing
+        # the dict so their coroutines don't linger into the next step window
+        # where the client's should_retry=True loop would re-dispatch them at
+        # the new weight.
+        cancelled = self._cancel_pending_prefills(reason="on_sampled")
+        metrics["reprefill_decoupled/prefill_cancelled"] = float(cancelled)
         self._pending_prefill.clear()
         return batch
 

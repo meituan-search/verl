@@ -200,7 +200,9 @@ class TestPipelinedOnSampled:
                 "global_steps": engine_global_steps,
             })
         ])
-        trainer._pending_prefill[uid] = _PendingPrefill(
+        # P2 keys `_pending_prefill` by trajectory key (matches what
+        # `_on_new_finished` resolves uids to).
+        trainer._pending_prefill[key] = _PendingPrefill(
             version=trainer.global_steps, future=fut
         )
 
@@ -237,7 +239,8 @@ class TestPipelinedOnSampled:
         trainer = _make_pipelined_trainer()
         stale_fut = concurrent.futures.Future()
         stale_fut.set_result([SimpleNamespace(extra_fields={"prompt_logprobs": []})])
-        trainer._pending_prefill[uid] = _PendingPrefill(
+        # Keyed by trajectory key, matching `_on_new_finished`'s resolution.
+        trainer._pending_prefill[key] = _PendingPrefill(
             version=trainer.global_steps - 1, future=stale_fut
         )
 
@@ -259,3 +262,329 @@ class TestPipelinedOnSampled:
         padded = data["new_rollout_log_probs"].to_padded_tensor(padding=0.0)
         assert padded.shape == (1, response_len)
         assert all(tag["resume_version"] == trainer.global_steps - 1 for tag in batch.tags)
+
+
+def _make_pipelined_trainer_with_dispatcher(expected_lens):
+    """Trainer with a real dispatcher and fake client for end-to-end C1 tests.
+
+    Wires up `_pending_prefill`, `_prefill_dispatcher`, `replay_buffer`
+    (a real `ReprefillReplayBuffer` so `_on_new_finished` can read its
+    `partitions` and `prompt_global_steps` snapshots), and `get_llm_client`
+    returning a `_FakeClient` with the given expected lens.
+    """
+    from verl.trainer.ppo.v1.replay_buffer import ReprefillReplayBuffer
+    from verl.trainer.ppo.v1.trainer_reprefill_decoupled import (
+        _PendingPrefill,
+        _PrefillDispatcher,
+    )
+
+    trainer = _make_trainer()
+    trainer.config.trainer.v1.reprefill_decoupled.enable_prefill_pipeline = True
+    trainer.config.data = OmegaConf.create({"train_batch_size": 8})
+    trainer._pending_prefill = {}
+    trainer._prefill_dispatcher = _PrefillDispatcher()
+    trainer._prefill_dispatcher.start()
+    trainer.replay_buffer = ReprefillReplayBuffer(
+        trainer_mode="reprefill_decoupled",
+        trainer_config={},
+        max_off_policy_threshold=8,
+        max_off_policy_strategy="drop",
+        sampler_kwargs={},
+        poll_interval=0.05,
+        refill_fn=None,
+    )
+    trainer.get_llm_client = lambda: _FakeClient(list(expected_lens))
+    return trainer
+
+
+def _seed_finished_prompt(partition_id, uid, sessions=1, global_steps=0,
+                          prompt_len=2, response_len=2):
+    """Write trajectory data + flip the prompt tag to finished, mirroring
+    the agent_loop_tq contract (trajectories written BEFORE the prompt
+    status flips to finished). Returns the list of trajectory keys."""
+    keys = [f"{uid}_{s}_0" for s in range(sessions)]
+    _write_trajectories(
+        keys, partition_id,
+        prompt_lens=[prompt_len] * sessions,
+        response_lens=[response_len] * sessions,
+    )
+    tq.kv_put(
+        key=uid, partition_id=partition_id,
+        tag={"is_prompt": True, "status": "finished", "global_steps": global_steps},
+    )
+    return keys
+
+
+def _clear_train_partition():
+    """Best-effort cleanup of the shared 'train' partition used by
+    TestOnNewFinished (which must use partition_id='train' because
+    `_on_new_finished` guards on `partition_id != 'train'`)."""
+    items = tq.kv_list() or {}
+    train_keys = list(items.get("train", {}).keys())
+    if train_keys:
+        tq.kv_clear(keys=train_keys, partition_id="train")
+
+
+class TestOnNewFinished:
+    """C1: `_on_new_finished` resolves prompt uids to trajectory keys and
+    pre-dispatches one re-prefill per trajectory key, keying `_pending_prefill`
+    by trajectory key so the pipelined on_sampled lookup is direct.
+
+    These tests use partition_id='train' (matching the production guard
+    `if partition_id != 'train': return`) and clean up the shared 'train'
+    partition via try/finally so they don't contaminate each other.
+    """
+
+    def test_resolves_uid_to_trajectory_key_and_predispatches(self, tq_init):
+        from verl.trainer.ppo.v1.trainer_reprefill_decoupled import _PendingPrefill
+
+        prompt_len, response_len = 2, 2
+        uid = uuid.uuid4().hex
+        try:
+            keys = _seed_finished_prompt(
+                "train", uid, sessions=1, global_steps=0,
+                prompt_len=prompt_len, response_len=response_len,
+            )
+            key = keys[0]
+
+            # Populate the replay buffer snapshot exactly as the poll loop
+            # would before the callback fires. The callback reads
+            # partitions + prompt_global_steps.
+            trainer = _make_pipelined_trainer_with_dispatcher(
+                expected_lens=[(prompt_len, response_len)],
+            )
+            trainer.replay_buffer._sync_metadata_from_transfer_queue()
+
+            # Callback receives the uid (what ReprefillReplayBuffer delivers).
+            trainer._on_new_finished("train", {uid})
+
+            # _pending_prefill is keyed by the trajectory key, not the uid.
+            assert key in trainer._pending_prefill
+            assert uid not in trainer._pending_prefill
+            entry = trainer._pending_prefill[key]
+            assert isinstance(entry, _PendingPrefill)
+            # Version == trainer.global_steps when the re-prefill was issued.
+            assert entry.version == trainer.global_steps
+            # Future resolves to a 1-element list whose result carries prompt_logprobs.
+            result = entry.future.result(timeout=10)
+            assert len(result) == 1
+            assert "prompt_logprobs" in result[0].extra_fields
+
+            trainer._prefill_dispatcher.shutdown()
+        finally:
+            _clear_train_partition()
+
+    def test_multi_session_uid_predispatches_one_per_trajectory_key(self, tq_init):
+        # A uid with multiple sessions → multiple trajectory keys, each gets
+        # its own pre-dispatched entry. Verifies the resolution loop covers
+        # all trajectories of a finished uid (terminal-group completeness).
+        prompt_len, response_len = 2, 1
+        sessions = 3
+        uid = uuid.uuid4().hex
+        try:
+            keys = _seed_finished_prompt(
+                "train", uid, sessions=sessions, global_steps=0,
+                prompt_len=prompt_len, response_len=response_len,
+            )
+
+            trainer = _make_pipelined_trainer_with_dispatcher(
+                expected_lens=[(prompt_len, response_len)] * sessions,
+            )
+            trainer.replay_buffer._sync_metadata_from_transfer_queue()
+
+            trainer._on_new_finished("train", {uid})
+
+            # Every trajectory key has an entry; the uid itself does not.
+            assert set(trainer._pending_prefill.keys()) == set(keys)
+            for key in keys:
+                entry = trainer._pending_prefill[key]
+                assert entry.version == trainer.global_steps
+                # Each future resolves independently to a 1-element list.
+                result = entry.future.result(timeout=10)
+                assert len(result) == 1
+
+            trainer._prefill_dispatcher.shutdown()
+        finally:
+            _clear_train_partition()
+
+    def test_skips_non_train_partition(self, tq_init):
+        # Callback is a no-op for validation partitions (partition_id != "train").
+        trainer = _make_pipelined_trainer_with_dispatcher(expected_lens=[])
+        try:
+            trainer._on_new_finished("val", {uuid.uuid4().hex})
+            assert trainer._pending_prefill == {}
+        finally:
+            trainer._prefill_dispatcher.shutdown()
+
+    def test_bounds_to_train_batch_size_uids(self, tq_init):
+        # I3: pre-dispatch is bounded to `train_batch_size` newly-finished
+        # uids per poll iteration, oldest-first (smallest prompt_global_steps).
+        from verl.trainer.ppo.v1.trainer_reprefill_decoupled import _PendingPrefill
+
+        prompt_len, response_len = 2, 1
+        # 4 finished uids with distinct global_steps; batch size capped at 2.
+        uids = [uuid.uuid4().hex for _ in range(4)]
+        steps_by_uid = {uids[0]: 0, uids[1]: 1, uids[2]: 2, uids[3]: 3}
+        try:
+            for uid in uids:
+                _seed_finished_prompt(
+                    "train", uid, sessions=1, global_steps=steps_by_uid[uid],
+                    prompt_len=prompt_len, response_len=response_len,
+                )
+
+            trainer = _make_pipelined_trainer_with_dispatcher(
+                expected_lens=[(prompt_len, response_len)] * 2,
+            )
+            # Override train_batch_size to 2 to force bounding without
+            # needing 8 fake results.
+            trainer.config.data.train_batch_size = 2
+            trainer.replay_buffer._sync_metadata_from_transfer_queue()
+
+            trainer._on_new_finished("train", set(uids))
+
+            # Only the 2 oldest uids (steps 0, 1) were pre-dispatched; their
+            # single trajectory keys are present.
+            expected_keys = {f"{uids[0]}_0_0", f"{uids[1]}_0_0"}
+            assert set(trainer._pending_prefill.keys()) == expected_keys
+            for key in expected_keys:
+                entry = trainer._pending_prefill[key]
+                assert isinstance(entry, _PendingPrefill)
+                assert entry.version == trainer.global_steps
+
+            trainer._prefill_dispatcher.shutdown()
+        finally:
+            _clear_train_partition()
+
+
+class TestPrefillCancellation:
+    """I1: unconsumed pre-dispatched futures are cancelled on on_sampled."""
+
+    def test_unconsumed_future_is_cancelled(self, tq_init, partition_id):
+        # An entry whose key is NOT in the sampled batch (unselected key)
+        # must have its future cancelled so its coroutine doesn't linger.
+        from verl.trainer.ppo.v1.trainer_reprefill_decoupled import _PendingPrefill
+
+        prompt_len, response_len = 2, 2
+        sampled_uid = uuid.uuid4().hex
+        sampled_key = f"{sampled_uid}_0_0"
+        _write_trajectories(
+            [sampled_key], partition_id, [prompt_len], [response_len],
+        )
+
+        trainer = _make_pipelined_trainer()
+        # A pending entry for a DIFFERENT key that won't be in the batch.
+        # Use a real dispatcher so we get a real `run_coroutine_threadsafe`
+        # future whose cancel() is meaningful.
+        from verl.trainer.ppo.v1.trainer_reprefill_decoupled import _PrefillDispatcher
+        trainer._prefill_dispatcher = _PrefillDispatcher()
+        trainer._prefill_dispatcher.start()
+        trainer.get_llm_client = lambda: _FakeClient([(prompt_len, response_len)])
+
+        orphan_uid = uuid.uuid4().hex
+        orphan_key = f"{orphan_uid}_0_0"
+
+        async def _hang_forever():
+            # A coroutine that awaits indefinitely so it stays cancellable.
+            import asyncio as _a
+            await _a.sleep(3600)
+            return [SimpleNamespace(extra_fields={"prompt_logprobs": []})]
+
+        orphan_future = trainer._prefill_dispatcher.submit(_hang_forever())
+        trainer._pending_prefill[orphan_key] = _PendingPrefill(
+            version=trainer.global_steps, future=orphan_future,
+        )
+        # Also add a consumed entry for the sampled key so the re-issue path
+        # is NOT triggered (valid entry → consumed).
+        consumed_fut = concurrent.futures.Future()
+        consumed_fut.set_result([SimpleNamespace(extra_fields={
+            "prompt_logprobs": [[-1.0 * i] for i in range(prompt_len + response_len)],
+            "global_steps": trainer.global_steps - 1,
+        })])
+        trainer._pending_prefill[sampled_key] = _PendingPrefill(
+            version=trainer.global_steps, future=consumed_fut,
+        )
+        trainer._reprefill_all = lambda prompt_ids_list: [
+            SimpleNamespace(extra_fields={
+                "prompt_logprobs": [[-0.5 * i] for i in range(prompt_len + response_len)],
+            })
+        ]
+
+        batch = _make_batch([sampled_key], partition_id)
+        metrics = {}
+        try:
+            batch = trainer.on_sampled(batch, metrics)
+        finally:
+            trainer._prefill_dispatcher.shutdown()
+
+        # The orphan future was cancelled (cancel() returns True for a
+        # pending run_coroutine_threadsafe future whose coroutine hasn't
+        # completed; .cancelled() reflects the wrapper state).
+        assert orphan_future.cancelled(), (
+            "orphan prefill future must be cancelled by on_sampled"
+        )
+        # Metric was emitted.
+        assert metrics["reprefill_decoupled/prefill_cancelled"] == 1.0
+        # Dict cleared.
+        assert trainer._pending_prefill == {}
+
+    def test_already_done_future_not_cancelled(self, tq_init, partition_id):
+        # A consumed entry whose future already resolved is skipped by
+        # cancellation (it's done); prefill_cancelled == 0.
+        from verl.trainer.ppo.v1.trainer_reprefill_decoupled import _PendingPrefill
+
+        prompt_len, response_len = 2, 2
+        sampled_uid = uuid.uuid4().hex
+        sampled_key = f"{sampled_uid}_0_0"
+        _write_trajectories(
+            [sampled_key], partition_id, [prompt_len], [response_len],
+        )
+
+        trainer = _make_pipelined_trainer()
+        fut = concurrent.futures.Future()
+        fut.set_result([SimpleNamespace(extra_fields={
+            "prompt_logprobs": [[-1.0 * i] for i in range(prompt_len + response_len)],
+            "global_steps": trainer.global_steps - 1,
+        })])
+        trainer._pending_prefill[sampled_key] = _PendingPrefill(
+            version=trainer.global_steps, future=fut,
+        )
+        trainer._reprefill_all = lambda prompt_ids_list: [
+            SimpleNamespace(extra_fields={
+                "prompt_logprobs": [[-0.5 * i] for i in range(prompt_len + response_len)],
+            })
+        ]
+
+        batch = _make_batch([sampled_key], partition_id)
+        metrics = {}
+        batch = trainer.on_sampled(batch, metrics)
+
+        # The consumed future was already done → not cancelled.
+        assert not fut.cancelled()
+        assert metrics["reprefill_decoupled/prefill_cancelled"] == 0.0
+
+
+class TestOnTrainEnd:
+    """I2: on_train_end shuts down the dispatcher if it was started."""
+
+    def test_shutdown_dispatcher(self):
+        from verl.trainer.ppo.v1.trainer_reprefill_decoupled import _PrefillDispatcher
+
+        trainer = _make_trainer()
+        trainer.config.trainer.v1.reprefill_decoupled.enable_prefill_pipeline = True
+        trainer._pending_prefill = {}
+        trainer._prefill_dispatcher = _PrefillDispatcher()
+        trainer._prefill_dispatcher.start()
+        # Sanity: loop is running.
+        assert trainer._prefill_dispatcher._loop is not None
+
+        trainer.on_train_end()
+
+        # Loop and thread are torn down.
+        assert trainer._prefill_dispatcher._loop is None
+        assert trainer._prefill_dispatcher._thread is None
+
+    def test_noop_when_pipeline_disabled(self):
+        # P1 path: `_prefill_dispatcher` is never set; on_train_end is a no-op.
+        trainer = _make_trainer()
+        # No `_prefill_dispatcher` attribute — must not raise.
+        trainer.on_train_end()
