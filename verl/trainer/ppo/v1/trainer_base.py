@@ -71,7 +71,12 @@ from verl.trainer.ppo.utils import (
     need_reference_policy,
     need_teacher_policy,
 )
-from verl.trainer.ppo.v1.replay_buffer import DAPO_FILTERED_REWARD_COUNTS_KEY, ReplayBuffer, ReplayBufferAsync
+from verl.trainer.ppo.v1.replay_buffer import (
+    DAPO_FILTERED_REWARD_COUNTS_KEY,
+    ReprefillReplayBuffer,
+    ReplayBuffer,
+    ReplayBufferAsync,
+)
 from verl.trainer.ppo.v1.utils import MetricsAggregator, compute_advantage_for_multi_trajectories
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils import tensordict_utils as tu
@@ -161,8 +166,14 @@ class PPOTrainer(ABC):
             # so it uses the sync ReplayBuffer. ReplayBufferAsync's unconditional
             # eviction+refill of failure_keys would submit new prompts mid-cycle,
             # breaking the "all at W_0" assumption.
+            # reprefill_decoupled layers a pre-dispatch hook on top of the async
+            # buffer: its ReprefillReplayBuffer fires on_new_finished while the
+            # poll loop waits, so the trainer can re-prefill at π_b's weight.
             sync_modes = ("sync", "staleness_sweep")
-            sampler_cls = ReplayBuffer if self.trainer_mode in sync_modes else ReplayBufferAsync
+            if self.trainer_mode == "reprefill_decoupled":
+                sampler_cls = ReprefillReplayBuffer
+            else:
+                sampler_cls = ReplayBuffer if self.trainer_mode in sync_modes else ReplayBufferAsync
 
         replay_buffer_kwargs = dict(
             trainer_mode=self.trainer_mode,
