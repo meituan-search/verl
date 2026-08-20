@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests for the reprefill_decoupled trainer (P1 synchronous path)."""
+"""CPU tests for the reprefill_decoupled trainer (P1 + P2 pipelined path)."""
 
+import concurrent.futures
 import uuid
 from types import SimpleNamespace
 
@@ -49,6 +50,20 @@ def _make_trainer(rollout_correction=None) -> PPOTrainerReprefillDecoupled:
     trainer.global_steps = 3
     trainer.timing_raw = {}
     trainer.tokenizer = SimpleNamespace(pad_token_id=0)
+    return trainer
+
+
+def _make_pipelined_trainer() -> PPOTrainerReprefillDecoupled:
+    """Trainer with the prefill pipeline armed (P2 path).
+
+    `_pending_prefill` is initialized as an empty dict exactly as
+    `on_train_begin` would do when `enable_prefill_pipeline=True`. The
+    dispatcher itself is only exercised by the dispatcher unit test; the
+    pipelined on_sampled tests inject completed futures directly.
+    """
+    trainer = _make_trainer()
+    trainer.config.trainer.v1.reprefill_decoupled.enable_prefill_pipeline = True
+    trainer._pending_prefill = {}
     return trainer
 
 
@@ -139,3 +154,108 @@ class TestComputeOldLogProb:
         )
         padded = data["old_log_probs"].to_padded_tensor(padding=0.0)
         assert torch.allclose(padded, expected.to_padded_tensor(padding=0.0))
+
+
+class TestPrefillDispatcher:
+    def test_submit_runs_coroutine_and_returns_future(self):
+        from verl.trainer.ppo.v1.trainer_reprefill_decoupled import _PrefillDispatcher
+
+        dispatcher = _PrefillDispatcher()
+        dispatcher.start()
+        try:
+            async def coro():
+                return 42
+
+            future = dispatcher.submit(coro())
+            assert future.result(timeout=10) == 42
+        finally:
+            dispatcher.shutdown()
+
+
+class TestPipelinedOnSampled:
+    """P2 path: on_sampled consumes pre-dispatched re-prefill entries when
+    their version matches the current step window, and falls back to a
+    synchronous re-issue otherwise (stale version or engine-version mismatch).
+    """
+
+    def test_valid_pending_entry_is_consumed(self, tq_init, partition_id):
+        # Contract 2: valid entry (version == global_steps, engine
+        # global_steps == global_steps - 1) → consumed, NO synchronous
+        # re-issue, TQ write with correct shape, dict cleared.
+        from verl.trainer.ppo.v1.trainer_reprefill_decoupled import _PendingPrefill
+
+        prompt_len, response_len = 2, 2
+        uid = uuid.uuid4().hex
+        key = f"{uid}_0_0"
+        _write_trajectories([key], partition_id, [prompt_len], [response_len])
+
+        trainer = _make_pipelined_trainer()
+        # global_steps == 3 → resume_version == 2 → engine global_steps must
+        # equal 2 to be accepted.
+        engine_global_steps = trainer.global_steps - 1
+        fut = concurrent.futures.Future()
+        fut.set_result([
+            SimpleNamespace(extra_fields={
+                "prompt_logprobs": [[-1.0 * i] for i in range(prompt_len + response_len)],
+                "global_steps": engine_global_steps,
+            })
+        ])
+        trainer._pending_prefill[uid] = _PendingPrefill(
+            version=trainer.global_steps, future=fut
+        )
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("should not re-issue synchronous prefill")
+
+        trainer._reprefill_all = _fail
+
+        batch = _make_batch([key], partition_id)
+        metrics = {}
+
+        batch = trainer.on_sampled(batch, metrics)
+
+        data = tq.kv_batch_get(
+            keys=[key], partition_id=partition_id,
+            select_fields=["new_rollout_log_probs"],
+        )
+        padded = data["new_rollout_log_probs"].to_padded_tensor(padding=0.0)
+        assert padded.shape == (1, response_len)
+        assert trainer._pending_prefill == {}
+        assert all(tag["resume_version"] == trainer.global_steps - 1 for tag in batch.tags)
+        assert metrics["reprefill_decoupled/resume_version"] == float(trainer.global_steps - 1)
+
+    def test_stale_version_entry_triggers_synchronous_reissue(self, tq_init, partition_id):
+        # Contract 3: stale-version entry (version == global_steps - 1) is
+        # treated as invalid and re-issued synchronously via _reprefill_all.
+        from verl.trainer.ppo.v1.trainer_reprefill_decoupled import _PendingPrefill
+
+        prompt_len, response_len = 2, 2
+        uid = uuid.uuid4().hex
+        key = f"{uid}_0_0"
+        _write_trajectories([key], partition_id, [prompt_len], [response_len])
+
+        trainer = _make_pipelined_trainer()
+        stale_fut = concurrent.futures.Future()
+        stale_fut.set_result([SimpleNamespace(extra_fields={"prompt_logprobs": []})])
+        trainer._pending_prefill[uid] = _PendingPrefill(
+            version=trainer.global_steps - 1, future=stale_fut
+        )
+
+        trainer._reprefill_all = lambda prompt_ids_list: [
+            SimpleNamespace(extra_fields={
+                "prompt_logprobs": [[-0.5 * i] for i in range(prompt_len + response_len)],
+            })
+        ]
+
+        batch = _make_batch([key], partition_id)
+        metrics = {}
+
+        batch = trainer.on_sampled(batch, metrics)
+
+        data = tq.kv_batch_get(
+            keys=[key], partition_id=partition_id,
+            select_fields=["new_rollout_log_probs"],
+        )
+        padded = data["new_rollout_log_probs"].to_padded_tensor(padding=0.0)
+        assert padded.shape == (1, response_len)
+        assert all(tag["resume_version"] == trainer.global_steps - 1 for tag in batch.tags)
