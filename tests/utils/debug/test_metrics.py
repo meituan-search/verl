@@ -91,9 +91,7 @@ class TestMetrics(unittest.TestCase):
 
         # Sanity: when new_rollout ≈ rollout, Pair 2 diff should be small
         # relative to Pair 1 (combined) diff.
-        assert metrics["training/new_rollout_vs_rollout_probs_diff_mean"] < metrics[
-            "training/rollout_probs_diff_mean"
-        ]
+        assert metrics["training/new_rollout_vs_rollout_probs_diff_mean"] < metrics["training/rollout_probs_diff_mean"]
 
 
 if __name__ == "__main__":

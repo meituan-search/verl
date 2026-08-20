@@ -73,9 +73,9 @@ from verl.trainer.ppo.utils import (
 )
 from verl.trainer.ppo.v1.replay_buffer import (
     DAPO_FILTERED_REWARD_COUNTS_KEY,
-    ReprefillReplayBuffer,
     ReplayBuffer,
     ReplayBufferAsync,
+    ReprefillReplayBuffer,
 )
 from verl.trainer.ppo.v1.utils import MetricsAggregator, compute_advantage_for_multi_trajectories
 from verl.utils import hf_processor, hf_tokenizer

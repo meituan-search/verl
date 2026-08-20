@@ -30,6 +30,7 @@ tail stragglers.
 
 Enable via: trainer.v1.trainer_mode=reprefill_decoupled
 """
+
 import asyncio
 import concurrent.futures
 import logging
@@ -38,6 +39,7 @@ import threading
 from dataclasses import dataclass
 
 import transfer_queue as tq
+from transfer_queue import KVBatchMeta
 
 from verl.trainer.ppo.v1.reprefill_utils import (
     build_reprefill_inputs,
@@ -150,8 +152,7 @@ class PPOTrainerReprefillDecoupled(PPOTrainerColocateAsync):
                 # Should not happen given the terminal-group contract, but
                 # skip defensively — on_sampled will re-issue synchronously.
                 logger.warning(
-                    f"reprefill_decoupled: no trajectory keys found for "
-                    f"finished uid {uid}; skipping pre-dispatch"
+                    f"reprefill_decoupled: no trajectory keys found for finished uid {uid}; skipping pre-dispatch"
                 )
                 continue
             for traj_key in traj_keys:
@@ -159,7 +160,8 @@ class PPOTrainerReprefillDecoupled(PPOTrainerColocateAsync):
                     continue
                 try:
                     prompt_ids_list, _, _ = build_reprefill_inputs(
-                        keys=[traj_key], partition_id=partition_id,
+                        keys=[traj_key],
+                        partition_id=partition_id,
                         pad_id=self.tokenizer.pad_token_id,
                     )
                     future = self._prefill_dispatcher.submit(
@@ -169,13 +171,9 @@ class PPOTrainerReprefillDecoupled(PPOTrainerColocateAsync):
                             request_prefix=f"reprefill_p2_{self.global_steps}_{traj_key}",
                         )
                     )
-                    self._pending_prefill[traj_key] = _PendingPrefill(
-                        version=self.global_steps, future=future
-                    )
+                    self._pending_prefill[traj_key] = _PendingPrefill(version=self.global_steps, future=future)
                 except Exception as e:
-                    logger.warning(
-                        f"reprefill_decoupled: pre-dispatch failed for {traj_key}: {e}"
-                    )
+                    logger.warning(f"reprefill_decoupled: pre-dispatch failed for {traj_key}: {e}")
 
     def on_sampled(self, batch: "KVBatchMeta", metrics: dict) -> "KVBatchMeta":
         if getattr(self, "_pending_prefill", None) is not None:
@@ -197,19 +195,19 @@ class PPOTrainerReprefillDecoupled(PPOTrainerColocateAsync):
     def _compute_new_rollout_log_prob(self, batch, metrics):
         resume_version = self.global_steps - 1
         prompt_ids_list, real_lens, data = build_reprefill_inputs(
-            keys=batch.keys, partition_id=batch.partition_id,
+            keys=batch.keys,
+            partition_id=batch.partition_id,
             pad_id=self.tokenizer.pad_token_id,
         )
         results = self._reprefill_all(prompt_ids_list)
         nested = [
-            slice_response_logprobs(
-                results[i].extra_fields["prompt_logprobs"], real_lens[i][0], real_lens[i][1]
-            )
+            slice_response_logprobs(results[i].extra_fields["prompt_logprobs"], real_lens[i][0], real_lens[i][1])
             for i in range(len(batch.keys))
         ]
         data["new_rollout_log_probs"] = to_nested_jagged(nested)
         tq.kv_batch_put(
-            keys=batch.keys, partition_id=batch.partition_id,
+            keys=batch.keys,
+            partition_id=batch.partition_id,
             fields=data.select("new_rollout_log_probs"),
         )
         for i in range(len(batch.keys)):
@@ -251,13 +249,10 @@ class PPOTrainerReprefillDecoupled(PPOTrainerColocateAsync):
                         f"could not be cancelled (already running/done) during {reason}"
                     )
             except Exception as e:
-                logger.warning(
-                    f"reprefill_decoupled: error cancelling prefill future for {key}: {e}"
-                )
+                logger.warning(f"reprefill_decoupled: error cancelling prefill future for {key}: {e}")
         if cancelled:
             logger.info(
-                f"reprefill_decoupled: cancelled {cancelled} unconsumed "
-                f"pre-dispatched prefill futures during {reason}"
+                f"reprefill_decoupled: cancelled {cancelled} unconsumed pre-dispatched prefill futures during {reason}"
             )
         return cancelled
 
@@ -269,7 +264,8 @@ class PPOTrainerReprefillDecoupled(PPOTrainerColocateAsync):
         # trajectory key → 1-element result list maps 1:1 to that key).
         resume_version = self.global_steps - 1
         prompt_ids_list, real_lens, data = build_reprefill_inputs(
-            keys=batch.keys, partition_id=batch.partition_id,
+            keys=batch.keys,
+            partition_id=batch.partition_id,
             pad_id=self.tokenizer.pad_token_id,
         )
 
@@ -292,16 +288,15 @@ class PPOTrainerReprefillDecoupled(PPOTrainerColocateAsync):
                         results_by_index[i] = result
                         consumed = True
                 except Exception as e:
-                    logger.warning(
-                        f"reprefill_decoupled: prefill future failed for {key}: {e}"
-                    )
+                    logger.warning(f"reprefill_decoupled: prefill future failed for {key}: {e}")
             if not consumed:
                 reissue_indices.append(i)
 
         if reissue_indices:
             keys = [batch.keys[i] for i in reissue_indices]
             prompt_ids_sub, _, _ = build_reprefill_inputs(
-                keys=keys, partition_id=batch.partition_id,
+                keys=keys,
+                partition_id=batch.partition_id,
                 pad_id=self.tokenizer.pad_token_id,
             )
             reissue_results = self._reprefill_all(prompt_ids_sub)
@@ -311,13 +306,15 @@ class PPOTrainerReprefillDecoupled(PPOTrainerColocateAsync):
         nested = [
             slice_response_logprobs(
                 results_by_index[i].extra_fields["prompt_logprobs"],
-                real_lens[i][0], real_lens[i][1],
+                real_lens[i][0],
+                real_lens[i][1],
             )
             for i in range(len(batch.keys))
         ]
         data["new_rollout_log_probs"] = to_nested_jagged(nested)
         tq.kv_batch_put(
-            keys=batch.keys, partition_id=batch.partition_id,
+            keys=batch.keys,
+            partition_id=batch.partition_id,
             fields=data.select("new_rollout_log_probs"),
         )
         for i in range(len(batch.keys)):
@@ -344,13 +341,12 @@ class PPOTrainerReprefillDecoupled(PPOTrainerColocateAsync):
             return super()._compute_old_log_prob(batch, metrics)
 
         data = tq.kv_batch_get(
-            keys=batch.keys, partition_id=batch.partition_id,
+            keys=batch.keys,
+            partition_id=batch.partition_id,
             select_fields=["new_rollout_log_probs"],
         )
         data["old_log_probs"] = data.pop("new_rollout_log_probs")
-        tq.kv_batch_put(
-            keys=batch.keys, partition_id=batch.partition_id, fields=data
-        )
+        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data)
         metrics["reprefill_decoupled/old_log_prob_source"] = 1.0  # 1.0 = reprefill
         return batch
 

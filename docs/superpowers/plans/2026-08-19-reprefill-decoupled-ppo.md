@@ -1,5 +1,7 @@
 # Re-prefill Decoupled PPO (`reprefill_decoupled`) Implementation Plan
 
+Last updated: 08/20/2026
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a `reprefill_decoupled` V1 PPO trainer (colocate async) where π_b (`old_log_probs`) comes from re-prefilling consumed trajectories on the rollout engine at its current weight, replacing the trainer-side forward pass — with P2 pipelining that pre-dispatches re-prefills while the replay buffer waits for remaining generation.

@@ -88,9 +88,7 @@ class TestReprefillTrajectories:
         import asyncio
 
         client = _FakeClient()
-        results = asyncio.run(
-            reprefill_trajectories(client, [[4], [1, 2, 3]], request_prefix="test_prefix")
-        )
+        results = asyncio.run(reprefill_trajectories(client, [[4], [1, 2, 3]], request_prefix="test_prefix"))
         assert len(results) == 2
         assert client.requests[0][0] == "test_prefix_0"
         assert client.requests[0][2] == {"prompt_logprobs": 0, "max_new_tokens": 0}
@@ -109,9 +107,7 @@ class TestBuildReprefillInputs:
         )
         tq.kv_batch_put(keys=keys, partition_id=partition_id, fields=fields)
 
-        prompt_ids_list, real_lens, data = build_reprefill_inputs(
-            keys=keys, partition_id=partition_id, pad_id=0
-        )
+        prompt_ids_list, real_lens, data = build_reprefill_inputs(keys=keys, partition_id=partition_id, pad_id=0)
         assert prompt_ids_list[0] == [101, 102, 103, 11, 12]
         assert prompt_ids_list[1] == [201, 21, 22, 23]
         assert real_lens == [(3, 2), (1, 3)]

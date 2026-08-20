@@ -36,10 +36,10 @@ Extends PPOTrainerSync with two additions:
 Each step k within a cycle has staleness = k-1 (samples were decoded at W_0,
 current weights are W_{k-1}). Across N steps, sweep staleness 0..N-1.
 """
+
 import logging
 import os
 
-import torch
 import transfer_queue as tq
 from transfer_queue import KVBatchMeta
 
@@ -116,6 +116,7 @@ class PPOTrainerStalenessSweep(PPOTrainerSync):
         # trajectories are in TQ at W_0, SGLang is idle, and the parent's
         # on_sample_end can safely sleep the engine each step.
         import time
+
         rb = self.replay_buffer
         last_debug = time.time()
         while True:
@@ -127,16 +128,14 @@ class PPOTrainerStalenessSweep(PPOTrainerSync):
             now = time.time()
             if now - last_debug > 30:
                 logger.info(
-                    f"staleness_sweep: waiting for cycle rollout to finish "
-                    f"(pending={pending}, running={running})"
+                    f"staleness_sweep: waiting for cycle rollout to finish (pending={pending}, running={running})"
                 )
                 last_debug = now
             time.sleep(rb.poll_interval)
         finished = len(rb.finished_keys.get("train", set()))
         failure = len(rb.failure_keys.get("train", set()))
         logger.info(
-            f"staleness_sweep: cycle rollout complete — "
-            f"finished={finished}, failure={failure}, pending=0, running=0"
+            f"staleness_sweep: cycle rollout complete — finished={finished}, failure={failure}, pending=0, running=0"
         )
 
     def _debug_log_prob_extra_fields(self) -> list[str]:
@@ -157,9 +156,7 @@ class PPOTrainerStalenessSweep(PPOTrainerSync):
         for i, result in enumerate(results):
             prompt_len, response_len = real_lens[i]
             prompt_logprobs_ls = result.extra_fields["prompt_logprobs"]
-            new_rollout_log_probs_nested.append(
-                slice_response_logprobs(prompt_logprobs_ls, prompt_len, response_len)
-            )
+            new_rollout_log_probs_nested.append(slice_response_logprobs(prompt_logprobs_ls, prompt_len, response_len))
 
         # Store as nested jagged tensor (same format as rollout_log_probs /
         # old_log_probs in TQ) so KVBatch.to_padded_tensor() converts it

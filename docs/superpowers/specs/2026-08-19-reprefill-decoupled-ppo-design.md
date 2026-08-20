@@ -1,5 +1,7 @@
 # Re-prefill Decoupled PPO (`reprefill_decoupled`) Design Spec
 
+Last updated: 08/20/2026
+
 - **Date**: 2026-08-19
 - **Branch**: `dev/wsl_v1_staleness_dev0`
 - **Status**: Design approved in conversation; pending user spec review

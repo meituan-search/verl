@@ -129,18 +129,20 @@ def calculate_debug_metrics(data: DataProto) -> dict:
             "training/rollout_actor_probs_pearson_corr": float("nan"),
         }
         if new_rollout_probs is not None:
-            metrics.update({
-                "training/new_rollout_vs_rollout_probs_diff_valid": 0,
-                "training/new_rollout_vs_rollout_probs_diff_max": float("nan"),
-                "training/new_rollout_vs_rollout_probs_diff_mean": float("nan"),
-                "training/new_rollout_vs_rollout_probs_diff_std": float("nan"),
-                "training/new_rollout_rollout_probs_pearson_corr": float("nan"),
-                "training/old_vs_new_rollout_probs_diff_valid": 0,
-                "training/old_vs_new_rollout_probs_diff_max": float("nan"),
-                "training/old_vs_new_rollout_probs_diff_mean": float("nan"),
-                "training/old_vs_new_rollout_probs_diff_std": float("nan"),
-                "training/old_new_rollout_probs_pearson_corr": float("nan"),
-            })
+            metrics.update(
+                {
+                    "training/new_rollout_vs_rollout_probs_diff_valid": 0,
+                    "training/new_rollout_vs_rollout_probs_diff_max": float("nan"),
+                    "training/new_rollout_vs_rollout_probs_diff_mean": float("nan"),
+                    "training/new_rollout_vs_rollout_probs_diff_std": float("nan"),
+                    "training/new_rollout_rollout_probs_pearson_corr": float("nan"),
+                    "training/old_vs_new_rollout_probs_diff_valid": 0,
+                    "training/old_vs_new_rollout_probs_diff_max": float("nan"),
+                    "training/old_vs_new_rollout_probs_diff_mean": float("nan"),
+                    "training/old_vs_new_rollout_probs_diff_std": float("nan"),
+                    "training/old_new_rollout_probs_pearson_corr": float("nan"),
+                }
+            )
         return metrics
 
     # Pair 1: rollout vs old (actor) — combined off-policy gap (always emitted)
@@ -163,15 +165,15 @@ def calculate_debug_metrics(data: DataProto) -> dict:
         )
         metrics["training/new_rollout_vs_rollout_probs_diff_valid"] = 1
         metrics["training/new_rollout_vs_rollout_probs_diff_max"] = torch.max(new_rollout_rollout_diff).detach().item()
-        metrics["training/new_rollout_vs_rollout_probs_diff_mean"] = torch.mean(new_rollout_rollout_diff).detach().item()
+        metrics["training/new_rollout_vs_rollout_probs_diff_mean"] = (
+            torch.mean(new_rollout_rollout_diff).detach().item()
+        )
         metrics["training/new_rollout_vs_rollout_probs_diff_std"] = torch.std(new_rollout_rollout_diff).detach().item()
         metrics["training/new_rollout_rollout_probs_pearson_corr"] = new_rollout_rollout_pearson
 
         # Pair 3: old vs new_rollout — T/R engine mismatch at same weight
         old_new_rollout_diff = calculate_log_prob_diff(actor_probs, new_rollout_probs, response_mask_bool)
-        old_new_rollout_pearson = pearson_correlation_coefficient(
-            actor_probs, new_rollout_probs, response_mask_bool
-        )
+        old_new_rollout_pearson = pearson_correlation_coefficient(actor_probs, new_rollout_probs, response_mask_bool)
         metrics["training/old_vs_new_rollout_probs_diff_valid"] = 1
         metrics["training/old_vs_new_rollout_probs_diff_max"] = torch.max(old_new_rollout_diff).detach().item()
         metrics["training/old_vs_new_rollout_probs_diff_mean"] = torch.mean(old_new_rollout_diff).detach().item()

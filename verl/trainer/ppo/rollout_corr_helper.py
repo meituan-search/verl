@@ -1087,21 +1087,17 @@ def compute_offpolicy_metrics(
             metrics[f"{prefix}/max"] = lr.masked_fill(~mask_bool, float("-inf")).max().item()
             # Fraction of tokens with |log_ratio| > 0.5 (significant deviation;
             # 0.5 in log-space ≈ r > 1.65 or r < 0.6).
-            metrics[f"{prefix}/fraction_high"] = verl_F.masked_mean(
-                (lr.abs() > 0.5).float(), response_mask
-            ).detach().item()
+            metrics[f"{prefix}/fraction_high"] = (
+                verl_F.masked_mean((lr.abs() > 0.5).float(), response_mask).detach().item()
+            )
             # Fraction of tokens with |log_ratio| < 0.1 (well-aligned; r ∈ (0.9, 1.1)).
-            metrics[f"{prefix}/fraction_low"] = verl_F.masked_mean(
-                (lr.abs() < 0.1).float(), response_mask
-            ).detach().item()
+            metrics[f"{prefix}/fraction_low"] = (
+                verl_F.masked_mean((lr.abs() < 0.1).float(), response_mask).detach().item()
+            )
             # Sign distribution: positive = rollout underestimates vs comparison
             # policy; negative = overestimates. Together they explain the mean.
-            metrics[f"{prefix}/positive_fraction"] = verl_F.masked_mean(
-                (lr > 0).float(), response_mask
-            ).detach().item()
-            metrics[f"{prefix}/negative_fraction"] = verl_F.masked_mean(
-                (lr < 0).float(), response_mask
-            ).detach().item()
+            metrics[f"{prefix}/positive_fraction"] = verl_F.masked_mean((lr > 0).float(), response_mask).detach().item()
+            metrics[f"{prefix}/negative_fraction"] = verl_F.masked_mean((lr < 0).float(), response_mask).detach().item()
 
             # --- Per-sequence distribution stats ---
             # Per-seq sum of log_ratio (proxy for sequence-level importance weight).
@@ -1115,9 +1111,7 @@ def compute_offpolicy_metrics(
                 metrics[f"{prefix}/seq_abs_max"] = seq_lr_sum_valid.abs().max().detach().item()
                 # Std across seqs — variability of per-seq importance.
                 metrics[f"{prefix}/seq_std"] = (
-                    seq_lr_sum_valid.std().detach().item()
-                    if seq_lr_sum_valid.numel() > 1
-                    else 0.0
+                    seq_lr_sum_valid.std().detach().item() if seq_lr_sum_valid.numel() > 1 else 0.0
                 )
             else:
                 metrics[f"{prefix}/seq_mean"] = 0.0
@@ -1135,9 +1129,7 @@ def compute_offpolicy_metrics(
             metrics[f"{prefix}/eff_sample_size"] = float(ess)
             # ESS ratio = ESS / actual token count — normalized to [0, 1].
             token_count = response_mask.sum().item()
-            metrics[f"{prefix}/eff_sample_size_ratio"] = (
-                float(ess) / float(token_count) if token_count > 0 else 0.0
-            )
+            metrics[f"{prefix}/eff_sample_size_ratio"] = float(ess) / float(token_count) if token_count > 0 else 0.0
 
     return metrics
 

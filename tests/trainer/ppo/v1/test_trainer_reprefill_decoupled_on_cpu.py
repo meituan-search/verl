@@ -74,15 +74,11 @@ class _FakeClient:
     async def generate(self, request_id, prompt_ids, sampling_params):
         plen, rlen = self.expected_lens.pop(0)
         assert len(prompt_ids) == plen + rlen
-        return SimpleNamespace(
-            extra_fields={"prompt_logprobs": [[-0.1 * i] for i in range(len(prompt_ids))]}
-        )
+        return SimpleNamespace(extra_fields={"prompt_logprobs": [[-0.1 * i] for i in range(len(prompt_ids))]})
 
 
 def _make_batch(keys, partition_id):
-    return tq.KVBatchMeta(
-        keys=keys, partition_id=partition_id, tags=[None] * len(keys)
-    )
+    return tq.KVBatchMeta(keys=keys, partition_id=partition_id, tags=[None] * len(keys))
 
 
 def _write_trajectories(keys, partition_id, prompt_lens, response_lens):
@@ -108,9 +104,7 @@ class TestOnSampled:
 
         batch = trainer.on_sampled(batch, metrics)
 
-        data = tq.kv_batch_get(
-            keys=keys, partition_id=partition_id, select_fields=["new_rollout_log_probs"]
-        )
+        data = tq.kv_batch_get(keys=keys, partition_id=partition_id, select_fields=["new_rollout_log_probs"])
         padded = data["new_rollout_log_probs"].to_padded_tensor(padding=0.0)
         assert padded.shape[0] == 2
         assert padded.shape[1] == 2  # max response len
@@ -123,7 +117,8 @@ class TestComputeOldLogProb:
         keys = [f"{uuid.uuid4().hex}_0_0" for _ in range(2)]
         expected = to_nested_jagged([[-0.5, -0.6], [-0.7]])
         tq.kv_batch_put(
-            keys=keys, partition_id=partition_id,
+            keys=keys,
+            partition_id=partition_id,
             fields=TensorDict({"new_rollout_log_probs": expected}, batch_size=len(keys)),
         )
         trainer = _make_trainer()  # no rollout_correction → decoupled path
@@ -131,9 +126,7 @@ class TestComputeOldLogProb:
 
         trainer._compute_old_log_prob(batch, {})
 
-        data = tq.kv_batch_get(
-            keys=keys, partition_id=partition_id, select_fields=["old_log_probs"]
-        )
+        data = tq.kv_batch_get(keys=keys, partition_id=partition_id, select_fields=["old_log_probs"])
         padded = data["old_log_probs"].to_padded_tensor(padding=0.0)
         assert torch.allclose(padded, expected.to_padded_tensor(padding=0.0))
 
@@ -141,7 +134,8 @@ class TestComputeOldLogProb:
         keys = [f"{uuid.uuid4().hex}_0_0" for _ in range(2)]
         expected = to_nested_jagged([[-1.5, -1.6], [-1.7]])
         tq.kv_batch_put(
-            keys=keys, partition_id=partition_id,
+            keys=keys,
+            partition_id=partition_id,
             fields=TensorDict({"rollout_log_probs": expected}, batch_size=len(keys)),
         )
         trainer = _make_trainer(rollout_correction={"bypass_mode": True})
@@ -149,9 +143,7 @@ class TestComputeOldLogProb:
 
         trainer._compute_old_log_prob(batch, {})
 
-        data = tq.kv_batch_get(
-            keys=keys, partition_id=partition_id, select_fields=["old_log_probs"]
-        )
+        data = tq.kv_batch_get(keys=keys, partition_id=partition_id, select_fields=["old_log_probs"])
         padded = data["old_log_probs"].to_padded_tensor(padding=0.0)
         assert torch.allclose(padded, expected.to_padded_tensor(padding=0.0))
 
@@ -163,6 +155,7 @@ class TestPrefillDispatcher:
         dispatcher = _PrefillDispatcher()
         dispatcher.start()
         try:
+
             async def coro():
                 return 42
 
@@ -194,17 +187,19 @@ class TestPipelinedOnSampled:
         # equal 2 to be accepted.
         engine_global_steps = trainer.global_steps - 1
         fut = concurrent.futures.Future()
-        fut.set_result([
-            SimpleNamespace(extra_fields={
-                "prompt_logprobs": [[-1.0 * i] for i in range(prompt_len + response_len)],
-                "global_steps": engine_global_steps,
-            })
-        ])
+        fut.set_result(
+            [
+                SimpleNamespace(
+                    extra_fields={
+                        "prompt_logprobs": [[-1.0 * i] for i in range(prompt_len + response_len)],
+                        "global_steps": engine_global_steps,
+                    }
+                )
+            ]
+        )
         # P2 keys `_pending_prefill` by trajectory key (matches what
         # `_on_new_finished` resolves uids to).
-        trainer._pending_prefill[key] = _PendingPrefill(
-            version=trainer.global_steps, future=fut
-        )
+        trainer._pending_prefill[key] = _PendingPrefill(version=trainer.global_steps, future=fut)
 
         def _fail(*args, **kwargs):
             raise AssertionError("should not re-issue synchronous prefill")
@@ -217,7 +212,8 @@ class TestPipelinedOnSampled:
         batch = trainer.on_sampled(batch, metrics)
 
         data = tq.kv_batch_get(
-            keys=[key], partition_id=partition_id,
+            keys=[key],
+            partition_id=partition_id,
             select_fields=["new_rollout_log_probs"],
         )
         padded = data["new_rollout_log_probs"].to_padded_tensor(padding=0.0)
@@ -240,14 +236,14 @@ class TestPipelinedOnSampled:
         stale_fut = concurrent.futures.Future()
         stale_fut.set_result([SimpleNamespace(extra_fields={"prompt_logprobs": []})])
         # Keyed by trajectory key, matching `_on_new_finished`'s resolution.
-        trainer._pending_prefill[key] = _PendingPrefill(
-            version=trainer.global_steps - 1, future=stale_fut
-        )
+        trainer._pending_prefill[key] = _PendingPrefill(version=trainer.global_steps - 1, future=stale_fut)
 
         trainer._reprefill_all = lambda prompt_ids_list: [
-            SimpleNamespace(extra_fields={
-                "prompt_logprobs": [[-0.5 * i] for i in range(prompt_len + response_len)],
-            })
+            SimpleNamespace(
+                extra_fields={
+                    "prompt_logprobs": [[-0.5 * i] for i in range(prompt_len + response_len)],
+                }
+            )
         ]
 
         batch = _make_batch([key], partition_id)
@@ -256,7 +252,8 @@ class TestPipelinedOnSampled:
         batch = trainer.on_sampled(batch, metrics)
 
         data = tq.kv_batch_get(
-            keys=[key], partition_id=partition_id,
+            keys=[key],
+            partition_id=partition_id,
             select_fields=["new_rollout_log_probs"],
         )
         padded = data["new_rollout_log_probs"].to_padded_tensor(padding=0.0)
@@ -274,7 +271,6 @@ def _make_pipelined_trainer_with_dispatcher(expected_lens):
     """
     from verl.trainer.ppo.v1.replay_buffer import ReprefillReplayBuffer
     from verl.trainer.ppo.v1.trainer_reprefill_decoupled import (
-        _PendingPrefill,
         _PrefillDispatcher,
     )
 
@@ -297,19 +293,20 @@ def _make_pipelined_trainer_with_dispatcher(expected_lens):
     return trainer
 
 
-def _seed_finished_prompt(partition_id, uid, sessions=1, global_steps=0,
-                          prompt_len=2, response_len=2):
+def _seed_finished_prompt(partition_id, uid, sessions=1, global_steps=0, prompt_len=2, response_len=2):
     """Write trajectory data + flip the prompt tag to finished, mirroring
     the agent_loop_tq contract (trajectories written BEFORE the prompt
     status flips to finished). Returns the list of trajectory keys."""
     keys = [f"{uid}_{s}_0" for s in range(sessions)]
     _write_trajectories(
-        keys, partition_id,
+        keys,
+        partition_id,
         prompt_lens=[prompt_len] * sessions,
         response_lens=[response_len] * sessions,
     )
     tq.kv_put(
-        key=uid, partition_id=partition_id,
+        key=uid,
+        partition_id=partition_id,
         tag={"is_prompt": True, "status": "finished", "global_steps": global_steps},
     )
     return keys
@@ -342,8 +339,12 @@ class TestOnNewFinished:
         uid = uuid.uuid4().hex
         try:
             keys = _seed_finished_prompt(
-                "train", uid, sessions=1, global_steps=0,
-                prompt_len=prompt_len, response_len=response_len,
+                "train",
+                uid,
+                sessions=1,
+                global_steps=0,
+                prompt_len=prompt_len,
+                response_len=response_len,
             )
             key = keys[0]
 
@@ -383,8 +384,12 @@ class TestOnNewFinished:
         uid = uuid.uuid4().hex
         try:
             keys = _seed_finished_prompt(
-                "train", uid, sessions=sessions, global_steps=0,
-                prompt_len=prompt_len, response_len=response_len,
+                "train",
+                uid,
+                sessions=sessions,
+                global_steps=0,
+                prompt_len=prompt_len,
+                response_len=response_len,
             )
 
             trainer = _make_pipelined_trainer_with_dispatcher(
@@ -428,8 +433,12 @@ class TestOnNewFinished:
         try:
             for uid in uids:
                 _seed_finished_prompt(
-                    "train", uid, sessions=1, global_steps=steps_by_uid[uid],
-                    prompt_len=prompt_len, response_len=response_len,
+                    "train",
+                    uid,
+                    sessions=1,
+                    global_steps=steps_by_uid[uid],
+                    prompt_len=prompt_len,
+                    response_len=response_len,
                 )
 
             trainer = _make_pipelined_trainer_with_dispatcher(
@@ -468,7 +477,10 @@ class TestPrefillCancellation:
         sampled_uid = uuid.uuid4().hex
         sampled_key = f"{sampled_uid}_0_0"
         _write_trajectories(
-            [sampled_key], partition_id, [prompt_len], [response_len],
+            [sampled_key],
+            partition_id,
+            [prompt_len],
+            [response_len],
         )
 
         trainer = _make_pipelined_trainer()
@@ -476,6 +488,7 @@ class TestPrefillCancellation:
         # Use a real dispatcher so we get a real `run_coroutine_threadsafe`
         # future whose cancel() is meaningful.
         from verl.trainer.ppo.v1.trainer_reprefill_decoupled import _PrefillDispatcher
+
         trainer._prefill_dispatcher = _PrefillDispatcher()
         trainer._prefill_dispatcher.start()
         trainer.get_llm_client = lambda: _FakeClient([(prompt_len, response_len)])
@@ -486,27 +499,38 @@ class TestPrefillCancellation:
         async def _hang_forever():
             # A coroutine that awaits indefinitely so it stays cancellable.
             import asyncio as _a
+
             await _a.sleep(3600)
             return [SimpleNamespace(extra_fields={"prompt_logprobs": []})]
 
         orphan_future = trainer._prefill_dispatcher.submit(_hang_forever())
         trainer._pending_prefill[orphan_key] = _PendingPrefill(
-            version=trainer.global_steps, future=orphan_future,
+            version=trainer.global_steps,
+            future=orphan_future,
         )
         # Also add a consumed entry for the sampled key so the re-issue path
         # is NOT triggered (valid entry → consumed).
         consumed_fut = concurrent.futures.Future()
-        consumed_fut.set_result([SimpleNamespace(extra_fields={
-            "prompt_logprobs": [[-1.0 * i] for i in range(prompt_len + response_len)],
-            "global_steps": trainer.global_steps - 1,
-        })])
+        consumed_fut.set_result(
+            [
+                SimpleNamespace(
+                    extra_fields={
+                        "prompt_logprobs": [[-1.0 * i] for i in range(prompt_len + response_len)],
+                        "global_steps": trainer.global_steps - 1,
+                    }
+                )
+            ]
+        )
         trainer._pending_prefill[sampled_key] = _PendingPrefill(
-            version=trainer.global_steps, future=consumed_fut,
+            version=trainer.global_steps,
+            future=consumed_fut,
         )
         trainer._reprefill_all = lambda prompt_ids_list: [
-            SimpleNamespace(extra_fields={
-                "prompt_logprobs": [[-0.5 * i] for i in range(prompt_len + response_len)],
-            })
+            SimpleNamespace(
+                extra_fields={
+                    "prompt_logprobs": [[-0.5 * i] for i in range(prompt_len + response_len)],
+                }
+            )
         ]
 
         batch = _make_batch([sampled_key], partition_id)
@@ -519,9 +543,7 @@ class TestPrefillCancellation:
         # The orphan future was cancelled (cancel() returns True for a
         # pending run_coroutine_threadsafe future whose coroutine hasn't
         # completed; .cancelled() reflects the wrapper state).
-        assert orphan_future.cancelled(), (
-            "orphan prefill future must be cancelled by on_sampled"
-        )
+        assert orphan_future.cancelled(), "orphan prefill future must be cancelled by on_sampled"
         # Metric was emitted.
         assert metrics["reprefill_decoupled/prefill_cancelled"] == 1.0
         # Dict cleared.
@@ -536,22 +558,34 @@ class TestPrefillCancellation:
         sampled_uid = uuid.uuid4().hex
         sampled_key = f"{sampled_uid}_0_0"
         _write_trajectories(
-            [sampled_key], partition_id, [prompt_len], [response_len],
+            [sampled_key],
+            partition_id,
+            [prompt_len],
+            [response_len],
         )
 
         trainer = _make_pipelined_trainer()
         fut = concurrent.futures.Future()
-        fut.set_result([SimpleNamespace(extra_fields={
-            "prompt_logprobs": [[-1.0 * i] for i in range(prompt_len + response_len)],
-            "global_steps": trainer.global_steps - 1,
-        })])
+        fut.set_result(
+            [
+                SimpleNamespace(
+                    extra_fields={
+                        "prompt_logprobs": [[-1.0 * i] for i in range(prompt_len + response_len)],
+                        "global_steps": trainer.global_steps - 1,
+                    }
+                )
+            ]
+        )
         trainer._pending_prefill[sampled_key] = _PendingPrefill(
-            version=trainer.global_steps, future=fut,
+            version=trainer.global_steps,
+            future=fut,
         )
         trainer._reprefill_all = lambda prompt_ids_list: [
-            SimpleNamespace(extra_fields={
-                "prompt_logprobs": [[-0.5 * i] for i in range(prompt_len + response_len)],
-            })
+            SimpleNamespace(
+                extra_fields={
+                    "prompt_logprobs": [[-0.5 * i] for i in range(prompt_len + response_len)],
+                }
+            )
         ]
 
         batch = _make_batch([sampled_key], partition_id)

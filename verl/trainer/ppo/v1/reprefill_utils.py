@@ -17,6 +17,7 @@ trajectories under the rollout engine's current weight
 
 Used by staleness_sweep (diagnostics) and reprefill_decoupled (π_b for
 Decoupled PPO)."""
+
 import asyncio
 import logging
 import os
@@ -51,9 +52,7 @@ def to_nested_jagged(nested_list):
 
 
 def build_reprefill_inputs(keys, partition_id, pad_id):
-    data = tq.kv_batch_get(
-        keys=keys, partition_id=partition_id, select_fields=["prompts", "responses"]
-    )
+    data = tq.kv_batch_get(keys=keys, partition_id=partition_id, select_fields=["prompts", "responses"])
     prompts_padded = data["prompts"].to_padded_tensor(padding=pad_id)
     responses_padded = data["responses"].to_padded_tensor(padding=pad_id)
 
@@ -69,14 +68,16 @@ def build_reprefill_inputs(keys, partition_id, pad_id):
 
 async def reprefill_trajectories(client, prompt_ids_list, request_prefix="reprefill"):
     sampling_params_list = [{"prompt_logprobs": 0, "max_new_tokens": 0}] * len(prompt_ids_list)
-    results = await asyncio.gather(*[
-        client.generate(
-            request_id=f"{request_prefix}_{i}",
-            prompt_ids=pids,
-            sampling_params=sp,
-        )
-        for i, (pids, sp) in enumerate(zip(prompt_ids_list, sampling_params_list))
-    ])
+    results = await asyncio.gather(
+        *[
+            client.generate(
+                request_id=f"{request_prefix}_{i}",
+                prompt_ids=pids,
+                sampling_params=sp,
+            )
+            for i, (pids, sp) in enumerate(zip(prompt_ids_list, sampling_params_list, strict=False))
+        ]
+    )
     return results
 
 
@@ -91,13 +92,16 @@ def compute_and_emit_staleness_metrics(batch, metrics, global_steps):
     fields = ["rollout_log_probs", "new_rollout_log_probs", "old_log_probs", "response_mask"]
     try:
         data = tq.kv_batch_get(
-            keys=batch.keys, partition_id=batch.partition_id, select_fields=fields,
+            keys=batch.keys,
+            partition_id=batch.partition_id,
+            select_fields=fields,
         )
     except Exception as e:
         logger.warning(f"reprefill: failed to fetch logprobs for metrics: {e}")
         return
 
     from verl import DataProto
+
     data = DataProto(batch=data.to_padded_tensor())
 
     rollout_lp = data.batch["rollout_log_probs"]
