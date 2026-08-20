@@ -185,3 +185,42 @@ async def test_merged_routing_converts_for_downstream(monkeypatch, backend):
     # a fresh writable buffer, so from_numpy is safe without one.
     assert merged.flags.writeable
     assert _markers(torch.from_numpy(merged)) == [10, 11, 22]
+
+
+@pytest.mark.asyncio
+async def test_prompt_logprobs_propagated_to_final_output(monkeypatch):
+    """Re-prefill requests (max_new_tokens=0, prompt_logprobs=0) read the prompt
+    log probs from the client result's extra_fields; the merge loop must not
+    drop them. On resume the latest attempt covers the full accumulated
+    sequence, so its values win."""
+    segments = [
+        TokenOutput(
+            token_ids=[],
+            stop_reason="aborted",
+            extra_fields={"prompt_logprobs": [[-1.0], [-2.0]], "global_steps": 3},
+        ),
+        TokenOutput(
+            token_ids=[],
+            stop_reason="completed",
+            extra_fields={"prompt_logprobs": [[-0.5], [-0.6], [-0.7]], "global_steps": 4},
+        ),
+    ]
+    _install_segments(monkeypatch, segments)
+
+    output = await _client().generate(request_id="req-0", prompt_ids=[1, 2, 3], sampling_params={})
+
+    assert output.extra_fields["prompt_logprobs"] == [[-0.5], [-0.6], [-0.7]]
+    assert output.extra_fields["global_steps"] == 4
+
+
+@pytest.mark.asyncio
+async def test_prompt_logprobs_absent_when_not_requested(monkeypatch):
+    """Normal generation never asks for prompt log probs; the merge must not
+    fabricate the key."""
+    segment = TokenOutput(token_ids=[101], stop_reason="completed", extra_fields={"global_steps": 5})
+    _install_segments(monkeypatch, [segment])
+
+    output = await _client().generate(request_id="req-0", prompt_ids=[1], sampling_params={})
+
+    assert "prompt_logprobs" not in output.extra_fields
+    assert output.extra_fields["global_steps"] == 5

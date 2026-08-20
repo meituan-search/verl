@@ -391,6 +391,8 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             if output.num_preempted is not None:
                 final_output.num_preempted += output.num_preempted
             final_output.stop_reason = output.stop_reason
+            if "prompt_logprobs" in output.extra_fields:
+                final_output.extra_fields["prompt_logprobs"] = output.extra_fields["prompt_logprobs"]
 
             # update model weights version
             global_steps = output.extra_fields.get("global_steps", None)
