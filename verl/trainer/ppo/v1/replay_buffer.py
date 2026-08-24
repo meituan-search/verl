@@ -577,3 +577,35 @@ class ReplayBufferAsync(ReplayBuffer):
             )
 
         return self._materialize_batch(partition_id, selected_prompt_uids, partition_snapshot), eviction_metrics
+
+
+class ReprefillReplayBuffer(ReplayBufferAsync):
+    """ReplayBufferAsync that notifies a callback when keys transition to finished.
+
+    Used by reprefill_decoupled to pre-dispatch re-prefill requests while the
+    sample() poll loop waits for the remaining trajectories. The rollout
+    engine weight is constant within a step window, so re-prefills issued
+    here are version-aligned with the π_b the upcoming on_sampled needs.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._on_new_finished_callback = None
+
+    def set_on_new_finished_callback(self, callback):
+        self._on_new_finished_callback = callback
+
+    def _sync_metadata_from_transfer_queue(self):
+        before = {pid: set(keys) for pid, keys in self.finished_keys.items()}
+        super()._sync_metadata_from_transfer_queue()
+        if self._on_new_finished_callback is None:
+            return
+        for partition_id, keys in self.finished_keys.items():
+            new_keys = keys - before.get(partition_id, set())
+            if not new_keys:
+                continue
+            try:
+                self._on_new_finished_callback(partition_id, new_keys)
+            except Exception as e:
+                # Diagnostics/prefill must never break sampling.
+                logger.warning(f"ReprefillReplayBuffer: on_new_finished callback failed: {e}")

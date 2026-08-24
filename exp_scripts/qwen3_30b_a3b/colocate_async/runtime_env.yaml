@@ -1,0 +1,21 @@
+env_vars:
+  HYDRA_FULL_ERROR: "1"
+  NCCL_NVLS_ENABLE: "0"
+  NCCL_SOCKET_IFNAME: "eth0"
+  CUDA_CACHE_PATH: "/tmp/cuda_cache"
+  TMPDIR: "/tmp"
+  CUDA_TMPDIR: "/tmp"
+  CUDA_CACHE_PATH: "/tmp/cuda_cache"
+  PATH: "/usr/local/miniconda3/bin:$PATH"
+  TENSORBOARD_DIR: "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-xt-ai-search/ai-search/deepsearch_files_xtssd/wangshulin02/tensorboard/v1_test/qwen3_30b_a3b_dapo-math_colocate_async_t0"
+  http_proxy: "http://set-zw05-mlp-codelab-pc242:10181"
+  https_proxy: "http://set-zw05-mlp-codelab-pc242:10181"
+  HTTP_PROXY: "http://set-zw05-mlp-codelab-pc242:10181"
+  HTTPS_PROXY: "http://set-zw05-mlp-codelab-pc242:10181"
+
+excludes:
+  - ".git/"
+  - "third_party/"
+
+pip:
+    - TransferQueue

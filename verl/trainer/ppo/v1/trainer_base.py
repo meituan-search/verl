@@ -71,7 +71,12 @@ from verl.trainer.ppo.utils import (
     need_reference_policy,
     need_teacher_policy,
 )
-from verl.trainer.ppo.v1.replay_buffer import DAPO_FILTERED_REWARD_COUNTS_KEY, ReplayBuffer, ReplayBufferAsync
+from verl.trainer.ppo.v1.replay_buffer import (
+    DAPO_FILTERED_REWARD_COUNTS_KEY,
+    ReplayBuffer,
+    ReplayBufferAsync,
+    ReprefillReplayBuffer,
+)
 from verl.trainer.ppo.v1.utils import MetricsAggregator, compute_advantage_for_multi_trajectories
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils import tensordict_utils as tu
@@ -155,7 +160,20 @@ class PPOTrainer(ABC):
         if has_custom_sampler:
             sampler_cls = load_extern_type(custom_sampler.path, custom_sampler.name)
         else:
-            sampler_cls = ReplayBuffer if self.trainer_mode == "sync" else ReplayBufferAsync
+            # staleness_sweep extends PPOTrainerSync (sleep_replicas in
+            # on_sample_end, no in-flight requests during training) and
+            # manages its own cycle submission via _wait_for_cycle_rollout_complete,
+            # so it uses the sync ReplayBuffer. ReplayBufferAsync's unconditional
+            # eviction+refill of failure_keys would submit new prompts mid-cycle,
+            # breaking the "all at W_0" assumption.
+            # reprefill_decoupled layers a pre-dispatch hook on top of the async
+            # buffer: its ReprefillReplayBuffer fires on_new_finished while the
+            # poll loop waits, so the trainer can re-prefill at π_b's weight.
+            sync_modes = ("sync", "staleness_sweep")
+            if self.trainer_mode == "reprefill_decoupled":
+                sampler_cls = ReprefillReplayBuffer
+            else:
+                sampler_cls = ReplayBuffer if self.trainer_mode in sync_modes else ReplayBufferAsync
 
         replay_buffer_kwargs = dict(
             trainer_mode=self.trainer_mode,
@@ -547,6 +565,7 @@ class PPOTrainer(ABC):
             )
             metrics.update(off_policy_metrics)
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+            batch = self.on_sampled(batch, metrics=metrics)
             self.on_sample_end()
 
         # 2. [OPTIONAL] compute reward score with colocated reward model
@@ -628,6 +647,26 @@ class PPOTrainer(ABC):
     def on_sample_begin(self):
         """Called at the beginning of sampling batch from replay buffer."""
         return
+
+    def on_sampled(self, batch: "KVBatchMeta", metrics: dict) -> "KVBatchMeta":
+        """Called after replay_buffer.sample and before on_sample_end.
+
+        Override to inject custom pre-processing on the sampled batch while the
+        rollout engine is still awake (e.g., compute π_new-rollout logprobs via
+        selective re-prefill before on_sample_end aborts+sleeps the engine).
+        Default: no-op.
+        """
+        return batch
+
+    def _debug_log_prob_extra_fields(self) -> list[str]:
+        """Extra TQ fields to fetch alongside old_log_prob for debug metrics.
+
+        Override in subclasses that write extra logprob fields in ``on_sampled``
+        (e.g., staleness_sweep writes ``new_rollout_log_probs``). Fetched fields
+        become visible to ``calculate_debug_metrics`` so pairwise diff metrics
+        beyond rollout-vs-old can be emitted.
+        """
+        return []
 
     @abstractmethod
     def on_sample_end(self):
@@ -1513,6 +1552,7 @@ class PPOTrainer(ABC):
         fields = ["entropy", "log_probs", "response_mask"]
         if self.config.actor_rollout_ref.rollout.calculate_log_probs:
             fields.extend(["responses", "rollout_log_probs"])
+        fields.extend(self._debug_log_prob_extra_fields())
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         # 2. write old_log_probs and entropy back to TransferQueue

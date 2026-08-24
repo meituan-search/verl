@@ -888,6 +888,11 @@ trainer:
     separate_async:
       num_warmup_batches: 1
       parameter_sync_step: 4
+    staleness_sweep:
+      num_steps: 8
+    reprefill_decoupled:
+      num_warmup_batches: 1
+      enable_prefill_pipeline: false
     sampler:
       max_off_policy_threshold: 8
       max_off_policy_strategy: drop
