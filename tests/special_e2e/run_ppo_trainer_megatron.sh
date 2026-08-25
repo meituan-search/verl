@@ -1,11 +1,32 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
+# Megatron-LM is baked into the CI image but the vemlp runner / Ray workers do not inherit
+# the image's PYTHONPATH, so set it at runtime (main_ppo forwards it into the Ray runtime env).
+export PYTHONPATH="/workspace/Megatron-LM${PYTHONPATH:+:${PYTHONPATH}}"
+echo "PYTHONPATH=${PYTHONPATH}"
+
 export CUDA_DEVICE_MAX_CONNECTIONS=1 # For megatron communication/computation overlapping
 export VERL_LOGGING_LEVEL=INFO
 export VERL_PPO_LOGGING_LEVEL=INFO
 
 NUM_GPUS=${NUM_GPUS:-8}
+
+ENGINE=${ENGINE:-"vllm"}
+
+########################### launch ###########################
+# uv (set VERL_USE_UV=0 for system python, as the ascend / rocm / trtllm images do):
+# GPU vllm/sglang x megatron run every python entrypoint here — including the Ray
+# workers, via runtime_env.py_executable — through `uv run` on the matching extras of
+# the committed uv.lock, so the job needs no install step. Other backends / NPU fall
+# back to ambient python. Run from the verl repo root.
+LAUNCH=(python3)
+RAY=(ray_kwargs.ray_init.runtime_env.py_executable=null)
+if [ "${VERL_USE_UV:-1}" != 0 ] && [ "${DEVICE:-gpu}" = gpu ] && { [ "${ENGINE}" = vllm ] || [ "${ENGINE}" = sglang ]; }; then
+    UV_EXTRAS=(--extra "${ENGINE}" --extra megatron --extra math)
+    LAUNCH=(uv run --frozen --all-packages "${UV_EXTRAS[@]}" python3)
+    RAY=(ray_kwargs.ray_init.runtime_env.py_executable="uv -v run --frozen --all-packages ${UV_EXTRAS[*]}")
+fi
 
 MODEL_ID=${MODEL_ID:-Qwen/Qwen2.5-0.5B}
 MODEL_PATH=${MODEL_PATH:-${HOME}/models/${MODEL_ID}}
@@ -20,7 +41,7 @@ if [ "$USE_DUMMY_MODEL" = "True" ]; then
         exit 1
     fi
 
-    python scripts/init_random_model.py \
+    "${LAUNCH[@]}" scripts/init_random_model.py \
         --hf_model_path "${MODEL_PATH}" \
         --new_config_path "${DUMMY_MODEL_CONFIG_PATH}" \
         --output_path "${DUMMY_MODEL_PATH}"
@@ -124,12 +145,11 @@ if [ "$USE_DIST_CKPT" = "True" ]; then
     if [ "$USE_DUMMY_MODEL" = "True" ]; then
         DIST_CKPT_PATH=${HOME}/dist_ckpt_dummy/${MODEL_ID}
     fi
-    python scripts/converter_hf_to_mcore.py \
+    "${LAUNCH[@]}" scripts/converter_hf_to_mcore.py \
         --hf_model_path "${MODEL_PATH}" \
         --output_path "${DIST_CKPT_PATH}"
 fi
 
-ENGINE=${ENGINE:-"vllm"}
 if [ "$ENGINE" = "vllm" ]; then
     export VLLM_USE_V1=1
 fi
@@ -286,23 +306,23 @@ common_params=(
 )
 
     # Detect device
-    device_name=$(python3 - <<'EOF'
+    device_name=$("${LAUNCH[@]}" - <<'EOF'
 from verl.utils.device import get_device_name
 print(get_device_name())
 EOF
 )
 
 if [ -n "$device_name" ] && [ "$device_name" == "cuda" ]; then
-    python3 -m verl.trainer.main_ppo \
+    "${LAUNCH[@]}" -m verl.trainer.main_ppo \
         --config-path=config \
         --config-name='ppo_megatron_trainer.yaml' \
-        "${common_params[@]}" $@
+        "${common_params[@]}" "${RAY[@]}" $@
 
 elif [ -n "$device_name" ] && [ "$device_name" == "npu" ]; then
-    python3 -m verl.trainer.main_ppo \
+    "${LAUNCH[@]}" -m verl.trainer.main_ppo \
         --config-path=config \
         --config-name='ppo_megatron_trainer.yaml' \
-        "${common_params[@]}" \
+        "${common_params[@]}" "${RAY[@]}" \
         +actor_rollout_ref.actor.megatron.override_transformer_config.context_parallel_size=${ACTOR_CP} \
         +actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True \
         global_profiler.tool=npu \

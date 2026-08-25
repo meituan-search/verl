@@ -23,9 +23,11 @@ from contextlib import contextmanager
 from enum import Enum
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import orjson
+from packaging.version import Version
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +71,7 @@ class Tracking:
                 assert backend in self.supported_backend, f"{backend} is not supported"
 
         self.logger = {}
+        self._finished = False
 
         if "tracking" in default_backend or "wandb" in default_backend:
             import os
@@ -190,32 +193,43 @@ class Tracking:
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
 
+    def finish(self, exit_code: int = 0):
+        """Flush and finalize every configured backend exactly once."""
+        if getattr(self, "_finished", False):
+            return
+        self._finished = True
+        loggers = getattr(self, "logger", {})
+
+        if "wandb" in loggers:
+            loggers["wandb"].finish(exit_code=exit_code)
+        if "swanlab" in loggers:
+            loggers["swanlab"].finish()
+        if "vemlp_wandb" in loggers:
+            loggers["vemlp_wandb"].finish(exit_code=exit_code)
+        if "tensorboard" in loggers:
+            loggers["tensorboard"].finish()
+        if "clearml" in loggers:
+            loggers["clearml"].finish()
+        if "trackio" in loggers:
+            loggers["trackio"].finish()
+        if "file" in loggers:
+            loggers["file"].finish()
+        if "rl_insight" in loggers:
+            loggers["rl_insight"].finish()
+
     def __del__(self):
-        if "wandb" in self.logger:
-            self.logger["wandb"].finish(exit_code=0)
-        if "swanlab" in self.logger:
-            self.logger["swanlab"].finish()
-        if "vemlp_wandb" in self.logger:
-            self.logger["vemlp_wandb"].finish(exit_code=0)
-        if "tensorboard" in self.logger:
-            self.logger["tensorboard"].finish()
-        if "clearml" in self.logger:
-            self.logger["clearml"].finish()
-        if "trackio" in self.logger:
-            self.logger["trackio"].finish()
-        if "file" in self.logger:
-            self.logger["file"].finish()
-        if "rl_insight" in self.logger:
-            self.logger["rl_insight"].finish()
+        self.finish()
 
 
 class RLInsightLogger:
     """Logger backend that exports scalar metrics and rl-insight runtime signals."""
 
     ENABLE_ENV = "VERL_RL_INSIGHT_ENABLE"
+    MINIMUM_RL_INSIGHT_VERSION = Version("0.3.0")
     _init_done = False
     _rl_insight_module = None
     _registered_metrics: set[tuple[str | None, tuple[str, ...], str | None]] = set()
+    _warned_unsupported_features: set[str] = set()
 
     def __init__(self, project_name, experiment_name, config=None):
         self.init(project_name=project_name, experiment_name=experiment_name, config=config)
@@ -232,6 +246,23 @@ class RLInsightLogger:
     def enabled(cls) -> bool:
         """Return whether rl-insight is globally enabled in this process."""
         return os.getenv(cls.ENABLE_ENV) == "1"
+
+    @classmethod
+    def _warn_unsupported_rl_insight(cls, feature: str) -> None:
+        """Warn once when an optional RL-Insight feature is unavailable."""
+        if feature in cls._warned_unsupported_features:
+            return
+        cls._warned_unsupported_features.add(feature)
+        logger.warning(
+            "RL-Insight does not support %s (requires >= %s); monitoring is disabled for this feature",
+            feature,
+            cls.MINIMUM_RL_INSIGHT_VERSION,
+        )
+
+    @classmethod
+    def _rl_insight_version(cls) -> Version:
+        module = cls._get_rl_insight()
+        return Version(getattr(module, "__version__", "0"))
 
     @classmethod
     def init(cls, project_name=None, experiment_name=None, config=None):
@@ -253,9 +284,7 @@ class RLInsightLogger:
     def log(cls, data, step):
         if not cls.enabled():
             return
-        if not cls._init_done:
-            cls._get_rl_insight().init()
-            cls._init_done = True
+        cls._ensure_rl_insight_init()
         metric_gauge = cls._get_rl_insight().metric_gauge
 
         for key, value in data.items():
@@ -287,11 +316,101 @@ class RLInsightLogger:
             yield
             return
 
+        cls._ensure_rl_insight_init()
+        with cls._get_rl_insight().trace_state(state_name, state_lane_id=state_lane_id, **labels):
+            yield
+
+    @classmethod
+    def trace_span(
+        cls,
+        name: str,
+        *,
+        start_time_ns: int,
+        end_time_ns: int,
+        attributes: dict[str, Any] | None = None,
+    ) -> None:
+        """Report one completed span through rl-insight's direct trace API."""
+        if not cls.enabled():
+            return
+
+        module = cls._get_rl_insight()
+        if cls._rl_insight_version() < cls.MINIMUM_RL_INSIGHT_VERSION or not callable(
+            getattr(module, "trace_span", None)
+        ):
+            cls._warn_unsupported_rl_insight("trace_span")
+            return
+        cls._ensure_rl_insight_init()
+        cls._get_rl_insight().trace_span(
+            name=name,
+            start_time_ns=start_time_ns,
+            end_time_ns=end_time_ns,
+            attributes=dict(attributes or {}),
+        )
+
+    @classmethod
+    def _ensure_rl_insight_init(cls) -> None:
         if not cls._init_done:
             cls._get_rl_insight().init()
             cls._init_done = True
-        with cls._get_rl_insight().trace_state(state_name, state_lane_id=state_lane_id, **labels):
-            yield
+
+    @classmethod
+    def agent_loop_session(
+        cls,
+        *,
+        experiment_name: Any | None = None,
+        sample: Any,
+        session: Any,
+        traj: Any = 0,
+        uid: Any = None,
+        global_steps: Any = None,
+        session_id: Any = None,
+    ):
+        """Return the shared agent-loop session trace state."""
+        from verl.utils.rollout_trace import RolloutTraceConfig
+
+        rollout_config = RolloutTraceConfig.get_instance()
+        project_name = rollout_config.project_name
+        if experiment_name is None:
+            experiment_name = rollout_config.experiment_name or "default"
+
+        def fallback_session():
+            return SimpleNamespace(
+                identity={
+                    "project": project_name or "default",
+                    "experiment_name": experiment_name,
+                    "sample": str(sample),
+                    "session": str(session),
+                    "traj": str(traj),
+                    "state_lane_id": f"experiment={experiment_name}/sample={sample}/session={session}/traj={traj}",
+                    "uid": uid or "",
+                    "global_steps": global_steps if global_steps is not None else "",
+                    "session_id": session_id or "",
+                },
+                finish=lambda **kwargs: None,
+            )
+
+        if cls.enabled() and cls._rl_insight_version() < cls.MINIMUM_RL_INSIGHT_VERSION:
+            cls._warn_unsupported_rl_insight("agent_loop_session")
+            return fallback_session()
+        if cls.enabled() and not cls._init_done:
+            cls.init(project_name=project_name, experiment_name=experiment_name)
+
+        try:
+            from rl_insight.agent_loop import agent_loop_session
+        except ImportError:
+            cls._warn_unsupported_rl_insight("agent_loop_session")
+            return fallback_session()
+
+        return agent_loop_session(
+            project=project_name,
+            experiment_name=experiment_name,
+            sample=sample,
+            session=session,
+            traj=traj,
+            uid=uid,
+            global_steps=global_steps,
+            session_id=session_id,
+        )
 
     @classmethod
     def register_rollout_metrics(
@@ -726,3 +845,53 @@ class ValidationGenerationsLogger:
         self.writer.add_text("val/generations", text_content, step)
         # Flush to ensure data is written
         self.writer.flush()
+
+
+@dataclasses.dataclass
+class DapoFilteredRewardTableLogger:
+    """Wandb table of DAPO-filtered (no-signal) group counts per reward value.
+
+    Each training step adds one row containing compact ``reward:count`` pairs. Wandb 0.20+
+    uploads rows incrementally; older versions rebuild the full table for compatibility.
+
+    Intentionally wandb-only: this "value distribution over time" view is a table, which other
+    tracking backends do not render usefully. Non-wandb backends are silently skipped.
+    """
+
+    project_name: str = None
+    experiment_name: str = None
+
+    def log(self, loggers, reward_counts: dict, step: int):
+        """reward_counts maps metric value -> count for this step (already merged across mini-batches)."""
+        if "wandb" in loggers:
+            self._log_to_wandb(reward_counts, step)
+
+    def _log_to_wandb(self, reward_counts: dict, step: int):
+        import wandb
+
+        if wandb.run is None:
+            return
+
+        row = {float(value): int(count) for value, count in reward_counts.items()}
+        counts_text = ", ".join(f"{value:g}:{row[value]}" for value in sorted(row))
+        columns = ["step", "reward_counts"]
+
+        if not hasattr(self, "_use_incremental_table"):
+            self._use_incremental_table = Version(wandb.__version__) >= Version("0.20.0")
+            if self._use_incremental_table:
+                self._table = wandb.Table(columns=columns, log_mode="INCREMENTAL")
+            else:
+                self._rows = []
+                logger.warning(
+                    "wandb<0.20.0 does not support incremental tables; "
+                    "the DAPO filtered-reward table will re-upload its full history each step."
+                )
+
+        if self._use_incremental_table:
+            self._table.add_data(step, counts_text)
+            table = self._table
+        else:
+            self._rows.append([step, counts_text])
+            table = wandb.Table(columns=columns, data=list(self._rows))
+
+        wandb.log({"training/filter_groups/filtered_reward_counts": table}, step=step)

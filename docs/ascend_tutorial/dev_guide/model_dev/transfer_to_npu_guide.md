@@ -33,7 +33,7 @@ VeRL 推理引擎采用分层架构设计，通过抽象接口与工厂模式，
 
 ### 2.2 训练引擎选择与适配
 
-VeRL 主线代码将训练引擎抽象为 `Engine`类，通过标准化接口层实现调度逻辑与底层训练实现的解耦。该架构设计支持 FSDP、Megatron、MindSpeed-LLM 等多种训练后端灵活接入、即插即用，无需修改 VeRL 核心算法与调度逻辑，大幅降低迁移适配成本。
+VeRL 主线代码将训练引擎抽象为 `Engine`类，通过标准化接口层实现调度逻辑与底层训练实现的解耦。该架构设计支持 FSDP、Megatron 等多种训练后端灵活接入、即插即用，无需修改 VeRL 核心算法与调度逻辑，大幅降低迁移适配成本。
 
 当前 NPU 已通过 `is_npu_available` 接口完成设备自动检测，并自动应用对应的 NPU 设备适配补丁。目前只需通过配置 model_engine=fsdp/megatron，即可一键切换训练后端至 FSDP、Megatron，系统会自动加载对应后端的 NPU 适配逻辑，无需额外修改代码。VeRL中昇腾对Megatron做了适配与优化，具体特性配置参考[verl-MindSpeed特性文档](https://gitcode.com/Ascend/MindSpeed/blob/master/docs/zh/user-guide/verl.md)设置。
 
@@ -155,7 +155,7 @@ class DSAIndexer(MegatronModule):
 
 为了解决这一通用问题，业界引入了 **Routing Replay（路由回放）** 机制。其核心思想是通过锁定特定阶段的专家路由路径，屏蔽微小扰动对路由决策的干扰，从而保证模型训练的稳定性。目前主流包含R2和R3两种变体：
 
-* **（1）Vanilla Routing Replay (R2)**： (对应`actor_rollout_ref.actor.router_replay.mode="R2"`)
+* **（1）Vanilla Routing Replay (R2)**： (对应`actor_rollout_ref.actor.megatron.router_replay.mode="R2"`，VeOmni 则为 `actor_rollout_ref.actor.veomni.router_replay.mode="R2"`)
   
   * **机制**：在梯度更新阶段，复现训练引擎在上一轮采样阶段计算出的专家路径。
   * **作用**：主要缓解**策略陈旧性**对路由的影响。随着策略的更新，当前前向传播计算出的路由可能与生成旧数据时的路由不一致，R2通过回放旧路由来维持优化信号的连贯性。
@@ -169,9 +169,11 @@ class DSAIndexer(MegatronModule):
 因此对于大尺寸 MoE 模型，在实际配置中通常推荐使用对齐更彻底的 R3 模式：
 
 ```
-actor_rollout_ref.actor.router_replay.mode="R3" \
+actor_rollout_ref.actor.megatron.router_replay.mode="R3" \
 actor_rollout_ref.rollout.enable_rollout_routing_replay=True \
 ```
+
+VeOmni 后端请改用 `actor_rollout_ref.actor.veomni.router_replay.mode="R3"`。顶层 `actor.router_replay` 已移除，不会再生效。
 
 ## 四、性能优化
 

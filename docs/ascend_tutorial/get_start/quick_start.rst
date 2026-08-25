@@ -41,6 +41,8 @@ Qwen3-0.6B GSM8K GRPO Quick Start
 运行本文脚本前，请确认已完成 verl Ascend 环境安装。
 环境安装详见 `install_guidance <./install_guidance.rst>`_ 。
 
+A3 每卡含 2 die，A2 每卡 1 die，如果在 A3 机器上跑示例，需要将 ``n_gpus_per_node`` 设置成 16。
+
 四个脚本均默认使用 ``Qwen/Qwen3-0.6B`` 和 GSM8K 数据集进行基础链路验证。
 
 主要用于检查：
@@ -120,6 +122,8 @@ Quick Start 当前提供四种常用训推后端组合。用户可根据训练�
 
 脚本内具体参数说明详见 `训练配置参数与指标说明 <https://github.com/verl-project/verl/blob/main/docs/ascend_tutorial/dev_guide/model_dev/parameter_and_metrics.md>`_
 
+多节点任务拉起详见 `多节点任务拉起实践 <https://github.com/verl-project/verl/blob/main/docs/ascend_tutorial/model_support/examples/multi-machine_task_startup_practice.rst>`_
+
 SGLang 后端使能说明
 -------------------------------------------
 
@@ -149,5 +153,4 @@ vLLM 后端脚本转换为 SGLang
 
    # chunked_prefill 默认关闭
    +actor_rollout_ref.rollout.engine_kwargs.sglang.chunked_prefill_size=-1
-
 
