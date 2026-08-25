@@ -666,7 +666,10 @@ def balance_prefix_tree_v1(batch, trie, metrics: dict, dp_size: int, logging_pre
 
     Synthetic padding samples (``is_padding`` tag) are excluded from the balance and
     re-appended after the permutation, mirroring v0's pure-batch balancing."""
-    block_ids = [k.rsplit("_", 1)[0] for k in batch.keys]
+    # Key format is {uid}_{session_id}_{index}: uid is the prompt group whose n
+    # trajectories share the full prompt — that shared prompt is the main prefix-tree
+    # win, so blocks are per-uid (v0 parity). rsplit("_", 2) tolerates "_" inside uid.
+    block_ids = [k.rsplit("_", 2)[0] for k in batch.keys]
     real_positions = [i for i, tag in enumerate(batch.tags) if not tag.get("is_padding", False)]
     pad_positions = [i for i in range(len(batch.keys)) if batch.tags[i].get("is_padding", False)]
     permutation, partitions, workloads = balance_prefix_tree_blocks(
