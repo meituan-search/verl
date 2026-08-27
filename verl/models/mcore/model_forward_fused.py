@@ -35,7 +35,6 @@ from verl.models.mcore.util import preprocess_packed_seqs, preprocess_thd_engine
 from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
 from verl.utils.megatron_utils import unwrap_model
 from verl.utils.model import CausalLMOutputForPPO
-from verl.utils.prefix_tree.forward import fused_prefix_tree_forward
 
 from .util import postprocess_packed_seqs_for_dict_output, postprocess_thd_engine
 
@@ -426,25 +425,6 @@ def _fused_GPTModel_forward(
     """
 
     inference_context = deprecate_inference_params(inference_context, inference_params)
-
-    pt_batch = kwargs.pop("pt_batch", None)
-    if pt_batch is not None:
-        output = fused_prefix_tree_forward(
-            model,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            temperature=temperature,
-            pt_batch=pt_batch,
-            decoder_input=decoder_input,
-            packed_seq_params=packed_seq_params,
-            extra_block_kwargs=extra_block_kwargs,
-            inference_context=inference_context,
-            kwargs=kwargs,
-        )
-        if output is not None:
-            return output
 
     preprocess_kwargs = {}
     if padding_mask is not None:

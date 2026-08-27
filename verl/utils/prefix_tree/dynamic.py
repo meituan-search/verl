@@ -394,11 +394,10 @@ def prepare_prefix_tree_micro_batches(
         max_token_len = data["max_token_len_per_gpu"] * sp_size
         batch_idx_list = mbs_groups_from_leaf_idx(leaf_idx, trie, max_token_len)
     else:
-        # Fixed mbs: chunk by sequence count in DFS trie order so same-prefix
-        # sequences land in the same micro-batch.
+        # Fixed mbs: contiguous chunks in batch order (no DFS reorder).
         mbs = data["micro_batch_size_per_gpu"] * force_group_size
-        dfs_order = trie_dfs_leaf_order_from_leaf_idx(leaf_idx, trie)
-        batch_idx_list = [dfs_order[i : i + mbs] for i in range(0, len(dfs_order), mbs)]
+        n = len(leaf_idx)
+        batch_idx_list = [list(range(i, min(i + mbs, n))) for i in range(0, n, mbs)]
 
     # Pad to the max micro-batch count across the DP group, then to divisibility.
     target = len(batch_idx_list)

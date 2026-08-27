@@ -14,12 +14,13 @@
 """Prefix-tree forward-path: tree build, MAGI dispatch, rope override,
     fused/unfused forward drivers, and LCE post-processing.
 
-Public: prepare_prefix_tree, tree_post_processing, fuse_forward_body, dispatch_magi."""
+Public: prepare_prefix_tree, tree_post_processing, prefix_tree_output_processor, dispatch_magi."""
 
 from __future__ import annotations
 
 import logging as _log
 from collections import Counter, OrderedDict, namedtuple
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -34,11 +35,13 @@ from magi_attention.common import AttnRanges
 from magi_attention.common.enum import AttnMaskType
 from magi_attention.meta.solver.dispatch_solver import DispatchConfig
 from megatron.core import parallel_state as mpu
+from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from torch import Tensor
 from torch.nn.attention.flex_attention import create_block_mask
 
 from verl.utils.megatron_utils import unwrap_model
+from verl.utils.model import CausalLMOutputForPPO
 from verl.utils.prefix_tree.magi import (
     PackRestorationParam,
     PrefixTreeMagiBatch,
@@ -290,15 +293,21 @@ def tree_post_processing(ctx, output_orig, logits_processor, logits_processor_ar
         return output_orig
     pt_batch = ctx.pb
     real_tokens = pt_batch.real_tokens
+    prefix_tree_attention = ctx.attention
+
+    # Normalize to batch-first [1, seq, ...]. flex strips padding to real_tokens
+    # here; magi keeps full local tokens and strips padding after undispatch.
     if output_orig.shape[0] == 1:
-        output_orig = output_orig[:, :real_tokens]
+        if prefix_tree_attention != "magi":
+            output_orig = output_orig[:, :real_tokens]
     else:
-        output_orig = output_orig[:real_tokens].permute(1, 0, 2)
+        if prefix_tree_attention != "magi":
+            output_orig = output_orig[:real_tokens]
+        output_orig = output_orig.permute(1, 0, 2)
 
     if not post_process or logits_processor is None:
         return output_orig.permute(1, 0, 2)
 
-    prefix_tree_attention = ctx.attention
     try:
         logits_flat = output_orig.squeeze(0)
 
@@ -320,7 +329,6 @@ def tree_post_processing(ctx, output_orig, logits_processor, logits_processor_ar
             ancestor_ranges = [[pt_batch.restoration.prefix_range] for _ in range(n)]
         temperature = orig_args.get("temperature")
         temp_is_nested = isinstance(temperature, torch.Tensor) and temperature.is_nested
-        temp_vals = temperature.values() if temp_is_nested else None
         outputs: dict[str, list] = {}
         for leaf_idx, sample_idx in enumerate(pt_batch.subtrie.leaf_to_sample):
             s, e = pt_batch.restoration.segment_ranges[leaf_idx]
@@ -328,12 +336,17 @@ def tree_post_processing(ctx, output_orig, logits_processor, logits_processor_ar
             pieces = [logits_flat[a:b] for a, b in ranges if b > a]
             sample_logits = torch.cat(pieces, dim=0).unsqueeze(1)  # (len, 1, vocab)
             sample_label = pt_batch.per_sample_labels[sample_idx].unsqueeze(1)  # (len, 1)
+            # logits_processor expects per-token temperature of shape (len, 1).
+            # Clone: the processor does an inplace temperature[temperature <= 0] = 1e-8,
+            # which must not mutate the shared nested temperature across leaves/samples.
             if temp_is_nested:
-                t = float(temp_vals[sample_idx].item())
+                t = temperature[sample_idx].unsqueeze(1).clone()
             elif isinstance(temperature, torch.Tensor):
-                t = float(temperature.flatten()[0].item())
+                t = temperature.new_full((sample_logits.shape[0], 1), float(temperature.flatten()[0]))
             else:
-                t = 1.0 if temperature is None else float(temperature)
+                t = sample_logits.new_full(
+                    (sample_logits.shape[0], 1), 1.0 if temperature is None else float(temperature)
+                )
             out = logits_processor(sample_logits, label=sample_label, temperature=t, **flat_args)
             for key, val in out.items():
                 if isinstance(val, torch.Tensor):
@@ -352,7 +365,7 @@ def tree_post_processing(ctx, output_orig, logits_processor, logits_processor_ar
 def _prepare_lce_inputs_with_boundary(
     hidden_states: Tensor,
     labels: Tensor,
-    model,
+    config,
     magi_key,
     pt_batch: Optional[PrefixTreeMagiBatch],
 ):
@@ -361,7 +374,7 @@ def _prepare_lce_inputs_with_boundary(
     Returns (hidden_ext, labels_ext, n_local, boundary_tags) where boundary_tags
     are [(boundary_position, sample_idx)] aligned with the appended tail rows.
     """
-    if model.config.sequence_parallel:
+    if config.sequence_parallel:
         hidden_states = gather_from_sequence_parallel_region(hidden_states)
 
     if magi_key is not None:
@@ -435,7 +448,7 @@ def _run_lce(
     output_weight: Tensor,
     labels: Tensor,
     temperature: float,
-    model,
+    config,
     magi_key=None,
     pt_batch: Optional[PrefixTreeMagiBatch] = None,
 ) -> tuple[Tensor, Tensor]:
@@ -443,7 +456,7 @@ def _run_lce(
     from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
 
     hidden_ext, labels_ext, n_local, boundary_tags = _prepare_lce_inputs_with_boundary(
-        hidden_states, labels, model, magi_key, pt_batch
+        hidden_states, labels, config, magi_key, pt_batch
     )
 
     logprobs_ext, entropy_ext = linear_cross_entropy(
@@ -552,129 +565,26 @@ def post_processing_packed_lce(
     pt_batch._boundary_logps = boundary_logps
 
 
-def fused_prefix_tree_forward(
-    model,
+@dataclass
+class PrefixTreeOutputProcessorContext:
+    """Context passed through Megatron's output-processor hook for the prefix-tree fused path."""
+
+    pt_batch: PrefixTreeMagiBatch
+    magi_key: object
+    temperature: float
+
+
+def prefix_tree_output_processor(
     *,
-    input_ids: Tensor,
-    position_ids: Tensor,
-    attention_mask: Tensor,
-    labels: Optional[Tensor],
-    temperature: float,
-    pt_batch,
-    decoder_input: Optional[Tensor],
-    packed_seq_params,
-    extra_block_kwargs: Optional[dict],
-    inference_context,
-    kwargs: dict,
-):
-    """Fused prefix-tree forward: pops attention key from kwargs, installs
-    rope+decoder contexts, delegates to fuse_forward_body."""
-    _magi_key = kwargs.pop("magi_attention_key", None)
-    _flex_key = kwargs.pop("flex_attention_key", None)
-    if _magi_key is None and _flex_key is None:
-        return None
-
-    set_rope_pids(model, position_ids)
-    try:
-        with prefix_tree_decoder_key_context(model, _magi_key, _flex_key):
-            result = fuse_forward_body(
-                model,
-                input_ids=input_ids,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                temperature=temperature,
-                pt_batch=pt_batch,
-                magi_key=_magi_key,
-                flex_key=_flex_key,
-                decoder_input=decoder_input,
-                packed_seq_params=packed_seq_params,
-                extra_block_kwargs=extra_block_kwargs,
-                inference_context=inference_context,
-            )
-    finally:
-        clear_rope_pids(model)
-    return result
-
-
-def fuse_forward_body(
-    model,
-    input_ids: Tensor,
-    position_ids: Tensor,
-    attention_mask: Optional[Tensor],
-    labels: Tensor,
-    temperature: float,
-    pt_batch: PrefixTreeMagiBatch,
-    magi_key=None,
-    flex_key=None,
+    hidden_states,
+    output_layer,
+    output_weight,
+    labels,
+    context,
+    config,
     **kwargs,
 ):
-    """Fused-path: preprocess → decoder → LCE (no logits tensor). Assumes rope+decoder-key contexts active."""
-    from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
-    from megatron.core.utils import deprecate_inference_params
-
-    from verl.utils.model import CausalLMOutputForPPO
-
-    inference_context = kwargs.pop("inference_context", None)
-    inference_params = kwargs.pop("inference_params", None)
-    inference_context = deprecate_inference_params(inference_context, inference_params)
-    decoder_input = kwargs.pop("decoder_input", None)
-    packed_seq_params = kwargs.pop("packed_seq_params", None)
-    extra_block_kwargs = kwargs.pop("extra_block_kwargs", None)
-
-    preproc_output = model._preprocess(
-        input_ids=input_ids,
-        position_ids=position_ids,
-        decoder_input=decoder_input,
-        inference_context=inference_context,
-        packed_seq_params=packed_seq_params,
-    )
-    (decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset) = preproc_output[:5]
-
-    hidden_states = model.decoder(
-        hidden_states=decoder_input,
-        attention_mask=attention_mask,
-        inference_context=inference_context,
-        rotary_pos_emb=rotary_pos_emb,
-        rotary_pos_cos=rotary_pos_cos,
-        rotary_pos_sin=rotary_pos_sin,
-        packed_seq_params=packed_seq_params,
-        sequence_len_offset=sequence_len_offset,
-        **(extra_block_kwargs or {}),
-        **kwargs,
-    )
-
-    if not model.post_process:
-        return hidden_states
-
-    if hasattr(model, "output_layer") and model.output_layer is not None and model.output_layer.weight is not None:
-        output_weight = model.output_layer.weight
-    else:
-        output_weight = model.embedding.word_embeddings.weight
-
-    if magi_key is not None:
-        logprobs, entropy = _run_lce(
-            hidden_states, output_weight, labels, temperature, model, magi_key=magi_key, pt_batch=pt_batch
-        )
-    else:
-        logprobs, entropy = _run_lce(hidden_states, output_weight, labels, temperature, model)
-
-    # Boundary-patch: cross-CP all_gather of per-leaf boundary log-probs, before restore.
-    post_processing_packed_lce(pt_batch, magi_key=magi_key)
-
-    if has_config_logger_enabled(model.config):
-        payload = OrderedDict(
-            {
-                "input_ids": input_ids,
-                "position_ids": position_ids,
-                "attention_mask": attention_mask,
-                "decoder_input": decoder_input,
-                "logprobs": logprobs,
-                "entropy": entropy,
-            }
-        )
-        log_config_to_disk(model.config, payload, prefix="input_and_logits")
-
+    """Fused prefix-tree LCE at Megatron's postprocess boundary."""
     output = CausalLMOutputForPPO(
         loss=None,
         logits=None,
@@ -682,6 +592,37 @@ def fuse_forward_body(
         hidden_states=hidden_states,
         attentions=None,
     )
+
+    # Megatron passes the shared embedding as output_weight for tied models; for
+    # untied models the weight lives on output_layer.
+    weight = output_weight if output_weight is not None else output_layer.weight
+
+    logprobs, entropy = _run_lce(
+        hidden_states,
+        weight,
+        labels,
+        context.temperature,
+        config,
+        magi_key=context.magi_key,
+        pt_batch=context.pt_batch,
+    )
+
+    # Boundary-patch: cross-CP all_gather of per-leaf boundary log-probs, before restore.
+    post_processing_packed_lce(context.pt_batch, magi_key=context.magi_key)
+
+    if has_config_logger_enabled(config):
+        payload = OrderedDict(
+            {
+                "input_ids": kwargs.get("input_ids"),
+                "position_ids": kwargs.get("position_ids"),
+                "attention_mask": kwargs.get("attention_mask"),
+                "decoder_input": kwargs.get("decoder_input"),
+                "logprobs": logprobs,
+                "entropy": entropy,
+            }
+        )
+        log_config_to_disk(config, payload, prefix="input_and_logits")
+
     output.entropy = entropy
     output.log_probs = logprobs
     return output
@@ -718,11 +659,14 @@ def run_fused_prefix_tree(
 def _fused_core(model, pb, prefix_tree_attention, labels, temperature, calculate_entropy):
     """Fused-path core: forward pass with fused vocab projection (LCE)."""
     local_input_ids, local_position_ids, attn_kwargs = _prepare_attn_inputs(pb, prefix_tree_attention)
+    _magi_key = attn_kwargs.pop("magi_attention_key", None)
+    _flex_key = attn_kwargs.pop("flex_attention_key", None)
 
-    post_process = unwrap_model(model).post_process
+    m = unwrap_model(model)
+    post_process = m.post_process
 
     # Only the last PP stage (post_process=True) needs labels for LCE.
-    # Non-last stages pass labels=None; fuse_forward_body returns before LCE.
+    # Non-last stages pass labels=None; the hook runs only on post_process=True.
     real_tokens = pb.real_tokens
     if post_process:
         if pb.tree_packed_labels is None:
@@ -733,16 +677,25 @@ def _fused_core(model, pb, prefix_tree_attention, labels, temperature, calculate
     else:
         labels_arg = None
 
-    output_orig = model(
-        input_ids=local_input_ids,
-        attention_mask=None,
-        position_ids=local_position_ids,
-        packed_seq_params=None,
-        labels=labels_arg,
-        temperature=temperature,
-        pt_batch=pb,
-        **attn_kwargs,
-    )
+    # Route through stock model.forward (mcore>=0.18) with the prefix-tree
+    # output_processor hook, reusing the same preprocess->decoder->postprocess
+    # machinery as the non-prefix-tree path.
+    set_rope_pids(m, local_position_ids)
+    try:
+        with prefix_tree_decoder_key_context(m, _magi_key, _flex_key):
+            output_orig = m(
+                input_ids=local_input_ids,
+                position_ids=local_position_ids,
+                attention_mask=None,
+                labels=labels_arg,
+                packed_seq_params=None,
+                output_processor=prefix_tree_output_processor,
+                output_processor_context=PrefixTreeOutputProcessorContext(
+                    pt_batch=pb, magi_key=_magi_key, temperature=temperature
+                ),
+            )
+    finally:
+        clear_rope_pids(m)
 
     if not post_process:
         return output_orig
