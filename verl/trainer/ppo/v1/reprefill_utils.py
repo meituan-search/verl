@@ -175,3 +175,85 @@ def build_partial_new_rollout_log_probs(
     their rollout_log_probs IS the W_resume logprob — no re-prefill needed.
     """
     return list(prefix_prompt_logprobs) + list(suffix_rollout_log_probs)
+
+
+def compute_and_emit_token_staleness_metrics(batch, metrics, global_steps):
+    """Emit per-token staleness metrics using token_versions + the three logprobs.
+
+    Metrics (all under `offpolicy_token/`):
+      - staleness_mean: per-token mean of |log(π_rollout) - log(π_new_rollout)|
+        over tokens where token_versions[i] < global_steps - 1.
+      - fresh_token_ratio: fraction of tokens with version == global_steps - 1.
+      - stale_token_ratio: complement.
+      - staleness_by_version_gap_0: ratio of tokens with version gap 0.
+      - staleness_by_version_gap_1: ratio with gap 1.
+      - staleness_by_version_gap_2_3: ratio with gap 2-3.
+      - staleness_by_version_gap_4plus: ratio with gap ≥4.
+
+    Best-effort diagnostics: fetch failures and per-key missing/malformed
+    `token_versions` (e.g. a case-1 piggyback trajectory in a mixed batch)
+    skip that key's per-token stats without raising. Note that transfer_queue
+    drops a field from the batch-level get result when ANY key lacks it, so a
+    single key without `token_versions` suppresses these metrics for the
+    whole batch.
+    """
+    fields = ["rollout_log_probs", "new_rollout_log_probs", "old_log_probs", "response_mask", "token_versions"]
+    try:
+        data = tq.kv_batch_get(
+            keys=batch.keys,
+            partition_id=batch.partition_id,
+            select_fields=fields,
+        )
+    except Exception as e:
+        logger.warning(f"token staleness metrics: failed to fetch: {e}")
+        return
+
+    token_versions_field = data.get("token_versions", None)
+
+    current_version = global_steps - 1
+    total_tokens = 0
+    fresh_tokens = 0
+    gap_buckets = {0: 0, 1: 0, "2_3": 0, "4plus": 0}
+    staleness_diffs: list[float] = []
+
+    for i in range(len(batch.keys)):
+        try:
+            rollout = data["rollout_log_probs"][i].tolist()
+            new_rollout = data["new_rollout_log_probs"][i].tolist()
+            mask = data["response_mask"][i].tolist()
+            tv_entry = token_versions_field[i] if token_versions_field is not None else None
+            tv = tv_entry.tolist() if tv_entry is not None else None
+        except Exception as e:
+            logger.debug(f"token staleness metrics: skipping key {batch.keys[i]} (malformed entry): {e}")
+            continue
+        if tv is None or len(tv) != len(rollout):
+            # No usable token_versions for this key (mixed batch) or a
+            # length mismatch (malformed) — skip this key's per-token stats.
+            logger.debug(f"token staleness metrics: skipping key {batch.keys[i]} (no/mismatched token_versions)")
+            continue
+        for j in range(len(rollout)):
+            if mask[j] == 0:
+                continue
+            total_tokens += 1
+            gap = current_version - tv[j]
+            if gap == 0:
+                fresh_tokens += 1
+                gap_buckets[0] += 1
+            elif gap == 1:
+                gap_buckets[1] += 1
+            elif gap <= 3:
+                gap_buckets["2_3"] += 1
+            else:
+                gap_buckets["4plus"] += 1
+            if gap > 0:
+                staleness_diffs.append(abs(rollout[j] - new_rollout[j]))
+
+    if total_tokens == 0:
+        return
+    metrics["offpolicy_token/fresh_token_ratio"] = fresh_tokens / total_tokens
+    metrics["offpolicy_token/stale_token_ratio"] = 1.0 - fresh_tokens / total_tokens
+    metrics["offpolicy_token/staleness_mean"] = sum(staleness_diffs) / len(staleness_diffs) if staleness_diffs else 0.0
+    metrics["offpolicy_token/staleness_by_version_gap_0"] = gap_buckets[0] / total_tokens
+    metrics["offpolicy_token/staleness_by_version_gap_1"] = gap_buckets[1] / total_tokens
+    metrics["offpolicy_token/staleness_by_version_gap_2_3"] = gap_buckets["2_3"] / total_tokens
+    metrics["offpolicy_token/staleness_by_version_gap_4plus"] = gap_buckets["4plus"] / total_tokens

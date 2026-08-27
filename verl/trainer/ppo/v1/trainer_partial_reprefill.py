@@ -183,9 +183,13 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
         return batch
 
     def _compute_advantage(self, batch, metrics: dict):
-        from verl.trainer.ppo.v1.reprefill_utils import compute_and_emit_staleness_metrics
+        from verl.trainer.ppo.v1.reprefill_utils import (
+            compute_and_emit_staleness_metrics,
+            compute_and_emit_token_staleness_metrics,
+        )
 
         compute_and_emit_staleness_metrics(batch, metrics, self.global_steps)
+        compute_and_emit_token_staleness_metrics(batch, metrics, self.global_steps)
         return super()._compute_advantage(batch, metrics)
 
     def _debug_log_prob_extra_fields(self) -> list[str]:
