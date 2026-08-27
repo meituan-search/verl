@@ -19,6 +19,7 @@ re-prefill requests while the remaining generation finishes. Producer helpers ar
 copied verbatim from test_replay_buffer_on_cpu.py (they are file-local there).
 """
 
+import asyncio
 import threading
 import time
 import uuid
@@ -29,6 +30,8 @@ import torch
 import transfer_queue as tq
 from transfer_queue import KVBatchMeta
 
+from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopOutput, AgentLoopWorker
+from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopWorkerTQ
 from verl.trainer.ppo.v1.replay_buffer import ReprefillReplayBuffer
 
 # Small poll interval so the blocking consumer reacts to producer writes quickly.
@@ -260,3 +263,126 @@ def test_callback_exception_does_not_break_sampling(tq_init, partition_id):
         assert len(batch.keys) == 1
     finally:
         _clear_partition(partition_id)
+
+
+# --------------------------------------------------------------------------- #
+# partial_rollout piggyback field propagation through agent_loop_tq.
+# --------------------------------------------------------------------------- #
+
+
+class _PostprocessWorker:
+    """Minimal stand-in for AgentLoopWorkerTQ covering only the attributes
+    ``_agent_loop_postprocess`` touches (reward/teacher hooks are no-ops)."""
+
+    _compute_multi_modal_inputs = AgentLoopWorker._compute_multi_modal_inputs
+    _compute_position_ids = AgentLoopWorker._compute_position_ids
+    _compute_score = AgentLoopWorker._compute_score
+    _compute_teacher_logprobs = AgentLoopWorker._compute_teacher_logprobs
+    reward_loop_worker_handles = None
+    distillation_enabled = False
+
+    def __init__(self):
+        self.processor = None
+
+
+def test_partial_rollout_fields_propagate_to_tq(tq_init):
+    """A TokenOutput carrying partial_rollout piggyback fields must land in
+    TransferQueue when it flows through ``_agent_loop_postprocess``:
+    - ``token_versions`` / ``new_rollout_log_probs`` as per-trajectory
+      (nested-jagged) fields, readable with the trainer's access pattern.
+    - ``piggyback_marker`` / ``resume_version`` as tag entries.
+    - ``prompt_logprobs`` (an intermediate already consumed into
+      ``new_rollout_log_probs``) must NOT be propagated as a TQ field.
+
+    NOTE: ``_agent_loop_postprocess`` hardcodes the partition to "train"
+    (validate=False), so the test reads and cleans that partition; the uid
+    is unique so it cannot collide with other tests.
+    """
+
+    async def run():
+        uid = _uid()
+        output = AgentLoopOutput(
+            prompt_ids=[101, 102],
+            response_ids=[11, 12],
+            response_mask=[1, 1],
+            metrics=AgentLoopMetrics(),
+            extra_fields={
+                "token_versions": torch.tensor([3, 3, 3, 4], dtype=torch.int32),
+                "new_rollout_log_probs": [-0.5, -1.5],
+                "piggyback_marker": True,
+                "resume_version": 4,
+                # Intermediate field; consumed into new_rollout_log_probs by the client.
+                "prompt_logprobs": [-9.0] * 4,
+            },
+        )
+        worker = _PostprocessWorker()
+        await AgentLoopWorkerTQ.__ray_actor_class__._agent_loop_postprocess(
+            worker,
+            output,
+            validate=False,
+            uid=uid,
+            session_id=0,
+            global_steps=4,
+        )
+        return uid
+
+    uid = asyncio.run(run())
+    key = _trajectory_key(uid, session_id=0, index=0)
+    try:
+        # Mirror the trainer's consumer access pattern (trainer_partial_reprefill).
+        meta = tq.kv_batch_get(
+            keys=[key],
+            partition_id="train",
+            select_fields=["token_versions", "new_rollout_log_probs"],
+        )
+        token_versions = meta["token_versions"][0]
+        assert token_versions.tolist() == [3, 3, 3, 4]
+        assert token_versions.dtype == torch.int32
+        new_rollout = meta["new_rollout_log_probs"][0]
+        torch.testing.assert_close(new_rollout, torch.tensor([-0.5, -1.5], dtype=torch.float32))
+
+        # prompt_logprobs must not be promoted to a TQ field.
+        full = tq.kv_batch_get(keys=[key], partition_id="train")
+        assert "prompt_logprobs" not in full
+
+        tag = tq.kv_list()["train"][key]
+        assert tag["piggyback_marker"] is True
+        assert tag["resume_version"] == 4
+    finally:
+        tq.kv_clear(keys=[key], partition_id="train")
+
+
+def test_no_piggyback_fields_no_extra_tq_writes(tq_init):
+    """Trajectories without piggyback fields must not grow new TQ fields/tags."""
+
+    async def run():
+        uid = _uid()
+        output = AgentLoopOutput(
+            prompt_ids=[101, 102],
+            response_ids=[11, 12],
+            response_mask=[1, 1],
+            metrics=AgentLoopMetrics(),
+            extra_fields={},
+        )
+        worker = _PostprocessWorker()
+        await AgentLoopWorkerTQ.__ray_actor_class__._agent_loop_postprocess(
+            worker,
+            output,
+            validate=False,
+            uid=uid,
+            session_id=0,
+            global_steps=0,
+        )
+        return uid
+
+    uid = asyncio.run(run())
+    key = _trajectory_key(uid, session_id=0, index=0)
+    try:
+        full = tq.kv_batch_get(keys=[key], partition_id="train")
+        assert "token_versions" not in full
+        assert "new_rollout_log_probs" not in full
+        tag = tq.kv_list()["train"][key]
+        assert "piggyback_marker" not in tag
+        assert "resume_version" not in tag
+    finally:
+        tq.kv_clear(keys=[key], partition_id="train")
