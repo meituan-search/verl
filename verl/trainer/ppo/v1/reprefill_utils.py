@@ -128,3 +128,24 @@ def compute_and_emit_staleness_metrics(batch, metrics, global_steps):
             metrics[f"offpolicy/{key}"] = value.item()
         else:
             metrics[f"offpolicy/{key}"] = value
+
+
+def decide_case(
+    piggyback_marker: bool,
+    last_token_version: int | None,
+    current_parameter_version: int,
+    enable_case_skip: bool,
+    enable_piggyback: bool,
+) -> int:
+    """Decide which reprefill case to apply to a trajectory.
+
+    Returns 1 (piggyback), 2 (full reprefill), or 3 (skip — copy rollout_log_probs).
+    Case 1 requires piggyback marker AND enable_piggyback. Case 3 requires
+    last_token_version == current_parameter_version AND enable_case_skip.
+    Everything else falls through to case 2.
+    """
+    if piggyback_marker and enable_piggyback:
+        return 1
+    if enable_case_skip and last_token_version is not None and last_token_version == current_parameter_version:
+        return 3
+    return 2
