@@ -149,3 +149,29 @@ def decide_case(
     if enable_case_skip and last_token_version is not None and last_token_version == current_parameter_version:
         return 3
     return 2
+
+
+def build_token_versions(segment_versions: list[int], segment_lengths: list[int]) -> torch.Tensor:
+    """Expand per-segment version into per-token int32 1D tensor.
+
+    Used by client to record each token's decode-time global_steps.
+    """
+    assert len(segment_versions) == len(segment_lengths)
+    tokens: list[int] = []
+    for v, n in zip(segment_versions, segment_lengths, strict=True):
+        tokens.extend([int(v)] * n)
+    return torch.tensor(tokens, dtype=torch.int32)
+
+
+def build_partial_new_rollout_log_probs(
+    prefix_prompt_logprobs: list[float],
+    suffix_rollout_log_probs: list[float],
+) -> list[float]:
+    """Concatenate prefix (re-prefilled at W_resume) + suffix (decode logprob
+    at W_resume, copied as-is) into one trajectory's new_rollout_log_probs.
+
+    For partial_rollout trajectories: prefix tokens were decoded at W_prefix
+    and re-prefilled at W_resume; suffix tokens were decoded at W_resume, so
+    their rollout_log_probs IS the W_resume logprob — no re-prefill needed.
+    """
+    return list(prefix_prompt_logprobs) + list(suffix_rollout_log_probs)
