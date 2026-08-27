@@ -893,6 +893,13 @@ trainer:
     reprefill_decoupled:
       num_warmup_batches: 1
       enable_prefill_pipeline: false
+      compare_trainer_old_log_prob: false
+    partial_reprefill:
+      num_warmup_batches: 1
+      enable_prefill_pipeline: false
+      enable_case_skip: true
+      enable_piggyback: true
+      compare_trainer_old_log_prob: false
     sampler:
       max_off_policy_threshold: 8
       max_off_policy_strategy: drop

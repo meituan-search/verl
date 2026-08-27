@@ -1,5 +1,7 @@
 # Partial Re-prefill (`partial_reprefill` trainer) Implementation Plan
 
+Last updated: 08/27/2026
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a new `partial_reprefill` trainer that per-trajectory dispatches between skip-reprefill (fully-fresh), consume-client-piggyback (partial_rollout), and full-reprefill (fully-stale), reducing wasted re-prefill work in colocate async training.

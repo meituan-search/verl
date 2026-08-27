@@ -273,6 +273,34 @@ trainer:
       # result remains the old_log_probs used for training.
       compare_trainer_old_log_prob: false
 
+    # Partial Re-prefill trainer: per-trajectory case dispatch between
+    # fully-fresh (skip reprefill), partial piggyback (consume client-side
+    # resume-prefill prompt_logprobs), and fully-stale (full reprefill at
+    # W_sample). Sibling to reprefill_decoupled.
+    partial_reprefill:
+
+      # Number of warmup batches to add before training loop starts
+      num_warmup_batches: 1
+
+      # Pre-dispatch re-prefill for samples as they finish during the
+      # replay-buffer poll loop (P2 pipelined path).
+      enable_prefill_pipeline: false
+
+      # Case 3 fast path: skip reprefill for fully-fresh trajectories
+      # (all tokens decoded at current rollout weight). Set false to
+      # force full reprefill for A/B isolation.
+      enable_case_skip: true
+
+      # Case 1: consume client-side piggyback (partial_rollout resume
+      # prefill prompt_logprobs for stale prefix). Set false to ignore
+      # piggyback marker and always do full reprefill for A/B isolation.
+      enable_piggyback: true
+
+      # A/B timing comparison: keep computing the trainer-side old_log_prob
+      # forward pass alongside the rollout-side computation, stored as
+      # trainer_old_log_probs.
+      compare_trainer_old_log_prob: false
+
     # Replay buffer sampling strategy
     sampler:
 

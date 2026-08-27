@@ -15,9 +15,10 @@
 from .agent_loop_tq import AgentLoopManagerTQ, AgentLoopWorkerTQ
 from .trainer_base import PPOTrainer, get_trainer_cls, register_trainer
 from .trainer_colocate_async import PPOTrainerColocateAsync
+from .trainer_partial_reprefill import PPOTrainerPartialReprefill
+from .trainer_reprefill_decoupled import PPOTrainerReprefillDecoupled
 from .trainer_separate_async import PPOTrainerSeparateAsync
 from .trainer_staleness_sweep import PPOTrainerStalenessSweep
-from .trainer_reprefill_decoupled import PPOTrainerReprefillDecoupled
 from .trainer_sync import PPOTrainerSync
 
 __all__ = [
@@ -29,6 +30,7 @@ __all__ = [
     "PPOTrainerSeparateAsync",
     "PPOTrainerStalenessSweep",
     "PPOTrainerReprefillDecoupled",
+    "PPOTrainerPartialReprefill",
     "AgentLoopWorkerTQ",
     "AgentLoopManagerTQ",
 ]
