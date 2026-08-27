@@ -13,12 +13,10 @@
 # limitations under the License.
 """CPU tests for partial reprefill helpers."""
 
-from verl.trainer.ppo.v1.reprefill_utils import decide_case
-
-
 from verl.trainer.ppo.v1.reprefill_utils import (
-    build_token_versions,
     build_partial_new_rollout_log_probs,
+    build_token_versions,
+    decide_case,
 )
 
 
@@ -29,15 +27,11 @@ class TestBuildTokenVersions:
 
     def test_two_segments_partial_rollout(self):
         # prefix decoded at W_3 (len 4), suffix decoded at W_5 (len 3)
-        tv = build_token_versions(
-            segment_versions=[3, 5], segment_lengths=[4, 3]
-        )
+        tv = build_token_versions(segment_versions=[3, 5], segment_lengths=[4, 3])
         assert tv.tolist() == [3, 3, 3, 3, 5, 5, 5]
 
     def test_three_segments_multi_interrupt(self):
-        tv = build_token_versions(
-            segment_versions=[3, 4, 5], segment_lengths=[2, 2, 2]
-        )
+        tv = build_token_versions(segment_versions=[3, 4, 5], segment_lengths=[2, 2, 2])
         assert tv.tolist() == [3, 3, 4, 4, 5, 5]
 
 
