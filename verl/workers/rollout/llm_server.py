@@ -278,6 +278,54 @@ class LLMServerClient:
             self._release_server(server_id)
 
 
+def _build_piggyback_fields(segments: list, prompt_len: int) -> dict:
+    """Build piggyback fields from a partial_rollout's segment outputs.
+
+    Called after the partial_rollout loop completes. `segments` is the list
+    of per-segment outputs from super().generate() calls. The LAST segment's
+    prompt_logprobs (if present) is the resume-prefill result covering
+    `prompt + cumulative_prefix` at the final W_resume.
+
+    Returns a dict with:
+      - token_versions: per-token int32 1D tensor (always present).
+      - piggyback_marker: bool (True only if prefix was successfully re-prefilled).
+      - new_rollout_log_probs: list[float] (only if piggyback_marker=True).
+      - resume_version: int (only if piggyback_marker=True).
+    """
+    from verl.trainer.ppo.v1.reprefill_utils import (
+        build_partial_new_rollout_log_probs,
+        build_token_versions,
+        slice_response_logprobs,
+    )
+
+    segment_versions = [int(s.extra_fields.get("global_steps", 0)) for s in segments]
+    segment_lengths = [len(s.token_ids) for s in segments]
+    token_versions = build_token_versions(segment_versions, segment_lengths)
+
+    result = {"token_versions": token_versions, "piggyback_marker": False}
+
+    # Piggyback only when: >=2 segments AND last segment emitted prompt_logprobs.
+    if len(segments) < 2:
+        return result
+    last_seg = segments[-1]
+    last_pl = last_seg.extra_fields.get("prompt_logprobs")
+    if last_pl is None:
+        return result
+
+    # Cumulative prefix length = total tokens before the last segment.
+    prefix_len = sum(len(s.token_ids) for s in segments[:-1])
+    # last_pl has length prompt_len + prefix_len (SGLang emits one logprob per
+    # prompt token when prompt_logprobs is set). Slice out the prefix portion.
+    prefix_prompt_logprobs = slice_response_logprobs(last_pl, prompt_len, prefix_len)
+    # Suffix = last segment's decode log_probs (already at W_resume).
+    suffix_rollout_logprobs = [float(x) for x in (last_seg.log_probs or [])]
+    new_rollout = build_partial_new_rollout_log_probs(prefix_prompt_logprobs, suffix_rollout_logprobs)
+    result["piggyback_marker"] = True
+    result["new_rollout_log_probs"] = new_rollout
+    result["resume_version"] = segment_versions[-1]
+    return result
+
+
 class FullyAsyncLLMServerClient(LLMServerClient):
     """FullyLLMServerClient supports resume generation on partial rollout, making rollout interruption
     invisible to the AgentLoop.
@@ -361,6 +409,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             num_preempted=0,
         )
         min_global_steps, max_global_steps = None, None
+        segments = []
 
         while True:
             # 1. generate tokens
@@ -393,6 +442,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             final_output.stop_reason = output.stop_reason
             if "prompt_logprobs" in output.extra_fields:
                 final_output.extra_fields["prompt_logprobs"] = output.extra_fields["prompt_logprobs"]
+            segments.append(output)
 
             # update model weights version
             global_steps = output.extra_fields.get("global_steps", None)
@@ -416,7 +466,21 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             if output.stop_reason not in ("aborted", "abort") or not should_retry:
                 break
 
+            # Resume path: request prompt_logprobs so the resume prefill emits
+            # logprobs for the cumulative prefix (piggyback target). Assumes
+            # SGLang returns prompt_logprobs for a max_new_tokens>0 resume call;
+            # if not, piggyback falls back (marker=False) and the trainer's
+            # case-2 full reprefill path covers the prefix.
+            sampling_params = {**sampling_params, "prompt_logprobs": 0}
             await asyncio.sleep(1)
+
+        # Build piggyback fields from segment outputs (partial_rollout).
+        piggyback = _build_piggyback_fields(segments, prompt_len=len(prompt_ids))
+        final_output.extra_fields["token_versions"] = piggyback["token_versions"]
+        if piggyback["piggyback_marker"]:
+            final_output.extra_fields["piggyback_marker"] = True
+            final_output.extra_fields["new_rollout_log_probs"] = piggyback["new_rollout_log_probs"]
+            final_output.extra_fields["resume_version"] = piggyback["resume_version"]
 
         final_output.extra_fields["global_steps"] = global_steps
         final_output.extra_fields["min_global_steps"] = min_global_steps
