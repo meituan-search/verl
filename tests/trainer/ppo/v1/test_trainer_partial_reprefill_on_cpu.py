@@ -13,6 +13,7 @@
 # limitations under the License.
 """CPU tests for the partial_reprefill trainer (case dispatch)."""
 
+import concurrent.futures
 import uuid
 from types import SimpleNamespace
 
@@ -23,7 +24,10 @@ from omegaconf import OmegaConf
 from tensordict import TensorDict
 
 from verl.trainer.ppo.v1.reprefill_utils import to_nested_jagged
-from verl.trainer.ppo.v1.trainer_partial_reprefill import PPOTrainerPartialReprefill
+from verl.trainer.ppo.v1.trainer_partial_reprefill import (
+    _PendingPrefill,
+    PPOTrainerPartialReprefill,
+)
 
 
 @pytest.fixture(scope="module")
@@ -179,3 +183,179 @@ class TestComputeNewRolloutLogProbCase2:
         # (approx: to_nested_jagged stores float32, so values round-trip with
         # float32 precision, e.g. -0.1 → -0.10000000149011612)
         assert data["new_rollout_log_probs"][0].tolist() == pytest.approx([-0.1, -0.2, -0.3])
+
+
+class TestOnNewFinishedCaseAware:
+    def test_skips_case1_and_case3_only_dispatches_case2(self, tq_init):
+        # Uses partition "train" to match the production guard
+        # `if partition_id != "train": return`, with try/finally cleanup so
+        # the shared partition isn't contaminated.
+        # current_parameter_version = global_steps - 1 = 5.
+        trainer = _make_trainer()
+        submitted = []
+
+        def _submit(coro):
+            coro.close()  # never awaited by this stub; close to silence RuntimeWarning
+            future = concurrent.futures.Future()
+            submitted.append(future)
+            return future
+
+        trainer._prefill_dispatcher = SimpleNamespace(submit=_submit)
+        trainer._pending_prefill = {}
+        trainer.tokenizer = SimpleNamespace(pad_token_id=0)
+        trainer.get_llm_client = lambda: None
+        # Uids must not contain underscores: production resolves trajectory
+        # keys via `k.split("_")[0] == uid` (traj key = `{uid}_{session}_{index}`).
+        # Unique suffix keeps the shared "train" partition clean across runs.
+        sfx = uuid.uuid4().hex[:6]
+        uid_a, uid_b, uid_c = f"uida{sfx}", f"uidb{sfx}", f"uidc{sfx}"
+        key_a = f"{uid_a}_0_0"  # case 2 (stale: token_versions 3 < 5, no piggyback)
+        key_b = f"{uid_b}_0_0"  # case 1 (piggyback marker in the partition tag)
+        key_c = f"{uid_c}_0_0"  # case 3 (fresh: token_versions == 5)
+        trainer.replay_buffer = SimpleNamespace(
+            prompt_global_steps={"train": {}},
+            partitions={
+                "train": {
+                    key_a: None,
+                    key_b: {"piggyback_marker": True},
+                    key_c: None,
+                }
+            },
+        )
+        # All three trajectories exist in TQ (as they do in production once
+        # finished). token_versions drives decide_case; prompts/responses are
+        # only consumed by the dispatched case-2 request.
+        tq.kv_batch_put(
+            keys=[key_a, key_b, key_c],
+            partition_id="train",
+            fields=TensorDict(
+                {
+                    "prompts": to_nested_jagged([[1, 2], [1, 2], [1, 2]]),
+                    "responses": to_nested_jagged([[10, 11], [10, 11], [10, 11]]),
+                    "token_versions": torch.nested.as_nested_tensor(
+                        [
+                            torch.tensor([3, 3], dtype=torch.int32),
+                            torch.tensor([3, 3], dtype=torch.int32),
+                            torch.tensor([5, 5], dtype=torch.int32),
+                        ],
+                        layout=torch.jagged,
+                    ),
+                },
+                batch_size=3,
+            ),
+        )
+
+        try:
+            trainer._on_new_finished("train", [uid_a, uid_b, uid_c])
+
+            assert list(trainer._pending_prefill.keys()) == [key_a]
+            assert len(submitted) == 1
+            assert trainer._pending_prefill[key_a].version == trainer.global_steps
+        finally:
+            tq.kv_clear(partition_id="train", keys=[key_a, key_b, key_c])
+
+
+class TestComputeNewRolloutLogProbPipelined:
+    def _write_trajs(self, partition_id, stale_key, fresh_key=None):
+        # stale: token_versions 3 (case 2); fresh (if given): token_versions 5
+        # (case 3). All keys get prompts/responses so build_reprefill_inputs
+        # works for the case-2 key; rollout_log_probs serves the case-3 copy.
+        trajs = [(stale_key, [3, 3, 3])]
+        if fresh_key is not None:
+            trajs.append((fresh_key, [5, 5, 5]))
+        n = len(trajs)
+        tq.kv_batch_put(
+            keys=[k for k, _ in trajs],
+            partition_id=partition_id,
+            fields=TensorDict(
+                {
+                    "prompts": to_nested_jagged([[1, 2]] * n),
+                    "responses": to_nested_jagged([[10, 11, 12]] * n),
+                    "token_versions": torch.nested.as_nested_tensor(
+                        [torch.tensor(tv, dtype=torch.int32) for _, tv in trajs],
+                        layout=torch.jagged,
+                    ),
+                    "rollout_log_probs": to_nested_jagged([[0.1, 0.2, 0.3]] * n),
+                },
+                batch_size=n,
+            ),
+        )
+
+    def test_case2_consumes_prefill_future_case3_fast_path(self, tq_init, partition_id):
+        trainer = _make_trainer()
+        trainer.tokenizer = SimpleNamespace(pad_token_id=0)
+        trainer._pending_prefill = {}
+        stale_key = f"uid_s_{uuid.uuid4().hex[:6]}_0"
+        fresh_key = f"uid_f_{uuid.uuid4().hex[:6]}_0"
+        self._write_trajs(partition_id, stale_key, fresh_key)
+
+        # Pre-dispatched future for the stale key: done + version-aligned
+        # (resume_version = global_steps - 1 = 5).
+        future = concurrent.futures.Future()
+        future.set_result(
+            [
+                SimpleNamespace(
+                    extra_fields={
+                        "prompt_logprobs": [[-0.0], [-0.1], [-0.2], [-0.3], [-0.4]],
+                        "global_steps": 5,
+                    }
+                )
+            ]
+        )
+        trainer._pending_prefill[stale_key] = _PendingPrefill(version=trainer.global_steps, future=future)
+
+        reprefill_called = []
+
+        def _reprefill_all(_):
+            reprefill_called.append(True)
+            return []
+
+        trainer._reprefill_all = _reprefill_all
+        batch = _make_batch(partition_id, [stale_key, fresh_key])
+        metrics = {}
+
+        trainer._compute_new_rollout_log_prob_pipelined(batch, metrics)
+
+        assert reprefill_called == [], "aligned prefill future must be consumed, not re-issued"
+        assert metrics["partial_reprefill/case_distribution.case_2"] == 1.0
+        assert metrics["partial_reprefill/case_distribution.case_3"] == 1.0
+        assert metrics["partial_reprefill/prefill_consumed"] == 1.0
+        data = tq.kv_batch_get(
+            keys=[stale_key, fresh_key],
+            partition_id=partition_id,
+            select_fields=["new_rollout_log_probs"],
+        )
+        # prompt_len=2, response_len=3 → slice [1:4]
+        assert data["new_rollout_log_probs"][0].tolist() == pytest.approx([-0.1, -0.2, -0.3])
+        assert data["new_rollout_log_probs"][1].tolist() == pytest.approx([0.1, 0.2, 0.3])
+        assert trainer._pending_prefill == {}
+
+    def test_stale_version_future_triggers_reissue(self, tq_init, partition_id):
+        trainer = _make_trainer()
+        trainer.tokenizer = SimpleNamespace(pad_token_id=0)
+        trainer._pending_prefill = {}
+        stale_key = f"uid_s_{uuid.uuid4().hex[:6]}_0"
+        self._write_trajs(partition_id, stale_key)
+
+        # Future resolved at the wrong engine version → must not be consumed.
+        future = concurrent.futures.Future()
+        future.set_result(
+            [SimpleNamespace(extra_fields={"prompt_logprobs": [[-9.0]], "global_steps": 4})]
+        )
+        trainer._pending_prefill[stale_key] = _PendingPrefill(version=trainer.global_steps, future=future)
+
+        fake_result = SimpleNamespace(extra_fields={"prompt_logprobs": [[-0.0], [-0.1], [-0.2], [-0.3], [-0.4]]})
+        trainer._reprefill_all = lambda _: [fake_result]
+        batch = _make_batch(partition_id, [stale_key])
+        metrics = {}
+
+        trainer._compute_new_rollout_log_prob_pipelined(batch, metrics)
+
+        assert metrics["partial_reprefill/prefill_consumed"] == 0.0
+        data = tq.kv_batch_get(
+            keys=[stale_key],
+            partition_id=partition_id,
+            select_fields=["new_rollout_log_probs"],
+        )
+        assert data["new_rollout_log_probs"][0].tolist() == pytest.approx([-0.1, -0.2, -0.3])
+        assert trainer._pending_prefill == {}
