@@ -120,13 +120,13 @@ class TestComputeNewRolloutLogProbCase1:
         key = f"traj-{uuid.uuid4().hex}"
         expected_lp = [-0.1, -0.2, -0.3]
         tq.kv_batch_put(
-            keys=[key], partition_id=partition_id,
-            fields=TensorDict(
-                {"new_rollout_log_probs": to_nested_jagged([expected_lp])}, batch_size=1
-            ),
+            keys=[key],
+            partition_id=partition_id,
+            fields=TensorDict({"new_rollout_log_probs": to_nested_jagged([expected_lp])}, batch_size=1),
         )
         batch = _make_batch(
-            partition_id, [key],
+            partition_id,
+            [key],
             tags=[{"piggyback_marker": True, "resume_version": 5}],
         )
         metrics = {}
@@ -145,7 +145,8 @@ class TestComputeNewRolloutLogProbCase2:
         trainer = _make_trainer()
         key = f"traj-{uuid.uuid4().hex}"
         tq.kv_batch_put(
-            keys=[key], partition_id=partition_id,
+            keys=[key],
+            partition_id=partition_id,
             fields=TensorDict(
                 {
                     "prompts": to_nested_jagged([[1, 2]]),
@@ -162,9 +163,7 @@ class TestComputeNewRolloutLogProbCase2:
         metrics = {}
 
         # Stub _reprefill_all to return a fake result with prompt_logprobs.
-        fake_result = SimpleNamespace(
-            extra_fields={"prompt_logprobs": [[-0.0], [-0.1], [-0.2], [-0.3], [-0.4]]}
-        )
+        fake_result = SimpleNamespace(extra_fields={"prompt_logprobs": [[-0.0], [-0.1], [-0.2], [-0.3], [-0.4]]})
         trainer._reprefill_all = lambda _: [fake_result]
         # Stub tokenizer.pad_token_id
         trainer.tokenizer = SimpleNamespace(pad_token_id=0)
@@ -172,7 +171,8 @@ class TestComputeNewRolloutLogProbCase2:
         out = trainer._compute_new_rollout_log_prob(batch, metrics)
         assert metrics["partial_reprefill/case_distribution.case_2"] == 1.0
         data = tq.kv_batch_get(
-            keys=[key], partition_id=partition_id,
+            keys=[key],
+            partition_id=partition_id,
             select_fields=["new_rollout_log_probs"],
         )
         # prompt_len=2, response_len=3 → slice [1:4] → [-0.1, -0.2, -0.3]
