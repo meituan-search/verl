@@ -39,7 +39,7 @@
 
 ## Phase A: Trainer skeleton + case 3 (skip reprefill for fully-fresh)
 
-### Task A1: Add config block + register trainer
+### Task 1: Add config block + register trainer
 
 **Files:**
 - Modify: `verl/trainer/config/ppo_trainer.yaml` (after `reprefill_decoupled:` block, ~line 270)
@@ -142,7 +142,7 @@ git commit -m "feat: add partial_reprefill trainer skeleton + config namespace"
 
 ---
 
-### Task A2: `decide_case` helper in `reprefill_utils.py`
+### Task 2: `decide_case` helper in `reprefill_utils.py`
 
 **Files:**
 - Modify: `verl/trainer/ppo/v1/reprefill_utils.py` (append after existing helpers)
@@ -273,7 +273,7 @@ git commit -m "feat: add decide_case helper for partial reprefill case dispatch"
 
 ---
 
-### Task A3: Trainer `_compute_new_rollout_log_prob` with case 3 logic
+### Task 3: Trainer `_compute_new_rollout_log_prob` with case 3 logic
 
 **Files:**
 - Modify: `verl/trainer/ppo/v1/trainer_partial_reprefill.py` (replace skeleton)
@@ -590,7 +590,7 @@ git commit -m "feat: implement partial_reprefill trainer with case 3 skip logic"
 
 ## Phase B: Client-side partial_rollout piggyback
 
-### Task B1: SGLang behavior verification spike
+### Task 4: SGLang behavior verification spike
 
 **Files:**
 - Test (throwaway): `tests/workers/rollout/test_sglang_prompt_logprobs_on_resume.py`
@@ -641,7 +641,7 @@ Result: [EMITS / DOES NOT EMIT] prompt_logprobs when max_new_tokens>0.
 
 ---
 
-### Task B2: `build_token_versions` + `build_partial_new_rollout_log_probs` helpers
+### Task 5: `build_token_versions` + `build_partial_new_rollout_log_probs` helpers
 
 **Files:**
 - Modify: `verl/trainer/ppo/v1/reprefill_utils.py`
@@ -752,7 +752,7 @@ git commit -m "feat: add token_versions + partial new_rollout_log_probs builders
 
 ---
 
-### Task B3: Modify `FullyAsyncLLMServerClient.generate` to emit piggyback
+### Task 6: Modify `FullyAsyncLLMServerClient.generate` to emit piggyback
 
 **Files:**
 - Modify: `verl/workers/rollout/llm_server.py:355-424` (partial_rollout loop)
@@ -941,7 +941,7 @@ git commit -m "feat: emit token_versions + piggyback new_rollout_log_probs from 
 
 ---
 
-### Task B4: Propagate client fields through agent_loop_tq to TQ
+### Task 7: Propagate client fields through agent_loop_tq to TQ
 
 **Files:**
 - Modify: `verl/trainer/ppo/v1/agent_loop_tq.py:182-227` (the `_agent_loop_postprocess` field-put loop)
@@ -1004,7 +1004,7 @@ git commit -m "feat: propagate partial_rollout piggyback fields through agent_lo
 
 ## Phase C: Trainer case 1 consumption + token-level metrics
 
-### Task C1: Extend trainer tests to cover case 1 + case 2
+### Task 8: Extend trainer tests to cover case 1 + case 2
 
 **Files:**
 - Modify: `tests/trainer/ppo/v1/test_trainer_partial_reprefill_on_cpu.py` (extend)
@@ -1089,7 +1089,7 @@ git commit -m "test: cover case 1 (piggyback skip) and case 2 (full reprefill) i
 
 ---
 
-### Task C2: Token-level metrics function
+### Task 9: Token-level metrics function
 
 **Files:**
 - Modify: `verl/trainer/ppo/v1/reprefill_utils.py`
@@ -1253,7 +1253,7 @@ git commit -m "feat: add per-token staleness metrics alongside per-trajectory me
 
 ## Phase D: P2 pipelined pre-dispatch with case awareness
 
-### Task D1: Duplicate `_PrefillDispatcher` + `_on_new_finished` in new trainer
+### Task 10: Duplicate `_PrefillDispatcher` + `_on_new_finished` in new trainer
 
 **Files:**
 - Modify: `verl/trainer/ppo/v1/trainer_partial_reprefill.py`
@@ -1373,7 +1373,7 @@ git commit -m "feat: P2 pipelined pre-dispatch with case-aware skip for partial_
 
 ---
 
-### Task D2: Enable `enable_prefill_pipeline` flag wiring in `on_train_begin`/`on_train_end`
+### Task 11: Enable `enable_prefill_pipeline` flag wiring in `on_train_begin`/`on_train_end`
 
 **Files:**
 - Modify: `verl/trainer/ppo/v1/trainer_partial_reprefill.py`
@@ -1430,16 +1430,16 @@ git commit -m "feat: wire enable_prefill_pipeline flag in partial_reprefill trai
 **1. Spec coverage:**
 - §2 design overview (three cases) → Tasks A3, B3, C1
 - §3 TQ schema (token_versions, piggyback_marker) → Tasks B2, B3, B4
-- §4.1 client changes (prompt_logprobs, merge behavior) → Task B3
-- §4.2 trainer case-decision dispatcher → Task A3
-- §4.3 P2 pipelined case-aware → Task D1
-- §4.4 staleness metrics unchanged → Task C1 (no change to existing function)
-- §4.5 new token-level metrics → Task C2
+- §4.1 client changes (prompt_logprobs, merge behavior) → Task 6
+- §4.2 trainer case-decision dispatcher → Task 3
+- §4.3 P2 pipelined case-aware → Task 10
+- §4.4 staleness metrics unchanged → Task 8 (no change to existing function)
+- §4.5 new token-level metrics → Task 9
 - §5 data flow walkthrough → covered by tests in A3, B3, C1
 - §6 edge cases (multi-interruption, piggyback failure, stale current_parameter_version) → covered by decide_case tests (A2) + _build_piggyback_fields tests (B3)
 - §7 testing strategy → all test tasks
-- §8 rollout / config → Task A1
-- §9 open questions → Task B1 resolves SGLang behavior
+- §8 rollout / config → Task 1
+- §9 open questions → Task 4 resolves SGLang behavior
 
 **2. Placeholder scan:** Verify no "TBD" / "TODO" / "implement later" in any task body. (D1 Step 3 has "see A3's dispatcher" — that's a reference, not a placeholder; the dispatcher IS implemented in A3.)
 
