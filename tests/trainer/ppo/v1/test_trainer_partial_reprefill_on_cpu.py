@@ -42,7 +42,7 @@ def partition_id():
     return f"test-{uuid.uuid4().hex}"
 
 
-def _make_trainer(enable_case_skip=True, enable_piggyback=True):
+def _make_trainer(enable_case_skip=True, enable_piggyback=True, enable_prefill_pipeline=False, num_warmup_batches=0):
     trainer = PPOTrainerPartialReprefill.__new__(PPOTrainerPartialReprefill)
     trainer.config = OmegaConf.create(
         {
@@ -50,10 +50,11 @@ def _make_trainer(enable_case_skip=True, enable_piggyback=True):
             "trainer": {
                 "v1": {
                     "partial_reprefill": {
-                        "enable_prefill_pipeline": False,
+                        "enable_prefill_pipeline": enable_prefill_pipeline,
                         "enable_case_skip": enable_case_skip,
                         "enable_piggyback": enable_piggyback,
                         "compare_trainer_old_log_prob": False,
+                        "num_warmup_batches": num_warmup_batches,
                     }
                 }
             },
@@ -359,3 +360,63 @@ class TestComputeNewRolloutLogProbPipelined:
         )
         assert data["new_rollout_log_probs"][0].tolist() == pytest.approx([-0.1, -0.2, -0.3])
         assert trainer._pending_prefill == {}
+
+
+class TestEnablePrefillPipelineFlag:
+    """Verify `enable_prefill_pipeline` gates P2 dispatcher creation.
+
+    Flag off (default): `_prefill_dispatcher` stays None, `_pending_prefill`
+    stays None — `on_sampled` takes the non-pipelined branch. Flag on: dispatcher
+    is started, `_pending_prefill` becomes `{}`, and the replay-buffer callback
+    is registered. This is the carry-forward test from Task 10's review.
+    """
+
+    def test_flag_off_does_not_create_dispatcher(self):
+        trainer = _make_trainer(enable_prefill_pipeline=False)
+        added = []
+        trainer._add_batch_to_generate = lambda: added.append(True)
+        trainer.replay_buffer = SimpleNamespace()
+        trainer.on_train_begin()
+        assert getattr(trainer, "_prefill_dispatcher", None) is None
+        assert getattr(trainer, "_pending_prefill", None) is None
+
+    def test_flag_on_creates_dispatcher_and_pending_dict(self):
+        trainer = _make_trainer(enable_prefill_pipeline=True, num_warmup_batches=1)
+        added = []
+        trainer._add_batch_to_generate = lambda: added.append(True)
+        callback_registered = []
+        rb = SimpleNamespace(
+            set_on_new_finished_callback=lambda cb: callback_registered.append(cb)
+        )
+        trainer.replay_buffer = rb
+        trainer.on_train_begin()
+        assert len(added) == 1, "warmup batches must be added"
+        assert trainer._prefill_dispatcher is not None
+        assert trainer._pending_prefill == {}
+        assert callback_registered == [trainer._on_new_finished]
+        trainer.on_train_end()
+        assert trainer._prefill_dispatcher._loop is None, "dispatcher loop must be closed on_train_end"
+
+    def test_on_sampled_non_pipelined_when_flag_off(self):
+        trainer = _make_trainer(enable_prefill_pipeline=False)
+        called = []
+        trainer._compute_new_rollout_log_prob = lambda batch, metrics: (called.append("non_pipelined") or batch)
+        trainer._compute_new_rollout_log_prob_pipelined = lambda batch, metrics: (called.append("pipelined") or batch)
+        trainer.timing_raw = {}
+        batch = _make_batch("p", ["k1"])
+        trainer.on_sampled(batch, {})
+        assert called == ["non_pipelined"]
+
+    def test_on_sampled_pipelined_when_flag_on(self):
+        trainer = _make_trainer(enable_prefill_pipeline=True)
+        # `on_train_begin` sets `_pending_prefill = {}` when flag is on;
+        # simulate that state without actually starting the dispatcher thread.
+        trainer._pending_prefill = {}
+        called = []
+        trainer._compute_new_rollout_log_prob = lambda batch, metrics: (called.append("non_pipelined") or batch)
+        trainer._compute_new_rollout_log_prob_pipelined = lambda batch, metrics: (called.append("pipelined") or batch)
+        trainer.timing_raw = {}
+        batch = _make_batch("p", ["k1"])
+        trainer.on_sampled(batch, {})
+        assert called == ["pipelined"]
+
