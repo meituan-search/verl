@@ -68,7 +68,7 @@ def _install_stub_finder(prefixes: list[str]) -> None:
     sys.meta_path.insert(0, _StubFinder)
 
 
-_STUB_PACKAGES = ["megatron", "magi_attention", "apex", "transformer_engine"]
+_STUB_PACKAGES = ["megatron", "apex", "transformer_engine"]
 for _pkg in _STUB_PACKAGES:
     try:
         importlib.util.find_spec(_pkg)

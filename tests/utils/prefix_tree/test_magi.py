@@ -17,6 +17,11 @@
 
 from __future__ import annotations
 
+import importlib
+import sys
+from types import SimpleNamespace
+
+import pytest
 import torch
 
 from verl.utils.prefix_tree import magi as magi_mod
@@ -65,6 +70,77 @@ def _build_pt_batch(tokens):
         ),
         subtrie=subtrie,
     )
+
+
+def _fake_magi_modules():
+    api = SimpleNamespace(
+        DistAttnConfig=object(),
+        get_position_ids=object(),
+        magi_attn_flex_key=object(),
+        undispatch=object(),
+        calc_attn=object(),
+    )
+    common = SimpleNamespace(AttnRanges=object())
+    enum = SimpleNamespace(AttnMaskType=object())
+    solver = SimpleNamespace(DispatchConfig=object())
+    return {
+        "magi_attention.api": api,
+        "magi_attention.common": common,
+        "magi_attention.common.enum": enum,
+        "magi_attention.meta.solver.dispatch_solver": solver,
+    }
+
+
+def test_import_magi_attention_reports_actionable_error(monkeypatch):
+    original_import_module = importlib.import_module
+
+    def reject_magi(name):
+        if name.startswith("magi_attention"):
+            raise ModuleNotFoundError("No module named 'magi_attention'", name=name)
+        return original_import_module(name)
+
+    monkeypatch.setattr(magi_mod, "import_module", reject_magi, raising=False)
+
+    try:
+        magi_mod.import_magi_attention.cache_clear()
+        with pytest.raises(ImportError) as exc_info:
+            magi_mod.import_magi_attention()
+        assert isinstance(exc_info.value.__cause__, ModuleNotFoundError)
+    finally:
+        if hasattr(magi_mod, "import_magi_attention"):
+            magi_mod.import_magi_attention.cache_clear()
+
+
+def test_import_magi_attention_caches_loaded_symbols(monkeypatch):
+    modules = _fake_magi_modules()
+    imported_modules = []
+
+    def import_fake_magi(name):
+        imported_modules.append(name)
+        return modules[name]
+
+    monkeypatch.setattr(magi_mod, "import_module", import_fake_magi, raising=False)
+
+    try:
+        magi_mod.import_magi_attention.cache_clear()
+        first = magi_mod.import_magi_attention()
+        second = magi_mod.import_magi_attention()
+
+        assert first is second
+        assert first.calc_attn is modules["magi_attention.api"].calc_attn
+        assert imported_modules == list(modules)
+    finally:
+        if hasattr(magi_mod, "import_magi_attention"):
+            magi_mod.import_magi_attention.cache_clear()
+
+
+def test_prefix_tree_flex_modules_import_without_magi_attention():
+    assert not any(name == "magi_attention" or name.startswith("magi_attention.") for name in sys.modules)
+
+    importlib.import_module("verl.utils.prefix_tree.forward")
+    importlib.import_module("verl.utils.prefix_tree.prefix_tree_patch_impl")
+
+    assert not any(name == "magi_attention" or name.startswith("magi_attention.") for name in sys.modules)
 
 
 def test_basic_shared_prefix_flat_layout_and_flex_rects():

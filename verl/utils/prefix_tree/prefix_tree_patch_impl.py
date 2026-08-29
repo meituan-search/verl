@@ -22,7 +22,6 @@ import logging
 
 import megatron.core.tensor_parallel as tp
 import torch
-from magi_attention.api import calc_attn
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -32,6 +31,8 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from torch import Tensor
 from torch.nn.attention.flex_attention import flex_attention
+
+from verl.utils.prefix_tree.magi import import_magi_attention
 
 # Stack for passing attention keys through gradient-checkpoint recompute.
 # Pushed by _fn_with_key before calling checkpointed fn, popped after.
@@ -72,11 +73,12 @@ def magi_attn_forward(
 ) -> Tensor:
     """Execute MAGI calc_attn for prefix-tree: squeeze pre-dispatched CP-local Q/K/V, call calc_attn, reshape."""
 
+    magi = import_magi_attention()
     q = query.squeeze(1).contiguous()
     k = key.squeeze(1).contiguous()
     v = value.squeeze(1).contiguous()
 
-    out, _ = calc_attn(q, k, v, magi_attention_key)
+    out, _ = magi.calc_attn(q, k, v, magi_attention_key)
 
     return out.reshape(out.shape[0], 1, -1)
 

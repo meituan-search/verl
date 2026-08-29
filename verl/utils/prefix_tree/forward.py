@@ -25,15 +25,6 @@ from typing import Optional
 
 import torch
 import torch.distributed as _dist
-from magi_attention.api import (
-    DistAttnConfig,
-    get_position_ids,
-    magi_attn_flex_key,
-    undispatch,
-)
-from magi_attention.common import AttnRanges
-from magi_attention.common.enum import AttnMaskType
-from magi_attention.meta.solver.dispatch_solver import DispatchConfig
 from megatron.core import parallel_state as mpu
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
@@ -48,6 +39,7 @@ from verl.utils.prefix_tree.magi import (
     build_prefix_tree_micro_batch,
     clear_rope_pids,
     prefix_tree_decoder_key_context,
+    import_magi_attention,
     restore_flat_to_nested,
     set_rope_pids,
     strip_prefix_tree_args,
@@ -128,6 +120,7 @@ def _build_flex_key(params, device):
 
 def _build_magi_key(model, params):
     """Build magi_attn_flex_key from PrefixTreeParams and model config."""
+    magi = import_magi_attention()
     # TP shards heads: each rank holds heads/tp_size. GQA falls back to num_attention_heads.
     cfg = unwrap_model(model).config
     tp_size = mpu.get_tensor_model_parallel_world_size()
@@ -140,10 +133,10 @@ def _build_magi_key(model, params):
     except Exception:
         cp_group = _dist.group.WORLD
 
-    return magi_attn_flex_key(
-        q_ranges=AttnRanges.from_ranges(params.q_ranges),
-        k_ranges=AttnRanges.from_ranges(params.k_ranges),
-        attn_mask_type=[AttnMaskType(m) for m in params.mask_types],
+    return magi.magi_attn_flex_key(
+        q_ranges=magi.AttnRanges.from_ranges(params.q_ranges),
+        k_ranges=magi.AttnRanges.from_ranges(params.k_ranges),
+        attn_mask_type=[magi.AttnMaskType(m) for m in params.mask_types],
         total_seqlen_q=params.total_seqlen_q,
         total_seqlen_k=params.total_seqlen_k,
         num_heads_q=num_heads_q,
@@ -151,8 +144,8 @@ def _build_magi_key(model, params):
         head_dim=head_dim,
         pad_size=0,
         cp_group_or_mesh=cp_group,
-        dist_attn_config=DistAttnConfig(
-            dispatch_config=DispatchConfig(uneven_shard=True),
+        dist_attn_config=magi.DistAttnConfig(
+            dispatch_config=magi.DispatchConfig(uneven_shard=True),
         ),
     )
 
@@ -218,7 +211,8 @@ def _finalize_prefix_tree_batch(
 def dispatch_magi(pt_batch: PrefixTreeMagiBatch) -> tuple[Tensor, Tensor]:
     """Slice local_input_ids / local_position_ids via magi dispatch
     (get_position_ids). Each CP rank processes its assigned slice."""
-    local_indices = get_position_ids(pt_batch.magi_key)
+    magi = import_magi_attention()
+    local_indices = magi.get_position_ids(pt_batch.magi_key)
     local_input_ids = pt_batch.tree_packed_input_ids[local_indices].unsqueeze(0)
     local_position_ids = pt_batch.tree_packed_position_ids[local_indices].unsqueeze(0)
     return local_input_ids, local_position_ids
@@ -317,7 +311,8 @@ def tree_post_processing(ctx, output_orig, logits_processor, logits_processor_ar
         }
 
         if prefix_tree_attention == "magi":
-            local_indices = get_position_ids(pt_batch.magi_key)
+            magi = import_magi_attention()
+            local_indices = magi.get_position_ids(pt_batch.magi_key)
             flat_padded = pt_batch.tree_packed_input_ids.shape[0]
             logits_full = logits_flat.new_zeros((flat_padded, logits_flat.shape[-1]))
             logits_full[local_indices] = logits_flat
@@ -378,7 +373,8 @@ def _prepare_lce_inputs_with_boundary(
         hidden_states = gather_from_sequence_parallel_region(hidden_states)
 
     if magi_key is not None:
-        local_indices = get_position_ids(magi_key)
+        magi = import_magi_attention()
+        local_indices = magi.get_position_ids(magi_key)
         flat_padded = pt_batch.tree_packed_input_ids.shape[0]
         pad = flat_padded - labels.shape[0]
         labels_full = torch.cat([labels, labels.new_zeros(pad)]) if pad > 0 else labels
@@ -438,8 +434,9 @@ def _run_lce_postprocess(
 
     # only dispatch the REAL token not the padded boundary token, tp/cp padding
     if magi_key is not None:
-        logprobs = undispatch(logprobs.reshape(-1), magi_key)[: pt_batch.real_tokens]
-        entropy = undispatch(entropy.reshape(-1), magi_key)[: pt_batch.real_tokens]
+        magi = import_magi_attention()
+        logprobs = magi.undispatch(logprobs.reshape(-1), magi_key)[: pt_batch.real_tokens]
+        entropy = magi.undispatch(entropy.reshape(-1), magi_key)[: pt_batch.real_tokens]
     return logprobs, entropy
 
 
