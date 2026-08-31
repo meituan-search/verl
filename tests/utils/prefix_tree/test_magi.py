@@ -74,7 +74,7 @@ def test_magi_backend_raises_actionable_error_without_magi(monkeypatch):
     """The magi backend entry point raises an actionable ImportError when MAGI is missing."""
     import verl.utils.prefix_tree.forward as forward_mod
 
-    monkeypatch.setattr(forward_mod, "_MAGI_AVAILABLE", False)
+    monkeypatch.setattr(forward_mod, "_MAGI_ATTENTION_AVAILABLE", False)
     with pytest.raises(ImportError, match="prefix_tree_attention=flex"):
         forward_mod._build_magi_key(object(), object())
 
@@ -83,7 +83,7 @@ def test_magi_attn_forward_raises_actionable_error_without_magi(monkeypatch):
     """magi_attn_forward raises an actionable ImportError when MAGI is missing."""
     import verl.utils.prefix_tree.prefix_tree_patch_impl as patch_mod
 
-    monkeypatch.setattr(patch_mod, "_MAGI_AVAILABLE", False)
+    monkeypatch.setattr(patch_mod, "_MAGI_ATTENTION_AVAILABLE", False)
     with pytest.raises(ImportError, match="prefix_tree_attention=flex"):
         patch_mod.magi_attn_forward(object(), object(), object(), object())
 
@@ -93,7 +93,7 @@ def test_prefix_tree_flex_modules_import_without_magi_attention():
     import verl.utils.prefix_tree.forward as forward_mod
     import verl.utils.prefix_tree.prefix_tree_patch_impl as patch_mod
 
-    if forward_mod._MAGI_AVAILABLE or patch_mod._MAGI_AVAILABLE:
+    if forward_mod._MAGI_ATTENTION_AVAILABLE or patch_mod._MAGI_ATTENTION_AVAILABLE:
         pytest.skip("magi_attention is installed in this environment")
 
     assert not any(name == "magi_attention" or name.startswith("magi_attention.") for name in sys.modules)

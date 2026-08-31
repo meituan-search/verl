@@ -35,9 +35,9 @@ from torch.nn.attention.flex_attention import flex_attention
 try:
     from magi_attention.api import calc_attn
 
-    _MAGI_AVAILABLE = True
+    _MAGI_ATTENTION_AVAILABLE = True
 except ImportError:
-    _MAGI_AVAILABLE = False
+    _MAGI_ATTENTION_AVAILABLE = False
 
 # Stack for passing attention keys through gradient-checkpoint recompute.
 # Pushed by _fn_with_key before calling checkpointed fn, popped after.
@@ -78,7 +78,7 @@ def magi_attn_forward(
 ) -> Tensor:
     """Execute MAGI calc_attn for prefix-tree: squeeze pre-dispatched CP-local Q/K/V, call calc_attn, reshape."""
 
-    if not _MAGI_AVAILABLE:
+    if not _MAGI_ATTENTION_AVAILABLE:
         raise ImportError(
             "Prefix-tree attention backend 'magi' requires a working 'magi_attention' "
             "installation. Install a compatible MAGI Attention build, or set "

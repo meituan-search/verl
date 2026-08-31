@@ -37,9 +37,9 @@ try:
     from magi_attention.common.enum import AttnMaskType
     from magi_attention.meta.solver.dispatch_solver import DispatchConfig
 
-    _MAGI_AVAILABLE = True
+    _MAGI_ATTENTION_AVAILABLE = True
 except ImportError:
-    _MAGI_AVAILABLE = False
+    _MAGI_ATTENTION_AVAILABLE = False
 
 from megatron.core import parallel_state as mpu
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
@@ -135,7 +135,7 @@ def _build_flex_key(params, device):
 
 def _build_magi_key(model, params):
     """Build magi_attn_flex_key from PrefixTreeParams and model config."""
-    if not _MAGI_AVAILABLE:
+    if not _MAGI_ATTENTION_AVAILABLE:
         raise ImportError(
             "Prefix-tree attention backend 'magi' requires a working 'magi_attention' "
             "installation. Install a compatible MAGI Attention build, or set "
