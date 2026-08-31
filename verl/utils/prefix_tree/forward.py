@@ -73,6 +73,8 @@ def _prepare_attn_inputs(
         local_input_ids, local_position_ids = dispatch_magi(pb)
         attn_kwargs = {"magi_attention_key": pb.magi_key}
     else:
+        if pb.flex_key is None:
+            raise RuntimeError("flex attention requires pb.flex_key")
         local_input_ids = pb.tree_packed_input_ids.unsqueeze(0)
         local_position_ids = pb.tree_packed_position_ids.unsqueeze(0)
         attn_kwargs = {"flex_attention_key": pb.flex_key}
@@ -99,30 +101,55 @@ def _unpack_nested_to_list(x, mask: Optional[Tensor] = None) -> Optional[list[Te
     return None
 
 
-def _build_flex_key(params, device):
-    """Build torch flex_attention block_mask from PrefixTreeParams
-    (prefix causal + per-leaf causal + cross-leaf blocked)."""
-    total = params.total_seqlen_q
-    prefix_end = params.prefix_range[1]  # == prefix_len
+def _build_flex_key(params, device, subtrie=None):
+    """Build flex_attention block_mask from the trie topology.
 
-    leaf_id = torch.full((total,), -1, dtype=torch.int32, device=device)
-    for i, (s, e) in enumerate(params.leaf_ranges):
-        leaf_id[s:e] = i
+    A query at flat position q sees a kv position iff kv's node is an ancestor-or-self
+    of q's node (full), with same-node pairs causal. Interval containment via DFS
+    enter/exit times; BFS flat layout puts ancestors strictly before descendants, so
+    ``kv_idx <= q_idx`` binds same-node causality and is auto-true for ancestors.
+    """
+    if subtrie is None:
+        raise RuntimeError("_build_flex_key: subtrie required for flex (trie topology)")
+
+    # DFS enter/exit times: u is ancestor-or-self of v iff tin[u] <= tin[v] <= tout[u].
+    tin: dict[int, int] = {}
+    tout: dict[int, int] = {}
+    counter = 0
+
+    def _visit(node) -> None:
+        nonlocal counter
+        tin[node.node_idx] = counter
+        counter += 1
+        for child in subtrie.children_of(node):
+            _visit(child)
+        tout[node.node_idx] = counter
+        counter += 1
+
+    for root in subtrie.roots:
+        _visit(root)
+
+    # Map each flat position (BFS layout, same as utils.py Pass 1) to its node's interval.
+    total = params.total_seqlen_q
+    tin_arr = torch.zeros(total, dtype=torch.int64, device=device)
+    tout_arr = torch.zeros(total, dtype=torch.int64, device=device)
+    pos = 0
+    for node in subtrie.bfs():
+        length = len(node.input_ids)
+        tin_arr[pos : pos + length] = tin[node.node_idx]
+        tout_arr[pos : pos + length] = tout[node.node_idx]
+        pos += length
 
     def prefix_tree_mask(b, h, q_idx, kv_idx):
-        q_leaf = leaf_id[q_idx]
-        k_leaf = leaf_id[kv_idx]
-        in_prefix_k = kv_idx < prefix_end
-        same_leaf = (q_leaf == k_leaf) & (q_leaf >= 0)
-        causal = kv_idx <= q_idx
-        return (in_prefix_k & causal) | (same_leaf & causal) | (in_prefix_k & (q_leaf >= 0))
+        ancestor_or_self = (tin_arr[kv_idx] <= tin_arr[q_idx]) & (tout_arr[q_idx] <= tout_arr[kv_idx])
+        return ancestor_or_self & (kv_idx <= q_idx)
 
     # _compile=False: avoid Triton JIT which takes minutes for new shapes.
     # Memory is handled at the call site via torch.utils.checkpoint.
     block_mask = create_block_mask(
         prefix_tree_mask, B=None, H=None, Q_LEN=total, KV_LEN=total, device=device, _compile=False
     )
-    block_mask._leaf_id = leaf_id  # keep closure alive
+    block_mask._flex_aux = (tin_arr, tout_arr)  # pin closure tensors against GC
     return block_mask
 
 
@@ -132,7 +159,8 @@ def _build_magi_key(model, params):
     cfg = unwrap_model(model).config
     tp_size = mpu.get_tensor_model_parallel_world_size()
     num_heads_q = cfg.num_attention_heads // tp_size
-    num_heads_kv = (getattr(cfg, "num_query_groups", None) or cfg.num_attention_heads) // tp_size
+    num_query_groups = getattr(cfg, "num_query_groups", cfg.num_attention_heads) or cfg.num_attention_heads
+    num_heads_kv = max(1, num_query_groups // tp_size)
     head_dim = cfg.kv_channels  # hidden_size // num_attention_heads
 
     try:
@@ -193,7 +221,7 @@ def _finalize_prefix_tree_batch(
                 subtrie._cached_magi_key = magi_key
         flex_key = None
     elif attention_type == "flex":
-        flex_key = _build_flex_key(params, params.tree_packed_tokens.device)
+        flex_key = _build_flex_key(params, params.tree_packed_tokens.device, subtrie=subtrie)
         magi_key = None
     else:
         raise ValueError(f"Unknown attention_type: {attention_type!r} (expected 'magi' or 'flex')")
