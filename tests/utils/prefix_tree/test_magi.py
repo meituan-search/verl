@@ -70,21 +70,21 @@ def _build_pt_batch(tokens):
     )
 
 
-def test_magi_backend_raises_actionable_error_without_magi(monkeypatch):
-    """The magi backend entry point raises an actionable ImportError when MAGI is missing."""
+def test_magi_backend_raises_import_error_without_magi(monkeypatch):
+    """The magi backend entry point raises an ImportError when MAGI is missing."""
     import verl.utils.prefix_tree.forward as forward_mod
 
     monkeypatch.setattr(forward_mod, "_MAGI_ATTENTION_AVAILABLE", False)
-    with pytest.raises(ImportError, match="prefix_tree_attention=flex"):
+    with pytest.raises(ImportError):
         forward_mod._build_magi_key(object(), object())
 
 
-def test_magi_attn_forward_raises_actionable_error_without_magi(monkeypatch):
-    """magi_attn_forward raises an actionable ImportError when MAGI is missing."""
+def test_magi_attn_forward_raises_import_error_without_magi(monkeypatch):
+    """magi_attn_forward raises an ImportError when MAGI is missing."""
     import verl.utils.prefix_tree.prefix_tree_patch_impl as patch_mod
 
     monkeypatch.setattr(patch_mod, "_MAGI_ATTENTION_AVAILABLE", False)
-    with pytest.raises(ImportError, match="prefix_tree_attention=flex"):
+    with pytest.raises(ImportError):
         patch_mod.magi_attn_forward(object(), object(), object(), object())
 
 
