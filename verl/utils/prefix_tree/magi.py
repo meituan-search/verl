@@ -20,8 +20,6 @@ import contextlib
 import functools
 import logging as _log
 from dataclasses import dataclass
-from importlib import import_module
-from types import SimpleNamespace
 from typing import Optional
 
 import torch
@@ -37,34 +35,6 @@ except ImportError:  # local dev without megatron; tests monkeypatch this symbol
 
     def unwrap_model(m):
         return m
-
-
-@functools.cache
-def import_magi_attention():
-    """Load the optional MAGI dependency only when the MAGI backend is used."""
-    try:
-        api = import_module("magi_attention.api")
-        common = import_module("magi_attention.common")
-        enum = import_module("magi_attention.common.enum")
-        solver = import_module("magi_attention.meta.solver.dispatch_solver")
-
-        return SimpleNamespace(
-            DistAttnConfig=api.DistAttnConfig,
-            get_position_ids=api.get_position_ids,
-            magi_attn_flex_key=api.magi_attn_flex_key,
-            undispatch=api.undispatch,
-            AttnRanges=common.AttnRanges,
-            AttnMaskType=enum.AttnMaskType,
-            DispatchConfig=solver.DispatchConfig,
-            calc_attn=api.calc_attn,
-        )
-    except (ImportError, AttributeError, OSError) as exc:
-        raise ImportError(
-            "Prefix-tree attention backend 'magi' requires a working "
-            "'magi_attention' installation. Install a compatible MAGI "
-            "Attention build, or set prefix_tree_attention=flex. "
-            f"Original import error: {exc}"
-        ) from exc
 
 
 @dataclass
