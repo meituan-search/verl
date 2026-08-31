@@ -305,17 +305,43 @@ def _build_piggyback_fields(segments: list, prompt_len: int) -> dict:
     result = {"token_versions": token_versions, "piggyback_marker": False}
 
     # Piggyback only when: >=2 segments AND last segment emitted prompt_logprobs.
+    # Failure paths below log a warning (spec §4.1.6/§6 observability) so a
+    # persistently-broken piggyback is visible in logs; the trainer's
+    # partial_reprefill/case_distribution.* metrics indirectly surface the
+    # failure rate (case 1 count drops when piggyback fails).
+    # TODO: emit a dedicated piggyback_failure counter (e.g. via a
+    # piggyback_attempted extra field the trainer can tally) if dashboards
+    # need direct failure counts; log-only for now.
     if len(segments) < 2:
         return result
     last_seg = segments[-1]
     last_pl = last_seg.extra_fields.get("prompt_logprobs")
     if last_pl is None:
+        logger.warning(
+            "partial_reprefill piggyback failed: last segment (of %d) emitted no prompt_logprobs; "
+            "falling back to full reprefill (case 2)",
+            len(segments),
+        )
         return result
 
     # Cumulative prefix length = total tokens before the last segment.
     prefix_len = sum(len(s.token_ids) for s in segments[:-1])
     # last_pl has length prompt_len + prefix_len (SGLang emits one logprob per
     # prompt token when prompt_logprobs is set). Slice out the prefix portion.
+    # slice_response_logprobs reads indices [prompt_len - 1, prompt_len + prefix_len - 1),
+    # so require len(last_pl) >= prompt_len + prefix_len (conservative: the full
+    # prefill input length) before trusting the slice; a shorter list means SGLang
+    # emitted an unexpected shape and the slice would silently miss prefix entries.
+    if len(last_pl) < prompt_len + prefix_len:
+        logger.warning(
+            "partial_reprefill piggyback failed: last segment prompt_logprobs length %d "
+            "< prompt_len %d + prefix_len %d (unexpected SGLang emission shape); "
+            "falling back to full reprefill (case 2)",
+            len(last_pl),
+            prompt_len,
+            prefix_len,
+        )
+        return result
     prefix_prompt_logprobs = slice_response_logprobs(last_pl, prompt_len, prefix_len)
     # Suffix = last segment's decode log_probs (already at W_resume).
     suffix_rollout_logprobs = [float(x) for x in (last_seg.log_probs or [])]

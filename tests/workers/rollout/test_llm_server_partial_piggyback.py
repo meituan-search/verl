@@ -13,6 +13,7 @@
 # limitations under the License.
 """CPU tests for the partial_rollout piggyback field builder."""
 
+import logging
 from types import SimpleNamespace
 
 from verl.workers.rollout.llm_server import _build_piggyback_fields
@@ -75,3 +76,39 @@ class TestBuildPiggybackFields:
         assert result["piggyback_marker"] is False
         assert "new_rollout_log_probs" not in result
         assert result["token_versions"].tolist() == [3, 3, 5, 5]
+
+    def test_short_prompt_logprobs_no_piggyback(self, caplog):
+        # M1: last segment's prompt_logprobs too short to cover the prefix
+        # slice (SGLang emitted a different length than the prefill input).
+        # Must bail out with piggyback_marker=False (case-2 fallback), not
+        # silently emit a wrong-shaped new_rollout_log_probs.
+        # prompt_len=2, prefix_len=2 -> last_pl needs >= 4 entries; give 2.
+        segs = [
+            _seg(token_ids=[10, 11], log_probs=[-0.9, -0.8], prompt_logprobs=None, global_steps=3),
+            _seg(
+                token_ids=[12, 13, 14],
+                log_probs=[-0.2, -0.15, -0.1],
+                prompt_logprobs=[[-1.0], [-0.5]],  # 2 entries — too short
+                global_steps=5,
+            ),
+        ]
+        with caplog.at_level(logging.WARNING):
+            result = _build_piggyback_fields(segs, prompt_len=2)
+        assert result["piggyback_marker"] is False
+        assert "new_rollout_log_probs" not in result
+        assert "resume_version" not in result
+        # token_versions still built
+        assert result["token_versions"].tolist() == [3, 3, 5, 5, 5]
+        assert any("piggyback" in r.message.lower() for r in caplog.records)
+
+    def test_missing_prompt_logprobs_logs_warning(self, caplog):
+        # M2: piggyback failure must be observable — warning logged when the
+        # last segment has no prompt_logprobs despite >= 2 segments.
+        segs = [
+            _seg(token_ids=[10, 11], log_probs=[-0.9, -0.8], prompt_logprobs=None, global_steps=3),
+            _seg(token_ids=[12, 13], log_probs=[-0.2, -0.15], prompt_logprobs=None, global_steps=5),
+        ]
+        with caplog.at_level(logging.WARNING):
+            result = _build_piggyback_fields(segs, prompt_len=2)
+        assert result["piggyback_marker"] is False
+        assert any("piggyback" in r.message.lower() for r in caplog.records)
