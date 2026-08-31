@@ -70,7 +70,7 @@ def _build_pt_batch(tokens):
     )
 
 
-def test_magi_backend_raises_import_error_without_magi(monkeypatch):
+def test_forward_module_raises_import_error_without_magi(monkeypatch):
     """The magi backend entry point raises an ImportError when MAGI is missing."""
     import verl.utils.prefix_tree.forward as forward_mod
 
@@ -79,7 +79,7 @@ def test_magi_backend_raises_import_error_without_magi(monkeypatch):
         forward_mod._build_magi_key(object(), object())
 
 
-def test_magi_attn_forward_raises_import_error_without_magi(monkeypatch):
+def test_patch_impl_module_raises_import_error_without_magi(monkeypatch):
     """magi_attn_forward raises an ImportError when MAGI is missing."""
     import verl.utils.prefix_tree.prefix_tree_patch_impl as patch_mod
 
