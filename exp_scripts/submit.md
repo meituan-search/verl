@@ -17,6 +17,12 @@ RAY_ADDRESS='http://33.32.44.108:44390' ray job submit \
   --working-dir . \
   -- bash exp_scripts/qwen3_8b/staleness_sweep/run_qwen3_8b_megatron_staleness_sweep.sh
 
+# qwen3_8b partial_reprefill
+RAY_ADDRESS='http://33.32.28.122:44390' ray job submit \
+  --runtime-env exp_scripts/qwen3_8b/partial_reprefill/runtime_env.yaml \
+  --working-dir . \
+  -- bash exp_scripts/qwen3_8b/partial_reprefill/run_qwen3_8b_megatron_partial_reprefill.sh
+
 # qwen3_5_35b sync
 RAY_ADDRESS='http://33.32.44.108:44390' ray job submit \
   --runtime-env exp_scripts/qwen3_5_35b/sync/runtime_env.yaml \
