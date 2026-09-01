@@ -166,11 +166,12 @@ class PPOTrainer(ABC):
             # so it uses the sync ReplayBuffer. ReplayBufferAsync's unconditional
             # eviction+refill of failure_keys would submit new prompts mid-cycle,
             # breaking the "all at W_0" assumption.
-            # reprefill_decoupled layers a pre-dispatch hook on top of the async
-            # buffer: its ReprefillReplayBuffer fires on_new_finished while the
-            # poll loop waits, so the trainer can re-prefill at π_b's weight.
+            # reprefill_decoupled and partial_reprefill layer a pre-dispatch hook
+            # on top of the async buffer: ReprefillReplayBuffer fires
+            # on_new_finished while the poll loop waits, so the trainer can
+            # re-prefill at π_b's weight.
             sync_modes = ("sync", "staleness_sweep")
-            if self.trainer_mode == "reprefill_decoupled":
+            if self.trainer_mode in ("reprefill_decoupled", "partial_reprefill"):
                 sampler_cls = ReprefillReplayBuffer
             else:
                 sampler_cls = ReplayBuffer if self.trainer_mode in sync_modes else ReplayBufferAsync
