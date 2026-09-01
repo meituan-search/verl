@@ -344,12 +344,10 @@ def tree_post_processing(ctx, output_orig, logits_processor, logits_processor_ar
             k: v for k, v in orig_args.items() if k not in ("label", "temperature", "loss_mask", "use_prefix_tree")
         }
 
+        # undispatch from magi's cp dispatching
+        # flex should not have cp anyway
         if prefix_tree_attention == "magi":
-            local_indices = get_position_ids(pt_batch.magi_key)
-            flat_padded = pt_batch.tree_packed_input_ids.shape[0]
-            logits_full = logits_flat.new_zeros((flat_padded, logits_flat.shape[-1]))
-            logits_full[local_indices] = logits_flat
-            logits_flat = logits_full[:real_tokens]
+            logits_flat = undispatch(logits_flat, pt_batch.magi_key)[:real_tokens]
 
         n = len(pt_batch.subtrie.leaf_to_sample)
         ancestor_ranges = pt_batch.restoration.ancestor_segment_ranges
@@ -405,34 +403,50 @@ def _prepare_lce_inputs_with_boundary(
     if config.sequence_parallel:
         hidden_states = gather_from_sequence_parallel_region(hidden_states)
 
+    # generate labels based on the after-packing sequence: [AB; AC] --> [ABC] where A is shared prefix
     if magi_key is not None:
+        # magi ran on only this rank's CP-dispatched slice of the flat sequence:
+        # reorder labels to match those rows (pad to flat length first).
         local_indices = get_position_ids(magi_key)
         flat_padded = pt_batch.tree_packed_input_ids.shape[0]
         pad = flat_padded - labels.shape[0]
         labels_full = torch.cat([labels, labels.new_zeros(pad)]) if pad > 0 else labels
         lce_labels = labels_full[local_indices]
     else:
-        lce_labels = labels
+        # flex ran on the whole flat sequence: hidden rows are already one-per-flat-position,
+        # so labels only need zero-padding to the same row count.
         local_indices = None
+        n_rows = hidden_states.numel() // hidden_states.shape[-1]
+        pad = n_rows - labels.shape[0]
+        if pad > 0:
+            labels = torch.cat([labels, labels.new_zeros(pad)])
+        lce_labels = labels
 
     hidden_2d = hidden_states.view(-1, hidden_states.shape[-1])
     registry = pt_batch.restoration.boundary_registry if (pt_batch is not None and pt_batch.restoration) else None
 
-    # The boundary token (last token in a branch) might have n possible next token -->
+    # The boundary token (last token in a branch of three; multiple childs) might have n possible next token -->
     # we need to duplicate these token with multiple labels
     boundary_pairs: list[tuple[int, int]] = []
     boundary_tags: list[tuple[int, int]] = []
-    if magi_key is not None and registry:
+    if registry:
         for boundary_position, leaves in registry:
-            matches = (local_indices == boundary_position).nonzero()
-            if matches.shape[0] == 0:
-                continue  # boundary hidden lives on another CP rank
-            local_idx = int(matches[0, 0].item())
+            if magi_key is not None:
+                matches = (local_indices == boundary_position).nonzero()
+                if matches.shape[0] == 0:
+                    continue  # boundary hidden lives on another CP rank
+                local_idx = int(matches[0, 0].item())
+            else:
+                # Non-magi: no CP dispatch — hidden rows are already in global flat
+                # order, so the registry's flat position IS the row index.
+                local_idx = boundary_position
             for sample_idx, next_token in leaves:
                 boundary_pairs.append((local_idx, int(next_token)))
                 boundary_tags.append((boundary_position, sample_idx))
 
     n_local = hidden_2d.shape[0]
+    # Append duplicated (hidden, label) tail rows for the forks: one hidden row
+    # per leaf, each scored against its OWN next token.
     if boundary_pairs:
         idx, lbl = zip(*boundary_pairs, strict=False)
         idx_t = torch.tensor(idx, device=hidden_2d.device)
@@ -588,6 +602,17 @@ def post_processing_packed_lce(
             local_boundary_positions, local_sample_indices, local_log_probs, strict=True
         ):
             boundary_logps.setdefault(sample_idx, []).append((boundary_position, log_prob))
+        # Fail closed: with no cross-CP gather to validate coverage, a registry
+        # with boundaries must be fully covered by locally produced values.
+        if registry:
+            got = {(p, s) for s, lst in boundary_logps.items() for p, _ in lst}
+            expected = {(p, s) for p, leaves in registry for s, _ in leaves}
+            if got != expected:
+                raise AssertionError(
+                    f"post_processing_packed_lce: registry/produced mismatch on CP=1 path — "
+                    f"missing={sorted(expected - got)[:3]}, unexpected={sorted(got - expected)[:3]}. "
+                    f"Aborting to avoid silent wrong boundary patches."
+                )
 
     # used to modify the behaviour when copy the packed tensor back to normal batch
     pt_batch._boundary_logps = boundary_logps

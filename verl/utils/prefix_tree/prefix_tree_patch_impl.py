@@ -33,6 +33,10 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from torch import Tensor
 from torch.nn.attention.flex_attention import flex_attention
 
+# Eager flex_attention materializes the full scores matrix and burns ~100ms+/layer of
+# Python/autograd dispatch; the compiled form emits a fused kernel instead.
+_compiled_flex_attention = torch.compile(flex_attention)
+
 # Stack for passing attention keys through gradient-checkpoint recompute.
 # Pushed by _fn_with_key before calling checkpointed fn, popped after.
 # Simple list is safe: training is single-threaded per worker.
@@ -56,7 +60,7 @@ def flex_attn_forward(
     v = value.squeeze(1).permute(1, 0, 2).unsqueeze(0)
     enable_gqa = q.shape[1] != k.shape[1]
 
-    out = flex_attention(q, k, v, block_mask=flex_attention_key, enable_gqa=enable_gqa)
+    out = _compiled_flex_attention(q, k, v, block_mask=flex_attention_key, enable_gqa=enable_gqa)
     out = out.squeeze(0).permute(1, 0, 2)  # (T, Hq, D)
     return out.reshape(T, 1, -1)  # (T, 1, Hq*D)
 
