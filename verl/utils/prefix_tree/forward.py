@@ -19,21 +19,27 @@ Public: prepare_prefix_tree, tree_post_processing, prefix_tree_output_processor,
 from __future__ import annotations
 
 import logging as _log
+import os
 from collections import Counter, OrderedDict, namedtuple
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
 import torch.distributed as _dist
-from magi_attention.api import (
-    DistAttnConfig,
-    get_position_ids,
-    magi_attn_flex_key,
-    undispatch,
-)
-from magi_attention.common import AttnRanges
-from magi_attention.common.enum import AttnMaskType
-from magi_attention.meta.solver.dispatch_solver import DispatchConfig
+
+try:  # magi_attention is optional — the prefix-tree path requires it at runtime
+    from magi_attention.api import (
+        DistAttnConfig,
+        get_position_ids,
+        magi_attn_flex_key,
+        undispatch,
+    )
+    from magi_attention.common import AttnRanges
+    from magi_attention.common.enum import AttnMaskType
+    from magi_attention.meta.solver.dispatch_solver import DispatchConfig
+except (ImportError, OSError):  # OSError: prebuilt CUDA ext can fail on arch mismatch
+    DistAttnConfig = get_position_ids = magi_attn_flex_key = undispatch = None
+    AttnRanges = AttnMaskType = DispatchConfig = None
 from megatron.core import parallel_state as mpu
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
@@ -469,6 +475,14 @@ def _prepare_lce_inputs_with_boundary(
     return hidden_ext, labels_ext, n_local, boundary_tags, flat_positions
 
 
+# Per-token grad probe: when PT_TOKEN_DUMP is set, every fused-LCE call stashes
+# its (hidden_ext, logprobs_ext, row metadata) here with retain_grad(). The dump
+# site in McoreEngine.optimizer_step reads .grad after backward and clears the
+# stash. Entries whose tensor never got a grad (forward-only passes) are skipped.
+_PT_TOKEN_DUMP = os.environ.get("PT_TOKEN_DUMP")
+_PT_TOKEN_STASH: list[dict] = []
+
+
 def _run_lce_postprocess(
     logprobs_ext: Tensor,
     entropy_ext: Tensor,
@@ -518,6 +532,21 @@ def _run_lce(
         "none",
         mpu.get_tensor_model_parallel_group(),
     )
+
+    if _PT_TOKEN_DUMP and hidden_ext.requires_grad:
+        hidden_ext.retain_grad()
+        _PT_TOKEN_STASH.append(
+            {
+                "kind": "fused",
+                "hidden": hidden_ext,
+                "labels_ext": labels_ext.detach(),
+                "logprobs_ext": logprobs_ext.detach(),
+                "n_local": n_local,
+                "boundary_tags": list(boundary_tags),
+                "flat_positions": flat_positions.detach(),
+                "pt_batch": pt_batch,
+            }
+        )
 
     return _run_lce_postprocess(logprobs_ext, entropy_ext, n_local, boundary_tags, magi_key, pt_batch)
 
