@@ -411,6 +411,12 @@ def prepare_prefix_tree_micro_batches(
             g = batch_idx_list[idx]
             batch_idx_list[idx] = g[:-1]
             batch_idx_list.append([g[-1]])
+        if len(batch_idx_list) < n_mb.item():
+            _log.warning(
+                f"prepare_prefix_tree_micro_batches: cannot equalize micro-batch count across DP "
+                f"(have {len(batch_idx_list)}, DP max {n_mb.item()}): every micro-batch is a "
+                f"singleton. Continuing with unequal counts."
+            )
 
     if num_batches_divided_by is not None:
         target = roundup_divisible(len(batch_idx_list), num_batches_divided_by)

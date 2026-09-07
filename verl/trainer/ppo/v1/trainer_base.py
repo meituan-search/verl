@@ -1662,6 +1662,7 @@ class PPOTrainer(ABC):
         if self.ref_in_actor:
             metadata["no_lora_adapter"] = True
         batch.extra_info.update(metadata)
+        self._inject_prefix_tree(batch)
         if self.ref_in_actor:
             output = self.actor_rollout_wg.compute_log_prob(batch)
         else:

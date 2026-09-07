@@ -116,19 +116,28 @@ def prepare_packed_label(
     """Build boundary registry for LCE boundary-patch: maps flat positions with ≥2 branching children to per-leaf
     (sample_idx, next_token) pairs, so restore_flat_to_nested can patch non-owner leaf boundary log-probs after LCE."""
 
-    def _collect_leaf_descendants(node: TrieNode) -> list[TrieNode]:
-        """All leaf nodes (no in-view children) in the subtree rooted at *node*."""
-        return list(subtrie.dfs(roots=subtrie.children_of(node), leaf_only=True))
+    def _collect_reader_nodes(node: TrieNode) -> list[TrieNode]:
+        """Descendant termination nodes: every sample ending strictly below *node*
+        reads the junction position. A sample can end at an internal descendant
+        (its sequence is a strict prefix of another's), not only at a childless
+        leaf — leaf_only would skip it and leave its boundary log-prob unpatched."""
+        return [n for n in subtrie.dfs(roots=subtrie.children_of(node)) if n.node_idx in leaf_node_id_to_samples]
 
     registry: BoundaryRegistry = []
 
     # BFS walk to find branching nodes (≥2 children → boundary).
     for node in subtrie.bfs():
         children = subtrie.children_of(node)
-        # Boundary condition: ≥2 children AND node has ≥1 token to emit.
-        # A node with 0 tokens has no flat position (no predictor), and a
-        # node with <2 children doesn't cause divergence here.
-        if len(children) < 2 or len(node.input_ids) < 1:
+        # A node with 0 tokens has no flat position (no predictor).
+        if len(node.input_ids) < 1:
+            continue
+        # Junction where a sample terminates (its whole sequence is a strict
+        # prefix of another's) behaves like a fork for labels: the terminating
+        # owner's rolled label here is a 0-pad, but the continuing sample reads
+        # this position — it needs its own next token.
+        terminates_here = bool(leaf_node_id_to_samples.get(node.node_idx))
+        # Ordinary boundary condition: ≥2 children → divergence.
+        if len(children) < 2 and not (terminates_here and len(children) == 1):
             continue
 
         # The boundary is the LAST token of this shared ancestor.
@@ -136,9 +145,9 @@ def prepare_packed_label(
         next_token_pos = owner_offset[node.node_idx] + len(node.input_ids)
 
         leaves_info: list[tuple[int, int]] = []
-        for leaf in _collect_leaf_descendants(node):
-            # Expand to ALL samples sharing this leaf node (duplicates).
-            for sample_idx in leaf_node_id_to_samples.get(leaf.node_idx, []):
+        for term_node in _collect_reader_nodes(node):
+            # Expand to ALL samples sharing this termination node (duplicates).
+            for sample_idx in leaf_node_id_to_samples.get(term_node.node_idx, []):
                 # Zero-length leaf: next_token is past sample end; skip to
                 # avoid IndexError (no token to predict at the boundary).
                 sample_len = samples[sample_idx].shape[0]
@@ -147,7 +156,7 @@ def prepare_packed_label(
                 next_token = int(samples[sample_idx][next_token_pos].item())
                 leaves_info.append((sample_idx, next_token))
 
-        if len(leaves_info) >= 2:
+        if len(leaves_info) >= 1:
             registry.append((b_pos, leaves_info))
 
     return registry

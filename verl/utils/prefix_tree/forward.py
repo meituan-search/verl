@@ -397,8 +397,10 @@ def _prepare_lce_inputs_with_boundary(
 ):
     """Preprocess LCE inputs: SP gather, label pad+dispatch, boundary-pair resolution.
 
-    Returns (hidden_ext, labels_ext, n_local, boundary_tags) where boundary_tags
-    are [(boundary_position, sample_idx)] aligned with the appended tail rows.
+    Returns (hidden_ext, labels_ext, n_local, boundary_tags, flat_positions) where
+    boundary_tags are [(boundary_position, sample_idx)] aligned with the appended
+    tail rows, and flat_positions maps main row j -> flat packed position (local
+    CP indices for magi, arange for flex/CP=1).
     """
     if config.sequence_parallel:
         hidden_states = gather_from_sequence_parallel_region(hidden_states)
@@ -457,7 +459,14 @@ def _prepare_lce_inputs_with_boundary(
     else:
         hidden_ext, labels_ext = hidden_2d, lce_labels
 
-    return hidden_ext, labels_ext, n_local, boundary_tags
+    # Main-row j -> flat packed position: magi rows follow the rank's CP-dispatch
+    # order (local_indices); flex/CP=1 rows are already global flat order.
+    if magi_key is not None:
+        flat_positions = local_indices
+    else:
+        flat_positions = torch.arange(n_local, device=hidden_2d.device)
+
+    return hidden_ext, labels_ext, n_local, boundary_tags, flat_positions
 
 
 def _run_lce_postprocess(
@@ -497,7 +506,7 @@ def _run_lce(
     """Fused LCE for MAGI/flex: prepare → linear_cross_entropy → postprocess."""
     from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
 
-    hidden_ext, labels_ext, n_local, boundary_tags = _prepare_lce_inputs_with_boundary(
+    hidden_ext, labels_ext, n_local, boundary_tags, flat_positions = _prepare_lce_inputs_with_boundary(
         hidden_states, labels, config, magi_key, pt_batch
     )
 
@@ -511,6 +520,34 @@ def _run_lce(
     )
 
     return _run_lce_postprocess(logprobs_ext, entropy_ext, n_local, boundary_tags, magi_key, pt_batch)
+
+
+class _AllGatherWithGrad(torch.autograd.Function):
+    """all_gather with autograd, same pattern as Megatron's _GatherFromSequenceParallelRegion
+    (forward gather, backward comm): plain dist.all_gather detaches, so boundary log-probs
+    would forward correctly but backprop nothing.
+
+    Backward all_reduces the stacked per-slice grads (instead of Megatron's reduce_scatter,
+    which gloo lacks and which needs even splits — boundary counts are uneven, often 0 on
+    some ranks) so each rank's slice total (its own usage + other ranks' usage of its copy)
+    reaches its owner. Requires symmetric backward across the group, like every
+    collective-in-backward op."""
+
+    @staticmethod
+    def forward(ctx, tensor, group, world_size):
+        ctx.group = group
+        ctx.rank = _dist.get_rank(group)
+        out = [torch.empty_like(tensor) for _ in range(world_size)]
+        _dist.all_gather(out, tensor, group=group)
+        return tuple(out)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        if not any(g is not None for g in grads):
+            return None, None, None
+        stack = torch.stack([g if g is not None else torch.zeros_like(grads[0]) for g in grads])
+        _dist.all_reduce(stack, group=ctx.group)
+        return stack[ctx.rank], None, None
 
 
 def post_processing_packed_lce(
@@ -552,15 +589,20 @@ def post_processing_packed_lce(
         max_n = int(count_tensor.item())
 
         # Pack (boundary_position, sample_idx, log_prob) into one tensor.
+        # Values only — grads do NOT flow through this gather: the restore+loss
+        # is replicated on every CP rank, so routing every rank's consumption
+        # back to the owner would count the boundary gradient CP-world-fold
+        # (the 4x tail-row grad amplification found by the per-token probe).
+        # Instead the owner rank consumes its own locally-produced tail logprob
+        # (already in its autograd graph) below; other ranks patch with these
+        # detached gathered values.
         local_packed = torch.zeros(max_n, 3, dtype=torch.float32, device=device)
         local_packed[:, 1] = -1  # sentinel for padding rows
         if local_count > 0:
             local_packed[:local_count, 0] = torch.tensor(local_boundary_positions, dtype=torch.float32, device=device)
             local_packed[:local_count, 1] = torch.tensor(local_sample_indices, dtype=torch.float32, device=device)
-            local_packed[:local_count, 2] = torch.stack(local_log_probs).to(torch.float32)
-
-        # Single all_gather instead of 3 separate ones.
-        all_packed = [torch.zeros_like(local_packed) for _ in range(cp_world)]
+            local_packed[:local_count, 2] = torch.stack(local_log_probs).to(torch.float32).detach()
+        all_packed = [torch.empty_like(local_packed) for _ in range(cp_world)]
         _dist.all_gather(all_packed, local_packed, group=cp_group)
 
         # Validate: each (boundary_position, sample_idx) must arrive from exactly one rank.
@@ -568,6 +610,13 @@ def post_processing_packed_lce(
             (boundary_position, sample_idx) for boundary_position, leaves in registry for sample_idx, _ in leaves
         }
         key_counts: Counter[tuple[int, int]] = Counter()
+
+        # Locally-produced entries: use the graph-connected local tail logprob so
+        # the boundary gradient flows exactly once (through this rank's replica).
+        local_keys = set(zip(local_boundary_positions, local_sample_indices, strict=True))
+        local_by_key = dict(
+            zip(zip(local_boundary_positions, local_sample_indices, strict=True), local_log_probs, strict=False)
+        )
 
         for r in range(cp_world):
             for i in range(max_n):
@@ -578,6 +627,8 @@ def post_processing_packed_lce(
                 log_prob = all_packed[r][i, 2]
                 key = (boundary_position, sample_idx)
                 key_counts[key] += 1
+                if key in local_keys:
+                    log_prob = local_by_key[key]
                 boundary_logps.setdefault(sample_idx, []).append((boundary_position, log_prob))
 
         # Single validation pass: unexpected, duplicate, or missing entries.
