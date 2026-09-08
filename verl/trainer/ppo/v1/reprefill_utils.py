@@ -31,7 +31,12 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 def slice_response_logprobs(prompt_logprobs_ls, prompt_len, response_len):
-    # sglang prompt_logprobs_ls has length S = prompt_len + response_len.
+    # SGLang prompt_logprobs_ls has length S = prompt_len + response_len
+    # (only when logprob_start_len=0 — the case-2 full-reprefill path and
+    # the distillation teacher). The piggyback resume path uses
+    # logprob_start_len=prompt_len-1 and emits a separate
+    # prefix_prompt_logprobs field instead; this helper does not apply
+    # to that path (see _build_piggyback_fields in llm_server.py).
     # Entry i is the logprob of the token at position i+1 predicted by
     # tokens [0..i]. Response tokens occupy positions
     # [prompt_len, prompt_len + response_len - 1]; their logprobs are at

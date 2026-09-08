@@ -40,7 +40,7 @@ NUM_WARMUP_BATCHES=${NUM_WARMUP_BATCHES:-1}
 # P2 pipelined pre-dispatch: overlap re-prefill with remaining generation as
 # samples finish during the replay-buffer poll loop. false = P1 (post-hoc
 # re-prefill); true = P2 (pipelined pre-dispatch).
-ENABLE_PREFILL_PIPELINE=${ENABLE_PREFILL_PIPELINE:-True}
+ENABLE_PREFILL_PIPELINE=${ENABLE_PREFILL_PIPELINE:-False}
 
 # A/B timing comparison: also run the original trainer-side old_log_prob
 # forward pass each step (old_log_prob timer) alongside the rollout-side

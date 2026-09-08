@@ -37,6 +37,7 @@ import threading
 from dataclasses import dataclass
 
 import transfer_queue as tq
+from omegaconf import OmegaConf
 from tensordict import TensorDict
 from transfer_queue import KVBatchMeta
 
@@ -93,6 +94,14 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
 
     def on_train_begin(self):
         cfg = self.config.trainer.v1.partial_reprefill
+        # Sync the piggyback gate to the rollout-side config mirror so the
+        # rollout client's resume branch can decide whether to compute
+        # prompt_logprobs without reaching into trainer config paths.
+        # Defensive: actor_rollout_ref may be absent in stripped-down test
+        # configs; skip the sync in that case (rollout-side default is False).
+        rollout_cfg = OmegaConf.select(self.config, "actor_rollout_ref.rollout", default=None)
+        if rollout_cfg is not None:
+            rollout_cfg.enable_piggyback = cfg.enable_piggyback
         num_warmup_batches = cfg.num_warmup_batches
         for _ in range(num_warmup_batches):
             self._add_batch_to_generate()

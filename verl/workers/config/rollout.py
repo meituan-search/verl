@@ -267,6 +267,12 @@ class RolloutConfig(BaseConfig):
 
     enable_sleep_mode: bool = True
 
+    # Mirror of trainer.v1.partial_reprefill.enable_piggyback. The trainer
+    # syncs this at init so the rollout client can gate the resume-time
+    # prompt_logprobs computation on whether piggyback is actually wanted.
+    # When False, the resume branch skips prompt_logprobs entirely (no tax).
+    enable_piggyback: bool = False
+
     mtp: MtpConfig = field(default_factory=MtpConfig)
 
     qat: Optional[dict] = None

@@ -169,6 +169,10 @@ ROLLOUT=(
     actor_rollout_ref.rollout.disable_log_stats=False \
     actor_rollout_ref.rollout.prometheus.enable=True \
     actor_rollout_ref.rollout.prometheus.port=44398 \
+    # Mirror of trainer.v1.partial_reprefill.enable_piggyback. The trainer
+    # syncs this at on_train_begin, but we also set it here so the rollout
+    # client picks it up before the first generate() call.
+    actor_rollout_ref.rollout.enable_piggyback=${ENABLE_PIGGYBACK}
 )
 
 REF=(

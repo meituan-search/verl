@@ -599,6 +599,12 @@ class SGLangHttpServer:
         # input-token logprobs for every position (top-K when K>0, sampled-token
         # logprob only when K==0). Translate to SGLang's per-request logprob API.
         prompt_logprobs = sampling_params.pop("prompt_logprobs", None)
+        # Caller-provided start position for prompt logprob computation. When
+        # absent, default to 0 (cover the whole prompt — distillation teacher
+        # path). The partial-rollout resume path sets this to len(P) - 1 to
+        # skip the original prompt portion and only compute logprobs for the
+        # decoded prefix (piggyback target).
+        prompt_logprob_start_len = sampling_params.pop("logprob_start_len", None)
         if prompt_logprobs is not None:
             return_logprob = True
 
@@ -613,7 +619,9 @@ class SGLangHttpServer:
         }
 
         if prompt_logprobs is not None:
-            request["logprob_start_len"] = 0
+            request["logprob_start_len"] = (
+                prompt_logprob_start_len if prompt_logprob_start_len is not None else 0
+            )
             if prompt_logprobs > 0:
                 request["top_logprobs_num"] = prompt_logprobs
 
@@ -679,12 +687,30 @@ class SGLangHttpServer:
 
         extra_fields = {"global_steps": self.global_steps}
         if prompt_logprobs is not None:
-            _extract_prompt_logprobs_sglang(
-                meta_info=meta_info,
-                num_prompt_logprobs=prompt_logprobs,
-                sequence_length=len(prompt_ids),
-                result_dict=extra_fields,
-            )
+            if prompt_logprob_start_len is not None and prompt_logprob_start_len > 0:
+                # Piggyback resume path: SGLang returned a short list covering
+                # only positions [start_len, start_len + N - 1] of the full
+                # prompt. Emit it as a separate field for the piggyback
+                # consumer (_build_piggyback_fields in llm_server.py); skip
+                # _extract_prompt_logprobs_sglang, whose vLLM-style contract
+                # (sequence_length == len(prompt_ids)) doesn't apply to the
+                # short list.
+                input_token_logprobs = meta_info.get("input_token_logprobs") or []
+                # Each entry is (logprob, token_id, _); entry 0 is None per
+                # SGLang's [None] + [:-1] post-processing. The piggyback
+                # builder slices [1, prefix_len + 1) from this list.
+                extra_fields["prefix_prompt_logprobs"] = [
+                    (float(lp) if lp is not None else None, int(tid))
+                    for lp, tid, _ in input_token_logprobs
+                ]
+            else:
+                # Distillation teacher path: full vLLM contract.
+                _extract_prompt_logprobs_sglang(
+                    meta_info=meta_info,
+                    num_prompt_logprobs=prompt_logprobs,
+                    sequence_length=len(prompt_ids),
+                    result_dict=extra_fields,
+                )
 
         # Re-key backend spec-decoding stats to the rollout-common names.
         if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:

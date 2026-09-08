@@ -593,6 +593,14 @@ class AgentLoopWorker:
             top_k=config.top_k,
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
+            # Piggyback gate: when True, the rollout client's resume branch
+            # requests prompt_logprobs for the decoded prefix only (skipping
+            # the original prompt portion via logprob_start_len). When False,
+            # the resume branch skips prompt_logprobs entirely — no tax.
+            # Synced from trainer.v1.partial_reprefill.enable_piggyback at
+            # trainer init; defaults to False for trainers that don't use
+            # piggyback (colocate_async, reprefill_decoupled).
+            enable_piggyback=getattr(config, "enable_piggyback", False),
         )
 
         def apply_greedy_sampling_params(params: dict[str, Any]) -> None:

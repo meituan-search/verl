@@ -336,6 +336,13 @@ enable_rollout_routing_replay: False
 # Set to 0 to disable.
 moe_load_balance_metrics_interval: 0
 
+# Mirror of trainer.v1.partial_reprefill.enable_piggyback. The trainer syncs
+# this at init so the rollout client can gate the resume-time prompt_logprobs
+# computation on whether piggyback is actually wanted. When False, the resume
+# branch skips prompt_logprobs entirely (no tax on colocate_async or
+# partial_reprefill with piggyback off). Set both this and the trainer-side
+# flag together (the launch script does this automatically).
+enable_piggyback: False
 
 # profile the rollout model in `generate_sequence`
 profiler:

@@ -283,8 +283,10 @@ def _build_piggyback_fields(segments: list, prompt_len: int) -> dict:
 
     Called after the partial_rollout loop completes. `segments` is the list
     of per-segment outputs from super().generate() calls. The LAST segment's
-    prompt_logprobs (if present) is the resume-prefill result covering
-    `prompt + cumulative_prefix` at the final W_resume.
+    prefix_prompt_logprobs (if present) is the resume-prefill result covering
+    the decoded prefix (final_output.token_ids) at the final W_resume —
+    emitted only when the resume branch set logprob_start_len=prompt_len-1
+    so SGLang skips the original prompt portion.
 
     Returns a dict with:
       - token_versions: per-token int32 1D tensor (always present).
@@ -295,7 +297,6 @@ def _build_piggyback_fields(segments: list, prompt_len: int) -> dict:
     from verl.trainer.ppo.v1.reprefill_utils import (
         build_partial_new_rollout_log_probs,
         build_token_versions,
-        slice_response_logprobs,
     )
 
     segment_versions = [int(s.extra_fields.get("global_steps", 0)) for s in segments]
@@ -315,10 +316,10 @@ def _build_piggyback_fields(segments: list, prompt_len: int) -> dict:
     if len(segments) < 2:
         return result
     last_seg = segments[-1]
-    last_pl = last_seg.extra_fields.get("prompt_logprobs")
+    last_pl = last_seg.extra_fields.get("prefix_prompt_logprobs")
     if last_pl is None:
         logger.warning(
-            "partial_reprefill piggyback failed: last segment (of %d) emitted no prompt_logprobs; "
+            "partial_reprefill piggyback failed: last segment (of %d) emitted no prefix_prompt_logprobs; "
             "falling back to full reprefill (case 2)",
             len(segments),
         )
@@ -326,23 +327,27 @@ def _build_piggyback_fields(segments: list, prompt_len: int) -> dict:
 
     # Cumulative prefix length = total tokens before the last segment.
     prefix_len = sum(len(s.token_ids) for s in segments[:-1])
-    # last_pl has length prompt_len + prefix_len (SGLang emits one logprob per
-    # prompt token when prompt_logprobs is set). Slice out the prefix portion.
-    # slice_response_logprobs reads indices [prompt_len - 1, prompt_len + prefix_len - 1),
-    # so require len(last_pl) >= prompt_len + prefix_len (conservative: the full
-    # prefill input length) before trusting the slice; a shorter list means SGLang
-    # emitted an unexpected shape and the slice would silently miss prefix entries.
-    if len(last_pl) < prompt_len + prefix_len:
+    # last_pl is the short list emitted by the SGLang adapter when
+    # logprob_start_len = prompt_len - 1: it covers absolute positions
+    # [prompt_len - 1, prompt_len + prefix_len - 1] of P+D, total length
+    # prefix_len + 1. SGLang's [None] + [:-1] post-processing puts a None
+    # at entry 0 (semantically wrong here — position prompt_len-1 DOES
+    # have predicting context — but we work around it by slicing
+    # [1, prefix_len + 1)). Entries [1, prefix_len + 1) are logprobs
+    # of D[0..prefix_len-1] under W_resume, which is exactly what
+    # piggyback needs for new_rollout_log_probs' prefix portion.
+    if len(last_pl) < prefix_len + 1:
         logger.warning(
-            "partial_reprefill piggyback failed: last segment prompt_logprobs length %d "
-            "< prompt_len %d + prefix_len %d (unexpected SGLang emission shape); "
+            "partial_reprefill piggyback failed: last segment prefix_prompt_logprobs length %d "
+            "< prefix_len %d + 1 (unexpected SGLang emission shape); "
             "falling back to full reprefill (case 2)",
             len(last_pl),
-            prompt_len,
             prefix_len,
         )
         return result
-    prefix_prompt_logprobs = slice_response_logprobs(last_pl, prompt_len, prefix_len)
+    prefix_prompt_logprobs = [
+        last_pl[i][0] for i in range(1, prefix_len + 1)
+    ]
     # Suffix = last segment's decode log_probs (already at W_resume).
     suffix_rollout_logprobs = [float(x) for x in (last_seg.log_probs or [])]
     new_rollout = build_partial_new_rollout_log_probs(prefix_prompt_logprobs, suffix_rollout_logprobs)
@@ -422,6 +427,11 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         """
         prompt_ids = normalize_token_ids(prompt_ids)
 
+        # Pop the piggyback gate before forwarding to super().generate() —
+        # SGLang/vLLM would choke on an unknown sampling_params key. The
+        # rollout-side gate is read in the resume branch below.
+        enable_piggyback = sampling_params.pop("enable_piggyback", False)
+
         limit_key = None
         if "max_tokens" in sampling_params:
             limit_key = "max_tokens"
@@ -492,12 +502,22 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             if output.stop_reason not in ("aborted", "abort") or not should_retry:
                 break
 
-            # Resume path: request prompt_logprobs so the resume prefill emits
-            # logprobs for the cumulative prefix (piggyback target). Assumes
-            # SGLang returns prompt_logprobs for a max_new_tokens>0 resume call;
-            # if not, piggyback falls back (marker=False) and the trainer's
-            # case-2 full reprefill path covers the prefix.
-            sampling_params = {**sampling_params, "prompt_logprobs": 0}
+            # Resume path: when piggyback is enabled, request prompt logprobs
+            # only for the decoded prefix (final_output.token_ids) so the
+            # resume prefill emits piggyback values for that prefix under
+            # W_resume. Skip the original prompt portion via
+            # logprob_start_len = len(prompt_ids) - 1 — its logprobs are not
+            # useful (the prompt is given, not a sampling decision) and
+            # computing them is the dominant cost on long-prompt datasets
+            # (dapo). When piggyback is off, skip prompt_logprobs entirely:
+            # the trainer's case-2 full reprefill covers the prefix anyway,
+            # so paying the prompt-logprob tax here is pure waste.
+            if enable_piggyback:
+                sampling_params = {
+                    **sampling_params,
+                    "prompt_logprobs": 0,
+                    "logprob_start_len": max(len(prompt_ids) - 1, 0),
+                }
             await asyncio.sleep(1)
 
         # Build piggyback fields from segment outputs (partial_rollout).
