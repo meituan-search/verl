@@ -13,100 +13,33 @@
 # limitations under the License.
 
 
-"""CPU tests for verl/utils/prefix_tree/magi.py: flat layout build,"""
+"""CPU tests for verl/utils/prefix_tree/magi.py, including strict-prefix junction
+coverage for the fused LCE boundary registry.
+
+Junction rule: where a sample terminates (its whole sequence is a strict token
+prefix of another sample's), the junction must be registered like a fork: the
+continuing sample reads the junction position, so it needs its own next-token
+label. Pre-fix, only >=2-children nodes were registered, so the continuing
+sample's boundary log-prob came from the terminating owner's rolled 0-pad
+label — silently wrong. Triggers on multi-turn/agentic data, not on ordinary
+shared-prompt forks or GRPO n-siblings.
+"""
 
 from __future__ import annotations
 
+import types
+
+import pytest
 import torch
+from _helpers import build_layout
 
 from verl.utils.prefix_tree import magi as magi_mod
 from verl.utils.prefix_tree.dynamic import build_tree_dynamic
-from verl.utils.prefix_tree.magi import PrefixTreeMagiBatch, restore_flat_to_nested
-from verl.utils.prefix_tree.utils import build_layout_from_tree_node
-
-
-def _build_params(tokens):
-    result = build_tree_dynamic(tokens)
-    assert result is not None, "Expected shared prefix trie"
-    return build_layout_from_tree_node(tokens, result), result
-
-
-def _build_pt_batch(tokens):
-    from verl.utils.prefix_tree.magi import PackRestorationParam
-
-    params, subtrie = _build_params(tokens)
-    return PrefixTreeMagiBatch(
-        tree_packed_input_ids=params.tree_packed_tokens,
-        tree_packed_position_ids=params.tree_packed_position_ids,
-        tree_packed_labels=params.tree_packed_labels,
-        magi_key=None,
-        flex_key=None,
-        restoration=PackRestorationParam(
-            segment_ranges=params.leaf_ranges,
-            prefix_range=params.prefix_range,
-        ),
-        subtrie=subtrie,
-    )
-
-
-def _build_pt_batch(tokens):
-    from verl.utils.prefix_tree.magi import PackRestorationParam
-
-    params, subtrie = _build_params(tokens)
-    return PrefixTreeMagiBatch(
-        tree_packed_input_ids=params.tree_packed_tokens,
-        tree_packed_position_ids=params.tree_packed_position_ids,
-        tree_packed_labels=params.tree_packed_labels,
-        magi_key=None,
-        flex_key=None,
-        restoration=PackRestorationParam(
-            segment_ranges=params.leaf_ranges,
-            prefix_range=params.prefix_range,
-        ),
-        subtrie=subtrie,
-    )
-
-
-def test_basic_shared_prefix_flat_layout_and_flex_rects():
-    tokens = [
-        torch.tensor([10, 20, 30, 41, 42]),
-        torch.tensor([10, 20, 30, 51]),
-        torch.tensor([10, 20, 30, 61, 62, 63]),
-    ]
-    params, _ = _build_params(tokens)
-    assert list(params.tree_packed_tokens[:3].tolist()) == [10, 20, 30]
-    assert params.prefix_range[0] == 0 and params.prefix_range[1] >= 1
-    assert len(params.leaf_ranges) == 3  # one per sample
-    assert params.total_seqlen_q >= max(t.numel() for t in tokens)
-    short = [torch.tensor([10, 20, 30, 41, 42]), torch.tensor([10, 20, 30, 51])]
-    sp, _ = _build_params(short)
-    rects = set(zip(sp.q_ranges, sp.k_ranges, sp.mask_types, strict=False))
-    assert any(m == "causal" for _, _, m in rects)
-    assert any(m == "full" for _, _, m in rects)
-
-
-def test_restore_token_ids_round_trip():
-    tokens = [
-        torch.tensor([10, 20, 30, 41, 42]),
-        torch.tensor([10, 20, 30, 51]),
-        torch.tensor([10, 20, 30, 61, 62, 63]),
-    ]
-    pt_batch = _build_pt_batch(tokens)
-    restored = restore_flat_to_nested(pt_batch.tree_packed_input_ids, pt_batch)
-    offsets, vals = restored.offsets(), restored.values()
-    lengths = offsets.diff().tolist()
-    assert lengths == [5, 4, 6]
-    pos = 0
-    for i, orig in enumerate(tokens):
-        assert torch.equal(vals[pos : pos + int(lengths[i])], orig), f"sample {i} mismatch"
-        pos += int(lengths[i])
+from verl.utils.prefix_tree.magi import restore_flat_to_nested
 
 
 def test_build_prefix_tree_micro_batch_unpacks_nested(monkeypatch):
     """Integration: NestedTensor input -> flat layout via build_prefix_tree_micro_batch."""
-    import types
-
-    pytest = __import__("pytest")
     pytest.importorskip("codetiming")
     import verl.utils.prefix_tree.forward as ptf
     import verl.utils.prefix_tree.magi as ptm
@@ -189,3 +122,58 @@ def test_set_rope_pids_noop_when_position_ids_none(monkeypatch):
 
     magi_mod.set_rope_pids(wrapped, None)
     assert getattr(gpt.rotary_pos_emb, "_pids", None) is None
+
+
+# ---- strict-prefix junction registration (boundary registry) ----
+
+
+def test_strict_prefix_junction_registered():
+    """A=[1,2,3] is a strict prefix of B=[1,2,3,4]: the junction (last shared
+    token, flat pos 2) must be registered with B's next token 4."""
+    _, params = build_layout([torch.tensor([1, 2, 3]), torch.tensor([1, 2, 3, 4])])
+    assert params.boundary_registry == [(2, [(1, 4)])], params.boundary_registry
+
+
+def test_fork_registry():
+    """Ordinary forks must not gain entries from the strict-prefix junction fix:
+    a pure 3-way fork keeps ONE boundary with all three leaves; when one branch
+    also terminates mid-way, the fork boundary carries the continuing leaves and
+    the terminating branch's junction carries only the continuing leaf."""
+    _, params = build_layout([torch.tensor([1, 2, 3, 4]), torch.tensor([1, 2, 3, 5]), torch.tensor([1, 2, 3, 6])])
+    assert params.boundary_registry == [(2, [(0, 4), (1, 5), (2, 6)])], params.boundary_registry
+    _, params = build_layout([torch.tensor([1, 2, 3]), torch.tensor([1, 2, 3, 4]), torch.tensor([1, 2, 3, 5])])
+    assert params.boundary_registry == [(2, [(1, 4), (2, 5)])], params.boundary_registry
+
+
+def test_chain_junctions_registered():
+    """A=[1,2] ⊂ B=[1,2,3] ⊂ C=[1,2,3,4]: junction 1 is read by BOTH B and C
+    (B terminates at the internal node [3], not a childless leaf); junction 2
+    is read only by C."""
+    tensors = [torch.tensor([1, 2]), torch.tensor([1, 2, 3]), torch.tensor([1, 2, 3, 4])]
+    _, params = build_layout(tensors)
+    assert params.boundary_registry == [(1, [(1, 3), (2, 3)]), (2, [(2, 4)])], params.boundary_registry
+
+
+def test_strict_prefix_junction_restore():
+    """End-to-end restore: only the continuing sample B has a boundary entry
+    (A terminates — its label at the junction is the masked 0-pad, so A keeps
+    the flat value). B's tensor must carry B's own log-prob at the junction."""
+    tensors = [torch.tensor([1, 2, 3]), torch.tensor([1, 2, 3, 4])]
+    pb, params = build_layout(tensors)
+    (boundary_pos, [(sample_idx, _next_token)]) = params.boundary_registry[0]
+    assert (boundary_pos, sample_idx) == (2, 1)
+
+    b_val = torch.tensor(-7.0)
+    pb._boundary_logps = {sample_idx: [(boundary_pos, b_val)]}
+
+    flat = torch.arange(pb.tree_packed_input_ids.shape[0], dtype=torch.float32)
+    restored = restore_flat_to_nested(flat, pb, apply_boundary_patch=True)
+    lengths = restored.offsets().diff().tolist()
+    assert lengths == [len(s) for s in tensors]
+    vals = restored.values()
+    # A (sample 0): no entry → keeps flat value at the junction.
+    assert vals[2] == flat[boundary_pos], "terminating sample's junction row was modified"
+    assert vals[0] == flat[0] and vals[1] == flat[1], "terminating sample's prefix rows corrupted"
+    # B (sample 1): junction patched to its own log-prob.
+    assert vals[3 + 2] == b_val, "continuing sample's junction not patched"
+    assert vals[3 + 3] == flat[3], "continuing sample's extension row corrupted"

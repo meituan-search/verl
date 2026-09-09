@@ -31,16 +31,16 @@ megatron, apex, transformer_engine) - forward.py hard-imports magi_attention.
 
 from __future__ import annotations
 
+import pytest
 import torch
+from _helpers import make_pt_batch
 
 from verl.utils.prefix_tree.dynamic import build_tree_dynamic
 from verl.utils.prefix_tree.forward import (
-    TreeForwardCtx,
     _build_flex_key,
     _finalize_prefix_tree_batch,
     _prepare_attn_inputs,
 )
-from verl.utils.prefix_tree.magi import PackRestorationParam, PrefixTreeMagiBatch
 from verl.utils.prefix_tree.utils import build_layout_from_tree_node
 
 
@@ -110,68 +110,34 @@ def _assert_mask_matches_oracle(samples, case: str):
 # Mask semantics vs oracle (bug lockers)
 # ---------------------------------------------------------------------------
 
+_T = torch.tensor
 
-def test_flex_mask_shared_prefix_only():
-    """Depth-2 trie (shared prompt, divergent responses) - passes today; regression guard."""
-    _assert_mask_matches_oracle(
-        [
-            torch.tensor([1, 2, 3, 4, 5, 6]),
-            torch.tensor([1, 2, 3, 4, 7, 8]),
-        ],
-        "shared-prefix-only",
-    )
-
-
-def test_flex_mask_intermediate_branch_nodes_visible():
-    """Depth-3 trie: middle branch node (shared response prefix beyond the prompt)
-    must be visible to its descendants. Bug locker: leaf-only leaf_id made these
-    tokens invisible, so samples could not attend their own shared tokens."""
-    _assert_mask_matches_oracle(
-        [
-            torch.tensor([1, 2, 3, 4, 5, 6]),
-            torch.tensor([1, 2, 3, 4, 7, 8]),
-            torch.tensor([1, 2, 9, 9, 9, 9]),
-        ],
-        "intermediate-branch",
-    )
+_MASK_CASES = [
+    ("shared-prefix-only", [_T([1, 2, 3, 4, 5, 6]), _T([1, 2, 3, 4, 7, 8])]),
+    ("intermediate-branch", [_T([1, 2, 3, 4, 5, 6]), _T([1, 2, 3, 4, 7, 8]), _T([1, 2, 9, 9, 9, 9])]),
+    ("mixed-depths", [_T([1, 2, 3, 4, 5]), _T([1, 2, 3, 6, 7]), _T([1, 2, 8]), _T([1, 2, 8, 9])]),
+    ("strict-prefix", [_T([1, 2, 3]), _T([1, 2, 3, 4, 5])]),
+    ("duplicates", [_T([1, 2, 3, 4]), _T([1, 2, 3, 4]), _T([1, 2, 5, 6])]),
+]
 
 
-def test_flex_mask_mixed_depths():
-    """Unequal branch depths: middle nodes and a mid-tree branch must all be visible."""
-    _assert_mask_matches_oracle(
-        [
-            torch.tensor([1, 2, 3, 4, 5]),
-            torch.tensor([1, 2, 3, 6, 7]),
-            torch.tensor([1, 2, 8]),
-            torch.tensor([1, 2, 8, 9]),
-        ],
-        "mixed-depths",
-    )
-
-
-def test_flex_mask_strict_prefix_sample_is_causal():
-    """One sample's sequence is a strict prefix of another's: the trie root IS
-    that sample's leaf. Its tokens must attend only causally (no future leak).
-    Bug locker: ``in_prefix_k & (q_leaf >= 0)`` let q=0 see the whole root."""
-    _assert_mask_matches_oracle(
-        [
-            torch.tensor([1, 2, 3]),
-            torch.tensor([1, 2, 3, 4, 5]),
-        ],
-        "strict-prefix",
-    )
-
-
-def test_flex_mask_duplicate_sequences():
-    """Identical sequences share one leaf - mask must stay correct per leaf."""
-    _assert_mask_matches_oracle(
-        [
-            torch.tensor([1, 2, 3, 4]),
-            torch.tensor([1, 2, 3, 4]),
-            torch.tensor([1, 2, 5, 6]),
-        ],
-        "duplicates",
-    )
+@pytest.mark.parametrize(("case", "samples"), _MASK_CASES)
+def test_flex_mask_matches_oracle(case, samples):
+    """_build_flex_key's mask must equal the trie oracle on every topology.
+    Bug lockers per case:
+    - shared-prefix-only: depth-2 trie (shared prompt, divergent responses) -
+      passes today; regression guard.
+    - intermediate-branch: middle branch node (shared response prefix beyond
+      the prompt) must be visible to its descendants - leaf-only leaf_id made
+      these tokens invisible, so samples could not attend their own shared tokens.
+    - mixed-depths: unequal branch depths; middle nodes and a mid-tree branch
+      must all be visible.
+    - strict-prefix: one sample's sequence is a strict prefix of another's: the
+      trie root IS that sample's leaf; its tokens must attend only causally
+      (``in_prefix_k & (q_leaf >= 0)`` let q=0 see the whole root).
+    - duplicates: identical sequences share one leaf - mask must stay correct
+      per leaf."""
+    _assert_mask_matches_oracle(samples, case)
 
 
 # ---------------------------------------------------------------------------
@@ -206,21 +172,6 @@ def test_flex_block_mask_keeps_leaf_id_closure_alive():
 # ---------------------------------------------------------------------------
 
 
-def _make_pb(params, subtrie, flex_key):
-    return PrefixTreeMagiBatch(
-        tree_packed_input_ids=params.tree_packed_tokens,
-        tree_packed_position_ids=params.tree_packed_position_ids,
-        tree_packed_labels=params.tree_packed_labels,
-        magi_key=None,
-        flex_key=flex_key,
-        restoration=PackRestorationParam(
-            segment_ranges=params.leaf_ranges,
-            prefix_range=params.prefix_range,
-        ),
-        subtrie=subtrie,
-    )
-
-
 def test_prepare_attn_inputs_flex_returns_full_layout():
     """Flex path: no dispatch - full tree-packed tokens, batch dim added, flex key kwarg."""
     params, subtrie = _layout(
@@ -230,7 +181,7 @@ def test_prepare_attn_inputs_flex_returns_full_layout():
         ]
     )
     block_mask = _build_flex_key(params, torch.device("cpu"), subtrie=subtrie)
-    pb = _make_pb(params, subtrie, block_mask)
+    pb = make_pt_batch(params, subtrie, flex_key=block_mask)
 
     input_ids, position_ids, attn_kwargs = _prepare_attn_inputs(pb, "flex")
 
@@ -251,12 +202,9 @@ def test_prepare_attn_inputs_rejects_flex_without_key():
             torch.tensor([10, 20, 30, 51]),
         ]
     )
-    pb = _make_pb(params, subtrie, flex_key=None)
-    try:
+    pb = make_pt_batch(params, subtrie)
+    with pytest.raises(RuntimeError, match="flex_key"):
         _prepare_attn_inputs(pb, "flex")
-    except Exception:
-        return
-    raise AssertionError("expected _prepare_attn_inputs to raise when flex_key is None")
 
 
 # ---------------------------------------------------------------------------
@@ -293,15 +241,5 @@ def test_finalize_rejects_unknown_attention_type():
             torch.tensor([10, 20, 30, 51]),
         ]
     )
-    try:
+    with pytest.raises(ValueError):
         _finalize_prefix_tree_batch(params, model=None, num_samples=2, attention_type="bogus")
-    except ValueError:
-        return
-    raise AssertionError("expected ValueError for unknown attention_type")
-
-
-def test_tree_forward_ctx_holds_flex_attention_string():
-    """TreeForwardCtx round-trips the attention string (used by tree_post_processing
-    to pick the restore path; 'flex' must survive verbatim)."""
-    ctx = TreeForwardCtx(None, None, None, "flex", model=None)
-    assert ctx.attention == "flex"
