@@ -518,7 +518,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             )
         else:  # Recompute old_log_probs
             with marked_timer("old_log_prob", timing_raw, color="blue"):
-                old_log_prob, old_log_prob_mfu, _ = self._compute_old_log_prob(batch)
+                old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                 entropys = old_log_prob.batch["entropys"]
                 response_masks = batch.batch["response_mask"]
                 actor_config = self.config.actor_rollout_ref.actor

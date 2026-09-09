@@ -1325,10 +1325,6 @@ class RayPPOTrainer:
 
         output_metrics = tu.get(output, "metrics") or {}
         old_log_prob_mfu = output_metrics["mfu"]
-        # Surface engine-emitted prefix-tree metrics (computed post-micro-batch-build)
-        # to the trainer metrics dict under the ``actor/`` namespace, matching the
-        # ``_update_actor`` rename pattern.
-        old_log_prob_pt_metrics = {f"actor/{k}": v for k, v in output_metrics.items() if k.startswith("prefix_tree/")}
         # step 4. No padding to padding
         entropy = no_padding_2_padding(entropy, batch_td)
         log_probs = no_padding_2_padding(log_probs, batch_td)
@@ -1342,7 +1338,10 @@ class RayPPOTrainer:
             result["sum_pi_squared"] = sum_pi_squared.float()
         old_log_prob = tu.get_tensordict(result)
         old_log_prob = DataProto.from_tensordict(old_log_prob)
-        return old_log_prob, old_log_prob_mfu, old_log_prob_pt_metrics
+        old_log_prob.meta_info["prefix_tree_metrics"] = {
+            f"actor/{k}": v for k, v in output_metrics.items() if k.startswith("prefix_tree/")
+        }
+        return old_log_prob, old_log_prob_mfu
 
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
@@ -1614,7 +1613,7 @@ class RayPPOTrainer:
                         )
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob, old_log_prob_mfu, old_log_prob_pt_metrics = self._compute_old_log_prob(batch)
+                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             actor_config = self.config.actor_rollout_ref.actor
@@ -1629,8 +1628,8 @@ class RayPPOTrainer:
                                 "perf/mfu/actor_infer": old_log_prob_mfu,
                             }
                             metrics.update(old_log_prob_metrics)
-                            if old_log_prob_pt_metrics:
-                                metrics.update(old_log_prob_pt_metrics)
+                            if old_log_prob.meta_info.get("prefix_tree_metrics"):
+                                metrics.update(old_log_prob.meta_info.pop("prefix_tree_metrics"))
                             old_log_prob.batch.pop("entropys")
                             if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
                                 raise ValueError(
