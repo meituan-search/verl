@@ -281,80 +281,82 @@ class LLMServerClient:
 def _build_piggyback_fields(segments: list, prompt_len: int) -> dict:
     """Build piggyback fields from a partial_rollout's segment outputs.
 
-    Called after the partial_rollout loop completes. `segments` is the list
-    of per-segment outputs from super().generate() calls. The LAST segment's
-    prefix_prompt_logprobs (if present) is the resume-prefill result covering
-    the decoded prefix (final_output.token_ids) at the final W_resume —
-    emitted only when the resume branch set logprob_start_len=prompt_len-1
-    so SGLang skips the original prompt portion.
-
-    Returns a dict with:
-      - token_versions: per-token int32 1D tensor (always present).
-      - piggyback_marker: bool (True only if prefix was successfully re-prefilled).
-      - new_rollout_log_probs: list[float] (only if piggyback_marker=True).
-      - resume_version: int (only if piggyback_marker=True).
+    Only called when piggyback is enabled AND the trajectory was resumed
+    (>= 2 segments). The last segment is a post-abort retry that carried the
+    prompt_logprobs request, so its prefix_prompt_logprobs covers the decoded
+    prefix at W_resume. Missing or misaligned data raises.
     """
-    from verl.trainer.ppo.v1.reprefill_utils import (
-        build_partial_new_rollout_log_probs,
-        build_token_versions,
+    from verl.trainer.ppo.v1.reprefill_utils import build_partial_new_rollout_log_probs
+
+    last_seg = segments[-1]
+    last_pl = last_seg.extra_fields.get("prefix_prompt_logprobs")
+    assert last_pl is not None, (
+        f"partial_reprefill piggyback failed: last segment (of {len(segments)}) emitted no "
+        "prefix_prompt_logprobs despite enable_piggyback=True"
     )
+
+    prefix_len = sum(len(s.token_ids) for s in segments[:-1])
+    # last_pl covers absolute positions [prompt_len - 1, prompt_len + prefix_len)
+    # of P+D (length prefix_len + 1). Entry 0 is None per SGLang's
+    # [None] + [:-1] shift; entries [1, prefix_len + 1) are logprobs of
+    # D[0..prefix_len-1] under W_resume.
+    assert len(last_pl) >= prefix_len + 1, (
+        f"partial_reprefill piggyback failed: last segment prefix_prompt_logprobs length "
+        f"{len(last_pl)} < prefix_len {prefix_len} + 1 (unexpected SGLang emission shape)"
+    )
+    prefix_prompt_logprobs = [last_pl[i][0] for i in range(1, prefix_len + 1)]
+    suffix_rollout_logprobs = [float(x) for x in (last_seg.log_probs or [])]
+    new_rollout = build_partial_new_rollout_log_probs(prefix_prompt_logprobs, suffix_rollout_logprobs)
+    assert len(new_rollout) == prefix_len + len(last_seg.token_ids), (
+        "partial_reprefill piggyback failed: new_rollout_log_probs length "
+        f"{len(new_rollout)} != total generated tokens "
+        f"{prefix_len + len(last_seg.token_ids)}"
+    )
+    return {
+        "piggyback_marker": True,
+        "new_rollout_log_probs": new_rollout,
+        "resume_version": int(last_seg.extra_fields["global_steps"]),
+    }
+
+
+def _populate_new_rollout_fields(final_output, segments: list, prompt_len: int, enable_piggyback: bool) -> None:
+    """Populate token_versions (always) and new_rollout_log_probs (gated).
+
+    new_rollout_log_probs is all-or-nothing per the enable_piggyback gate:
+    piggyback value when resumed (>= 2 segments), a rollout_log_probs copy
+    when never aborted (single weight version), nothing when disabled.
+
+    resume_version (the weight version the existing logprobs were computed
+    at — what the trainer's case dispatch keys on) is written whenever the
+    trajectory's logprobs live at a single version: single-segment always,
+    multi-segment only with piggyback (prefix re-prefilled + suffix decoded
+    both at W_resume). A resumed trajectory without piggyback has logprobs
+    spanning multiple versions and gets no resume_version — the trainer
+    falls it to a full reprefill.
+    """
+    from verl.trainer.ppo.v1.reprefill_utils import build_token_versions
 
     segment_versions = [int(s.extra_fields.get("global_steps", 0)) for s in segments]
     segment_lengths = [len(s.token_ids) for s in segments]
-    token_versions = build_token_versions(segment_versions, segment_lengths)
+    final_output.extra_fields["token_versions"] = build_token_versions(segment_versions, segment_lengths)
 
-    result = {"token_versions": token_versions, "piggyback_marker": False}
-
-    # Piggyback only when: >=2 segments AND last segment emitted prompt_logprobs.
-    # Failure paths below log a warning (spec §4.1.6/§6 observability) so a
-    # persistently-broken piggyback is visible in logs; the trainer's
-    # partial_reprefill/case_distribution.* metrics indirectly surface the
-    # failure rate (case 1 count drops when piggyback fails).
-    # TODO: emit a dedicated piggyback_failure counter (e.g. via a
-    # piggyback_attempted extra field the trainer can tally) if dashboards
-    # need direct failure counts; log-only for now.
-    if len(segments) < 2:
-        return result
-    last_seg = segments[-1]
-    last_pl = last_seg.extra_fields.get("prefix_prompt_logprobs")
-    if last_pl is None:
-        logger.warning(
-            "partial_reprefill piggyback failed: last segment (of %d) emitted no prefix_prompt_logprobs; "
-            "falling back to full reprefill (case 2)",
-            len(segments),
-        )
-        return result
-
-    # Cumulative prefix length = total tokens before the last segment.
-    prefix_len = sum(len(s.token_ids) for s in segments[:-1])
-    # last_pl is the short list emitted by the SGLang adapter when
-    # logprob_start_len = prompt_len - 1: it covers absolute positions
-    # [prompt_len - 1, prompt_len + prefix_len - 1] of P+D, total length
-    # prefix_len + 1. SGLang's [None] + [:-1] post-processing puts a None
-    # at entry 0 (semantically wrong here — position prompt_len-1 DOES
-    # have predicting context — but we work around it by slicing
-    # [1, prefix_len + 1)). Entries [1, prefix_len + 1) are logprobs
-    # of D[0..prefix_len-1] under W_resume, which is exactly what
-    # piggyback needs for new_rollout_log_probs' prefix portion.
-    if len(last_pl) < prefix_len + 1:
-        logger.warning(
-            "partial_reprefill piggyback failed: last segment prefix_prompt_logprobs length %d "
-            "< prefix_len %d + 1 (unexpected SGLang emission shape); "
-            "falling back to full reprefill (case 2)",
-            len(last_pl),
-            prefix_len,
-        )
-        return result
-    prefix_prompt_logprobs = [
-        last_pl[i][0] for i in range(1, prefix_len + 1)
-    ]
-    # Suffix = last segment's decode log_probs (already at W_resume).
-    suffix_rollout_logprobs = [float(x) for x in (last_seg.log_probs or [])]
-    new_rollout = build_partial_new_rollout_log_probs(prefix_prompt_logprobs, suffix_rollout_logprobs)
-    result["piggyback_marker"] = True
-    result["new_rollout_log_probs"] = new_rollout
-    result["resume_version"] = segment_versions[-1]
-    return result
+    if len(segments) >= 2 and enable_piggyback:
+        piggyback = _build_piggyback_fields(segments, prompt_len=prompt_len)
+        final_output.extra_fields["piggyback_marker"] = True
+        final_output.extra_fields["new_rollout_log_probs"] = piggyback["new_rollout_log_probs"]
+        final_output.extra_fields["resume_version"] = piggyback["resume_version"]
+    elif len(segments) == 1:
+        if enable_piggyback:
+            assert final_output.log_probs is not None and len(final_output.log_probs) == len(
+                final_output.token_ids
+            ), (
+                "partial_reprefill: single-segment trajectory with enable_piggyback=True must have "
+                f"decode log_probs aligned with token_ids "
+                f"(got {len(final_output.log_probs or [])} logprobs for "
+                f"{len(final_output.token_ids)} tokens)"
+            )
+            final_output.extra_fields["new_rollout_log_probs"] = list(final_output.log_probs)
+        final_output.extra_fields["resume_version"] = segment_versions[-1]
 
 
 class FullyAsyncLLMServerClient(LLMServerClient):
@@ -502,16 +504,12 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             if output.stop_reason not in ("aborted", "abort") or not should_retry:
                 break
 
-            # Resume path: when piggyback is enabled, request prompt logprobs
-            # only for the decoded prefix (final_output.token_ids) so the
-            # resume prefill emits piggyback values for that prefix under
-            # W_resume. Skip the original prompt portion via
-            # logprob_start_len = len(prompt_ids) - 1 — its logprobs are not
-            # useful (the prompt is given, not a sampling decision) and
-            # computing them is the dominant cost on long-prompt datasets
-            # (dapo). When piggyback is off, skip prompt_logprobs entirely:
-            # the trainer's case-2 full reprefill covers the prefix anyway,
-            # so paying the prompt-logprob tax here is pure waste.
+            # Resume path: request prefix logprobs only for the decoded prefix
+            # (logprob_start_len = len(prompt_ids) - 1) so the resume prefill
+            # emits piggyback values under W_resume. Skipping the original
+            # prompt portion avoids its dominant cost on long-prompt datasets;
+            # when piggyback is off, the trainer's case-2 full reprefill
+            # covers the prefix anyway.
             if enable_piggyback:
                 sampling_params = {
                     **sampling_params,
@@ -520,13 +518,9 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 }
             await asyncio.sleep(1)
 
-        # Build piggyback fields from segment outputs (partial_rollout).
-        piggyback = _build_piggyback_fields(segments, prompt_len=len(prompt_ids))
-        final_output.extra_fields["token_versions"] = piggyback["token_versions"]
-        if piggyback["piggyback_marker"]:
-            final_output.extra_fields["piggyback_marker"] = True
-            final_output.extra_fields["new_rollout_log_probs"] = piggyback["new_rollout_log_probs"]
-            final_output.extra_fields["resume_version"] = piggyback["resume_version"]
+        _populate_new_rollout_fields(
+            final_output, segments, prompt_len=len(prompt_ids), enable_piggyback=enable_piggyback
+        )
 
         final_output.extra_fields["global_steps"] = global_steps
         final_output.extra_fields["min_global_steps"] = min_global_steps

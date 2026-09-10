@@ -44,16 +44,16 @@ def partition_id():
 class TestBuildTokenVersions:
     def test_single_segment(self):
         tv = build_token_versions(segment_versions=[5], segment_lengths=[4])
-        assert tv.tolist() == [5, 5, 5, 5]
+        assert tv == [5, 5, 5, 5]
 
     def test_two_segments_partial_rollout(self):
         # prefix decoded at W_3 (len 4), suffix decoded at W_5 (len 3)
         tv = build_token_versions(segment_versions=[3, 5], segment_lengths=[4, 3])
-        assert tv.tolist() == [3, 3, 3, 3, 5, 5, 5]
+        assert tv == [3, 3, 3, 3, 5, 5, 5]
 
     def test_three_segments_multi_interrupt(self):
         tv = build_token_versions(segment_versions=[3, 4, 5], segment_lengths=[2, 2, 2])
-        assert tv.tolist() == [3, 3, 4, 4, 5, 5]
+        assert tv == [3, 3, 4, 4, 5, 5]
 
 
 class TestBuildPartialNewRolloutLogProbs:
@@ -77,51 +77,100 @@ class TestBuildPartialNewRolloutLogProbs:
 
 
 class TestDecideCase:
-    def test_case1_piggyback_enabled(self):
+    def test_case1_piggyback_within_budget(self):
+        # resume_version=5, current=6, budget=1: gap within budget → consume piggyback
         assert (
             decide_case(
                 piggyback_marker=True,
-                last_token_version=5,
                 current_parameter_version=6,
                 enable_case_skip=True,
                 enable_piggyback=True,
+                resume_version=5,
+                max_resume_staleness=1,
             )
             == 1
         )
 
-    def test_case1_piggyback_disabled_falls_to_case2(self):
-        # piggyback disabled: even if marker set, fall through to case dispatch
+    def test_case1_piggyback_beyond_budget_falls_to_case2(self):
+        # resume_version=3, current=6, budget=1: gap 3 > budget → refresh via reprefill
         assert (
             decide_case(
                 piggyback_marker=True,
-                last_token_version=5,
                 current_parameter_version=6,
                 enable_case_skip=True,
-                enable_piggyback=False,
+                enable_piggyback=True,
+                resume_version=3,
+                max_resume_staleness=1,
             )
             == 2
         )
 
-    def test_case3_fully_fresh(self):
+    def test_case1_piggyback_zero_gap(self):
         assert (
             decide_case(
-                piggyback_marker=False,
-                last_token_version=6,
+                piggyback_marker=True,
                 current_parameter_version=6,
                 enable_case_skip=True,
                 enable_piggyback=True,
+                resume_version=6,
+                max_resume_staleness=0,
+            )
+            == 1
+        )
+
+    def test_case1_piggyback_disabled_falls_to_case3_within_budget(self):
+        # piggyback disabled: marker is ignored, but a within-budget
+        # resume_version still means the logprobs are fresh enough →
+        # copy fast path (case 3), not a reprefill.
+        assert (
+            decide_case(
+                piggyback_marker=True,
+                current_parameter_version=6,
+                enable_case_skip=True,
+                enable_piggyback=False,
+                resume_version=5,
+                max_resume_staleness=1,
             )
             == 3
         )
 
-    def test_case2_fully_stale(self):
+    def test_case3_copy_within_budget(self):
+        # single-segment trajectory whose logprobs are fresh enough
         assert (
             decide_case(
                 piggyback_marker=False,
-                last_token_version=5,
                 current_parameter_version=6,
                 enable_case_skip=True,
                 enable_piggyback=True,
+                resume_version=5,
+                max_resume_staleness=1,
+            )
+            == 3
+        )
+
+    def test_case3_copy_beyond_budget_falls_to_case2(self):
+        assert (
+            decide_case(
+                piggyback_marker=False,
+                current_parameter_version=6,
+                enable_case_skip=True,
+                enable_piggyback=True,
+                resume_version=3,
+                max_resume_staleness=1,
+            )
+            == 2
+        )
+
+    def test_missing_resume_version_is_case2(self):
+        # no resume_version (resumed without piggyback — logprobs span
+        # multiple versions; or an older client): full reprefill
+        assert (
+            decide_case(
+                piggyback_marker=False,
+                current_parameter_version=6,
+                enable_case_skip=True,
+                enable_piggyback=True,
+                resume_version=None,
             )
             == 2
         )
@@ -131,23 +180,24 @@ class TestDecideCase:
         assert (
             decide_case(
                 piggyback_marker=False,
-                last_token_version=6,
                 current_parameter_version=6,
                 enable_case_skip=False,
                 enable_piggyback=True,
+                resume_version=6,
+                max_resume_staleness=1,
             )
             == 2
         )
 
-    def test_missing_last_token_version_is_case2(self):
-        # token_versions not populated (e.g. older client): default to case 2
+    def test_missing_resume_version_with_marker_is_case2(self):
+        # piggyback marker without resume_version (inconsistent): case 2
         assert (
             decide_case(
-                piggyback_marker=False,
-                last_token_version=None,
+                piggyback_marker=True,
                 current_parameter_version=6,
                 enable_case_skip=True,
                 enable_piggyback=True,
+                resume_version=None,
             )
             == 2
         )

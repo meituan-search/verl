@@ -156,35 +156,19 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
             for traj_key in traj_keys:
                 if traj_key in self._pending_prefill:
                     continue
-                # Case-awareness: fetch token_versions for this traj_key and
-                # read the piggyback marker from the replay buffer partition
-                # snapshot (synced from the TQ trajectory tag, which
-                # agent_loop_tq populates for piggyback trajectories).
-                try:
-                    meta = tq.kv_batch_get(
-                        keys=[traj_key],
-                        partition_id=partition_id,
-                        select_fields=["token_versions"],
-                    )
-                except Exception as e:
-                    # Missing key or not-yet-ready fields: skip pre-dispatch —
-                    # on_sampled will classify from the batch and re-issue
-                    # synchronously if needed. Must not raise into the
-                    # replay buffer poll callback that invokes us.
-                    logger.debug(
-                        f"partial_reprefill: case-detection fetch failed for {traj_key}: {e}; skipping pre-dispatch"
-                    )
-                    continue
+                # Case detection reads piggyback_marker / resume_version from
+                # the replay buffer partition snapshot (synced from the TQ
+                # trajectory tags by agent_loop_tq) — no TQ field access.
                 tag_dict = partition.get(traj_key) or {}
                 piggyback = bool(tag_dict.get("piggyback_marker", False)) and cfg.enable_piggyback
-                tv = meta.get("token_versions") if meta is not None else None
-                last_tv = int(tv[0][-1].item()) if tv is not None and len(tv) > 0 and len(tv[0]) > 0 else None
+                resume_version = tag_dict.get("resume_version")
                 case = decide_case(
                     piggyback_marker=piggyback,
-                    last_token_version=last_tv,
                     current_parameter_version=current_version,
                     enable_case_skip=cfg.enable_case_skip,
                     enable_piggyback=cfg.enable_piggyback,
+                    resume_version=int(resume_version) if resume_version is not None else None,
+                    max_resume_staleness=cfg.max_resume_staleness,
                 )
                 if case != 2:
                     continue  # only pre-dispatch case 2
@@ -228,7 +212,8 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
         """Classify each trajectory in the batch into case 1/2/3.
 
         Returns (case2_indices, case3_indices, case1_count). `meta` is the
-        kv_batch_get result holding at least `token_versions`.
+        kv_batch_get result holding `rollout_log_probs` (consumed by the
+        case 3 copy, not by the dispatch itself).
         """
         cfg = self.config.trainer.v1.partial_reprefill
         current_version = self.global_steps - 1
@@ -238,15 +223,14 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
         for i, tag in enumerate(batch.tags):
             tag = tag or {}
             piggyback = bool(tag.get("piggyback_marker", False)) and cfg.enable_piggyback
-            # token_versions is a nested-jagged int32 tensor; last element of trajectory i.
-            tv = meta["token_versions"][i] if "token_versions" in meta else None
-            last_tv = int(tv[-1].item()) if tv is not None and len(tv) > 0 else None
+            resume_version = tag.get("resume_version")
             case = decide_case(
                 piggyback_marker=piggyback,
-                last_token_version=last_tv,
                 current_parameter_version=current_version,
                 enable_case_skip=cfg.enable_case_skip,
                 enable_piggyback=cfg.enable_piggyback,
+                resume_version=int(resume_version) if resume_version is not None else None,
+                max_resume_staleness=cfg.max_resume_staleness,
             )
             if case == 1:
                 case1_count += 1
@@ -324,13 +308,12 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
     def _compute_new_rollout_log_prob(self, batch: KVBatchMeta, metrics: dict, _pending=None) -> KVBatchMeta:
         resume_version = self.global_steps - 1
 
-        # Pre-fetch rollout_log_probs + token_versions for all keys (case 3 needs
-        # rollout_log_probs; case dispatch needs token_versions[-1]).
-        fields = ["rollout_log_probs", "token_versions"]
+        # Pre-fetch rollout_log_probs for all keys (the case 3 copy source;
+        # dispatch itself keys on the resume_version tag).
         meta = tq.kv_batch_get(
             keys=batch.keys,
             partition_id=batch.partition_id,
-            select_fields=fields,
+            select_fields=["rollout_log_probs"],
         )
         case2_indices, case3_indices, case1_count = self._classify_cases(batch, meta)
 

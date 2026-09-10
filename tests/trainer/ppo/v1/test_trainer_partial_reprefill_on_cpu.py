@@ -18,7 +18,6 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
-import torch
 import transfer_queue as tq
 from omegaconf import OmegaConf
 from tensordict import TensorDict
@@ -42,7 +41,13 @@ def partition_id():
     return f"test-{uuid.uuid4().hex}"
 
 
-def _make_trainer(enable_case_skip=True, enable_piggyback=True, enable_prefill_pipeline=False, num_warmup_batches=0):
+def _make_trainer(
+    enable_case_skip=True,
+    enable_piggyback=True,
+    enable_prefill_pipeline=False,
+    num_warmup_batches=0,
+    max_resume_staleness=1,
+):
     trainer = PPOTrainerPartialReprefill.__new__(PPOTrainerPartialReprefill)
     trainer.config = OmegaConf.create(
         {
@@ -55,6 +60,7 @@ def _make_trainer(enable_case_skip=True, enable_piggyback=True, enable_prefill_p
                         "enable_piggyback": enable_piggyback,
                         "compare_trainer_old_log_prob": False,
                         "num_warmup_batches": num_warmup_batches,
+                        "max_resume_staleness": max_resume_staleness,
                     }
                 }
             },
@@ -80,22 +86,19 @@ def _make_batch(partition_id, keys, tags=None):
 
 class TestComputeNewRolloutLogProbCase3:
     def test_case3_copies_rollout_log_probs(self, tq_init, partition_id):
-        # Trajectory decoded at W_5 (= global_steps - 1 = 5); sampled at step 6
-        # with rollout engine still at W_5 → case 3 (fully fresh).
+        # Trajectory decoded at W_5 (= resume_version = global_steps - 1 = 5)
+        # → case 3 (fully fresh copy).
         trainer = _make_trainer()
         key = f"traj-{uuid.uuid4().hex}"
         rollout_lp = [float(i) for i in range(4)]
         fields = TensorDict(
             {
                 "rollout_log_probs": to_nested_jagged([rollout_lp]),
-                "token_versions": torch.nested.as_nested_tensor(
-                    [torch.tensor([5, 5, 5, 5], dtype=torch.int32)], layout=torch.jagged
-                ),
             },
             batch_size=1,
         )
         tq.kv_batch_put(keys=[key], partition_id=partition_id, fields=fields)
-        batch = _make_batch(partition_id, [key])
+        batch = _make_batch(partition_id, [key], tags=[{"resume_version": 5}])
         metrics = {}
         # Bypass the client call by stubbing _reprefill_all to assert it's NOT called
         called = {"yes": False}
@@ -132,7 +135,7 @@ class TestComputeNewRolloutLogProbCase1:
         batch = _make_batch(
             partition_id,
             [key],
-            tags=[{"piggyback_marker": True, "resume_version": 5}],
+            tags=[{"piggyback_marker": True, "resume_version": 5}],  # gap 0 ≤ budget
         )
         metrics = {}
         called = {"yes": False}
@@ -146,7 +149,7 @@ class TestComputeNewRolloutLogProbCase1:
 
 class TestComputeNewRolloutLogProbCase2:
     def test_case2_full_reprefill(self, tq_init, partition_id, monkeypatch):
-        # Trajectory decoded at W_3 (stale), no piggyback → case 2.
+        # No resume_version in the tag (resumed without piggyback) → case 2.
         trainer = _make_trainer()
         key = f"traj-{uuid.uuid4().hex}"
         tq.kv_batch_put(
@@ -156,10 +159,6 @@ class TestComputeNewRolloutLogProbCase2:
                 {
                     "prompts": to_nested_jagged([[1, 2]]),
                     "responses": to_nested_jagged([[10, 11, 12]]),
-                    "token_versions": torch.nested.as_nested_tensor(
-                        [torch.tensor([3, 3, 3], dtype=torch.int32)],
-                        layout=torch.jagged,
-                    ),
                 },
                 batch_size=1,
             ),
@@ -184,6 +183,46 @@ class TestComputeNewRolloutLogProbCase2:
         # (approx: to_nested_jagged stores float32, so values round-trip with
         # float32 precision, e.g. -0.1 → -0.10000000149011612)
         assert data["new_rollout_log_probs"][0].tolist() == pytest.approx([-0.1, -0.2, -0.3])
+
+    def test_piggyback_beyond_budget_refreshes_via_case2(self, tq_init, partition_id):
+        # Client wrote piggyback new_rollout_log_probs at W_3 (resume_version=3),
+        # current is W_5: gap 2 > budget 1 → refresh with a full reprefill that
+        # overwrites the stale piggyback value.
+        trainer = _make_trainer()
+        key = f"traj-{uuid.uuid4().hex}"
+        tq.kv_batch_put(
+            keys=[key],
+            partition_id=partition_id,
+            fields=TensorDict(
+                {
+                    "prompts": to_nested_jagged([[1, 2]]),
+                    "responses": to_nested_jagged([[10, 11, 12]]),
+                    "new_rollout_log_probs": to_nested_jagged([[-9.0, -9.0, -9.0]]),
+                },
+                batch_size=1,
+            ),
+        )
+        batch = _make_batch(
+            partition_id,
+            [key],
+            tags=[{"piggyback_marker": True, "resume_version": 3}],
+        )
+        metrics = {}
+        fake_result = SimpleNamespace(extra_fields={"prompt_logprobs": [[-0.0], [-0.1], [-0.2], [-0.3], [-0.4]]})
+        trainer._reprefill_all = lambda _: [fake_result]
+        trainer.tokenizer = SimpleNamespace(pad_token_id=0)
+
+        trainer._compute_new_rollout_log_prob(batch, metrics)
+        assert metrics["partial_reprefill/case_distribution.case_2"] == 1.0
+        assert metrics["partial_reprefill/case_distribution.case_1"] == 0.0
+        # refresh overwrote the stale piggyback logprobs, tag now points at W_5
+        data = tq.kv_batch_get(
+            keys=[key],
+            partition_id=partition_id,
+            select_fields=["new_rollout_log_probs"],
+        )
+        assert data["new_rollout_log_probs"][0].tolist() == pytest.approx([-0.1, -0.2, -0.3])
+        assert batch.tags[0]["resume_version"] == 5
 
 
 class TestOnNewFinishedCaseAware:
@@ -210,22 +249,21 @@ class TestOnNewFinishedCaseAware:
         # Unique suffix keeps the shared "train" partition clean across runs.
         sfx = uuid.uuid4().hex[:6]
         uid_a, uid_b, uid_c = f"uida{sfx}", f"uidb{sfx}", f"uidc{sfx}"
-        key_a = f"{uid_a}_0_0"  # case 2 (stale: token_versions 3 < 5, no piggyback)
-        key_b = f"{uid_b}_0_0"  # case 1 (piggyback marker in the partition tag)
-        key_c = f"{uid_c}_0_0"  # case 3 (fresh: token_versions == 5)
+        key_a = f"{uid_a}_0_0"  # case 2 (no resume_version: resumed without piggyback)
+        key_b = f"{uid_b}_0_0"  # case 1 (piggyback marker + fresh resume_version)
+        key_c = f"{uid_c}_0_0"  # case 3 (single-segment, fresh resume_version)
         trainer.replay_buffer = SimpleNamespace(
             prompt_global_steps={"train": {}},
             partitions={
                 "train": {
                     key_a: None,
-                    key_b: {"piggyback_marker": True},
-                    key_c: None,
+                    key_b: {"piggyback_marker": True, "resume_version": 5},
+                    key_c: {"resume_version": 5},
                 }
             },
         )
-        # All three trajectories exist in TQ (as they do in production once
-        # finished). token_versions drives decide_case; prompts/responses are
-        # only consumed by the dispatched case-2 request.
+        # Case detection reads only the partition tags — no TQ field access.
+        # prompts/responses are consumed by the dispatched case-2 request.
         tq.kv_batch_put(
             keys=[key_a, key_b, key_c],
             partition_id="train",
@@ -233,14 +271,6 @@ class TestOnNewFinishedCaseAware:
                 {
                     "prompts": to_nested_jagged([[1, 2], [1, 2], [1, 2]]),
                     "responses": to_nested_jagged([[10, 11], [10, 11], [10, 11]]),
-                    "token_versions": torch.nested.as_nested_tensor(
-                        [
-                            torch.tensor([3, 3], dtype=torch.int32),
-                            torch.tensor([3, 3], dtype=torch.int32),
-                            torch.tensor([5, 5], dtype=torch.int32),
-                        ],
-                        layout=torch.jagged,
-                    ),
                 },
                 batch_size=3,
             ),
@@ -257,25 +287,17 @@ class TestOnNewFinishedCaseAware:
 
 
 class TestComputeNewRolloutLogProbPipelined:
-    def _write_trajs(self, partition_id, stale_key, fresh_key=None):
-        # stale: token_versions 3 (case 2); fresh (if given): token_versions 5
-        # (case 3). All keys get prompts/responses so build_reprefill_inputs
-        # works for the case-2 key; rollout_log_probs serves the case-3 copy.
-        trajs = [(stale_key, [3, 3, 3])]
-        if fresh_key is not None:
-            trajs.append((fresh_key, [5, 5, 5]))
-        n = len(trajs)
+    def _write_trajs(self, partition_id, keys):
+        # All keys get prompts/responses so build_reprefill_inputs works for
+        # the case-2 keys; rollout_log_probs serves the case-3 copy.
+        n = len(keys)
         tq.kv_batch_put(
-            keys=[k for k, _ in trajs],
+            keys=keys,
             partition_id=partition_id,
             fields=TensorDict(
                 {
                     "prompts": to_nested_jagged([[1, 2]] * n),
                     "responses": to_nested_jagged([[10, 11, 12]] * n),
-                    "token_versions": torch.nested.as_nested_tensor(
-                        [torch.tensor(tv, dtype=torch.int32) for _, tv in trajs],
-                        layout=torch.jagged,
-                    ),
                     "rollout_log_probs": to_nested_jagged([[0.1, 0.2, 0.3]] * n),
                 },
                 batch_size=n,
@@ -288,7 +310,7 @@ class TestComputeNewRolloutLogProbPipelined:
         trainer._pending_prefill = {}
         stale_key = f"uid_s_{uuid.uuid4().hex[:6]}_0"
         fresh_key = f"uid_f_{uuid.uuid4().hex[:6]}_0"
-        self._write_trajs(partition_id, stale_key, fresh_key)
+        self._write_trajs(partition_id, [stale_key, fresh_key])
 
         # Pre-dispatched future for the stale key: done + version-aligned
         # (resume_version = global_steps - 1 = 5).
@@ -312,7 +334,13 @@ class TestComputeNewRolloutLogProbPipelined:
             return []
 
         trainer._reprefill_all = _reprefill_all
-        batch = _make_batch(partition_id, [stale_key, fresh_key])
+        # stale key: no resume_version tag → case 2; fresh key: resume_version
+        # == global_steps - 1 → case 3.
+        batch = _make_batch(
+            partition_id,
+            [stale_key, fresh_key],
+            tags=[None, {"resume_version": 5}],
+        )
         metrics = {}
 
         trainer._compute_new_rollout_log_prob_pipelined(batch, metrics)
@@ -336,7 +364,7 @@ class TestComputeNewRolloutLogProbPipelined:
         trainer.tokenizer = SimpleNamespace(pad_token_id=0)
         trainer._pending_prefill = {}
         stale_key = f"uid_s_{uuid.uuid4().hex[:6]}_0"
-        self._write_trajs(partition_id, stale_key)
+        self._write_trajs(partition_id, [stale_key])
 
         # Future resolved at the wrong engine version → must not be consumed.
         future = concurrent.futures.Future()

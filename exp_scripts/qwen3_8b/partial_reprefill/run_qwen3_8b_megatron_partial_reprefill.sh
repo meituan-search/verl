@@ -69,7 +69,7 @@ ENABLE_CASE_SKIP=${ENABLE_CASE_SKIP:-True}
 # trajectories. Set false to ignore the piggyback marker and always do full
 # reprefill for A/B isolation. ⚠️ See the SGLang spike caveat in the script
 # header — keep false until the spike passes.
-ENABLE_PIGGYBACK=${ENABLE_PIGGYBACK:-False}
+ENABLE_PIGGYBACK=${ENABLE_PIGGYBACK:-True}
 
 # A/B timing comparison: also run the original trainer-side old_log_prob
 # forward pass each step (old_log_prob timer) alongside the rollout-side

@@ -296,6 +296,13 @@ trainer:
       # piggyback marker and always do full reprefill for A/B isolation.
       enable_piggyback: true
 
+      # Max tolerated version gap between the weight the existing
+      # new_rollout_log_probs was computed at (resume_version) and the
+      # current rollout weight. 0 (default) = strict: any off-policy
+      # trajectory is re-prefilled; raise to accept small gaps via the
+      # piggyback/copy fast paths instead of reprefilling.
+      max_resume_staleness: 0
+
       # A/B timing comparison: keep computing the trainer-side old_log_prob
       # forward pass alongside the rollout-side computation, stored as
       # trainer_old_log_probs.

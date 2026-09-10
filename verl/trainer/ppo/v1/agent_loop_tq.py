@@ -31,7 +31,6 @@ from verl.experimental.agent_loop import (
     AgentLoopWorker,
     get_trajectory_info,
 )
-from verl.trainer.ppo.v1.reprefill_utils import to_nested_jagged
 from verl.utils.ray_utils import auto_await
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 
@@ -201,6 +200,16 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             field["input_ids"] = input_ids
             field["position_ids"] = position_ids
             field["multi_modal_inputs"] = multi_modal_inputs
+            # Promote partial_rollout piggyback fields (written by the llm_server
+            # client into extra_fields as lists) to top-level tensor fields so
+            # they travel with the main put.
+            extra = output.extra_fields or {}
+            if "token_versions" in extra:
+                field["token_versions"] = torch.tensor(extra["token_versions"], dtype=torch.int32)
+            if "new_rollout_log_probs" in extra:
+                field["new_rollout_log_probs"] = torch.tensor(
+                    extra["new_rollout_log_probs"], dtype=torch.float32
+                )
             fields.append(field)
             prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
             tag = {
@@ -220,7 +229,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             # partial_rollout piggyback scalars travel as per-trajectory tag entries.
             if field["extra_fields"].get("piggyback_marker"):
                 tag["piggyback_marker"] = True
-                tag["resume_version"] = int(field["extra_fields"].get("resume_version", 0))
+            if "resume_version" in field["extra_fields"]:
+                tag["resume_version"] = int(field["extra_fields"]["resume_version"])
             tags.append(tag)
 
         partition_id = "train" if not validate else "val"
@@ -230,44 +240,6 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             tags=tags,
             partition_id=partition_id,
         )
-
-        # Propagate partial_rollout piggyback fields (written by the llm_server
-        # client into extra_fields) into TransferQueue so the trainer can read
-        # them at sample time (see trainer_partial_reprefill.on_sampled):
-        # - token_versions / new_rollout_log_probs: per-trajectory fields, stored
-        #   as nested-jagged tensors (one inner tensor per trajectory) so
-        #   KVBatch.to_padded_tensor() and per-trajectory indexing work downstream.
-        # - piggyback_marker / resume_version: per-trajectory tag entries (above).
-        # NOTE: prompt_logprobs is an intermediate already consumed into
-        # new_rollout_log_probs by the client and is intentionally NOT put.
-        token_version_keys, token_versions = [], []
-        new_rollout_keys, new_rollout_log_probs = [], []
-        for key, output in zip(keys, outputs, strict=True):
-            extra = output.extra_fields or {}
-            if "token_versions" in extra:
-                token_version_keys.append(key)
-                token_versions.append(extra["token_versions"])
-            if extra.get("piggyback_marker") and "new_rollout_log_probs" in extra:
-                new_rollout_keys.append(key)
-                new_rollout_log_probs.append(extra["new_rollout_log_probs"])
-        if token_version_keys:
-            await tq.async_kv_batch_put(
-                keys=token_version_keys,
-                fields=TensorDict(
-                    {"token_versions": torch.nested.as_nested_tensor(token_versions, layout=torch.jagged)},
-                    batch_size=len(token_version_keys),
-                ),
-                partition_id=partition_id,
-            )
-        if new_rollout_keys:
-            await tq.async_kv_batch_put(
-                keys=new_rollout_keys,
-                fields=TensorDict(
-                    {"new_rollout_log_probs": to_nested_jagged(new_rollout_log_probs)},
-                    batch_size=len(new_rollout_keys),
-                ),
-                partition_id=partition_id,
-            )
 
 
 class AgentLoopManagerTQ(AgentLoopManager):

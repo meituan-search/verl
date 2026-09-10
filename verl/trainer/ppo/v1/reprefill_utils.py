@@ -137,35 +137,44 @@ def compute_and_emit_staleness_metrics(batch, metrics, global_steps):
 
 def decide_case(
     piggyback_marker: bool,
-    last_token_version: int | None,
     current_parameter_version: int,
     enable_case_skip: bool,
     enable_piggyback: bool,
+    resume_version: int | None,
+    max_resume_staleness: int = 0,
 ) -> int:
     """Decide which reprefill case to apply to a trajectory.
 
     Returns 1 (piggyback), 2 (full reprefill), or 3 (skip — copy rollout_log_probs).
-    Case 1 requires piggyback marker AND enable_piggyback. Case 3 requires
-    last_token_version == current_parameter_version AND enable_case_skip.
-    Everything else falls through to case 2.
+
+    Keys on resume_version: the weight version the trajectory's existing
+    logprobs were computed at (W_resume for piggyback, decode version for
+    single-segment trajectories). Absent means the logprobs span multiple
+    versions (resumed without piggyback) — always a full reprefill.
     """
+    if resume_version is None:
+        return 2
+    if not enable_case_skip:
+        return 2
+    if current_parameter_version - resume_version > max_resume_staleness:
+        return 2
     if piggyback_marker and enable_piggyback:
         return 1
-    if enable_case_skip and last_token_version is not None and last_token_version == current_parameter_version:
-        return 3
-    return 2
+    return 3
 
 
-def build_token_versions(segment_versions: list[int], segment_lengths: list[int]) -> torch.Tensor:
-    """Expand per-segment version into per-token int32 1D tensor.
+def build_token_versions(segment_versions: list[int], segment_lengths: list[int]) -> list[int]:
+    """Expand per-segment version into a per-token list.
 
-    Used by client to record each token's decode-time global_steps.
+    Used by client to record each token's decode-time global_steps; carried as
+    a list in extra_fields and converted to int32 tensor at the TQ promotion
+    site, same as new_rollout_log_probs.
     """
     assert len(segment_versions) == len(segment_lengths)
     tokens: list[int] = []
     for v, n in zip(segment_versions, segment_lengths, strict=True):
         tokens.extend([int(v)] * n)
-    return torch.tensor(tokens, dtype=torch.int32)
+    return tokens
 
 
 def build_partial_new_rollout_log_probs(

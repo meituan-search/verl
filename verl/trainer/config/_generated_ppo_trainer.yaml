@@ -915,6 +915,7 @@ trainer:
       enable_prefill_pipeline: false
       enable_case_skip: true
       enable_piggyback: true
+      max_resume_staleness: 0
       compare_trainer_old_log_prob: false
     sampler:
       max_off_policy_threshold: 8
