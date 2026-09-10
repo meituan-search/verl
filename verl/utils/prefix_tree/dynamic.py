@@ -61,15 +61,23 @@ from verl.utils.prefix_tree.tree import (  # noqa: E402
 )
 
 # ---------------------------------------------------------------------------
-# Module-level collector for post-micro-batch-build micro_batch_shared_ratio.
-# Populated by prepare_prefix_tree_micro_batches, consumed by maybe_collect_mbs_metric.
+# Module-level collector for post-micro-batch-build micro_batch_shared_ratio and
+# num_micro_batches. Populated by prepare_prefix_tree_micro_batches, consumed by
+# maybe_collect_prefix_tree_metrics in the engine.
 # ---------------------------------------------------------------------------
-_mbs_metric_state = {"shared_ratio_sum": 0.0, "count": 0}
+_mbs_metric_state = {
+    "shared_ratio_sum": 0.0,
+    "count": 0,
+    "n_micro_batches_sum": 0,
+    "n_mb_count": 0,
+}
 
 
 def _reset_mbs_metric():
     _mbs_metric_state["shared_ratio_sum"] = 0.0
     _mbs_metric_state["count"] = 0
+    _mbs_metric_state["n_micro_batches_sum"] = 0
+    _mbs_metric_state["n_mb_count"] = 0
 
 
 def _push_mbs_shared_ratio(ratio: Optional[float]) -> None:
@@ -79,15 +87,26 @@ def _push_mbs_shared_ratio(ratio: Optional[float]) -> None:
     _mbs_metric_state["count"] += 1
 
 
+def _push_n_micro_batches(n: Optional[int]) -> None:
+    if not n:
+        return
+    _mbs_metric_state["n_micro_batches_sum"] += n
+    _mbs_metric_state["n_mb_count"] += 1
+
+
 def _get_mbs_metric() -> dict:
     s, c = _mbs_metric_state["shared_ratio_sum"], _mbs_metric_state["count"]
-    if c == 0:
+    ns, nc = _mbs_metric_state["n_micro_batches_sum"], _mbs_metric_state["n_mb_count"]
+    if c == 0 and nc == 0:
         return {}
     from verl.utils.metric import AggregationType, Metric
 
-    return {
-        "prefix_tree/micro_batch_shared_ratio": Metric(value=s / c, aggregation=AggregationType.MEAN),
-    }
+    out = {}
+    if c:
+        out["prefix_tree/micro_batch_shared_ratio"] = Metric(value=s / c, aggregation=AggregationType.MEAN)
+    if nc:
+        out["prefix_tree/num_micro_batches"] = Metric(value=ns / nc, aggregation=AggregationType.MEAN)
+    return out
 
 
 def greedy_build_tries(
@@ -525,57 +544,6 @@ def build_subtrie_view(
     return subtrie
 
 
-_ZERO_PT_METRICS = {
-    "prefix_tree/global_shared_ratio": 0.0,
-    "prefix_tree/packed_tokens": 0,
-    "prefix_tree/raw_tokens": 0,
-}
-
-
-def compute_prefix_tree_metrics(
-    input_ids,
-    attention_mask=None,
-    max_token_len_per_gpu: int | None = None,
-    micro_batch_size: int = 0,
-    trie: Optional[PrefixTrie] = None,
-    leaf_idx=None,
-) -> dict:
-    """Compute prefix_tree/global_shared_ratio, prefix_tree/packed_tokens, prefix_tree/raw_tokens.
-
-    Uses caller-provided global trie (built once on driver). Per-call rebuild is disabled."""
-    if isinstance(input_ids, Tensor) and input_ids.is_nested:
-        sequences = [t.tolist() for t in input_ids.unbind()]
-    elif isinstance(input_ids, Tensor) and input_ids.dim() == 2:
-        seqlens = (
-            attention_mask.sum(dim=-1).tolist()
-            if attention_mask is not None
-            else [input_ids.shape[1]] * input_ids.shape[0]
-        )
-        sequences = [input_ids[i, : int(seqlens[i])].tolist() for i in range(input_ids.shape[0])]
-    elif isinstance(input_ids, list):
-        sequences = input_ids
-    else:
-        return _ZERO_PT_METRICS
-
-    total_raw = sum(len(s) for s in sequences)
-    if total_raw == 0:
-        return _ZERO_PT_METRICS
-
-    # Reuse the caller-provided global trie (built once on the driver).
-    if trie is None:
-        raise RuntimeError(
-            "compute_prefix_tree_metrics: global trie is None. The driver must call "
-            "build_global_trie and pass trie=... Per-call rebuild is disabled."
-        )
-    flat = sum(len(n.input_ids) for n in trie.nodes)
-
-    return {
-        "prefix_tree/global_shared_ratio": 1.0 - flat / total_raw,
-        "prefix_tree/packed_tokens": flat,
-        "prefix_tree/raw_tokens": total_raw,
-    }
-
-
 def prepare_prefix_tree_micro_batches(
     data,
     sp_size: int,
@@ -705,6 +673,7 @@ def prepare_prefix_tree_micro_batches(
         if group_raw == 0:
             continue
         _push_mbs_shared_ratio(1.0 - flat / group_raw)
+    _push_n_micro_batches(len(batch_idx_list))
 
     # Attach subtries (built once above, no rebuild).
     for mb, sub in zip(micro_batches, subtries, strict=False):

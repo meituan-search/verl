@@ -15,6 +15,7 @@
 """Prefix-tree (MAGI) attention package.
 
 Consumers import from submodules directly (e.g.
-``from verl.utils.prefix_tree.trainer import pt_metrics``); no package-level
-re-exports are provided. See README.md for the module-responsibility map.
+``from verl.utils.prefix_tree.trainer import build_global_trie``); no
+package-level re-exports are provided. See README.md for the
+module-responsibility map.
 """

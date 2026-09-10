@@ -66,7 +66,7 @@ from verl.utils.debug import marked_timer
 from verl.utils.import_utils import deprecated, load_class_from_fqn
 from verl.utils.metric import reduce_metrics
 from verl.utils.prefix_tree.dynamic import balance_prefix_tree_v0
-from verl.utils.prefix_tree.trainer import build_global_trie, pt_metrics
+from verl.utils.prefix_tree.trainer import build_global_trie
 from verl.utils.py_functional import rename_dict
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.skip.skip_manager import SkipManager
@@ -1748,26 +1748,6 @@ class RayPPOTrainer:
                             self.checkpoint_manager.update_weights(self.global_steps)
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-
-                        if self.config.actor_rollout_ref.model.get("use_prefix_tree", False):
-                            pt_metrics(
-                                actor_output_metrics,
-                                batch.batch["input_ids"],
-                                self.config.actor_rollout_ref.model,
-                                attention_mask=batch.batch.get("attention_mask"),
-                                max_token_len_per_gpu=getattr(
-                                    self.config.actor_rollout_ref.actor, "ppo_max_token_len_per_gpu", None
-                                ),
-                                trie=batch.meta_info.get("prefix_tree"),
-                                leaf_idx=batch.batch.get("leaf_idx"),
-                            )
-                            actor_output_metrics.update(
-                                {
-                                    f"actor/{k}": actor_output_metrics.pop(k)
-                                    for k in list(actor_output_metrics)
-                                    if k.startswith("prefix_tree/")
-                                }
-                            )
 
                         metrics.update(actor_output_metrics)
 

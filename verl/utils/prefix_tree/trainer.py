@@ -21,31 +21,7 @@ import time
 import numpy as np
 import torch
 
-from verl.utils.prefix_tree.dynamic import compute_prefix_tree_metrics, greedy_build_tries
-from verl.utils.prefix_tree.tree import _is_prefix_tree_enabled
-
-
-def pt_metrics(
-    metrics: dict,
-    input_ids,
-    config_or_data: dict,
-    attention_mask=None,
-    max_token_len_per_gpu: int | None = None,
-    trie=None,
-    leaf_idx=None,
-) -> None:
-    """Compute prefix_tree/* metrics if use_prefix_tree enabled (no-op otherwise)."""
-    if not _is_prefix_tree_enabled(config_or_data):
-        return
-    metrics.update(
-        compute_prefix_tree_metrics(
-            input_ids,
-            attention_mask=attention_mask,
-            max_token_len_per_gpu=max_token_len_per_gpu,
-            trie=trie,
-            leaf_idx=leaf_idx,
-        )
-    )
+from verl.utils.prefix_tree.dynamic import greedy_build_tries
 
 
 def build_global_trie(input_ids, attention_mask=None, *, metrics=None):
@@ -61,8 +37,14 @@ def build_global_trie(input_ids, attention_mask=None, *, metrics=None):
     _t0 = time.perf_counter()
     trie, _ = greedy_build_tries(seqs)
     _t1 = time.perf_counter()
+    total_raw = sum(len(s) for s in seqs)
     if metrics is not None:
         metrics["actor/prefix_tree/tree_build_time_s"] = _t1 - _t0
+        if total_raw > 0:
+            flat = sum(len(n.input_ids) for n in trie.nodes) if trie is not None else 0
+            metrics["actor/prefix_tree/global_shared_ratio"] = 1.0 - flat / total_raw
+            metrics["actor/prefix_tree/packed_tokens"] = flat
+            metrics["actor/prefix_tree/raw_tokens"] = total_raw
     if trie is None:
         return None, None, _t1 - _t0
 
