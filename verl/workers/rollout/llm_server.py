@@ -21,6 +21,7 @@ Utility classes for manage and request LLM servers:
 import asyncio
 import logging
 import os
+import time
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -336,9 +337,35 @@ def _populate_new_rollout_fields(final_output, segments: list, prompt_len: int, 
     """
     from verl.trainer.ppo.v1.reprefill_utils import build_token_versions
 
+    t0 = time.perf_counter()
     segment_versions = [int(s.extra_fields.get("global_steps", 0)) for s in segments]
     segment_lengths = [len(s.token_ids) for s in segments]
     final_output.extra_fields["token_versions"] = build_token_versions(segment_versions, segment_lengths)
+
+    if len(segments) >= 2 and enable_piggyback:
+        piggyback = _build_piggyback_fields(segments, prompt_len=prompt_len)
+        final_output.extra_fields["piggyback_marker"] = True
+        final_output.extra_fields["new_rollout_log_probs"] = piggyback["new_rollout_log_probs"]
+        final_output.extra_fields["resume_version"] = piggyback["resume_version"]
+    elif len(segments) == 1:
+        if enable_piggyback:
+            assert final_output.log_probs is not None and len(final_output.log_probs) == len(
+                final_output.token_ids
+            ), (
+                "partial_reprefill: single-segment trajectory with enable_piggyback=True must have "
+                f"decode log_probs aligned with token_ids "
+                f"(got {len(final_output.log_probs or [])} logprobs for "
+                f"{len(final_output.token_ids)} tokens)"
+            )
+            final_output.extra_fields["new_rollout_log_probs"] = list(final_output.log_probs)
+        final_output.extra_fields["resume_version"] = segment_versions[-1]
+    print(
+        f"[partial_reprefill] _populate_new_rollout_fields took "
+        f"{(time.perf_counter() - t0) * 1e3:.3f} ms "
+        f"(segments={len(segments)}, total_tokens={len(final_output.token_ids)}, "
+        f"enable_piggyback={enable_piggyback})",
+        flush=True,
+    )
 
     if len(segments) >= 2 and enable_piggyback:
         piggyback = _build_piggyback_fields(segments, prompt_len=prompt_len)

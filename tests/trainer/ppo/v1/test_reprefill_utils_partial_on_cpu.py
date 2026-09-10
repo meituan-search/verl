@@ -79,128 +79,101 @@ class TestBuildPartialNewRolloutLogProbs:
 class TestDecideCase:
     def test_case1_piggyback_within_budget(self):
         # resume_version=5, current=6, budget=1: gap within budget → consume piggyback
-        assert (
-            decide_case(
-                piggyback_marker=True,
-                current_parameter_version=6,
-                enable_case_skip=True,
-                enable_piggyback=True,
-                resume_version=5,
-                max_resume_staleness=1,
-            )
-            == 1
-        )
+        assert decide_case(
+            piggyback_marker=True,
+            current_parameter_version=6,
+            enable_case_skip=True,
+            enable_piggyback=True,
+            resume_version=5,
+            max_resume_staleness=1,
+        ) == (1, "piggyback")
 
     def test_case1_piggyback_beyond_budget_falls_to_case2(self):
         # resume_version=3, current=6, budget=1: gap 3 > budget → refresh via reprefill
-        assert (
-            decide_case(
-                piggyback_marker=True,
-                current_parameter_version=6,
-                enable_case_skip=True,
-                enable_piggyback=True,
-                resume_version=3,
-                max_resume_staleness=1,
-            )
-            == 2
-        )
+        assert decide_case(
+            piggyback_marker=True,
+            current_parameter_version=6,
+            enable_case_skip=True,
+            enable_piggyback=True,
+            resume_version=3,
+            max_resume_staleness=1,
+        ) == (2, "stale")
 
     def test_case1_piggyback_zero_gap(self):
-        assert (
-            decide_case(
-                piggyback_marker=True,
-                current_parameter_version=6,
-                enable_case_skip=True,
-                enable_piggyback=True,
-                resume_version=6,
-                max_resume_staleness=0,
-            )
-            == 1
-        )
+        assert decide_case(
+            piggyback_marker=True,
+            current_parameter_version=6,
+            enable_case_skip=True,
+            enable_piggyback=True,
+            resume_version=6,
+            max_resume_staleness=0,
+        ) == (1, "piggyback")
 
     def test_case1_piggyback_disabled_falls_to_case3_within_budget(self):
         # piggyback disabled: marker is ignored, but a within-budget
         # resume_version still means the logprobs are fresh enough →
         # copy fast path (case 3), not a reprefill.
-        assert (
-            decide_case(
-                piggyback_marker=True,
-                current_parameter_version=6,
-                enable_case_skip=True,
-                enable_piggyback=False,
-                resume_version=5,
-                max_resume_staleness=1,
-            )
-            == 3
-        )
+        assert decide_case(
+            piggyback_marker=True,
+            current_parameter_version=6,
+            enable_case_skip=True,
+            enable_piggyback=False,
+            resume_version=5,
+            max_resume_staleness=1,
+        ) == (3, "fresh_copy")
 
     def test_case3_copy_within_budget(self):
         # single-segment trajectory whose logprobs are fresh enough
-        assert (
-            decide_case(
-                piggyback_marker=False,
-                current_parameter_version=6,
-                enable_case_skip=True,
-                enable_piggyback=True,
-                resume_version=5,
-                max_resume_staleness=1,
-            )
-            == 3
-        )
+        assert decide_case(
+            piggyback_marker=False,
+            current_parameter_version=6,
+            enable_case_skip=True,
+            enable_piggyback=True,
+            resume_version=5,
+            max_resume_staleness=1,
+        ) == (3, "fresh_copy")
 
     def test_case3_copy_beyond_budget_falls_to_case2(self):
-        assert (
-            decide_case(
-                piggyback_marker=False,
-                current_parameter_version=6,
-                enable_case_skip=True,
-                enable_piggyback=True,
-                resume_version=3,
-                max_resume_staleness=1,
-            )
-            == 2
-        )
+        assert decide_case(
+            piggyback_marker=False,
+            current_parameter_version=6,
+            enable_case_skip=True,
+            enable_piggyback=True,
+            resume_version=3,
+            max_resume_staleness=1,
+        ) == (2, "stale")
 
     def test_missing_resume_version_is_case2(self):
         # no resume_version (resumed without piggyback — logprobs span
         # multiple versions; or an older client): full reprefill
-        assert (
-            decide_case(
-                piggyback_marker=False,
-                current_parameter_version=6,
-                enable_case_skip=True,
-                enable_piggyback=True,
-                resume_version=None,
-            )
-            == 2
-        )
+        assert decide_case(
+            piggyback_marker=False,
+            current_parameter_version=6,
+            enable_case_skip=True,
+            enable_piggyback=True,
+            resume_version=None,
+        ) == (2, "no_resume_version")
 
     def test_case3_disabled_falls_to_case2(self):
         # case skip disabled: even if fresh, force case 2
-        assert (
-            decide_case(
-                piggyback_marker=False,
-                current_parameter_version=6,
-                enable_case_skip=False,
-                enable_piggyback=True,
-                resume_version=6,
-                max_resume_staleness=1,
-            )
-            == 2
-        )
+        assert decide_case(
+            piggyback_marker=False,
+            current_parameter_version=6,
+            enable_case_skip=False,
+            enable_piggyback=True,
+            resume_version=6,
+            max_resume_staleness=1,
+        ) == (2, "case_skip_disabled")
 
     def test_missing_resume_version_with_marker_is_case2(self):
         # piggyback marker without resume_version (inconsistent): case 2
-        assert (
-            decide_case(
-                piggyback_marker=True,
-                current_parameter_version=6,
-                enable_case_skip=True,
-                enable_piggyback=True,
-                resume_version=None,
-            )
-            == 2
-        )
+        assert decide_case(
+            piggyback_marker=True,
+            current_parameter_version=6,
+            enable_case_skip=True,
+            enable_piggyback=True,
+            resume_version=None,
+        ) == (2, "no_resume_version")
 
 
 def _token_versions_field(per_traj_versions: list[list[int]]) -> torch.Tensor:

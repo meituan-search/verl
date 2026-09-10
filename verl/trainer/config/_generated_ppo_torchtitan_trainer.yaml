@@ -900,6 +900,7 @@ trainer:
       enable_case_skip: true
       enable_piggyback: true
       max_resume_staleness: 0
+      case2_reprefill_mode: engine
       compare_trainer_old_log_prob: false
     sampler:
       max_off_policy_threshold: 8

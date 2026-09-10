@@ -47,6 +47,7 @@ def _make_trainer(
     enable_prefill_pipeline=False,
     num_warmup_batches=0,
     max_resume_staleness=1,
+    case2_reprefill_mode="engine",
 ):
     trainer = PPOTrainerPartialReprefill.__new__(PPOTrainerPartialReprefill)
     trainer.config = OmegaConf.create(
@@ -61,6 +62,7 @@ def _make_trainer(
                         "compare_trainer_old_log_prob": False,
                         "num_warmup_batches": num_warmup_batches,
                         "max_resume_staleness": max_resume_staleness,
+                        "case2_reprefill_mode": case2_reprefill_mode,
                     }
                 }
             },
@@ -223,6 +225,73 @@ class TestComputeNewRolloutLogProbCase2:
         )
         assert data["new_rollout_log_probs"][0].tolist() == pytest.approx([-0.1, -0.2, -0.3])
         assert batch.tags[0]["resume_version"] == 5
+
+    def test_case2_trainer_mode_skips_engine_reprefill(self, tq_init, partition_id):
+        # case2_reprefill_mode=trainer: no engine re-prefill, no
+        # new_rollout_log_probs write — old_log_probs comes from the trainer-side
+        # actor forward in _compute_old_log_prob.
+        trainer = _make_trainer(case2_reprefill_mode="trainer")
+        key = f"traj-{uuid.uuid4().hex}"
+        tq.kv_batch_put(
+            keys=[key],
+            partition_id=partition_id,
+            fields=TensorDict(
+                {
+                    "rollout_log_probs": to_nested_jagged([[0.1, 0.2, 0.3]]),
+                },
+                batch_size=1,
+            ),
+        )
+        batch = _make_batch(partition_id, [key])  # no resume_version → case 2
+        metrics = {}
+        called = {"yes": False}
+
+        def _reprefill_all(_):
+            called["yes"] = True
+            return []
+
+        trainer._reprefill_all = _reprefill_all
+        trainer._compute_new_rollout_log_prob(batch, metrics)
+        assert called["yes"] is False, "trainer mode must not touch the rollout engine"
+        assert metrics["partial_reprefill/case_distribution.case_2"] == 1.0
+        assert metrics["partial_reprefill/case2_reprefill_mode"] == 1.0
+        data = tq.kv_batch_get(
+            keys=[key],
+            partition_id=partition_id,
+            select_fields=["new_rollout_log_probs"],
+        )
+        assert "new_rollout_log_probs" not in data
+
+    def test_case2_copy_mode_reuses_rollout_log_probs(self, tq_init, partition_id):
+        # case2_reprefill_mode=copy: stale rollout_log_probs reused as
+        # new_rollout_log_probs — no engine call, accepts the off-policy gap.
+        trainer = _make_trainer(case2_reprefill_mode="copy")
+        key = f"traj-{uuid.uuid4().hex}"
+        tq.kv_batch_put(
+            keys=[key],
+            partition_id=partition_id,
+            fields=TensorDict(
+                {
+                    "rollout_log_probs": to_nested_jagged([[0.1, 0.2, 0.3]]),
+                },
+                batch_size=1,
+            ),
+        )
+        batch = _make_batch(partition_id, [key])  # no resume_version → case 2
+        metrics = {}
+        called = {"yes": False}
+        trainer._reprefill_all = lambda _: called.__setitem__("yes", True) or []
+        trainer._compute_new_rollout_log_prob(batch, metrics)
+        assert called["yes"] is False, "copy mode must not touch the rollout engine"
+        assert metrics["partial_reprefill/case_distribution.case_2"] == 1.0
+        assert metrics["partial_reprefill/case2_reprefill_mode"] == 2.0
+        data = tq.kv_batch_get(
+            keys=[key],
+            partition_id=partition_id,
+            select_fields=["new_rollout_log_probs"],
+        )
+        assert data["new_rollout_log_probs"][0].tolist() == pytest.approx([0.1, 0.2, 0.3])
+        assert batch.tags[0]["resume_version"] == 5  # tagged as consumed, not refreshed
 
 
 class TestOnNewFinishedCaseAware:

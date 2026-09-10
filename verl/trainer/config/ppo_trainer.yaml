@@ -303,6 +303,17 @@ trainer:
       # piggyback/copy fast paths instead of reprefilling.
       max_resume_staleness: 0
 
+      # How case 2 (needs fresh logprobs) trajectories get their
+      # new_rollout_log_probs:
+      # - engine (default): full re-prefill on the rollout engine (original
+      #   behavior; competes with generation for engine capacity).
+      # - trainer: skip the engine re-prefill; the trainer-side actor
+      #   forward pass in _compute_old_log_prob computes old_log_probs for
+      #   these keys instead (exact, no engine load).
+      # - copy: skip the re-prefill and reuse the stale rollout_log_probs
+      #   as new_rollout_log_probs (fastest, accepts the off-policy gap).
+      case2_reprefill_mode: engine
+
       # A/B timing comparison: keep computing the trainer-side old_log_prob
       # forward pass alongside the rollout-side computation, stored as
       # trainer_old_log_probs.

@@ -34,6 +34,7 @@ import concurrent.futures
 import logging
 import os
 import threading
+from collections import Counter
 from dataclasses import dataclass
 
 import transfer_queue as tq
@@ -162,7 +163,7 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
                 tag_dict = partition.get(traj_key) or {}
                 piggyback = bool(tag_dict.get("piggyback_marker", False)) and cfg.enable_piggyback
                 resume_version = tag_dict.get("resume_version")
-                case = decide_case(
+                case, _ = decide_case(
                     piggyback_marker=piggyback,
                     current_parameter_version=current_version,
                     enable_case_skip=cfg.enable_case_skip,
@@ -208,23 +209,26 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
             request_prefix=f"partial_reprefill_{self.global_steps}",
         )
 
-    def _classify_cases(self, batch: KVBatchMeta, meta) -> tuple[list[int], list[int], int]:
+    def _classify_cases(self, batch: KVBatchMeta, meta) -> tuple[list[int], list[int], int, Counter]:
         """Classify each trajectory in the batch into case 1/2/3.
 
-        Returns (case2_indices, case3_indices, case1_count). `meta` is the
-        kv_batch_get result holding `rollout_log_probs` (consumed by the
-        case 3 copy, not by the dispatch itself).
+        Returns (case2_indices, case3_indices, case1_count, reason_counts).
+        `meta` is the kv_batch_get result holding `rollout_log_probs` (consumed
+        by the case 3 copy, not by the dispatch itself). `reason_counts` maps
+        each decide_case branch to its hit count, e.g. {"stale": 12} for a
+        batch of 12 too-stale case-2 trajectories.
         """
         cfg = self.config.trainer.v1.partial_reprefill
         current_version = self.global_steps - 1
         case2_indices: list[int] = []
         case3_indices: list[int] = []
         case1_count = 0
+        reason_counts: Counter = Counter()
         for i, tag in enumerate(batch.tags):
             tag = tag or {}
             piggyback = bool(tag.get("piggyback_marker", False)) and cfg.enable_piggyback
             resume_version = tag.get("resume_version")
-            case = decide_case(
+            case, reason = decide_case(
                 piggyback_marker=piggyback,
                 current_parameter_version=current_version,
                 enable_case_skip=cfg.enable_case_skip,
@@ -232,13 +236,14 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
                 resume_version=int(resume_version) if resume_version is not None else None,
                 max_resume_staleness=cfg.max_resume_staleness,
             )
+            reason_counts[reason] += 1
             if case == 1:
                 case1_count += 1
             elif case == 3:
                 case3_indices.append(i)
             else:
                 case2_indices.append(i)
-        return case2_indices, case3_indices, case1_count
+        return case2_indices, case3_indices, case1_count, reason_counts
 
     def _reprefill_case2(
         self,
@@ -315,28 +320,51 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
             partition_id=batch.partition_id,
             select_fields=["rollout_log_probs"],
         )
-        case2_indices, case3_indices, case1_count = self._classify_cases(batch, meta)
+        case2_indices, case3_indices, case1_count, reason_counts = self._classify_cases(batch, meta)
 
         # Case 2: full reprefill for selected keys (pipelined path consumes
         # pre-dispatched futures when `_pending` is provided).
         if case2_indices:
             keys2 = [batch.keys[i] for i in case2_indices]
-            nested, consumed = self._reprefill_case2(
-                keys2,
-                batch.partition_id,
-                pending=_pending,
-            )
-            if _pending is not None:
-                metrics["partial_reprefill/prefill_consumed"] = float(consumed)
-            tq.kv_batch_put(
-                keys=keys2,
-                partition_id=batch.partition_id,
-                fields=TensorDict({"new_rollout_log_probs": to_nested_jagged(nested)}, batch_size=len(keys2)),
-            )
-            for i in case2_indices:
-                if batch.tags[i] is None:
-                    batch.tags[i] = {}
-                batch.tags[i]["resume_version"] = int(resume_version)
+            mode = self.config.trainer.v1.partial_reprefill.get("case2_reprefill_mode", "engine")
+            if mode == "engine":
+                nested, consumed = self._reprefill_case2(
+                    keys2,
+                    batch.partition_id,
+                    pending=_pending,
+                )
+                if _pending is not None:
+                    metrics["partial_reprefill/prefill_consumed"] = float(consumed)
+                tq.kv_batch_put(
+                    keys=keys2,
+                    partition_id=batch.partition_id,
+                    fields=TensorDict(
+                        {"new_rollout_log_probs": to_nested_jagged(nested)}, batch_size=len(keys2)
+                    ),
+                )
+                for i in case2_indices:
+                    if batch.tags[i] is None:
+                        batch.tags[i] = {}
+                    batch.tags[i]["resume_version"] = int(resume_version)
+            else:
+                # trainer: actor forward computes old_log_probs for these keys
+                # in _compute_old_log_prob; copy: reuse stale rollout_log_probs.
+                # Both leave new_rollout_log_probs unset here.
+                metrics["partial_reprefill/case2_reprefill_mode"] = 1.0 if mode == "trainer" else 2.0
+                if mode == "copy":
+                    rollout_lp = meta["rollout_log_probs"]
+                    nested2 = [rollout_lp[i] for i in case2_indices]
+                    tq.kv_batch_put(
+                        keys=keys2,
+                        partition_id=batch.partition_id,
+                        fields=TensorDict(
+                            {"new_rollout_log_probs": to_nested_jagged(nested2)}, batch_size=len(keys2)
+                        ),
+                    )
+                    for i in case2_indices:
+                        if batch.tags[i] is None:
+                            batch.tags[i] = {}
+                        batch.tags[i]["resume_version"] = int(resume_version)
 
         # Case 3: copy rollout_log_probs → new_rollout_log_probs.
         if case3_indices:
@@ -358,6 +386,8 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
         metrics["partial_reprefill/case_distribution.case_1"] = float(case1_count)
         metrics["partial_reprefill/case_distribution.case_2"] = float(len(case2_indices))
         metrics["partial_reprefill/case_distribution.case_3"] = float(len(case3_indices))
+        for reason, count in reason_counts.items():
+            metrics[f"partial_reprefill/case_reason.{reason}"] = float(count)
         metrics["partial_reprefill/resume_version"] = float(resume_version)
         return batch
 
@@ -426,6 +456,14 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
         bypass = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
         if bypass:
             return super()._compute_old_log_prob(batch, metrics)
+        mode = self.config.trainer.v1.partial_reprefill.get("case2_reprefill_mode", "engine")
+        if mode == "trainer":
+            # Case 2 keys got no engine re-prefill, so new_rollout_log_probs is
+            # missing for them — compute old_log_probs for the whole batch via
+            # the trainer-side actor forward (exact, at current weights).
+            batch = super()._compute_old_log_prob(batch, metrics)
+            metrics["partial_reprefill/old_log_prob_source"] = 2.0
+            return batch
         compare = self.config.trainer.v1.partial_reprefill.get("compare_trainer_old_log_prob", False)
         if compare:
             batch = super()._compute_old_log_prob(batch, metrics)

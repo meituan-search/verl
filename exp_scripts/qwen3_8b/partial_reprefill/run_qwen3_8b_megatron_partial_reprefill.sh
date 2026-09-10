@@ -25,6 +25,7 @@
 #   trainer.v1.partial_reprefill.enable_prefill_pipeline={true|false}  (default false — P2)
 #   trainer.v1.partial_reprefill.enable_case_skip={true|false}  (default true — case 3 fast path)
 #   trainer.v1.partial_reprefill.enable_piggyback={true|false}  (default true — case 1)
+#   trainer.v1.partial_reprefill.case2_reprefill_mode={engine|trainer|copy}  (default engine — case 2)
 #
 # ⚠️ UNVERIFIED: Case 1 piggyback depends on SGLang emitting prompt_logprobs
 # during a max_new_tokens>0 resume prefill. The SGLang spike (spec Task 4)
@@ -76,6 +77,13 @@ ENABLE_PIGGYBACK=${ENABLE_PIGGYBACK:-True}
 # re-prefill (new_rollout_log_prob timer).
 COMPARE_TRAINER_OLD_LOG_PROB=${COMPARE_TRAINER_OLD_LOG_PROB:-False}
 
+# How case 2 (needs fresh logprobs) trajectories get old_log_probs:
+# - engine (default): re-prefill on the rollout engine (original path).
+# - trainer: skip the engine re-prefill; the trainer-side actor forward
+#   computes old_log_probs instead (zero rollout-engine load).
+# - copy: reuse stale rollout_log_probs (fastest, accepts off-policy data).
+CASE2_REPREFILL_MODE=${CASE2_REPREFILL_MODE:-copy}
+
 # Per-dataset defaults. Any knob can still be overridden via its env var
 # (TRAIN_FILES, TRAIN_BATCH_SIZE, ACTOR_LR, ...). DATASET just picks the base.
 case "$DATASET" in
@@ -111,7 +119,8 @@ entropy_coeff=${ENTROPY_COEFF:-0}
 project_name=${PROJECT_NAME:-verl_grpo_${DATASET}_math}
 pipeline_tag=$([ "$ENABLE_PREFILL_PIPELINE" = "true" ] && echo "_p2" || echo "_p1")
 piggyback_tag=$([ "$ENABLE_PIGGYBACK" = "true" ] && echo "_piggy" || echo "")
-experiment_name=${EXPERIMENT_NAME:-qwen3_8b_${INFER_BACKEND}_megatron_${DATASET}_partial_reprefill${pipeline_tag}${piggyback_tag}}
+case2_mode_tag=$([ "$CASE2_REPREFILL_MODE" = "engine" ] && echo "" || echo "_case2_${CASE2_REPREFILL_MODE}")
+experiment_name=${EXPERIMENT_NAME:-qwen3_8b_${INFER_BACKEND}_megatron_${DATASET}_partial_reprefill${pipeline_tag}${piggyback_tag}${case2_mode_tag}}
 
 actor_tp=${ACTOR_TP:-4}
 actor_pp=${ACTOR_PP:-2}
@@ -199,6 +208,7 @@ TRAINER=(
     trainer.v1.partial_reprefill.enable_prefill_pipeline=${ENABLE_PREFILL_PIPELINE}
     trainer.v1.partial_reprefill.enable_case_skip=${ENABLE_CASE_SKIP}
     trainer.v1.partial_reprefill.enable_piggyback=${ENABLE_PIGGYBACK}
+    trainer.v1.partial_reprefill.case2_reprefill_mode=${CASE2_REPREFILL_MODE}
     trainer.v1.partial_reprefill.compare_trainer_old_log_prob=${COMPARE_TRAINER_OLD_LOG_PROB}
 )
 

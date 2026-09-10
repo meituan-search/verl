@@ -107,10 +107,14 @@ def compute_and_emit_staleness_metrics(batch, metrics, global_steps):
 
     from verl import DataProto
 
+    # In case2_reprefill_mode=trainer the batch may carry no new_rollout_log_probs
+    # (case 2 keys never got one); fall back to old_log_probs for the diff metrics.
+    new_rollout_field = "new_rollout_log_probs" if "new_rollout_log_probs" in data else "old_log_probs"
+
     data = DataProto(batch=data.to_padded_tensor())
 
     rollout_lp = data.batch["rollout_log_probs"]
-    new_rollout_lp = data.batch["new_rollout_log_probs"]
+    new_rollout_lp = data.batch[new_rollout_field]
     old_lp = data.batch["old_log_probs"]
     response_mask = data.batch["response_mask"]
 
@@ -142,10 +146,13 @@ def decide_case(
     enable_piggyback: bool,
     resume_version: int | None,
     max_resume_staleness: int = 0,
-) -> int:
+) -> tuple[int, str]:
     """Decide which reprefill case to apply to a trajectory.
 
-    Returns 1 (piggyback), 2 (full reprefill), or 3 (skip — copy rollout_log_probs).
+    Returns (case, reason). Case: 1 (piggyback), 2 (full reprefill), or
+    3 (skip — copy rollout_log_probs). Reason identifies which branch fired:
+    "no_resume_version" | "case_skip_disabled" | "stale" | "piggyback" |
+    "fresh_copy".
 
     Keys on resume_version: the weight version the trajectory's existing
     logprobs were computed at (W_resume for piggyback, decode version for
@@ -153,14 +160,14 @@ def decide_case(
     versions (resumed without piggyback) — always a full reprefill.
     """
     if resume_version is None:
-        return 2
+        return 2, "no_resume_version"
     if not enable_case_skip:
-        return 2
+        return 2, "case_skip_disabled"
     if current_parameter_version - resume_version > max_resume_staleness:
-        return 2
+        return 2, "stale"
     if piggyback_marker and enable_piggyback:
-        return 1
-    return 3
+        return 1, "piggyback"
+    return 3, "fresh_copy"
 
 
 def build_token_versions(segment_versions: list[int], segment_lengths: list[int]) -> list[int]:
@@ -223,6 +230,9 @@ def compute_and_emit_token_staleness_metrics(batch, metrics, global_steps):
         return
 
     token_versions_field = data.get("token_versions", None)
+    # case2_reprefill_mode=trainer: new_rollout_log_probs may be absent for
+    # case 2 keys — diff against old_log_probs (same values, post-rename).
+    new_rollout_field = data.get("new_rollout_log_probs", None)
 
     current_version = global_steps - 1
     total_tokens = 0
@@ -233,7 +243,11 @@ def compute_and_emit_token_staleness_metrics(batch, metrics, global_steps):
     for i in range(len(batch.keys)):
         try:
             rollout = data["rollout_log_probs"][i].tolist()
-            new_rollout = data["new_rollout_log_probs"][i].tolist()
+            new_rollout = (
+                new_rollout_field[i].tolist()
+                if new_rollout_field is not None
+                else data["old_log_probs"][i].tolist()
+            )
             mask = data["response_mask"][i].tolist()
             tv_entry = token_versions_field[i] if token_versions_field is not None else None
             tv = tv_entry.tolist() if tv_entry is not None else None
