@@ -43,6 +43,7 @@ actor_rollout_ref:
       entropy_from_logits_chunk_size: ${oc.select:actor_rollout_ref.actor.entropy_from_logits_chunk_size,2048}
       use_torch_compile: true
       entropy_checkpointing: ${oc.select:actor_rollout_ref.actor.entropy_checkpointing,False}
+      use_no_sync_for_gradient_accumulation: false
       pad_to_length: ${oc.select:actor_rollout_ref.actor.pad_to_length,False}
       pad_to_length_bucket: 1024
       forward_only: false
@@ -248,6 +249,7 @@ actor_rollout_ref:
       entropy_from_logits_chunk_size: ${oc.select:actor_rollout_ref.ref.entropy_from_logits_chunk_size,2048}
       use_torch_compile: true
       entropy_checkpointing: ${oc.select:actor_rollout_ref.ref.entropy_checkpointing,False}
+      use_no_sync_for_gradient_accumulation: false
       pad_to_length: ${oc.select:actor_rollout_ref.ref.pad_to_length,False}
       pad_to_length_bucket: ${oc.select:actor_rollout_ref.actor.fsdp_config.pad_to_length_bucket,1024}
       forward_only: true
@@ -336,6 +338,7 @@ actor_rollout_ref:
       temperature: 0
       'n': 1
       do_sample: false
+    router_config_path: null
     multi_turn:
       _target_: verl.workers.config.MultiTurnConfig
       enable: false
@@ -439,6 +442,8 @@ actor_rollout_ref:
     enable_gradient_checkpointing: true
     enable_activation_offload: false
     use_remove_padding: true
+    use_prefix_tree: false
+    prefix_tree_attention: magi
     lora_rank: 0
     lora_alpha: 16
     target_modules: all-linear
@@ -565,6 +570,7 @@ critic:
     entropy_from_logits_chunk_size: 2048
     use_torch_compile: true
     entropy_checkpointing: false
+    use_no_sync_for_gradient_accumulation: false
     pad_to_length: false
     pad_to_length_bucket: 1024
     forward_only: false
@@ -678,6 +684,8 @@ critic:
     enable_gradient_checkpointing: true
     enable_activation_offload: false
     use_remove_padding: true
+    use_prefix_tree: false
+    prefix_tree_attention: magi
     lora_rank: 0
     lora_alpha: 16
     target_modules: all-linear
@@ -941,6 +949,7 @@ transfer_queue:
       device_name: ''
 trainer:
   balance_batch: true
+  balance_keep_minibatch: false
   total_epochs: 30
   total_training_steps: null
   project_name: verl_examples

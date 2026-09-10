@@ -39,6 +39,10 @@ enable_activation_offload: False
 # whether to use remove padding. Only valid when we use hf model definition
 use_remove_padding: True
 
+# Prefix-tree shared-prefix deduplication for actor/SFT training.
+use_prefix_tree: false
+prefix_tree_attention: magi
+
 # Set to positive value to enable LoRA (e.g., 32)
 lora_rank: 0
 
@@ -63,7 +67,8 @@ use_fused_kernels: False
 # fused kernel options.
 fused_kernel_options:
 
-  # the implementation backend for fused kernels.
+  # the implementation backend for fused kernels: torch, triton, or liger.
+  # Megatron only supports triton.
   impl_backend: torch
 
 # TiledMLP configuration for memory-efficient MLP computation.
