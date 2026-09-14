@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import functools
 import logging
-import time as _time
 
 import megatron.core.tensor_parallel as tp
 import torch
@@ -72,8 +71,6 @@ def flex_attn_forward(
 
 # MAGI attention kernel helper
 
-_MAGI_ATTN_TIMER = {"total": 0.0, "calls": 0}
-
 
 def magi_attn_forward(
     query: Tensor,
@@ -87,21 +84,9 @@ def magi_attn_forward(
     k = key.squeeze(1).contiguous()
     v = value.squeeze(1).contiguous()
 
-    t0 = _time.perf_counter()
     out, _ = calc_attn(q, k, v, magi_attention_key)
-    _MAGI_ATTN_TIMER["total"] += _time.perf_counter() - t0
-    _MAGI_ATTN_TIMER["calls"] += 1
 
     return out.reshape(out.shape[0], 1, -1)
-
-
-def reset_magi_attn_timer():
-    _MAGI_ATTN_TIMER["total"] = 0.0
-    _MAGI_ATTN_TIMER["calls"] = 0
-
-
-def get_magi_attn_timer():
-    return dict(_MAGI_ATTN_TIMER)
 
 
 # Per-batch attention-path counters (magi/flex/fa3)

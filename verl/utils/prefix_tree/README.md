@@ -12,10 +12,10 @@ for the module; design and usage are covered in
 
 ```mermaid
 graph TD
-    subgraph Trainer["Trainer (controller) -- ray_trainer.py"]
-        A1["build_global_trie<br/>(greedy_build_tries)"]
-        A2["pt_metrics<br/>(global_shared_ratio, packed_tokens)"]
-        A3["_balance_batch<br/>(DFS reorder; leaf_idx stays correct)"]
+    subgraph Trainer["Trainer (controller) -- ray_trainer.py / v1 trainer_base.py"]
+        A1["build_global_trie<br/>(greedy_build_tries + leaf_idx)"]
+        A2["build_global_trie metrics<br/>(global_shared_ratio, packed_tokens)"]
+        A3["_balance_batch -><br/>balance_prefix_tree_v0/v1<br/>(KK whole-prompt blocks)"]
         A4["dispatch to DP ranks"]
         A1 --> A2 --> A3 --> A4
     end
@@ -23,8 +23,8 @@ graph TD
     subgraph Worker["Worker (DP rank) -- engine/utils.py"]
         B1["prepare_micro_batches<br/>(use_prefix_tree branch)"]
         B2["prepare_prefix_tree_micro_batches<br/>(dynamic.py)"]
-        B3["mbs_groups_from_leaf_idx<br/>(flat-token budget grouping)"]
-        B4["create_and_attach_subtrie_views<br/>(per-mb PrefixSubTrie)"]
+        B3["one-pass count decision:<br/>fill + DP-max all_reduce +<br/>VPP roundup + _refill_to_count"]
+        B4["PrefixSubTrie per mb<br/>(built in prepare_*)"]
         B1 --> B2 --> B3 --> B4
     end
 
@@ -36,12 +36,12 @@ graph TD
     end
 
     subgraph Forward["Forward (prefix_tree) -- forward.py + model_forward*.py"]
-        D1["unfuse_try_forward_prefix_tree<br/>OR fuse_try_forward_prefix_tree"]
+        D1["prepare_prefix_tree / tree_post_processing<br/>OR run_fused_prefix_tree"]
         D2["build_prefix_tree_batch<br/>(build_prefix_tree_micro_batch)"]
         D3["_build_magi_key / _build_flex_key<br/>(q/k ranges, mask_types)"]
         D4["dispatch_magi<br/>(slice per-CP-rank local tokens)"]
         D5["model(...)<br/>with magi_attention_key"]
-        D6["fuse_forward_body / unfuse_forward<br/>(decoder + LCE)"]
+        D6["decoder + LCE<br/>(unfused: logits_processor; fused: _run_lce)"]
         D7["undispatch<br/>(gather CP-local logits)"]
         D8["_run_lce<br/>(linear_cross_entropy)"]
         D1 --> D2 --> D3 --> D4 --> D5 --> D6 --> D7 --> D8
@@ -130,17 +130,18 @@ Flat packed layout (tokens processed once):
 - Falls back to FA3 if neither MAGI nor flex key is provided.
 
 **Forward drivers** (`forward.py`):
-- `unfuse_try_forward_prefix_tree` / `fuse_try_forward_prefix_tree`: entry points for unfused and fused forward paths.
+- `prepare_prefix_tree` / `tree_post_processing`: unfused entry points (called from `model_forward.py`).
+- `run_fused_prefix_tree`: fused entry point (called from `model_forward_fused.py`).
 - `_build_magi_key` / `_build_flex_key`: build the attention key from model config and the trie.
-- `fuse_forward_body`: the fused-path body that wires RoPE + decoder-key contexts + the model call.
 
 **Micro-batch grouping** (`dynamic.py`):
 - `mbs_groups_from_leaf_idx`: groups samples into prefix-aware micro-batches using the reorder-safe `leaf_idx` (not the stale `sequence_ids`).
-- `prepare_prefix_tree_micro_batches`: splits the batch into micro-batches and attaches subtrie views.
+- `prepare_prefix_tree_micro_batches`: splits the batch into micro-batches (one-pass DP-count equalization + VPP-divisible refill on the dynbsz path, peel-one padding on the fixed path) and attaches subtrie views.
+- `balance_prefix_tree_v0/v1` → `balance_prefix_tree_blocks`: KK whole-prompt DP balancing on the driver.
 
 **Trainer helpers** (`trainer.py`):
-- `build_global_trie`: greedy token-by-token build of the global trie at the trainer level (before DP dispatch).
-- `pt_metrics`: compute prefix-sharing metrics (`global_shared_ratio`, `micro_batch_shared_ratio`, `packed_tokens`, `raw_tokens`, `avg_mbs`, `timing_s`).
+- `build_global_trie`: greedy token-by-token build of the global trie at the trainer level (before DP dispatch); emits `global_shared_ratio` / `packed_tokens` / `raw_tokens` / `tree_build_time_s` into the metrics dict.
+- `micro_batch_shared_ratio` and `num_micro_batches` are collected engine-side in `dynamic.py` (`_push_mbs_shared_ratio` / `_push_n_micro_batches`) and surfaced by `maybe_collect_prefix_tree_metrics` (engine).
 
 ## Parallelism Support
 
@@ -165,14 +166,14 @@ attention rectangles and are stripped before loss.
 Supported, magi backend only. CP dispatch is **non-contiguous**: each CP rank
 holds a topology-driven slice of the flat layout, not a sequential block.
 Megatron's rank-sliced RoPE is therefore wrong; the RoPE patch
-(`_rope_fwd_with_pids` in `prefix_tree_patch_impl.py`) builds the full RoPE table
+(`_rope_forward` in `prefix_tree_patch_impl.py`) builds the full RoPE table
 and indexes by actual local `position_ids`.
 
 - `dispatch_magi(pb)` (`forward.py`) calls `get_position_ids(magi_key)` to slice
   `tree_packed_input_ids`/`position_ids` to `(1, local_tokens)`; CP=1 covers all
   tokens.
 - `undispatch(...)` gathers local logits/entropy back to full flat before loss.
-  Unfused: `forward.py` `unfuse_try_forward_prefix_tree`; fused: `_run_lce`.
+  Unfused: `tree_post_processing`; fused: `_run_lce`.
 - The magi key carries `cp_group_or_mesh` and
   `DistAttnConfig(dispatch_config=DispatchConfig(uneven_shard=True))` so the kernel
   knows attention spans CP ranks.
@@ -186,7 +187,7 @@ Supported. All PP stages receive the same MAGI-dispatched local tokens. Stage 0
 embeds `local_input_ids` and emits `(seq, 1, hidden)` seq-first. Intermediate
 stages keep seq-first. Last stage runs LCE on local hidden, undispatches to full
 flat, expands per-sample. Unfused returns `output_orig.permute(1, 0, 2)` for
-non-last stages; fused returns raw hidden (`fuse_forward_body`).
+non-last stages; fused returns raw hidden.
 
 ### Fused vs unfused path
 
@@ -194,14 +195,14 @@ Two forward drivers, selected by `use_fused_kernels` (`transformer_impl.py`):
 
 | Path | Entry | Vocab projection | When used |
 |------|-------|------------------|-----------|
-| Fused | `fuse_try_forward_prefix_tree` (`forward.py`) | `linear_cross_entropy` (no logits tensor) | `use_fused_kernels=True` + `use_remove_padding=True` + scalar temperature |
-| Unfused | `unfuse_try_forward_prefix_tree` (`forward.py`) | materialises `(flat_tokens, vocab)` logits, runs `logits_processor` | per-sample temperature, or fused kernels off |
+| Fused | `run_fused_prefix_tree` (`forward.py`) | `linear_cross_entropy` (no logits tensor) | `use_fused_kernels=True` + `use_remove_padding=True` + scalar temperature |
+| Unfused | `prepare_prefix_tree` + `tree_post_processing` (`forward.py`) | materialises `(flat_tokens, vocab)` logits, runs `logits_processor` | per-sample temperature, or fused kernels off |
 
 Both share `build_prefix_tree_batch`, `_prepare_attn_inputs`, and `dispatch_magi`.
-The fused path calls `fuse_forward_body` via the patched `_fused_GPTModel_forward`
-(`model_forward_fused.py`), which installs `prefix_tree_rope_context` +
-`prefix_tree_decoder_key_context` and delegates to `fuse_forward_body` for
-preprocess → decoder → LCE. The unfused path calls `model(...)` directly with
+The fused path routes through the patched `_fused_GPTModel_forward`
+(`model_forward_fused.py`) with `prefix_tree_decoder_key_context`
+(`forward.py`) injecting the magi/flex key, then `_run_lce` for the fused LCE.
+The unfused path calls `model(...)` directly with
 `magi_attention_key` in `attn_kwargs`, then runs `logits_processor` outside the
 model. Fused-path limitation: scalar temperature only (`linear_cross_entropy`
 asserts `isinstance(temperature, float)`); per-sample temperature must use the
@@ -227,27 +228,27 @@ then splits into prefix-aware micro-batches.
 
 ### Why reorder
 
-`_balance_batch` (`ray_trainer.py`) reorders so each DP rank receives similar
-total tokens. For prefix-tree, the reorder has a second goal: **prefix locality**
-— samples sharing a long prefix should land on the same DP rank and adjacent
-micro-batch slots so the trie can dedup them. The prefix-tree reorder achieves
-both by reordering in DFS trie order first, then partitioning contiguously.
+`_balance_batch` (v0: `ray_trainer.py`; v1: `trainer_base.py`) reorders so each
+DP rank receives similar total tokens. For prefix-tree, the reorder has a second
+goal: **prefix locality** — a prompt's rollouts must land on the same DP rank so
+the trie can dedup their shared prefix (uid atomicity: GRPO advantage grouping
+also requires it).
 
-### DFS reorder + contiguous partition
+### Whole-prompt block balance (KK)
 
-`reorder_and_balance_for_prefix_tree` (`dynamic.py`) calls
-`get_dfs_balanced_partitions` with `contiguous_partitions=True`:
+`balance_prefix_tree_v0/v1` (`dynamic.py`) call `balance_prefix_tree_blocks`:
 
-1. `dfs_leaf_order(seqs, trie=attached_trie)` walks the trie in DFS pre-order,
-   emitting sample indices so same-prefix samples are contiguous.
-2. `data.reorder(torch.tensor(dfs_order))` permutes the batch.
-3. `contiguous_partitions=True` slices into `dp_size` equal contiguous chunks:
-   rank `r` gets `[r*per_rank, (r+1)*per_rank)`. Each rank's samples stay
-   trie-adjacent.
+1. Samples are grouped into blocks by prompt identity (`uid`); a block's
+   rollouts are never split across ranks.
+2. Each block's weight = `calculate_workload(flat_tokens)` (`24576*n + n^2`).
+3. `get_seqlen_balanced_partitions` (Karmarkar-Karp) assigns blocks to
+   `dp_size` ranks for balanced workload.
+4. A rank-major permutation (`permutation[new_pos] = original sample index`) is
+   applied via `data.reorder`, then slices are dispatched. Each rank also
+   receives the shared global trie and its `leaf_idx` slice.
 
-After dispatch, `reorder_and_balance_for_prefix_tree` calls `data.reorder(arange)`
-to undo the controller-side permutation so each rank sees its slice in natural
-order.
+After dispatch, ranks see their slice in natural order; the trie itself is never
+reordered (its `node_idx` space is immutable).
 
 ### Reorder-safety: `leaf_idx` is the source of truth
 
@@ -268,46 +269,66 @@ reorders for DP balance. The `leaf_idx`-driven grouping makes this safe.
 
 `prepare_prefix_tree_micro_batches` (`dynamic.py`) reads `max_token_len_per_gpu`
 and interprets it as a **flat (deduplicated) token budget** (not raw sequence
-length): `max_token_len = data["max_token_len_per_gpu"] * sp_size`, then
-`mbs_groups_from_leaf_idx(leaf_idx, trie, max_token_len)`.
+length): `max_token_len = data["max_token_len_per_gpu"] * sp_size`.
 
-`mbs_groups_from_leaf_idx` builds `leaf_to_positions` from `leaf_idx`
-(reorder-safe), then walks the trie in DFS leaf order via `_mbs_groups_dfs`.
-Budget is flat tokens: prefix counted once + unique branch tokens. When adding
-the next leaf's path would exceed the budget, the current group is closed.
-Duplicates (identical sequences sharing a leaf) stay in the same group to avoid
-a singleton group that would force `same_micro_num_in_dp` to pad the other DP
-rank. After grouping, micro-batches are sorted into inc-then-dec flat-token order
+Grouping is a leaf-greedy DFS walk (`_mbs_groups_dfs`) over `leaf_entries`
+(built reorder-safely from `leaf_idx` by `_leaf_entries_from_leaf_idx`): leaves
+are taken in DFS order; each leaf's cost is the trie nodes on its path not
+already covered in the current group (prefix counted once). When adding the
+next leaf's path would exceed the budget, the group is closed and the prefix is
+re-materialized in the next one. Duplicates (identical sequences sharing a
+leaf) stay in the same group.
+
+Each DP rank's natural bucket count is whatever its fill produced — counts can
+differ across ranks. They are equalized in a **single comm pass**:
+
+1. `all_reduce(MAX)` over the DP group agrees on the target count;
+2. `roundup_divisible(target, num_batches_divided_by)` bakes in VPP/PP
+   divisibility (before any adjustment — same order as the non-tree path);
+3. a rank below target **refills** (`_refill_to_count`): binary-search the
+   smallest budget whose fill count <= target (count is non-increasing in
+   budget, and the natural fill already satisfies count <= target, so an exact
+   landing exists whenever one does), with a peel-one fallback (last sample of
+   the largest bucket becomes an mbs=1 bucket) for plateau gaps;
+4. if the count still falls short (a rank has fewer samples than the target),
+   warn and continue with unequal counts.
+
+The dynbsz/fixed branch choice must be identical on every rank of the DP group —
+each branch performs its own `all_reduce`, so a per-rank disagreement would
+desync the collective. Safe because `use_dynamic_bsz` and `max_token_len_per_gpu`
+are driver-attached before DP dispatch.
+
+After grouping, micro-batches are sorted into inc-then-dec flat-token order
 to reduce PP bubbles, preserving prefix locality within each group.
 
 ### Fixed micro-batching (`use_dynamic_bsz=False`)
 
-When `max_token_len_per_gpu` is absent, `prepare_prefix_tree_micro_batches` reads
-`micro_batch_size_per_gpu` and chunks in DFS trie order:
-`dfs_order = trie_dfs_leaf_order_from_leaf_idx(leaf_idx, trie)` then slices
-`[dfs_order[i:i+mbs] for i in range(0, n, mbs)]`. Same-prefix samples still land
-together because `dfs_order` is trie-ordered, but the budget is sequence count,
-not flat tokens.
+When `max_token_len_per_gpu` is absent, `prepare_prefix_tree_micro_batches`
+reads `micro_batch_size_per_gpu` and chunks **contiguously in batch order**
+(`[i:i+mbs]` slices). Fixed-size chunks cannot budget-adjust, so DP-count
+equalization and VPP divisibility both pad by peeling the last sample of the
+largest bucket into an mbs=1 bucket (warn-and-continue when every bucket is
+already a singleton).
 
 ### Subtrie views per micro-batch
 
-`create_and_attach_subtrie_views` (`dynamic.py`) reads `leaf_idx` from each
-microbatch's `non_tensor_batch` and builds a `PrefixSubTrie` (`tree.py`) pruned
-to that microbatch's leaves, iterating `mb_leaf_idx.tolist()` and raising on any
-`-1`. The subtrie is attached as `prefix_tree_subtree` and later read by
-`build_prefix_tree_batch` (`forward.py`). `PrefixSubTrie` is serialisable via
-`__getstate__`/`__setstate__` (`tree.py`), storing compact per-node data so it
-survives pickle across PP ranks without dragging the full trie.
+`prepare_prefix_tree_micro_batches` builds a `PrefixSubTrie` (`tree.py`) per
+micro-batch, pruned to that micro-batch's leaves, and attaches it as
+`prefix_tree_subtree` (read later by `build_prefix_tree_batch` in `forward.py`).
+`PrefixSubTrie` is serialisable via `__getstate__`/`__setstate__` (`tree.py`),
+storing compact per-node data so it survives pickle across PP ranks without
+dragging the full trie.
 
 ### The `leaf_idx` contract
 
 1. `build_global_trie` attaches `non_tensor_batch["leaf_idx"]` (np.int64, sample →
    leaf `node_idx`; `-1` if no leaf).
 2. `_balance_batch` reorders; `leaf_idx` follows via numpy fancy-indexing.
-3. `prepare_prefix_tree_micro_batches` calls `mbs_groups_from_leaf_idx` (dynbsz)
-   or `trie_dfs_leaf_order_from_leaf_idx` (fixed mbs).
-4. `create_and_attach_subtrie_views` reads `leaf_idx` per microbatch to build the
-   subtrie view.
+3. `prepare_prefix_tree_micro_batches` derives `leaf_entries` via
+   `_leaf_entries_from_leaf_idx` (dynbsz fill + refill) or chunks contiguously
+   (fixed mbs).
+4. The per-micro-batch `PrefixSubTrie` view is built from the microbatch's
+   `leaf_idx` slice.
 
 All `leaf_idx`-based paths raise `ValueError` on `-1` entries: a sample without a
 leaf is a bug in `build_global_trie`, not a silent skip.
@@ -344,20 +365,15 @@ The `has_vision_data` check lives only at the fused path's prefix-tree guard:
 
 ## Tree-builder diagnostics
 
-When `PrefixTreeParams.__post_init__` raises `last leaf range must end at total
-sequence length`, the cause is `_assign_offsets` (uses `len(node.input_ids)`)
-disagreeing with `_emit` (slices actual samples). The per-node trace log (emitted
-in `build_layout_from_tree_node` when `last_leaf_end != total_tokens`) prints each
-node's `node_idx`, `iid_len`, `start`, `end`, `donated_in`, `donated_out`,
-`n_children`.
+`PrefixTreeParams.__post_init__` (`utils.py`) validates structural invariants of
+the layout: `leaf_ranges`/`leaf_to_sample` length agreement, `q_ranges`/
+`k_ranges`/`mask_types` triple agreement, `sample_to_leaf_range` covering exactly
+the sampled leaves, and `prefix_range` starting at 0 and non-decreasing. A
+violation means `build_layout_from_tree_node` produced an inconsistent layout —
+inspect the BFS pass that assigns `flat_start`/`flat_end` per node.
 
-Invariant per node: `end - start == (1 if donated_in else 0) + iid_len - (1 if donated_out else 0)`.
-Any node violating this is the bug.
-
-The OLP crash `no_padding_2_padding: token count mismatch` is a separate symptom:
-`sum(prompt_len + response_len) != actual_tokens_in_output`. The diagnostic log
-prints `prompt_lens`, `response_lens`, `sequence_lens` lists to identify which
-sample is short.
+`build_layout_from_tree_node` also raises if `leaf_idx` references a node not in
+the trie (see the `leaf_idx` contract above).
 
 ## Configuration
 

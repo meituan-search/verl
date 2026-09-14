@@ -99,7 +99,6 @@ def build_prefix_tree_micro_batch(
     if not samples:
         _log.getLogger(__name__).warning("prefix_tree: build_prefix_tree_micro_batch got empty samples; returning None")
         return None
-    loss_masks_by_sample = _unpack_nested_to_list(loss_mask)
     position_ids_by_sample = _unpack_nested_to_list(position_ids, mask=loss_mask)
 
     if subtrie is None:
@@ -113,7 +112,6 @@ def build_prefix_tree_micro_batch(
     params = build_layout_from_tree_node(
         samples,
         subtrie,
-        loss_masks_by_sample=loss_masks_by_sample,
         position_ids_by_sample=position_ids_by_sample,
     )
     pb = _finalize_prefix_tree_batch(
@@ -144,18 +142,15 @@ def _build_per_sample_tensor(
     # Packed-sequence ranges of the shared trie nodes on each leaf's root->parent path.
     ancestor_ranges = pt_batch.restoration.ancestor_segment_ranges
     if ancestor_ranges is None:
-        ancestor_ranges = [[pt_batch.restoration.prefix_range] for _ in range(n)]
-    # iterate each sample, from leaf
+        raise RuntimeError("restore_flat_to_nested: ancestor_segment_ranges is missing")
     for leaf_idx, sample_idx in enumerate(pt_batch.subtrie.leaf_to_sample):
         leaf_start, leaf_end = pt_batch.restoration.segment_ranges[leaf_idx]
         leaf_slice = flat_tensor[leaf_start:leaf_end]
         pieces: list[Tensor] = []
         boundary_tokens = boundary_logps.get(sample_idx, []) if boundary_logps is not None else []
-        # iterate the segment to build the entire sequence
         for start, end in ancestor_ranges[leaf_idx]:
             patched = False
             for pos, leaf_val in boundary_tokens:
-                # find the correct boundary token apply here
                 if start <= pos < end:
                     pieces.extend([flat_tensor[start:pos], leaf_val.reshape(1)])
                     patched = True
@@ -163,7 +158,6 @@ def _build_per_sample_tensor(
             if not patched:
                 pieces.append(flat_tensor[start:end])
         pieces.append(leaf_slice)
-        # torch cat the entire pieces togather
         sample_tensors[sample_idx] = torch.cat(pieces, dim=0)
     return sample_tensors
 

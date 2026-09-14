@@ -27,8 +27,8 @@ from verl.utils.prefix_tree.dynamic import greedy_build_tries
 def build_global_trie(input_ids, attention_mask=None, *, metrics=None):
     """Build global prefix trie via greedy token-by-token detection.
 
-    Returns (trie, leaf_idx, build_time). trie is None when there's no sharing.
-    Callers attach trie + leaf_idx as they need (DataProto, TQ, etc.)."""
+    Returns (trie, leaf_idx, build_time). Callers attach trie + leaf_idx as
+    they need (DataProto, TQ, etc.)."""
     if attention_mask is not None:
         seqs = [ids[mask.bool()].tolist() or [0] for ids, mask in zip(input_ids, attention_mask, strict=False)]
     else:

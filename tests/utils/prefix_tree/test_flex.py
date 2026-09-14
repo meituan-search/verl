@@ -33,9 +33,8 @@ from __future__ import annotations
 
 import pytest
 import torch
-from _helpers import make_pt_batch
+from _helpers import build_subtrie_production, make_pt_batch
 
-from verl.utils.prefix_tree.dynamic import build_tree_dynamic
 from verl.utils.prefix_tree.forward import (
     _build_flex_key,
     _finalize_prefix_tree_batch,
@@ -45,8 +44,7 @@ from verl.utils.prefix_tree.utils import build_layout_from_tree_node
 
 
 def _layout(samples):
-    subtrie = build_tree_dynamic(samples)
-    assert subtrie is not None, "expected a shared-prefix trie"
+    subtrie = build_subtrie_production(samples)
     return build_layout_from_tree_node(samples, subtrie), subtrie
 
 
@@ -126,15 +124,15 @@ def test_flex_mask_matches_oracle(case, samples):
     """_build_flex_key's mask must equal the trie oracle on every topology.
     Bug lockers per case:
     - shared-prefix-only: depth-2 trie (shared prompt, divergent responses) -
-      passes today; regression guard.
+      regression guard.
     - intermediate-branch: middle branch node (shared response prefix beyond
-      the prompt) must be visible to its descendants - leaf-only leaf_id made
-      these tokens invisible, so samples could not attend their own shared tokens.
+      the prompt) must be visible to its descendants - leaf-only visibility
+      made these tokens invisible, so samples could not attend their own shared tokens.
     - mixed-depths: unequal branch depths; middle nodes and a mid-tree branch
       must all be visible.
     - strict-prefix: one sample's sequence is a strict prefix of another's: the
       trie root IS that sample's leaf; its tokens must attend only causally
-      (``in_prefix_k & (q_leaf >= 0)`` let q=0 see the whole root).
+      (a leaf-only mask would let q=0 see the whole root).
     - duplicates: identical sequences share one leaf - mask must stay correct
       per leaf."""
     _assert_mask_matches_oracle(samples, case)
@@ -146,8 +144,8 @@ def test_flex_mask_matches_oracle(case, samples):
 
 
 def test_flex_block_mask_keeps_leaf_id_closure_alive():
-    """block_mask._flex_aux pins the closure tensors so they survive GC; must exist
-    and span ALL flat positions (sentinel -1 outside node spans, node id inside)."""
+    """block_mask._flex_aux pins (tin_arr, tout_arr) so the mask closure survives
+    GC; must exist and span all flat positions."""
     params, subtrie = _layout(
         [
             torch.tensor([1, 2, 3, 4, 5, 6]),
@@ -157,14 +155,13 @@ def test_flex_block_mask_keeps_leaf_id_closure_alive():
     block_mask = _build_flex_key(params, torch.device("cpu"), subtrie=subtrie)
     flex_aux = getattr(block_mask, "_flex_aux", None)
     assert flex_aux is not None, "block_mask._flex_aux missing (closure may be GC'd)"
-    pos_node = flex_aux[0]
-    assert pos_node.shape[0] == params.total_seqlen_q, (
-        f"pos_node spans {pos_node.shape[0]} positions != total {params.total_seqlen_q}"
+    tin_arr = flex_aux[0]
+    assert tin_arr.shape[0] == params.total_seqlen_q, (
+        f"tin_arr spans {tin_arr.shape[0]} positions != total {params.total_seqlen_q}"
     )
-    # Positions inside a node span carry that node's id; every real flat
-    # position belongs to exactly one trie node, so all must be >= 0.
-    in_node = pos_node >= 0
-    assert in_node.all(), "every flat position should map to a trie node"
+    # Every real flat position belongs to exactly one trie node, so every
+    # tin entry is a valid node index >= 0.
+    assert (tin_arr >= 0).all(), "every flat position should map to a trie node"
 
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-"""Trie/dynamic-builder unit tests: greedy_build_tries, build_tree_dynamic,"""
+"""Trie/dynamic-builder unit tests: greedy_build_tries, build_subtrie_view,"""
 
 from __future__ import annotations
 
@@ -22,14 +22,12 @@ import random
 
 import pytest
 import torch
+from _helpers import build_subtrie_production, make_grpo_samples, make_pt_batch
 from _helpers import build_trie as _build_trie
-from _helpers import make_grpo_samples, make_pt_batch
 
 from verl.utils.prefix_tree.dynamic import (
     balance_prefix_tree_blocks,
     build_subtrie_view,
-    build_tree_dynamic,
-    convert_trie_to_tree_node,
     dfs_leaf_order,
     greedy_build_tries,
 )
@@ -72,24 +70,14 @@ def test_build_subtrie_view_all_subset_and_empty():
     assert build_subtrie_view(trie, set()) is None and build_subtrie_view(trie, {99}) is None
 
 
-def test_build_tree_dynamic_and_convert_none_cases():
-    s2 = [torch.tensor([10, 11, 20, 21]), torch.tensor([10, 11, 30, 31]), torch.tensor([10, 11, 40, 41])]
-    r2 = build_tree_dynamic(s2)
-    assert r2 is not None and len(r2.nodes[0].input_ids) == 2 and sorted(r2.leaf_to_sample) == [0, 1, 2]
-    assert build_tree_dynamic([torch.tensor([1, 2, 3]), torch.tensor([4, 5, 6])]) is None
-    assert build_tree_dynamic([]) is None
-    # multi-root trie (no shared first token) cannot fold into one tree
-    assert convert_trie_to_tree_node(_build_trie([[1, 2], [3, 4]])) is None
-
-
 def test_layout_token_conservation_and_zero_length_leaf_skipped():
     s2 = [torch.tensor([10, 11, 20, 21]), torch.tensor([10, 11, 30, 31]), torch.tensor([10, 11, 40, 41])]
-    p2 = build_layout_from_tree_node(s2, build_tree_dynamic(s2))
+    p2 = build_layout_from_tree_node(s2, build_subtrie_production(s2))
     assert p2.tree_packed_tokens.shape[0] >= 8  # at least the raw 8 tokens
     assert p2.prefix_range[0] == 0 and p2.prefix_range[1] >= 1
     assert len(p2.leaf_ranges) == 3
     nested = [torch.tensor([1, 2]), torch.tensor([1, 2, 3, 4]), torch.tensor([1, 2, 3, 4, 5, 6])]
-    pn = build_layout_from_tree_node(nested, build_tree_dynamic(nested))
+    pn = build_layout_from_tree_node(nested, build_subtrie_production(nested))
     assert list(pn.tree_packed_tokens[:2].tolist()) == [1, 2]
     assert set(pn.tree_packed_tokens.tolist()) == {1, 2, 3, 4, 5, 6}
 
@@ -97,13 +85,13 @@ def test_layout_token_conservation_and_zero_length_leaf_skipped():
 def test_position_ids_are_sample_local():
     """Position IDs reset at branch points — sample-local, not flat 0..N-1."""
     s1 = [torch.tensor([10, 20, 30, 41, 42]), torch.tensor([10, 20, 30, 51])]
-    p1 = build_layout_from_tree_node(s1, build_tree_dynamic(s1))
+    p1 = build_layout_from_tree_node(s1, build_subtrie_production(s1))
     assert p1.tree_packed_position_ids.tolist() == [0, 1, 2, 3, 4, 3]
     custom_pids = [
         torch.tensor([10, 11, 12, 13, 14]),
         torch.tensor([10, 11, 12, 15]),
     ]
-    p2 = build_layout_from_tree_node(s1, build_tree_dynamic(s1), position_ids_by_sample=custom_pids)
+    p2 = build_layout_from_tree_node(s1, build_subtrie_production(s1), position_ids_by_sample=custom_pids)
     assert p2.tree_packed_position_ids.tolist() == [10, 11, 12, 13, 14, 15]
 
 
@@ -223,7 +211,7 @@ def test_balance_by_prompt_ids_keeps_prompt_blocks_whole():
 def test_strict_prefix_zero_length_leaf_boundary_skipped():
     """Strict-prefix sample (zero-length response) should not appear in boundary registry."""
     samples = [torch.tensor([1, 2, 3, 10, 11]), torch.tensor([1, 2, 3])]
-    p = build_layout_from_tree_node(samples, build_tree_dynamic(samples))
+    p = build_layout_from_tree_node(samples, build_subtrie_production(samples))
     registry = getattr(p, "boundary_registry", None)
     if registry:
         for b_pos, leaves_info in registry:
@@ -266,8 +254,7 @@ def test_pickle_round_trip_and_duplicate_leaf_alignment():
 def _build_and_restore(samples: list[torch.Tensor], subtrie=None) -> list[torch.Tensor]:
     """Build flat layout from subtrie, then restore back to per-sample tokens."""
     if subtrie is None:
-        subtrie = build_tree_dynamic(samples)
-    assert subtrie is not None
+        subtrie = build_subtrie_production(samples)
     params = build_layout_from_tree_node(samples, subtrie)
     pt_batch = make_pt_batch(params, subtrie)
     restored = restore_flat_to_nested(params.tree_packed_tokens, pt_batch)
@@ -312,8 +299,7 @@ def test_dp_shard_subtrie_round_trip():
     for _ in range(8):
         suffix = torch.randint(0, 1000, (50,))
         samples.append(torch.cat([prefix, suffix]))
-    full = build_tree_dynamic(samples)
-    assert full is not None
+    full = build_subtrie_production(samples)
 
     half = set(range(len(samples) // 2))
     shard_sub = build_subtrie_view(full.source or full, half)
@@ -329,8 +315,8 @@ def test_dp_shard_subtrie_round_trip():
 # ---- worker-side prefix-tree restore contracts ----
 # These tests walk the EXACT worker-side flow used in production:
 #     build_global_trie (deepest-node leaf_idx)
-#     → mbs_groups_from_leaf_idx / create_and_attach_subtrie_views
-#       (leaf_to_sample = LOCAL positions within the micro-batch)
+#     → prepare_prefix_tree_micro_batches
+#       (PrefixSubTrie with leaf_to_sample = LOCAL positions within the micro-batch)
 #     → build_layout_from_tree_node
 #     → restore_flat_to_nested
 # Each test locks a regression found in this suite (see per-test docstrings).
@@ -366,11 +352,8 @@ def _worker_restore(samples, trie, leaf_idx, order):
 )
 def test_owner_resolution_order_independent(order):
     """Owner resolution is order-independent (node-id keyed + descendant
-    propagation): an mb whose global sample ids are all >= mb size must restore
-    exactly instead of raising (previously: raise), and an mb whose order
-    differs from global id order must restore the right content (previously:
-    wrong content) — ``owner_of`` cross-matched GLOBAL sequence_ids against
-    LOCAL leaf_to_sample keys."""
+    propagation): an mb whose global sample ids are all >= mb size, or whose
+    order differs from global id order, must restore exactly."""
     samples = make_grpo_samples(4, 8, prefix_len=300, resp_len=200, seed=42)
     trie, leaf_idx, _ = _build_global_trie(samples)
     _worker_restore(samples, trie, leaf_idx, order)
@@ -442,8 +425,7 @@ def test_unfused_expand_first_no_boundary_patch(monkeypatch):
     monkeypatch.setattr(pt_forward, "clear_rope_pids", lambda model: None)
 
     tensors = [torch.tensor([1, 2, 3, 4]), torch.tensor([1, 2, 3, 5]), torch.tensor([1, 2, 3, 6])]
-    subtrie = build_tree_dynamic(tensors)
-    assert subtrie is not None
+    subtrie = build_subtrie_production(tensors)
     params = build_layout_from_tree_node(tensors, subtrie)
     pb = make_pt_batch(params, subtrie)
     pb.per_sample_labels = [torch.cat([s[1:], torch.zeros(1, dtype=torch.long)]) for s in tensors]

@@ -19,10 +19,10 @@ coverage for the fused LCE boundary registry.
 Junction rule: where a sample terminates (its whole sequence is a strict token
 prefix of another sample's), the junction must be registered like a fork: the
 continuing sample reads the junction position, so it needs its own next-token
-label. Pre-fix, only >=2-children nodes were registered, so the continuing
-sample's boundary log-prob came from the terminating owner's rolled 0-pad
-label — silently wrong. Triggers on multi-turn/agentic data, not on ordinary
-shared-prompt forks or GRPO n-siblings.
+label. Without the junction rule, only >=2-children nodes were registered, so
+the continuing sample's boundary log-prob came from the terminating owner's
+rolled 0-pad label — silently wrong. Triggers on multi-turn/agentic data, not
+on ordinary shared-prompt forks or GRPO n-siblings.
 """
 
 from __future__ import annotations
@@ -31,10 +31,9 @@ import types
 
 import pytest
 import torch
-from _helpers import build_layout
+from _helpers import build_layout, build_subtrie_production
 
 from verl.utils.prefix_tree import magi as magi_mod
-from verl.utils.prefix_tree.dynamic import build_tree_dynamic
 from verl.utils.prefix_tree.magi import restore_flat_to_nested
 
 
@@ -49,8 +48,7 @@ def test_build_prefix_tree_micro_batch_unpacks_nested(monkeypatch):
     model = types.SimpleNamespace(config=cfg, pre_process=True, post_process=True)
     tensors = [torch.tensor(t) for t in [[10, 20, 30, 41, 42], [10, 20, 30, 51], [10, 20, 30, 61, 62, 63]]]
     input_ids = torch.nested.nested_tensor(tensors, layout=torch.jagged)
-    subtrie = build_tree_dynamic(tensors)
-    assert subtrie is not None
+    subtrie = build_subtrie_production(tensors)
     result = ptm.build_prefix_tree_micro_batch(model, input_ids, subtrie=subtrie)
     assert result is not None and len(result.restoration.segment_ranges) == 3
     assert list(result.tree_packed_input_ids[:3].tolist()) == [10, 20, 30]

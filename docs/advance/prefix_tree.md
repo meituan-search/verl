@@ -2,7 +2,7 @@
 
 **Author:** `https://github.com/meituan-search`
 
-Last updated: 08/13/2026.
+Last updated: 09/11/2026.
 
 This document covers the **design and usage** of the prefix-deduplicated attention system (MAGI). Implementation detail — parallelism internals, the full call/data-flow graph, dynamic micro-batching, diagnostics — lives in [`verl/utils/prefix_tree/README.md`](../../verl/utils/prefix_tree/README.md).
 
@@ -184,9 +184,9 @@ When enabled, the trainer emits a `prefix_tree/` metric group:
 | `micro_batch_shared_ratio` | Mean per-micro-batch sharing ratio, using the same grouping the live mbs path uses. |
 | `packed_tokens` | Deduplicated packed-trie token count. |
 | `raw_tokens` | Total raw token count across all sequences (pre-dedup). |
-| `avg_mbs` | Average sequences per micro-batch (dynbsz only). |
+| `num_micro_batches` | Mean micro-batch count per prepare call (dynbsz only; averages over logprob and update calls). |
 | `attn_fa3_fallback_ratio` | Fraction of attention calls that fell back to FA3. |
-| `timing_s` | Wall-clock seconds spent building the trie. |
+| `tree_build_time_s` | Wall-clock seconds spent building the trie. |
 
 `raw_tokens` counts **valid (unpadded) tokens** across all sequences; padding is stripped via the attention mask before counting. `packed_tokens / raw_tokens` roughly equals `1 - global_shared_ratio`. See the README for aggregation rules (metrics must be wrapped in `Metric` before the allgather step).
 

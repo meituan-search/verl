@@ -19,7 +19,6 @@ Public: prepare_prefix_tree, tree_post_processing, prefix_tree_output_processor,
 from __future__ import annotations
 
 import logging as _log
-import os
 from collections import Counter, OrderedDict, namedtuple
 from dataclasses import dataclass
 from typing import Optional
@@ -62,8 +61,7 @@ from verl.utils.prefix_tree.magi import (
 _logger = _log.getLogger(__name__)
 
 TreeForwardCtx = namedtuple("TreeForwardCtx", ["pb", "input_ids", "position_ids", "attention", "model"])
-"""Returned by :func:`prepare_prefix_tree`.  ``rope_exit`` is a
-callable to deactivate the MAGI rope context (``None`` for flex / non-tree)."""
+"""Forward context returned by :func:`prepare_prefix_tree`: batch, local inputs, attention type, model."""
 
 # Shared helpers
 
@@ -291,10 +289,8 @@ def prepare_prefix_tree(
     """Prepare prefix-tree forward context.
 
     Returns a :class:`TreeForwardCtx` or ``None`` when tree is not applicable.
-    On success, merges attention kwargs into *model_kwargs* in-place and (for
-    MAGI) activates the rope context via ``ctx.rope_exit``.  The caller must
-    deactivate rope via ``ctx.rope_exit(None, None, None)`` after
-    post-processing (or on the intermediate-PP path).
+    On success, merges attention kwargs into *model_kwargs* in-place and sets
+    rope pids (cleared by :func:`tree_post_processing`).
     """
     if vision_model or mtp_enable_train:
         _logger.warning(
@@ -323,6 +319,11 @@ def prepare_prefix_tree(
 
 
 def tree_post_processing(ctx, output_orig, logits_processor, logits_processor_args, post_process):
+    """Undo the tree forward: un-permute, restore per-sample logits, clear rope pids.
+
+    The non-last-PP early return skips this clear_rope_pids call; the patched
+    GPTModel.forward has already cleared _pids by then (its own finally), so
+    this one is a backstop only."""
     if ctx is None:
         return output_orig
     pt_batch = ctx.pb
@@ -358,7 +359,7 @@ def tree_post_processing(ctx, output_orig, logits_processor, logits_processor_ar
         n = len(pt_batch.subtrie.leaf_to_sample)
         ancestor_ranges = pt_batch.restoration.ancestor_segment_ranges
         if ancestor_ranges is None:
-            ancestor_ranges = [[pt_batch.restoration.prefix_range] for _ in range(n)]
+            raise RuntimeError("tree_post_processing: ancestor_segment_ranges is missing")
         temperature = orig_args.get("temperature")
         temp_is_nested = isinstance(temperature, torch.Tensor) and temperature.is_nested
         outputs: dict[str, list] = {}
@@ -475,14 +476,6 @@ def _prepare_lce_inputs_with_boundary(
     return hidden_ext, labels_ext, n_local, boundary_tags, flat_positions
 
 
-# Per-token grad probe: when PT_TOKEN_DUMP is set, every fused-LCE call stashes
-# its (hidden_ext, logprobs_ext, row metadata) here with retain_grad(). The dump
-# site in McoreEngine.optimizer_step reads .grad after backward and clears the
-# stash. Entries whose tensor never got a grad (forward-only passes) are skipped.
-_PT_TOKEN_DUMP = os.environ.get("PT_TOKEN_DUMP")
-_PT_TOKEN_STASH: list[dict] = []
-
-
 def _run_lce_postprocess(
     logprobs_ext: Tensor,
     entropy_ext: Tensor,
@@ -532,21 +525,6 @@ def _run_lce(
         "none",
         mpu.get_tensor_model_parallel_group(),
     )
-
-    if _PT_TOKEN_DUMP and hidden_ext.requires_grad:
-        hidden_ext.retain_grad()
-        _PT_TOKEN_STASH.append(
-            {
-                "kind": "fused",
-                "hidden": hidden_ext,
-                "labels_ext": labels_ext.detach(),
-                "logprobs_ext": logprobs_ext.detach(),
-                "n_local": n_local,
-                "boundary_tags": list(boundary_tags),
-                "flat_positions": flat_positions.detach(),
-                "pt_batch": pt_batch,
-            }
-        )
 
     return _run_lce_postprocess(logprobs_ext, entropy_ext, n_local, boundary_tags, magi_key, pt_batch)
 
@@ -620,8 +598,7 @@ def post_processing_packed_lce(
         # Pack (boundary_position, sample_idx, log_prob) into one tensor.
         # Values only — grads do NOT flow through this gather: the restore+loss
         # is replicated on every CP rank, so routing every rank's consumption
-        # back to the owner would count the boundary gradient CP-world-fold
-        # (the 4x tail-row grad amplification found by the per-token probe).
+        # back to the owner would count the boundary gradient CP-world-fold.
         # Instead the owner rank consumes its own locally-produced tail logprob
         # (already in its autograd graph) below; other ranks patch with these
         # detached gathered values.

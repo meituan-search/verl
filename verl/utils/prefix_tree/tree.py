@@ -284,7 +284,7 @@ class PrefixTrie:
 class PrefixSubTrie(PrefixTrie):
     """Per-micro-batch PrefixTrie view with same interface. Serialisable via __getstate__/__setstate__.
 
-    leaf_to_sample: leaf i → global sample index
+    leaf_to_sample: leaf i → micro-batch-local sample position
     leaf_node_ids: leaf i → node_idx in source
     source: back-ref to global trie (not serialised)
     leaf_ids: shard-local position → leaf node_idx (-1 if absent)

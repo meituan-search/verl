@@ -93,8 +93,10 @@ install_stubs()
 
 import torch  # noqa: E402
 
-from verl.utils.prefix_tree.dynamic import build_tree_dynamic, greedy_build_tries  # noqa: E402
+from verl.utils.prefix_tree.dynamic import greedy_build_tries  # noqa: E402
 from verl.utils.prefix_tree.magi import PackRestorationParam, PrefixTreeMagiBatch  # noqa: E402
+from verl.utils.prefix_tree.trainer import build_global_trie  # noqa: E402
+from verl.utils.prefix_tree.tree import PrefixSubTrie  # noqa: E402
 from verl.utils.prefix_tree.utils import build_layout_from_tree_node  # noqa: E402
 
 
@@ -117,10 +119,28 @@ def make_pt_batch(params, subtrie, flex_key=None) -> PrefixTreeMagiBatch:
     )
 
 
+def build_subtrie_production(samples):
+    """Build the subtrie exactly the way production does.
+
+    Mirrors prepare_prefix_tree_micro_batches over a single group covering the
+    whole batch: build_global_trie (greedy_build_tries + finalize;
+    leaf_idx[seq_id] = deepest node whose sequence_ids include seq_id), then
+    PrefixSubTrie(source=trie, leaf_node_ids=leaf_idx, leaf_to_sample=LOCAL
+    positions 0..n-1, batch_size=n).
+    """
+    trie, leaf_idx, _ = build_global_trie(samples)
+    n = len(samples)
+    return PrefixSubTrie(
+        source=trie,
+        leaf_node_ids=[int(leaf_idx[i]) for i in range(n)],
+        leaf_to_sample=list(range(n)),
+        batch_size=n,
+    )
+
+
 def build_layout(samples):
-    """build_tree_dynamic + build_layout_from_tree_node, wrapped into a pb. Returns (pb, params)."""
-    subtrie = build_tree_dynamic(samples)
-    assert subtrie is not None, "samples share a prefix, a subtrie must exist"
+    """Production-path subtrie + build_layout_from_tree_node, wrapped into a pb. Returns (pb, params)."""
+    subtrie = build_subtrie_production(samples)
     params = build_layout_from_tree_node(samples, subtrie)
     return make_pt_batch(params, subtrie), params
 

@@ -12,13 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the reorder-safe micro-batch grouping API (grouping, balance
-pass, PP/VPP divisibility of the micro-batch count, DP equalization, and the
-fused MAGI+CP boundary grad flow)."""
+"""Unit tests for the reorder-safe micro-batch grouping API (grouping, DP
+equalization of the micro-batch count, and the fused MAGI+CP boundary grad
+flow)."""
 
 from __future__ import annotations
-
-import statistics
 
 import pytest
 import torch
@@ -145,97 +143,74 @@ def test_prepare_prefix_tree_micro_batches_attaches_subtrie():
         assert sub_leaves == mb_leaves, f"{sub_leaves} != {mb_leaves}"
 
 
-def _leaf_entries(trie, leaf_idx):
-    """leaf_entries list for calling _mbs_groups_dfs directly (pre-rebalance walk)."""
-    leaf_to_positions: dict[int, list[int]] = {}
-    for new_pos, leaf_fid in enumerate(leaf_idx.tolist()):
-        leaf_to_positions.setdefault(int(leaf_fid), []).append(new_pos)
-    entries = []
-    for node in trie.nodes:
-        positions = leaf_to_positions.get(node.node_idx)
-        if positions is not None:
-            entries.append((node, positions))
-    return entries
+def test_refill_lands_exact_count_for_every_target():
+    """_refill_to_count must land exactly on target for every target in
+    [natural, n_samples]: the binary search finds a budget whose fill count
+    equals target when one exists, and the peel fallback tops up any plateau
+    gap (while count < target <= n_samples some bucket still has >= 2 samples)."""
+    from verl.utils.prefix_tree.dynamic import _leaf_entries_from_leaf_idx, _refill_to_count
+
+    samples = _make_samples(8, 4, prefix_len=64, resp_len=24, seed=1)
+    trie = _build_trie(samples)
+    leaf_idx = _leaf_idx_from_trie(trie, len(samples))
+    leaf_entries = _leaf_entries_from_leaf_idx(leaf_idx, trie)
+    budget = 1200
+    natural = len(_mbs_groups_dfs(leaf_entries, budget))
+    assert natural < len(samples), "budget too large to exercise refill"
+    for target in range(natural, len(samples) + 1):
+        groups = _refill_to_count(leaf_entries, budget, target)
+        assert len(groups) == target, f"target {target}: got {len(groups)}"
+        assert sorted(p for g in groups for p in g) == list(range(len(samples))), f"target {target}: coverage broken"
 
 
-def _mb_cost_spread(groups, trie):
-    """max/min dedup flat-token cost over buckets (min floored at 1)."""
-    costs = [trie_group_flat_tokens(g, trie) for g in groups]
-    return max(costs) / max(min(c for c in costs if c > 0), 1)
+def test_refill_exact_landing_has_no_peeled_singletons():
+    """When the binary search lands exactly (no plateau gap), no bucket is a
+    1-sample peel: singletons only appear via the peel fallback. Guaranteed for
+    this data: every leaf holds rollout_n=4 positions, so a non-peel bucket is a
+    whole number of leaves (multiples of 4) while a peel bucket has <4 samples
+    left over from the largest bucket being split."""
+    from verl.utils.prefix_tree.dynamic import _leaf_entries_from_leaf_idx, _refill_to_count
+
+    samples = _make_samples(8, 4, prefix_len=64, resp_len=24, seed=1)
+    trie = _build_trie(samples)
+    leaf_idx = _leaf_idx_from_trie(trie, len(samples))
+    leaf_entries = _leaf_entries_from_leaf_idx(leaf_idx, trie)
+    budget = 1200
+    natural = len(_mbs_groups_dfs(leaf_entries, budget))
+    # one step up from natural: an exact budget landing exists (a budget whose
+    # fill splits exactly one more leaf off)
+    groups = _refill_to_count(leaf_entries, budget, natural + 1)
+    assert len(groups) == natural + 1
+    assert all(len(g) > 1 for g in groups), f"peel singletons on exact landing: {[len(g) for g in groups]}"
 
 
-def _fuzz_configs():
-    # (n_prompts, rollout_n, prefix_len, resp_len, budget, seed)
-    return [
-        (8, 4, 64, 24, 1200, 1),
-        (16, 4, 48, 20, 900, 2),
-        (24, 4, 32, 16, 700, 3),
-        (12, 8, 40, 12, 800, 4),
-        (32, 4, 56, 28, 1500, 5),
-        (20, 2, 100, 40, 1200, 6),
-        (10, 4, 80, 60, 2000, 7),
-        (40, 4, 24, 12, 600, 8),
-        (16, 4, 64, 32, 450, 9),  # tight budget -> many buckets
-        (14, 6, 50, 18, 1000, 10),
-    ]
-
-
-def test_balance_pass_fuzz_invariants():
-    """Balance pass (_rebalance_groups via mbs_groups_from_leaf_idx) on fuzzed
-    trees: every sample covered exactly once, every bucket's dedup flat-token
-    cost within budget, and median max/min bucket cost materially below the raw
-    DFS walk (the greedy cap-fill leaves a runt last bucket: cap, cap, ...,
-    leftover; best-effort target is max/min <= 1.5)."""
-    before, after = [], []
-    for n_prompts, rollout_n, prefix_len, resp_len, budget, seed in _fuzz_configs():
-        samples = _make_samples(n_prompts, rollout_n, prefix_len, resp_len, seed=seed)
-        trie = _build_trie(samples)
-        leaf_idx = _leaf_idx_from_trie(trie, len(samples))
-        bal = mbs_groups_from_leaf_idx(leaf_idx, trie, budget)
-        all_pos = sorted(p for g in bal for p in g)
-        assert all_pos == list(range(len(samples))), (
-            f"config {seed}: coverage broken — missing={set(range(len(samples))) - set(all_pos)}"
-        )
-        for gi, g in enumerate(bal):
-            cost = trie_group_flat_tokens(g, trie)
-            assert cost <= budget, f"config {seed}: bucket {gi} cost {cost} > budget {budget}"
-        raw = _mbs_groups_dfs(_leaf_entries(trie, leaf_idx), budget)
-        if len(raw) >= 2:
-            before.append(_mb_cost_spread(raw, trie))
-            after.append(_mb_cost_spread(bal, trie))
-    assert after, "no multi-bucket configs generated"
-    assert statistics.median(after) <= 1.5, f"median balance {statistics.median(after):.2f} > 1.5 after rebalance"
-    assert statistics.median(after) < statistics.median(before), "rebalance did not improve median balance"
-
-
-def test_pp2_divisibility_halves_without_singletons():
-    """Roundup to a PP2 multiple must halve the largest bucket, never peel a
-    1-sample runt (the old `g[:-1]/[g[-1]]` peel created singleton mbs that
-    idle their pipeline slot), and the resulting mb count is exactly
-    roundup_divisible(budget-derived count, 2) — no overshoot."""
+def test_pp2_divisibility_one_pass():
+    """The VPP roundup is baked into the single comm pass: the count is exactly
+    roundup_divisible(natural, 2), coverage holds, and buckets stay within the
+    hard max_token_len budget."""
     for seed, budget in [(1, 1200), (2, 900), (3, 700), (6, 1200), (7, 2000), (9, 450)]:
         samples = _make_samples(8, 4, prefix_len=64, resp_len=24, seed=seed)
         trie = _build_trie(samples)
         leaf_idx = _leaf_idx_from_trie(trie, len(samples))
         td = _make_td(samples, trie, leaf_idx, budget=budget)
         _, mbs = prepare_prefix_tree_micro_batches(td, sp_size=1, num_batches_divided_by=2)
+        natural = len(mbs_groups_from_leaf_idx(leaf_idx, trie, budget))
+        expected = roundup_divisible(natural, 2)
+        assert len(mbs) == expected, f"seed {seed}: got {len(mbs)} mbs, expected {expected} (natural {natural})"
         assert len(mbs) % 2 == 0, f"seed {seed}: mb count not PP2-divisible"
-        for g in mbs:
-            assert len(g) > 1, f"seed {seed}: singleton micro-bucket {g} (peel-one bug)"
         assert sorted(p for g in mbs for p in g) == list(range(len(samples))), f"seed {seed}: coverage broken"
-        base = mbs_groups_from_leaf_idx(leaf_idx, trie, budget)
-        expected = roundup_divisible(len(base), 2)
-        assert len(mbs) == expected, (
-            f"seed {seed}: got {len(mbs)} mbs, expected {expected} (base {len(base)} rounded up to PP2)"
-        )
+        for gi, g in enumerate(mbs):
+            cost = trie_group_flat_tokens(g, trie)
+            assert cost <= budget, f"seed {seed}: bucket {gi} cost {cost} > budget {budget}"
 
 
 # ---- 2-rank DP micro-batch count equalization ----
 # The tree path must produce the SAME number of micro-batches on every DP rank
-# (same_micro_num_in_dp), otherwise the DP gradient collective desyncs. When one
-# rank has fewer samples than the DP-max micro-batch count, it cannot split down
-# to the target count — it must raise (loudly, on every rank, so no peer hangs),
-# not warn-and-continue with unequal counts.
+# (same_micro_num_in_dp), otherwise the DP gradient collective desyncs. The
+# dynbsz path refills at a smaller budget to land on the DP-max count; the
+# fixed-mbs path peels single samples (mbs=1 buckets). A rank with fewer
+# samples than the target count cannot split that far: it warns and continues
+# with unequal counts.
 
 
 class _CPUDevice:
@@ -247,7 +222,8 @@ def _equalize_worker(rank, world_size, port, n_local_per_rank, result_queue):
     dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world_size)
     pt_dynamic.get_torch_device = _CPUDevice
     try:
-        all_samples = _make_samples(4, 4, prefix_len=20, resp_len=10, seed=42)
+        n_total = sum(n_local_per_rank)
+        all_samples = _make_samples((n_total + 3) // 4, 4, prefix_len=20, resp_len=10, seed=42)
         trie = _build_trie(all_samples)
         # deterministic per-rank slice: rank r takes a contiguous block of samples
         start = sum(n_local_per_rank[:rank])
@@ -277,33 +253,87 @@ def _run_two_rank(n_local_per_rank):
 
 
 def test_equalize_reaches_same_count_when_feasible():
-    """Both ranks have 4 samples, mbs=4 -> each makes 1 group. n_mb=1. No raise, equal counts."""
+    """Both ranks have 4 samples, mbs=4 -> each makes 1 group. n_mb=1. No padding, equal counts."""
     results = _run_two_rank([4, 4])
     assert sorted(r[0] for r in results) == ["ok", "ok"], f"unexpected results: {results}"
     counts = [r[2] for r in results]
     assert counts[0] == counts[1], f"unequal counts across ranks: {counts}"
 
 
-def test_starved_rank_raises_on_both_ranks():
-    """rank0: 8 samples / mbs 4 = 2 groups; rank1: 1 sample / mbs 4 = 1 group.
-    n_mb = 2, min_samples = 1 -> 2 > 1 -> infeasible -> both ranks raise."""
+def test_fixed_mbs_starved_rank_warns_and_continues():
+    """Fixed-mbs branch: rank1 has 1 sample, mbs=4 -> 1 group; rank0 has 8
+    samples -> 2 groups. n_mb=2 > rank1's 1 sample: peel padding cannot split a
+    singleton, so rank1 warns and keeps 1 group (unequal counts, no raise)."""
     results = _run_two_rank([8, 1])
-    kinds = sorted(r[0] for r in results)
-    assert kinds == ["raise", "raise"], f"expected both ranks to raise, got: {results}"
-    for r in results:
-        assert "cannot equalize micro-batch count" in r[2], f"unexpected message: {r[2]}"
+    assert sorted(r[0] for r in results) == ["ok", "ok"], f"unexpected results: {results}"
+    by_rank = {r[1]: r[2] for r in results}  # queue order is nondeterministic
+    assert by_rank[0] == 2 and by_rank[1] == 1, f"expected starved rank1 to stay at 1: {by_rank}"
+
+
+def _equalize_dynbsz_worker(rank, world_size, port, n_local_per_rank, budget, result_queue):
+    """Dynbsz variant: each rank fills at the same flat-token budget, natural
+    counts differ (different shard sizes); the comm pass agrees on the DP max
+    and each below-max rank refills at a smaller budget to land on it."""
+    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world_size)
+    pt_dynamic.get_torch_device = _CPUDevice
+    try:
+        n_total = sum(n_local_per_rank)
+        # ceil to a whole number of 4-rollout prompts so every rank slice is in bounds
+        all_samples = _make_samples((n_total + 3) // 4, 4, prefix_len=64, resp_len=24, seed=42)
+        trie = _build_trie(all_samples)
+        start = sum(n_local_per_rank[:rank])
+        local_ids = list(range(start, start + n_local_per_rank[rank]))
+        leaf_idx = _leaf_idx_from_trie(trie, len(all_samples))[local_ids]
+        data = _make_td([all_samples[i] for i in local_ids], trie, leaf_idx, budget=budget)
+        _, groups = prepare_prefix_tree_micro_batches(
+            data, sp_size=1, dp_group=dist.group.WORLD, same_micro_num_in_dp=True
+        )
+        result_queue.put(("ok", rank, len(groups)))
+    except ValueError as e:
+        result_queue.put(("raise", rank, str(e)))
+    except Exception as e:  # pragma: no cover - surfaces unexpected failure
+        result_queue.put(("error", rank, repr(e)))
+    finally:
+        dist.destroy_process_group()
+
+
+def _run_two_rank_dynbsz(n_local_per_rank, budget):
+    port = free_port()
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    mp.spawn(_equalize_dynbsz_worker, args=(2, port, n_local_per_rank, budget, q), nprocs=2, join=True)
+    return [q.get(timeout=30) for _ in range(2)]
+
+
+def test_dynbsz_equalize_refills_to_dp_max():
+    """rank0: 32 samples, rank1: 16 samples, same budget -> different natural
+    counts; the comm pass agrees on the DP max and rank1 refills to it (no
+    peel singletons in the common case: all buckets > 1 sample)."""
+    budget = 700  # 16-sample shard fills to fewer buckets than 32-sample shard
+    results = _run_two_rank_dynbsz([32, 16], budget)
+    assert sorted(r[0] for r in results) == ["ok", "ok"], f"unexpected results: {results}"
+    counts = [r[2] for r in results]
+    assert counts[0] == counts[1], f"unequal counts across ranks: {counts}"
+
+
+def test_dynbsz_starved_rank_warns_and_continues():
+    """rank1 has 1 sample; DP max > 1 -> rank1 cannot split that far: warns and
+    keeps its single group (unequal counts, no raise)."""
+    results = _run_two_rank_dynbsz([32, 1], 700)
+    assert sorted(r[0] for r in results) == ["ok", "ok"], f"unexpected results: {results}"
+    by_rank = {r[1]: r[2] for r in results}  # queue order is nondeterministic
+    assert by_rank[0] > by_rank[1], f"expected unequal counts (starved rank): {by_rank}"
 
 
 # ---- grad flow of the fused MAGI+CP boundary gather (2-proc gloo) ----
 # post_processing_packed_lce reassembles boundary log-probs across CP ranks with
-# a collective all_gather. Two failure modes, both found in the wild:
+# a collective all_gather. Two failure modes:
 #   (a) plain all_gather detaches: forward VALUES are right but the actor update
-#       backprops NOTHING through boundary tokens (original reviewer finding);
+#       backprops NOTHING through boundary tokens;
 #   (b) an autograd-aware all_gather whose backward all_reduces: under static CP
 #       the restore+loss is REPLICATED on every CP rank, so every rank's
 #       consumption reaches the owner and the boundary gradient is counted
-#       CP-world-fold (the 4x tail-row amplification found by the per-token
-#       grad probe).
+#       CP-world-fold.
 # Correct semantics: the owner rank patches with its own locally-produced tail
 # log-prob (already in its autograd graph — flows exactly once); other ranks
 # patch with detached gathered VALUES.

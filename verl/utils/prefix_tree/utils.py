@@ -44,7 +44,6 @@ class PrefixTreeParams:
     total_seqlen_k: int
     tree_packed_tokens: Optional[Tensor] = None
     tree_packed_labels: Optional[Tensor] = None
-    tree_packed_loss_mask: Optional[Tensor] = None
     tree_packed_position_ids: Optional[Tensor] = None
 
     # Boundary registry for the LCE boundary-patch fix (see prepare_packed_label).
@@ -165,7 +164,6 @@ def prepare_packed_label(
 def build_layout_from_tree_node(
     samples: Sequence[Tensor],
     subtrie: PrefixSubTrie,
-    loss_masks_by_sample: Optional[Sequence[Tensor]] = None,
     position_ids_by_sample: Optional[Sequence[Tensor]] = None,
 ) -> PrefixTreeParams:
     """generate metadata (PrefixTreeParams) from tree structure"""
@@ -190,7 +188,6 @@ def build_layout_from_tree_node(
     mask_types: list[str] = []
     flat_pieces: list[Tensor] = []
     flat_label_pieces: list[Tensor] = []
-    flat_lm_pieces: Optional[list[Tensor]] = [] if loss_masks_by_sample is not None else None
     flat_pid_pieces: Optional[list[Tensor]] = [] if position_ids_by_sample is not None else None
     default_pid_pieces: list[Tensor] = []
 
@@ -237,8 +234,6 @@ def build_layout_from_tree_node(
             continue  # pruned node, not owned by any sample in this shard
         flat_pieces.append(samples[src][s:e])
         flat_label_pieces.append(rolled_samples[src][s:e])
-        if flat_lm_pieces is not None:
-            flat_lm_pieces.append(loss_masks_by_sample[src][s:e])
 
         fs, fe = flat_start[nid], flat_end[nid]
         if flat_pid_pieces is not None:
@@ -259,7 +254,6 @@ def build_layout_from_tree_node(
 
     # Assemble packed tensors.
     tree_packed_tokens = _cat_or_empty(flat_pieces, samples[0].dtype, device)
-    tree_packed_loss_mask = torch.cat(flat_lm_pieces) if flat_lm_pieces is not None else None
     tree_packed_labels_tensor = (
         torch.cat(flat_label_pieces) if flat_label_pieces else torch.zeros_like(tree_packed_tokens)
     )
@@ -319,7 +313,6 @@ def build_layout_from_tree_node(
         total_seqlen_k=tree_packed_tokens.numel(),
         tree_packed_tokens=tree_packed_tokens,
         tree_packed_labels=tree_packed_labels_tensor,
-        tree_packed_loss_mask=tree_packed_loss_mask,
         tree_packed_position_ids=tree_packed_position_ids,
         boundary_registry=prepare_packed_label(samples, subtrie, leaf_node_id_to_samples, flat_end, owner_offset),
     )

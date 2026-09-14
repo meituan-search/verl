@@ -14,7 +14,7 @@
 # limitations under the License.
 
 """Dynamic-trie prefix-tree builder: token-by-token trie insertion, micro-batch
-    grouping, leaf_idx reorder-safety, DFS balancing.
+    grouping, leaf_idx reorder-safety, DP-count equalization.
 
 Algorithm originally derived from AReaL (https://github.com/inclusionAI/AReaL)."""
 
@@ -38,11 +38,9 @@ from verl.utils.seqlen_balancing import (
 _log = _logging.getLogger(__name__)
 
 __all__ = [
-    "build_tree_dynamic",
     # Lower-level helpers exposed for testing / benchmarking
     "TrieNode",
     "greedy_build_tries",
-    "convert_trie_to_tree_node",
     "build_subtrie_view",
     # Load balancing
     "trie_group_flat_tokens",
@@ -51,7 +49,6 @@ __all__ = [
 
 
 # TrieNode is canonical in tree.py; import from there (single definition).
-# Old code using .ancestors (list) will raise AttributeError immediately.
 from verl.utils.prefix_tree.tree import (  # noqa: E402
     PrefixSubTrie,
     PrefixTrie,
@@ -120,59 +117,6 @@ def greedy_build_tries(
         trie.insert(np.array(seq, dtype=np.int64), seq_id)
     trie.finalize()
     return trie, len(trie.nodes)
-
-
-def convert_trie_to_tree_node(
-    trie: PrefixTrie,
-) -> Optional[PrefixSubTrie]:
-    """Convert a compressed trie to a :class:`PrefixSubTrie`.
-
-    Returns ``None`` when there's no real sharing (no children or multi-root).
-    Delegates to :func:`build_subtrie_view` with all sequence IDs.
-    """
-    if not trie.children:
-        _log.warning("prefix_tree: convert_trie_to_tree_node: trie has no children; no sharing, returning None")
-        return None
-    if len(trie.children) > 1:
-        _log.warning(
-            "prefix_tree: convert_trie_to_tree_node: multiple roots (%d), returning None",
-            len(trie.children),
-        )
-        return None
-    all_seq_ids: set[int] = set()
-    for child in trie.children.values():
-        all_seq_ids.update(_trie_seq_ids(child))
-        # Also collect from internal nodes (strict-prefix samples).
-        all_seq_ids.update(child.sequence_ids)
-    return build_subtrie_view(trie, all_seq_ids)
-
-
-def build_tree_dynamic(samples: list[Tensor]) -> Optional[PrefixSubTrie]:
-    """Token-by-token trie detection. Returns a :class:`PrefixSubTrie` or None.
-
-    Returns ``None`` when there's no shared prefix (empty input, single sample,
-    or multi-forest case).
-    """
-    if not samples:
-        return None
-    sequences = [t.tolist() for t in samples]
-    trie, _ = greedy_build_tries(sequences)
-    if not trie.nodes:
-        _log.warning(
-            "prefix_tree: build_tree_dynamic: empty trie, returning None",
-        )
-        return None
-    return convert_trie_to_tree_node(trie)
-
-
-def _trie_seq_ids(node: TrieNode) -> list[int]:
-    """Collect all sequence IDs from leaf nodes of a compressed-trie subtree."""
-    if not node.children:
-        return list(node.sequence_ids)
-    ids: list[int] = []
-    for child in node.children.values():
-        ids.extend(_trie_seq_ids(child))
-    return ids
 
 
 def trie_group_flat_tokens(group: list[int], trie: PrefixTrie) -> int:
@@ -249,220 +193,10 @@ def _mbs_groups_dfs(
     return all_groups
 
 
-def _subtree_positions(node: TrieNode, leaf_to_positions: dict[int, list[int]]) -> list[int]:
-    """All batch positions whose samples terminate at/below node."""
-    out = list(leaf_to_positions.get(node.node_idx, []))
-    for child in node.children.values():
-        out.extend(_subtree_positions(child, leaf_to_positions))
-    return out
-
-
-def _bucket_cost(bucket: list[int], leaf_entries: list[tuple[TrieNode, list[int]]]) -> int:
-    """Dedup-aware flat-token cost of a bucket: trie nodes needed by its samples."""
-    needed: set[int] = set()
-    by_node: dict[int, TrieNode] = {}
-    for node, positions in leaf_entries:
-        for p in positions:
-            if p in bucket:
-                by_node[node.node_idx] = node
-                needed.add(node.node_idx)
-                for anc in trie_ancestors(node):
-                    needed.add(anc.node_idx)
-                    by_node[anc.node_idx] = anc
-    return sum(len(by_node[n].input_ids) for n in needed)
-
-
-def _rebalance_groups(
-    groups: list[list[int]],
-    leaf_entries: list[tuple[TrieNode, list[int]]],
-    leaf_to_positions: dict[int, list[int]],
-    max_token_len: int,
-    target_ratio: float = 1.5,
-) -> list[list[int]]:
-    """Move whole subtrees largest->smallest bucket until max/min cost <= target_ratio.
-
-    The DFS walk fills each bucket to the hard cap, leaving a runt last bucket
-    (cap, cap, ..., leftover). Single-leaf moves cannot fix this (the leaf that
-    shrinks the big bucket is too big for the runt; the leaf that fits doesn't
-    shrink it). Whole-subtree moves can: detaching a subtree relocates its
-    re-materialized shared prefix wholesale.
-
-    Best-effort: stops when no subtree move fits (budget-blocked) or the target
-    is reached. Buckets stay within max_token_len at all times.
-    """
-    if len(groups) <= 1:
-        return groups
-    pos_set = {p for g in groups for p in g}
-    # Movable units: for each leaf, climb to the HIGHEST ancestor whose whole
-    # subtree sits inside a single bucket. Such a subtree moves wholesale (all its
-    # nodes leave the source bucket with it), and stopping where it doesn't keeps
-    # shared prefixes shared. Real tries have one giant root child (shared
-    # instruction prefix spanning every bucket) — root-child granularity is
-    # therefore the whole batch (unmovable); this climb degrades to prompt groups.
-
-    # O(N) position->bucket map (replaces per-lookup bucket scans).
-    bucket_of: dict[int, int] = {}
-    for bi, g in enumerate(groups):
-        for p in g:
-            bucket_of[p] = bi
-    # node's subtree positions in THIS batch: node's own positions plus descendants'.
-    # (node.sequence_ids are original sample ids, not positions — invalid under
-    # permutation, so descend the trie instead.)
-    _node_positions_cache: dict[int, list[int]] = {}
-
-    def _node_positions(node) -> list[int]:
-        out = _node_positions_cache.get(node.node_idx)
-        if out is None:
-            out = list(leaf_to_positions.get(node.node_idx, []))
-            for c in node.children.values():
-                out.extend(_node_positions(c))
-            _node_positions_cache[node.node_idx] = out
-        return out
-
-    def _subtree_bucket(node):
-        # Single bucket id covering node's whole subtree, else -1 (memoized).
-        first = -2
-        for p in _node_positions(node):
-            b = bucket_of.get(p)
-            if b is None:
-                return -1
-            if first == -2:
-                first = b
-            elif b != first:
-                return -1
-        return first
-
-    def _single_bucket_subtree(node: TrieNode) -> TrieNode:
-        cur = node
-        while True:
-            anc = cur.ancestor
-            if anc is None:
-                break
-            if _subtree_bucket(anc) >= 0:
-                cur = anc
-            else:
-                break
-        return cur
-
-    unit_roots: list[TrieNode] = []
-    seen_roots: set[int] = set()
-    for node, positions in leaf_entries:
-        if not any(p in pos_set for p in positions):
-            continue
-        r = _single_bucket_subtree(node)
-        if id(r) not in seen_roots:
-            seen_roots.add(id(r))
-            unit_roots.append(r)
-    units = []
-    for r in unit_roots:
-        positions = [p for p in _subtree_positions(r, leaf_to_positions) if p in pos_set]
-        if positions:
-            units.append((r, positions))
-
-    # NOTE: the DFS walk may split a subtree's positions across buckets (a prompt's
-    # rollouts are independent samples; only identical sequences stay together), so a
-    # unit lives in a bucket only via the positions it holds THERE — track per-bucket
-    # position sets and move exactly the source bucket's slice of the unit.
-    group_sets = [set(g) for g in groups]
-    # unit positions per bucket: unit_positions[ui][bi] = positions of unit ui in bucket bi
-    unit_positions: list[dict[int, list[int]]] = []
-    for r, positions in units:
-        pmap: dict[int, list[int]] = {}
-        for p in positions:
-            for bi, gs in enumerate(group_sets):
-                if p in gs:
-                    pmap.setdefault(bi, []).append(p)
-                    break
-        unit_positions.append(pmap)
-
-    costs = [_bucket_cost(g, leaf_entries) for g in groups]
-
-    # entry -> node path (leaf + ancestors), computed once for O(path) move updates.
-    entry_path: dict[int, list[int]] = {}
-    for ei, (node, positions) in enumerate(leaf_entries):
-        path = []
-        n = node
-        while n is not None:
-            path.append(n.node_idx)
-            n = n.ancestor
-        entry_path[ei] = path
-
-    # position -> entry index (avoids O(entries) scans in the move loop)
-    entry_of_pos: dict[int, int] = {}
-    for ei, (node, positions) in enumerate(leaf_entries):
-        for p in positions:
-            entry_of_pos[p] = ei
-
-    # bucket refcounts: for each bucket, count how many of its entries use each node
-    bucket_refs: list[dict[int, int]] = [dict() for _ in groups]
-    for ei, (node, positions) in enumerate(leaf_entries):
-        for bi, gs in enumerate(group_sets):
-            if any(p in gs for p in positions):
-                for nid in entry_path[ei]:
-                    bucket_refs[bi][nid] = bucket_refs[bi].get(nid, 0) + 1
-                break
-
-    # node lengths, collected once from leaf entries + ancestors
-    node_len: dict[int, int] = {}
-    for node, positions in leaf_entries:
-        node_len[node.node_idx] = len(node.input_ids)
-        n = node.ancestor
-        while n is not None:
-            node_len[n.node_idx] = len(n.input_ids)
-            n = n.ancestor
-
-    for _ in range(50):  # bounded refinement
-        imax, cmax = max(enumerate(costs), key=lambda t: t[1])
-        imin, cmin = min(enumerate(costs), key=lambda t: t[1])
-        if cmax <= target_ratio * max(cmin, 1):
-            break
-        best = None
-        for ui, (r, positions) in enumerate(units):
-            slice_pos = unit_positions[ui].get(imax)
-            if not slice_pos:
-                continue
-            # slice = entries of unit ui currently in imax: compute per-entry deltas
-            added = removed = 0
-            # simulate: move entries one at a time; delta accumulates as refcounts shift
-            sim_src, sim_dst = dict(bucket_refs[imax]), dict(bucket_refs[imin])
-            for p in slice_pos:
-                ei = entry_of_pos[p]
-                for nid in entry_path[ei]:
-                    sim_src[nid] = sim_src.get(nid, 0) - 1
-                    if sim_src.get(nid, 0) == 0:
-                        removed += node_len.get(nid, 0)
-                    if sim_dst.get(nid, 0) == 0:
-                        added += node_len.get(nid, 0)
-                    sim_dst[nid] = sim_dst.get(nid, 0) + 1
-            if cmin + added <= max_token_len and removed > 0:
-                score = removed
-                if best is None or score > best[1]:
-                    best = (ui, added, removed, slice_pos)
-        if best is None:
-            break
-        ui, added, removed, slice_pos = best
-        group_sets[imax] -= set(slice_pos)
-        group_sets[imin].update(slice_pos)
-        for p in slice_pos:
-            ei = entry_of_pos[p]
-            for nid in entry_path[ei]:
-                bucket_refs[imax][nid] = bucket_refs[imax].get(nid, 0) - 1
-                bucket_refs[imin][nid] = bucket_refs[imin].get(nid, 0) + 1
-        unit_positions[ui][imin] = unit_positions[ui].get(imin, []) + slice_pos
-        unit_positions[ui][imax] = []
-        costs[imax] -= removed
-        costs[imin] += added
-
-    return [sorted(s) for s in group_sets]
-
-
-def mbs_groups_from_leaf_idx(
-    leaf_idx,
-    trie: PrefixTrie,
-    max_token_len: int,
-) -> list[list[int]]:
-    """Group reordered batch positions into micro-batches from leaf_idx
-    (reorder-safe: groups by leaf_idx rather than trie DFS order)."""
+def _leaf_entries_from_leaf_idx(leaf_idx, trie: PrefixTrie) -> list[tuple[TrieNode, list[int]]]:
+    """Validate leaf_idx and build leaf_entries once; shared by the plain fill
+    (mbs_groups_from_leaf_idx) and the count-targeted refill (_refill_to_count)
+    so the refill does not re-derive them per budget."""
     leaf_to_positions: dict[int, list[int]] = {}
     for new_pos, leaf_fid in enumerate(leaf_idx.tolist()):
         if leaf_fid < 0:
@@ -484,12 +218,50 @@ def mbs_groups_from_leaf_idx(
     if len(leaf_entries) != len(leaf_to_positions):
         uncovered = set(leaf_to_positions) - {node.node_idx for node in trie.nodes}
         raise ValueError(f"leaf_idx references {len(uncovered)} non-existent node(s): {sorted(uncovered)}")
+    return leaf_entries
 
-    groups = _mbs_groups_dfs(leaf_entries, max_token_len)
-    # Balance pass: the greedy cap-fill leaves a runt last bucket (cap, cap,
-    # ..., leftover). Move whole root-child subtrees largest->smallest until
-    # max/min <= 1.5 (best-effort when the budget blocks).
-    groups = _rebalance_groups(groups, leaf_entries, leaf_to_positions, max_token_len)
+
+def mbs_groups_from_leaf_idx(
+    leaf_idx,
+    trie: PrefixTrie,
+    max_token_len: int,
+) -> list[list[int]]:
+    """Group reordered batch positions into micro-batches from leaf_idx
+    (reorder-safe: groups by leaf_idx rather than trie DFS order)."""
+    leaf_entries = _leaf_entries_from_leaf_idx(leaf_idx, trie)
+    return _mbs_groups_dfs(leaf_entries, max_token_len)
+
+
+def _refill_to_count(
+    leaf_entries: list[tuple[TrieNode, list[int]]],
+    max_token_len: int,
+    target: int,
+) -> list[list[int]]:
+    """Refill the DFS walk at a smaller budget so the bucket count lands on target.
+
+    count(budget) is non-increasing in budget, and the natural fill already
+    satisfies count <= target (target is the DP max rounded up to divisibility),
+    so a budget landing exactly on target exists whenever any does: binary-search
+    the smallest budget whose count <= target. When a plateau skips target, pad
+    the remainder by peeling single samples (mbs=1 buckets) off the largest
+    bucket — the only case where singletons appear."""
+    lo, hi = 1, max_token_len
+    groups = _mbs_groups_dfs(leaf_entries, hi)  # natural fill: count <= target
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        cand = _mbs_groups_dfs(leaf_entries, mid)
+        if len(cand) <= target:
+            groups = cand
+            hi = mid - 1
+        else:
+            lo = mid + 1
+    while len(groups) < target:  # plateau gap: peel the remainder
+        idx = max(range(len(groups)), key=lambda i: len(groups[i]))
+        if len(groups[idx]) <= 1:
+            break
+        g = groups[idx]
+        groups[idx] = g[:-1]
+        groups.append([g[-1]])
     return groups
 
 
@@ -565,71 +337,78 @@ def prepare_prefix_tree_micro_batches(
         )
 
     use_dynamic_bsz_local = tu.get_non_tensor_data(data, "use_dynamic_bsz", default=True)
+    # The dynbsz/fixed branch taken here must be IDENTICAL on every rank of the DP
+    # group: each branch performs its own all_reduce, so a per-rank disagreement
+    # would desync the collective. Safe because use_dynamic_bsz and
+    # max_token_len_per_gpu are driver-attached to the batch before DP dispatch.
     if use_dynamic_bsz_local and "max_token_len_per_gpu" in data.keys():
-        # Dynamic bsz: group by flat-token budget.
+        # Dynamic bsz: fill at the natural budget, then ONE comm pass decides the
+        # final count (DP max, rounded up to VPP divisibility), then a single
+        # budget-targeted refill lands the count on it.
         _log.warning_once(
             "prefix_tree is on: max_token_len_per_gpu is interpreted as "
             "deduplicated (flat trie) token count, not raw sequence length."
         )
         max_token_len = data["max_token_len_per_gpu"] * sp_size
-        batch_idx_list = mbs_groups_from_leaf_idx(leaf_idx, trie, max_token_len)
+        leaf_entries = _leaf_entries_from_leaf_idx(leaf_idx, trie)
+        batch_idx_list = _mbs_groups_dfs(leaf_entries, max_token_len)
+
+        # The single comm pass: agree on the DP-max count, then bake in VPP
+        # divisibility, before any adjustment.
+        n_mb = len(batch_idx_list)
+        if torch.distributed.is_initialized() and same_micro_num_in_dp and dp_group is not None:
+            t = torch.tensor([n_mb], device=get_torch_device().current_device())
+            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX, group=dp_group)
+            n_mb = int(t.item())
+        if num_batches_divided_by is not None:
+            n_mb = roundup_divisible(n_mb, num_batches_divided_by)
+
+        if n_mb > len(batch_idx_list):
+            batch_idx_list = _refill_to_count(leaf_entries, max_token_len, n_mb)
+            if len(batch_idx_list) < n_mb:
+                _log.warning(
+                    f"prepare_prefix_tree_micro_batches: cannot equalize micro-batch count across DP "
+                    f"(have {len(batch_idx_list)}, target {n_mb} = DP max rounded up to divisibility): "
+                    f"a rank has too few samples to split into {n_mb} micro-batches. "
+                    f"Continuing with unequal counts."
+                )
     else:
         # Fixed mbs: contiguous chunks in batch order (no DFS reorder).
         mbs = data["micro_batch_size_per_gpu"] * force_group_size
         n = len(leaf_idx)
         batch_idx_list = [list(range(i, min(i + mbs, n))) for i in range(0, n, mbs)]
 
-    # Pad to the max micro-batch count across the DP group, then to divisibility.
-    target = len(batch_idx_list)
-    if torch.distributed.is_initialized() and same_micro_num_in_dp and dp_group is not None:
-        device = get_torch_device().current_device()
-        n_mb = torch.tensor([len(batch_idx_list)], device=device)
-        torch.distributed.all_reduce(n_mb, op=torch.distributed.ReduceOp.MAX, group=dp_group)
-        n_mb = int(n_mb.item())
+        # Fixed-size chunks cannot budget-adjust: pad to the DP max, then to
+        # divisibility, by peeling single samples (mbs=1 buckets).
+        if torch.distributed.is_initialized() and same_micro_num_in_dp and dp_group is not None:
+            n_mb = torch.tensor([len(batch_idx_list)], device=get_torch_device().current_device())
+            torch.distributed.all_reduce(n_mb, op=torch.distributed.ReduceOp.MAX, group=dp_group)
+            while len(batch_idx_list) < n_mb.item():
+                idx = max(range(len(batch_idx_list)), key=lambda i: len(batch_idx_list[i]))
+                if len(batch_idx_list[idx]) <= 1:
+                    break
+                g = batch_idx_list[idx]
+                batch_idx_list[idx] = g[:-1]
+                batch_idx_list.append([g[-1]])
+            if len(batch_idx_list) < n_mb.item():
+                _log.warning(
+                    f"prepare_prefix_tree_micro_batches: cannot equalize micro-batch count across DP "
+                    f"(have {len(batch_idx_list)}, DP max {n_mb.item()}): every micro-batch is a "
+                    f"singleton. Continuing with unequal counts."
+                )
 
-        # Fatal constraints must be agreed on before any rank raises, otherwise peers
-        # can hang in the next collective. min_samples is the fewest samples any rank
-        # holds, which bounds how many micro-batches it can split down to.
-        min_samples = torch.tensor([len(leaf_idx)], device=device)
-        torch.distributed.all_reduce(min_samples, op=torch.distributed.ReduceOp.MIN, group=dp_group)
-        min_samples = int(min_samples.item())
+        if num_batches_divided_by is not None:
+            target = roundup_divisible(len(batch_idx_list), num_batches_divided_by)
+            while len(batch_idx_list) < target:
+                idx = max(range(len(batch_idx_list)), key=lambda i: len(batch_idx_list[i]))
+                if len(batch_idx_list[idx]) <= 1:
+                    break
+                g = batch_idx_list[idx]
+                batch_idx_list[idx] = g[:-1]
+                batch_idx_list.append([g[-1]])
 
-        if n_mb > min_samples:
-            raise ValueError(
-                f"prepare_prefix_tree_micro_batches: cannot equalize micro-batch count across DP: "
-                f"target {n_mb} exceeds the minimum sample count {min_samples} across ranks; "
-                f"a rank has too few samples to split into {n_mb} micro-batches."
-            )
-
-        while len(batch_idx_list) < n_mb:
-            idx = max(range(len(batch_idx_list)), key=lambda i: len(batch_idx_list[i]))
-            g = batch_idx_list[idx]
-            # Split the largest bucket roughly in half (not peel one sample):
-            # peeling leaves a singleton runt bucket; halving keeps sizes even.
-            mid = len(g) // 2
-            if mid == 0:
-                break
-            batch_idx_list[idx] = g[:mid]
-            batch_idx_list.append(g[mid:])
-        assert len(batch_idx_list) == n_mb
-
-    if num_batches_divided_by is not None:
-        target = roundup_divisible(len(batch_idx_list), num_batches_divided_by)
-        while len(batch_idx_list) < target:
-            idx = max(range(len(batch_idx_list)), key=lambda i: len(batch_idx_list[i]))
-            if len(batch_idx_list[idx]) <= 1:
-                break
-            g = batch_idx_list[idx]
-            # Same halving rule as the DP-equalization split (no singleton runts).
-            mid = len(g) // 2
-            if mid == 0:
-                break
-            batch_idx_list[idx] = g[:mid]
-            batch_idx_list.append(g[mid:])
-
-    # Build subtries ONCE with LOCAL leaf_to_sample (required by downstream
-    # restore in build_layout_from_tree_node). The cached flat_tokens
-    # property provides the flat token count without a separate rebuild.
+    # Build subtries with LOCAL leaf_to_sample (required by downstream
+    # restore in build_layout_from_tree_node).
     _leaf_idx_list = leaf_idx.tolist()
     subtries = []
     for g in batch_idx_list:
@@ -675,7 +454,7 @@ def prepare_prefix_tree_micro_batches(
         _push_mbs_shared_ratio(1.0 - flat / group_raw)
     _push_n_micro_batches(len(batch_idx_list))
 
-    # Attach subtries (built once above, no rebuild).
+    # Attach each subtrie to its micro-batch.
     for mb, sub in zip(micro_batches, subtries, strict=False):
         tu.assign_non_tensor(mb, prefix_tree_subtree=sub)
     return micro_batches, batch_idx_list
