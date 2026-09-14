@@ -20,6 +20,7 @@ import logging
 import os
 from typing import Any
 
+import numpy as np
 import ray
 import torch
 import transfer_queue as tq
@@ -239,6 +240,17 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 tag["piggyback_marker"] = True
             if "resume_version" in field["extra_fields"]:
                 tag["resume_version"] = int(field["extra_fields"]["resume_version"])
+            # Record per-trajectory performance metrics in the tag so they
+            # sync to the replay buffer for free (fields need an explicit
+            # kv_batch_get) and the trainer can aggregate agent_loop/* timing
+            # from the sampled batch's tags.
+            m = output.metrics
+            tag["agent_loop_metrics"] = {
+                "generate_sequences": float(m.generate_sequences),
+                "tool_calls": float(m.tool_calls),
+                "compute_score": float(m.compute_score),
+                "num_preempted": int(m.num_preempted),
+            }
             tags.append(tag)
 
         partition_id = "train" if not validate else "val"
@@ -278,3 +290,47 @@ class AgentLoopManagerTQ(AgentLoopManager):
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=False)
             ]
         )
+
+    def _performance_metrics(self, tags: list) -> dict:
+        """Aggregate per-trajectory agent_loop metrics from the sampled batch's tags.
+
+        TQ-path mirror of AgentLoopManager._performance_metrics: the base
+        class aggregates per-sample metrics from DataProto outputs returned
+        by generate_sequences; here workers record the same AgentLoopMetrics
+        values into each trajectory's TQ tag (see _agent_loop_postprocess),
+        and the trainer calls this with the sampled batch's tags. Emits the
+        same agent_loop/* keys, plus the slowest trajectory's prompt/response
+        lengths from its tag.
+        """
+        rows = [(tag, tag["agent_loop_metrics"]) for tag in tags if tag and tag.get("agent_loop_metrics")]
+        if not rows:
+            return {}
+        t_generate_sequences = np.array([float(r["generate_sequences"]) for _, r in rows])
+        t_tool_calls = np.array([float(r["tool_calls"]) for _, r in rows])
+        t_compute_score = np.array([float(r["compute_score"]) for _, r in rows])
+        num_preempted = np.array([int(r["num_preempted"]) for _, r in rows])
+
+        timing = {
+            "agent_loop/num_preempted/min": num_preempted.min(),
+            "agent_loop/num_preempted/max": num_preempted.max(),
+            "agent_loop/num_preempted/mean": num_preempted.mean(),
+            "agent_loop/generate_sequences/min": t_generate_sequences.min(),
+            "agent_loop/generate_sequences/max": t_generate_sequences.max(),
+            "agent_loop/generate_sequences/mean": t_generate_sequences.mean(),
+            "agent_loop/tool_calls/min": t_tool_calls.min(),
+            "agent_loop/tool_calls/max": t_tool_calls.max(),
+            "agent_loop/tool_calls/mean": t_tool_calls.mean(),
+            "agent_loop/compute_score/min": t_compute_score.min(),
+            "agent_loop/compute_score/max": t_compute_score.max(),
+            "agent_loop/compute_score/mean": t_compute_score.mean(),
+        }
+
+        # batch sequence generation is bounded by the slowest sample
+        slowest = int(np.argmax(t_generate_sequences + t_tool_calls + t_compute_score))
+        timing["agent_loop/slowest/generate_sequences"] = t_generate_sequences[slowest]
+        timing["agent_loop/slowest/tool_calls"] = t_tool_calls[slowest]
+        timing["agent_loop/slowest/compute_score"] = t_compute_score[slowest]
+        timing["agent_loop/slowest/num_preempted"] = num_preempted[slowest]
+        timing["agent_loop/slowest/prompt_length"] = float(rows[slowest][0].get("prompt_len", 0))
+        timing["agent_loop/slowest/response_length"] = float(rows[slowest][0].get("response_len", 0))
+        return timing

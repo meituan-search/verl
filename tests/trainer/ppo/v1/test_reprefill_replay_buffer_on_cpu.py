@@ -306,7 +306,7 @@ def test_partial_rollout_fields_propagate_to_tq(tq_init):
             prompt_ids=[101, 102],
             response_ids=[11, 12],
             response_mask=[1, 1],
-            metrics=AgentLoopMetrics(),
+            metrics=AgentLoopMetrics(generate_sequences=1.5, tool_calls=0.25, compute_score=0.5, num_preempted=2),
             extra_fields={
                 "token_versions": torch.tensor([3, 3, 3, 4], dtype=torch.int32),
                 "new_rollout_log_probs": [-0.5, -1.5],
@@ -349,6 +349,12 @@ def test_partial_rollout_fields_propagate_to_tq(tq_init):
         tag = tq.kv_list()["train"][key]
         assert tag["piggyback_marker"] is True
         assert tag["resume_version"] == 4
+        assert tag["agent_loop_metrics"] == {
+            "generate_sequences": 1.5,
+            "tool_calls": 0.25,
+            "compute_score": 0.5,
+            "num_preempted": 2,
+        }
     finally:
         tq.kv_clear(keys=[key], partition_id="train")
 
@@ -475,3 +481,66 @@ def test_generate_sequences_piggyback_gate_defaults_off(monkeypatch, tq_init):
     captured = _run_generate_sequences(monkeypatch, rollout_cfg)
     assert len(captured) == 1
     assert captured[0]["enable_piggyback"] is False
+
+
+# --------------------------------------------------------------------------- #
+# AgentLoopManagerTQ._performance_metrics — agent_loop/* timing aggregation.
+# --------------------------------------------------------------------------- #
+
+
+def _agent_loop_manager_tq():
+    """Construct an AgentLoopManagerTQ without running __init__ (Ray actors,
+    config and LLM clients are irrelevant to _performance_metrics)."""
+    from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopManagerTQ
+
+    return AgentLoopManagerTQ.__new__(AgentLoopManagerTQ)
+
+
+def test_performance_metrics_aggregates_tags():
+    """_performance_metrics must emit the same agent_loop/* keys as the base
+    AgentLoopManager, aggregating the per-trajectory agent_loop_metrics tag
+    entries of the sampled batch."""
+    manager = _agent_loop_manager_tq()
+    tags = [
+        {
+            "prompt_len": 10,
+            "response_len": 20,
+            "agent_loop_metrics": {
+                "generate_sequences": 1.0,
+                "tool_calls": 0.0,
+                "compute_score": 0.1,
+                "num_preempted": 0,
+            },
+        },
+        {
+            "prompt_len": 5,
+            "response_len": 50,
+            # slowest: 3.0 + 1.0 + 0.2 = 4.2
+            "agent_loop_metrics": {
+                "generate_sequences": 3.0,
+                "tool_calls": 1.0,
+                "compute_score": 0.2,
+                "num_preempted": 2,
+            },
+        },
+        None,  # padding / reissued trajectories without metrics are skipped
+    ]
+    timing = manager._performance_metrics(tags)
+    assert timing["agent_loop/generate_sequences/min"] == 1.0
+    assert timing["agent_loop/generate_sequences/max"] == 3.0
+    assert timing["agent_loop/generate_sequences/mean"] == 2.0
+    assert timing["agent_loop/tool_calls/max"] == 1.0
+    assert timing["agent_loop/compute_score/max"] == 0.2
+    assert timing["agent_loop/num_preempted/mean"] == 1.0
+    assert timing["agent_loop/slowest/generate_sequences"] == 3.0
+    assert timing["agent_loop/slowest/tool_calls"] == 1.0
+    assert timing["agent_loop/slowest/num_preempted"] == 2
+    assert timing["agent_loop/slowest/prompt_length"] == 5
+    assert timing["agent_loop/slowest/response_length"] == 50
+
+
+def test_performance_metrics_empty_tags():
+    """No agent_loop_metrics entries (e.g. a batch fully made of padding)
+    must emit nothing rather than raise."""
+    manager = _agent_loop_manager_tq()
+    assert manager._performance_metrics([None, {}, {"prompt_len": 1}]) == {}
