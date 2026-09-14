@@ -112,7 +112,7 @@ class TestPopulateNewRolloutFields:
             _seg(token_ids=[10, 11], log_probs=[-0.9, -0.8], prefix_prompt_logprobs=None, global_steps=3),
         ]
         final = self._final_output([10, 11], [-0.9, -0.8])
-        _populate_new_rollout_fields(final, segs, prompt_len=2, enable_piggyback=False)
+        _populate_new_rollout_fields(final, segs, prompt_len=2, enable_piggyback=False, emit_token_versions=True)
         assert "new_rollout_log_probs" not in final.extra_fields
         assert final.extra_fields["resume_version"] == 3
         assert final.extra_fields["token_versions"] == [3, 3]
@@ -125,7 +125,7 @@ class TestPopulateNewRolloutFields:
             _seg(token_ids=[12, 13], log_probs=[-0.2, -0.15], prefix_prompt_logprobs=None, global_steps=5),
         ]
         final = self._final_output([10, 11, 12, 13], [-0.9, -0.8, -0.2, -0.15])
-        _populate_new_rollout_fields(final, segs, prompt_len=2, enable_piggyback=False)
+        _populate_new_rollout_fields(final, segs, prompt_len=2, enable_piggyback=False, emit_token_versions=True)
         assert "new_rollout_log_probs" not in final.extra_fields
         assert "resume_version" not in final.extra_fields
         assert final.extra_fields["token_versions"] == [3, 3, 5, 5]
@@ -136,7 +136,7 @@ class TestPopulateNewRolloutFields:
         # = rollout_log_probs (uniform all-or-nothing schema).
         segs = [_seg(token_ids=[10, 11, 12], log_probs=[-0.9, -0.8, -0.7], prefix_prompt_logprobs=None, global_steps=3)]
         final = self._final_output([10, 11, 12], [-0.9, -0.8, -0.7])
-        _populate_new_rollout_fields(final, segs, prompt_len=2, enable_piggyback=True)
+        _populate_new_rollout_fields(final, segs, prompt_len=2, enable_piggyback=True, emit_token_versions=True)
         assert final.extra_fields["new_rollout_log_probs"] == [-0.9, -0.8, -0.7]
         assert final.extra_fields["resume_version"] == 3
         assert final.extra_fields["token_versions"] == [3, 3, 3]
@@ -149,7 +149,7 @@ class TestPopulateNewRolloutFields:
         segs = [_seg(token_ids=[10, 11, 12], log_probs=[-0.9, -0.8, -0.7], prefix_prompt_logprobs=None, global_steps=3)]
         final = self._final_output([10, 11, 12], None)  # calculate_log_probs off
         with pytest.raises(AssertionError, match="aligned with token_ids"):
-            _populate_new_rollout_fields(final, segs, prompt_len=2, enable_piggyback=True)
+            _populate_new_rollout_fields(final, segs, prompt_len=2, enable_piggyback=True, emit_token_versions=True)
 
     def test_multi_segment_piggyback(self):
         prefix_prompt_logprobs = [(None, 99), (-0.5, 12), (-0.4, 13)]
@@ -163,8 +163,19 @@ class TestPopulateNewRolloutFields:
             ),
         ]
         final = self._final_output([10, 11, 12, 13, 14], [-0.9, -0.8, -0.2, -0.15, -0.1])
-        _populate_new_rollout_fields(final, segs, prompt_len=2, enable_piggyback=True)
+        _populate_new_rollout_fields(final, segs, prompt_len=2, enable_piggyback=True, emit_token_versions=True)
         assert final.extra_fields["piggyback_marker"] is True
         assert final.extra_fields["new_rollout_log_probs"] == [-0.5, -0.4, -0.2, -0.15, -0.1]
         assert final.extra_fields["resume_version"] == 5
         assert final.extra_fields["token_versions"] == [3, 3, 5, 5, 5]
+
+    def test_emit_token_versions_off_skips_construction(self):
+        # Trainers that don't consume token-level staleness diagnostics
+        # (colocate_async, ...) pass emit_token_versions=False: no
+        # token_versions field, but the piggyback/resume_version contract is
+        # unchanged.
+        segs = [_seg(token_ids=[10, 11], log_probs=[-0.9, -0.8], prefix_prompt_logprobs=None, global_steps=3)]
+        final = self._final_output([10, 11], [-0.9, -0.8])
+        _populate_new_rollout_fields(final, segs, prompt_len=2, enable_piggyback=False, emit_token_versions=False)
+        assert "token_versions" not in final.extra_fields
+        assert final.extra_fields["resume_version"] == 3

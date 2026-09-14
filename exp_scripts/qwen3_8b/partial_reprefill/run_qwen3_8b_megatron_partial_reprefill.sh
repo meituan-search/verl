@@ -182,6 +182,9 @@ ROLLOUT=(
     # syncs this at on_train_begin, but we also set it here so the rollout
     # client picks it up before the first generate() call.
     actor_rollout_ref.rollout.enable_piggyback=${ENABLE_PIGGYBACK}
+    # Mirror flag: token_versions bookkeeping is only consumed by this
+    # trainer's token-level staleness diagnostics.
+    actor_rollout_ref.rollout.emit_token_versions=True
 )
 
 REF=(

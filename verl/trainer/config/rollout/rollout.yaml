@@ -344,6 +344,11 @@ moe_load_balance_metrics_interval: 0
 # flag together (the launch script does this automatically).
 enable_piggyback: False
 
+# Mirror flag: emit per-token weight-version bookkeeping (token_versions) from
+# the rollout client. Only partial_reprefill (token-level staleness
+# diagnostics) needs it; other trainers skip the per-trajectory construction.
+emit_token_versions: False
+
 # profile the rollout model in `generate_sequence`
 profiler:
 

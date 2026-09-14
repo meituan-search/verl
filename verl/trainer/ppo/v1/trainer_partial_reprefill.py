@@ -103,6 +103,10 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
         rollout_cfg = OmegaConf.select(self.config, "actor_rollout_ref.rollout", default=None)
         if rollout_cfg is not None:
             rollout_cfg.enable_piggyback = cfg.enable_piggyback
+            # This trainer's token-level staleness diagnostics need
+            # token_versions from the rollout client; every other trainer
+            # skips the per-trajectory construction.
+            rollout_cfg.emit_token_versions = True
         num_warmup_batches = cfg.num_warmup_batches
         for _ in range(num_warmup_batches):
             self._add_batch_to_generate()

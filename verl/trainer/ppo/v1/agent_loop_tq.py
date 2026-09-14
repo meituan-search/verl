@@ -73,6 +73,10 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             # prefix_prompt_logprobs, and every multi-segment trajectory lands
             # in case 2 with reason "no_resume_version".
             enable_piggyback=getattr(config, "enable_piggyback", False),
+            # token_versions gate: only partial_reprefill's token-level
+            # staleness diagnostics consume the field; other trainers skip
+            # the per-trajectory construction cost entirely.
+            emit_token_versions=getattr(config, "emit_token_versions", False),
         )
 
         # override sampling params for validation
@@ -213,9 +217,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             if "token_versions" in extra:
                 field["token_versions"] = torch.tensor(extra["token_versions"], dtype=torch.int32)
             if "new_rollout_log_probs" in extra:
-                field["new_rollout_log_probs"] = torch.tensor(
-                    extra["new_rollout_log_probs"], dtype=torch.float32
-                )
+                field["new_rollout_log_probs"] = torch.tensor(extra["new_rollout_log_probs"], dtype=torch.float32)
             fields.append(field)
             prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
             tag = {

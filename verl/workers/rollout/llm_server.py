@@ -320,8 +320,10 @@ def _build_piggyback_fields(segments: list, prompt_len: int) -> dict:
     }
 
 
-def _populate_new_rollout_fields(final_output, segments: list, prompt_len: int, enable_piggyback: bool) -> None:
-    """Populate token_versions (always) and new_rollout_log_probs (gated).
+def _populate_new_rollout_fields(
+    final_output, segments: list, prompt_len: int, enable_piggyback: bool, emit_token_versions: bool
+) -> None:
+    """Populate token_versions (gated) and new_rollout_log_probs (piggyback-gated).
 
     new_rollout_log_probs is all-or-nothing per the enable_piggyback gate:
     piggyback value when resumed (>= 2 segments), a rollout_log_probs copy
@@ -334,13 +336,19 @@ def _populate_new_rollout_fields(final_output, segments: list, prompt_len: int, 
     both at W_resume). A resumed trajectory without piggyback has logprobs
     spanning multiple versions and gets no resume_version — the trainer
     falls it to a full reprefill.
+
+    token_versions is only built when emit_token_versions is set: only
+    partial_reprefill's token-level staleness diagnostics consume it, so
+    other trainers (colocate_async, ...) skip the per-trajectory
+    construction entirely.
     """
     from verl.trainer.ppo.v1.reprefill_utils import build_token_versions
 
     t0 = time.perf_counter()
     segment_versions = [int(s.extra_fields.get("global_steps", 0)) for s in segments]
-    segment_lengths = [len(s.token_ids) for s in segments]
-    final_output.extra_fields["token_versions"] = build_token_versions(segment_versions, segment_lengths)
+    if emit_token_versions:
+        segment_lengths = [len(s.token_ids) for s in segments]
+        final_output.extra_fields["token_versions"] = build_token_versions(segment_versions, segment_lengths)
 
     if len(segments) >= 2 and enable_piggyback:
         piggyback = _build_piggyback_fields(segments, prompt_len=prompt_len)
@@ -349,9 +357,7 @@ def _populate_new_rollout_fields(final_output, segments: list, prompt_len: int, 
         final_output.extra_fields["resume_version"] = piggyback["resume_version"]
     elif len(segments) == 1:
         if enable_piggyback:
-            assert final_output.log_probs is not None and len(final_output.log_probs) == len(
-                final_output.token_ids
-            ), (
+            assert final_output.log_probs is not None and len(final_output.log_probs) == len(final_output.token_ids), (
                 "partial_reprefill: single-segment trajectory with enable_piggyback=True must have "
                 f"decode log_probs aligned with token_ids "
                 f"(got {len(final_output.log_probs or [])} logprobs for "
@@ -359,31 +365,15 @@ def _populate_new_rollout_fields(final_output, segments: list, prompt_len: int, 
             )
             final_output.extra_fields["new_rollout_log_probs"] = list(final_output.log_probs)
         final_output.extra_fields["resume_version"] = segment_versions[-1]
-    print(
-        f"[partial_reprefill] _populate_new_rollout_fields took "
-        f"{(time.perf_counter() - t0) * 1e3:.3f} ms "
-        f"(segments={len(segments)}, total_tokens={len(final_output.token_ids)}, "
-        f"enable_piggyback={enable_piggyback})",
-        flush=True,
+    logger.debug(
+        "_populate_new_rollout_fields took %.3f ms (segments=%d, total_tokens=%d, "
+        "enable_piggyback=%s, emit_token_versions=%s)",
+        (time.perf_counter() - t0) * 1e3,
+        len(segments),
+        len(final_output.token_ids),
+        enable_piggyback,
+        emit_token_versions,
     )
-
-    if len(segments) >= 2 and enable_piggyback:
-        piggyback = _build_piggyback_fields(segments, prompt_len=prompt_len)
-        final_output.extra_fields["piggyback_marker"] = True
-        final_output.extra_fields["new_rollout_log_probs"] = piggyback["new_rollout_log_probs"]
-        final_output.extra_fields["resume_version"] = piggyback["resume_version"]
-    elif len(segments) == 1:
-        if enable_piggyback:
-            assert final_output.log_probs is not None and len(final_output.log_probs) == len(
-                final_output.token_ids
-            ), (
-                "partial_reprefill: single-segment trajectory with enable_piggyback=True must have "
-                f"decode log_probs aligned with token_ids "
-                f"(got {len(final_output.log_probs or [])} logprobs for "
-                f"{len(final_output.token_ids)} tokens)"
-            )
-            final_output.extra_fields["new_rollout_log_probs"] = list(final_output.log_probs)
-        final_output.extra_fields["resume_version"] = segment_versions[-1]
 
 
 class FullyAsyncLLMServerClient(LLMServerClient):
@@ -460,6 +450,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         # SGLang/vLLM would choke on an unknown sampling_params key. The
         # rollout-side gate is read in the resume branch below.
         enable_piggyback = sampling_params.pop("enable_piggyback", False)
+        emit_token_versions = sampling_params.pop("emit_token_versions", False)
 
         limit_key = None
         if "max_tokens" in sampling_params:
@@ -546,7 +537,11 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             await asyncio.sleep(1)
 
         _populate_new_rollout_fields(
-            final_output, segments, prompt_len=len(prompt_ids), enable_piggyback=enable_piggyback
+            final_output,
+            segments,
+            prompt_len=len(prompt_ids),
+            enable_piggyback=enable_piggyback,
+            emit_token_versions=emit_token_versions,
         )
 
         final_output.extra_fields["global_steps"] = global_steps

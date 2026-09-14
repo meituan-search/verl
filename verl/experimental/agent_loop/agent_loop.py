@@ -601,6 +601,10 @@ class AgentLoopWorker:
             # trainer init; defaults to False for trainers that don't use
             # piggyback (colocate_async, reprefill_decoupled).
             enable_piggyback=getattr(config, "enable_piggyback", False),
+            # token_versions gate, same mirror pattern as enable_piggyback:
+            # only partial_reprefill's token-level staleness diagnostics
+            # consume the field.
+            emit_token_versions=getattr(config, "emit_token_versions", False),
         )
 
         def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
