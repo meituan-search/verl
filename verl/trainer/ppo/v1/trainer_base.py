@@ -568,12 +568,15 @@ class PPOTrainer(ABC):
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
             batch = self.on_sampled(batch, metrics=metrics)
             self.on_sample_end()
-            # agent_loop/* timing for the sampled trajectories (TQ path only;
-            # the base AgentLoopManager aggregates these from DataProto
-            # outputs instead).
-            from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopManagerTQ
 
-            if isinstance(self.agent_loop_manager, AgentLoopManagerTQ):
+        # agent_loop/* timing for the sampled trajectories (TQ path only; the
+        # base AgentLoopManager aggregates these from DataProto outputs
+        # instead). Timed separately so the aggregation cost stays out of
+        # timing_s/gen.
+        from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopManagerTQ
+
+        if isinstance(self.agent_loop_manager, AgentLoopManagerTQ):
+            with marked_timer("agent_loop_metrics", timing_raw, color="red"):
                 metrics.update(self.agent_loop_manager._performance_metrics(batch.tags))
 
         # 2. [OPTIONAL] compute reward score with colocated reward model
