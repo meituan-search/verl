@@ -571,8 +571,11 @@ class PPOTrainer(ABC):
 
         # agent_loop/* timing for the sampled trajectories (TQ path only; the
         # base AgentLoopManager aggregates these from DataProto outputs
-        # instead). Timed separately so the aggregation cost stays out of
-        # timing_s/gen.
+        # instead). NOTE: unlike the base-class metrics, these describe the
+        # batch CONSUMED this step, not the batch generated this step — the
+        # replay buffer may return trajectories generated in earlier global
+        # steps (each trajectory is counted exactly once, at materialization).
+        # Timed separately so the aggregation cost stays out of timing_s/gen.
         from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopManagerTQ
 
         if isinstance(self.agent_loop_manager, AgentLoopManagerTQ):

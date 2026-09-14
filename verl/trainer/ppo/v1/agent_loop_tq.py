@@ -301,6 +301,15 @@ class AgentLoopManagerTQ(AgentLoopManager):
         and the trainer calls this with the sampled batch's tags. Emits the
         same agent_loop/* keys, plus the slowest trajectory's prompt/response
         lengths from its tag.
+
+        Semantics caveat: the input tags come from the batch the replay
+        buffer SAMPLED this step, which may include trajectories generated
+        in earlier global steps (e.g. staleness_sweep holds a whole cycle's
+        rollouts; async replay spans multiple steps). Metrics are attributed
+        to the consuming step, not the generating step — do not read them as
+        current-step rollout cost. Each trajectory is aggregated exactly
+        once (the buffer clears it on materialization), so there is no
+        double counting.
         """
         rows = [(tag, tag["agent_loop_metrics"]) for tag in tags if tag and tag.get("agent_loop_metrics")]
         if not rows:

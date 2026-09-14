@@ -461,10 +461,12 @@ def test_generate_sequences_forwards_piggyback_gate(monkeypatch, tq_init, gate_v
         top_k=-1,
         calculate_log_probs=False,
         enable_piggyback=gate_value,
+        emit_token_versions=gate_value,
     )
     captured = _run_generate_sequences(monkeypatch, rollout_cfg)
     assert len(captured) == 1
     assert captured[0]["enable_piggyback"] is gate_value
+    assert captured[0]["emit_token_versions"] is gate_value
 
 
 def test_generate_sequences_piggyback_gate_defaults_off(monkeypatch, tq_init):
@@ -481,6 +483,7 @@ def test_generate_sequences_piggyback_gate_defaults_off(monkeypatch, tq_init):
     captured = _run_generate_sequences(monkeypatch, rollout_cfg)
     assert len(captured) == 1
     assert captured[0]["enable_piggyback"] is False
+    assert captured[0]["emit_token_versions"] is False
 
 
 # --------------------------------------------------------------------------- #
