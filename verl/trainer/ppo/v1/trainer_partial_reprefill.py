@@ -93,11 +93,18 @@ class _PrefillDispatcher:
 class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
     """Partial reprefill trainer (colocate async)."""
 
-    def on_train_begin(self):
+    def __init__(self, config):
+        super().__init__(config)
         cfg = self.config.trainer.v1.partial_reprefill
         # Sync the piggyback gate to the rollout-side config mirror so the
         # rollout client's resume branch can decide whether to compute
         # prompt_logprobs without reaching into trainer config paths.
+        # This must run in __init__: the agent loop workers pickle the
+        # config when init_agent_loop_manager() creates them (after trainer
+        # construction, before fit()), so a later mutation — e.g. in
+        # on_train_begin — never reaches the workers. The launch script's
+        # hydra overrides remain the primary mechanism; this sync is the
+        # safety net for runs that omit them.
         # Defensive: actor_rollout_ref may be absent in stripped-down test
         # configs; skip the sync in that case (rollout-side default is False).
         rollout_cfg = OmegaConf.select(self.config, "actor_rollout_ref.rollout", default=None)
@@ -107,6 +114,9 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
             # token_versions from the rollout client; every other trainer
             # skips the per-trajectory construction.
             rollout_cfg.emit_token_versions = True
+
+    def on_train_begin(self):
+        cfg = self.config.trainer.v1.partial_reprefill
         num_warmup_batches = cfg.num_warmup_batches
         for _ in range(num_warmup_batches):
             self._add_batch_to_generate()
