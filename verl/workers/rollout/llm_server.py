@@ -261,6 +261,12 @@ class LLMServerClient:
             priority_kwargs = (
                 {"priority": priority} if priority != 0 and self.config.actor_rollout_ref.rollout.name == "vllm" else {}
             )
+            # Rollout-behavior gates smuggled through sampling_params by the
+            # agent loop workers. Only FullyAsyncLLMServerClient consumes
+            # them (resume branch); this base client just strips them so
+            # unknown keys never reach the engine's SamplingParams.
+            sampling_params.pop("enable_piggyback", None)
+            sampling_params.pop("emit_token_versions", None)
             output: TokenOutput = await server.generate.remote(
                 request_id=uuid4().hex,  # use new request_id for each turn
                 prompt_ids=prompt_ids,

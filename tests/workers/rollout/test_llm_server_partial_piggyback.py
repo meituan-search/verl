@@ -13,11 +13,17 @@
 # limitations under the License.
 """CPU tests for the partial_rollout piggyback field builder."""
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 
-from verl.workers.rollout.llm_server import _build_piggyback_fields, _populate_new_rollout_fields
+from verl.workers.rollout.llm_server import (
+    LLMServerClient,
+    _build_piggyback_fields,
+    _populate_new_rollout_fields,
+)
+from verl.workers.rollout.replica import TokenOutput
 
 
 def _seg(token_ids, log_probs, prefix_prompt_logprobs, global_steps):
@@ -179,3 +185,40 @@ class TestPopulateNewRolloutFields:
         _populate_new_rollout_fields(final, segs, prompt_len=2, enable_piggyback=False, emit_token_versions=False)
         assert "token_versions" not in final.extra_fields
         assert final.extra_fields["resume_version"] == 3
+
+
+class TestBaseClientStripsGateKeys:
+    def test_generate_strips_gate_keys(self):
+        # Agent loop workers smuggle rollout-behavior gates through
+        # sampling_params; only FullyAsyncLLMServerClient consumes them. The
+        # base LLMServerClient must strip them, else the unknown keys reach
+        # the engine's SamplingParams construction and raise TypeError
+        # (sync trainers / staleness_sweep use this base client).
+        client = LLMServerClient.__new__(LLMServerClient)
+        client.config = SimpleNamespace(actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(name="sglang")))
+
+        received = {}
+
+        class _FakeRemote:
+            def remote(self, **kwargs):
+                received.update(kwargs)
+
+                async def _ret():
+                    return TokenOutput(token_ids=[1], log_probs=[-0.5], num_preempted=0)
+
+                return _ret()
+
+        fake_server = SimpleNamespace(generate=SimpleNamespace(remote=_FakeRemote().remote))
+
+        async def _acquire(request_id):
+            return "s0", fake_server
+
+        client._acquire_server = _acquire
+        client._release_server = lambda server_id: None
+
+        sampling_params = {"temperature": 1.0, "top_p": 1.0, "enable_piggyback": True, "emit_token_versions": True}
+        output = asyncio.run(client.generate("req-0", prompt_ids=[10, 11], sampling_params=sampling_params))
+        assert output.token_ids == [1]
+        assert received["sampling_params"] == {"temperature": 1.0, "top_p": 1.0}
+        assert "enable_piggyback" not in received["sampling_params"]
+        assert "emit_token_versions" not in received["sampling_params"]
