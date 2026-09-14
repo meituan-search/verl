@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 import pytest
 import torch
 import transfer_queue as tq
+from tensordict import NonTensorData
 from transfer_queue import KVBatchMeta
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopOutput, AgentLoopWorker
@@ -386,3 +387,91 @@ def test_no_piggyback_fields_no_extra_tq_writes(tq_init):
         assert "resume_version" not in tag
     finally:
         tq.kv_clear(keys=[key], partition_id="train")
+
+
+# --------------------------------------------------------------------------- #
+# generate_sequences must forward the piggyback gate to the rollout client.
+# --------------------------------------------------------------------------- #
+
+
+class _SamplingParamsWorker:
+    """Minimal stand-in for AgentLoopWorkerTQ covering only the attributes
+    ``generate_sequences`` touches; ``_run_prompt`` captures its arguments."""
+
+    generate_sequences = AgentLoopWorkerTQ.__ray_actor_class__.generate_sequences
+
+    def __init__(self, rollout_cfg):
+        from types import SimpleNamespace
+
+        self.config = SimpleNamespace(actor_rollout_ref=SimpleNamespace(rollout=rollout_cfg))
+        self.background_tasks = set()
+        self.captured = []
+
+    async def _run_prompt(self, prompt, sampling_params, trajectory, trace=False):
+        self.captured.append(dict(sampling_params))
+
+
+class _SingleSampleBatch(dict):
+    """Dict-shaped batch stand-in whose ``len`` is the batch size, not the key
+    count (mirrors TensorDict semantics for the ``range(len(batch))`` loop)."""
+
+    def __len__(self):
+        return 1
+
+
+def _run_generate_sequences(monkeypatch, rollout_cfg) -> list[dict]:
+    async def fake_trajectory_info(*args, **kwargs):
+        return [{"validate": False}]
+
+    monkeypatch.setattr("verl.trainer.ppo.v1.agent_loop_tq.get_trajectory_info", fake_trajectory_info)
+    batch = _SingleSampleBatch(
+        validate=False,
+        agent_name=NonTensorData("single_turn_agent"),
+        global_steps=torch.tensor([1]),
+        index=torch.tensor([0]),
+    )
+    worker = _SamplingParamsWorker(rollout_cfg)
+
+    async def run():
+        await worker.generate_sequences(batch)
+        await asyncio.gather(*worker.background_tasks)
+
+    asyncio.run(run())
+    return worker.captured
+
+
+@pytest.mark.parametrize("gate_value", [True, False])
+def test_generate_sequences_forwards_piggyback_gate(monkeypatch, tq_init, gate_value):
+    """The trainer's enable_piggyback flag is synced into
+    actor_rollout_ref.rollout.enable_piggyback; generate_sequences must forward
+    it in sampling_params so the rollout client's resume branch computes
+    prefix_prompt_logprobs. Without it, every aborted-and-resumed trajectory
+    falls to case 2 with reason "no_resume_version"."""
+    from types import SimpleNamespace
+
+    rollout_cfg = SimpleNamespace(
+        temperature=1.0,
+        top_p=1.0,
+        top_k=-1,
+        calculate_log_probs=False,
+        enable_piggyback=gate_value,
+    )
+    captured = _run_generate_sequences(monkeypatch, rollout_cfg)
+    assert len(captured) == 1
+    assert captured[0]["enable_piggyback"] is gate_value
+
+
+def test_generate_sequences_piggyback_gate_defaults_off(monkeypatch, tq_init):
+    """Configs without the mirror flag (e.g. non-partial_reprefill trainers)
+    must default the gate to False — matching AgentLoopWorker's getattr."""
+    from types import SimpleNamespace
+
+    rollout_cfg = SimpleNamespace(
+        temperature=1.0,
+        top_p=1.0,
+        top_k=-1,
+        calculate_log_probs=False,
+    )
+    captured = _run_generate_sequences(monkeypatch, rollout_cfg)
+    assert len(captured) == 1
+    assert captured[0]["enable_piggyback"] is False

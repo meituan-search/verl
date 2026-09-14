@@ -67,6 +67,12 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             top_k=config.top_k,
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
+            # Piggyback gate, mirrored from AgentLoopWorker.generate_sequences
+            # (agent_loop.py). Without this key the rollout client pops a
+            # default False (llm_server.py), resumed trajectories never emit
+            # prefix_prompt_logprobs, and every multi-segment trajectory lands
+            # in case 2 with reason "no_resume_version".
+            enable_piggyback=getattr(config, "enable_piggyback", False),
         )
 
         # override sampling params for validation
