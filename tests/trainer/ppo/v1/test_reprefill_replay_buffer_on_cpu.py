@@ -304,12 +304,12 @@ def test_partial_rollout_fields_propagate_to_tq(tq_init):
         uid = _uid()
         output = AgentLoopOutput(
             prompt_ids=[101, 102],
-            response_ids=[11, 12],
-            response_mask=[1, 1],
+            response_ids=[11, 12, 13, 14],
+            response_mask=[1, 1, 1, 1],
             metrics=AgentLoopMetrics(generate_sequences=1.5, tool_calls=0.25, compute_score=0.5, num_preempted=2),
             extra_fields={
                 "token_versions": torch.tensor([3, 3, 3, 4], dtype=torch.int32),
-                "new_rollout_log_probs": [-0.5, -1.5],
+                "new_rollout_log_probs": [-0.5, -1.5, -0.7, -0.8],
                 "piggyback_marker": True,
                 "resume_version": 4,
                 # Intermediate field; consumed into new_rollout_log_probs by the client.
@@ -340,7 +340,7 @@ def test_partial_rollout_fields_propagate_to_tq(tq_init):
         assert token_versions.tolist() == [3, 3, 3, 4]
         assert token_versions.dtype == torch.int32
         new_rollout = meta["new_rollout_log_probs"][0]
-        torch.testing.assert_close(new_rollout, torch.tensor([-0.5, -1.5], dtype=torch.float32))
+        torch.testing.assert_close(new_rollout, torch.tensor([-0.5, -1.5, -0.7, -0.8], dtype=torch.float32))
 
         # prompt_logprobs must not be promoted to a TQ field.
         full = tq.kv_batch_get(keys=[key], partition_id="train")
@@ -393,6 +393,41 @@ def test_no_piggyback_fields_no_extra_tq_writes(tq_init):
         assert "resume_version" not in tag
     finally:
         tq.kv_clear(keys=[key], partition_id="train")
+
+
+def test_piggyback_length_mismatch_raises(tq_init):
+    """Piggyback fields longer than the (response_length-truncated) responses
+    must fail the trajectory at the worker instead of being stored — the
+    trainer's offpolicy metrics zip new_rollout_log_probs/token_versions with
+    response_mask and crash on a size mismatch. Reproduces the
+    uncapped-abort-resume-total bug class."""
+
+    async def run():
+        output = AgentLoopOutput(
+            prompt_ids=[101, 102],
+            response_ids=[11, 12],
+            response_mask=[1, 1],
+            metrics=AgentLoopMetrics(),
+            extra_fields={
+                # Raw multi-segment total (4) exceeded response_length, so the
+                # agent loop truncated responses to 2 but the client-built
+                # piggyback list kept the raw length.
+                "token_versions": torch.tensor([3, 3, 3, 4], dtype=torch.int32),
+                "new_rollout_log_probs": [-0.5, -1.5, -0.7, -0.8],
+            },
+        )
+        worker = _PostprocessWorker()
+        await AgentLoopWorkerTQ.__ray_actor_class__._agent_loop_postprocess(
+            worker,
+            output,
+            validate=False,
+            uid=_uid(),
+            session_id=0,
+            global_steps=0,
+        )
+
+    with pytest.raises(AssertionError, match="token_versions length 4 != response length 2"):
+        asyncio.run(run())
 
 
 # --------------------------------------------------------------------------- #

@@ -463,6 +463,15 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             limit_key = "max_tokens"
         elif "max_new_tokens" in sampling_params:
             limit_key = "max_new_tokens"
+        else:
+            # Inject the response-length budget so the resume loop below can
+            # cap the ACCUMULATED token count across abort-resume segments.
+            # The engine clamps each request individually to response_length,
+            # but without a client-side limit key the multi-segment total is
+            # unbounded — the piggyback new_rollout_log_probs built from the
+            # raw total then outgrows the agent-loop-truncated response_mask.
+            sampling_params["max_tokens"] = self.config.actor_rollout_ref.rollout.response_length
+            limit_key = "max_tokens"
         original_max_tokens = sampling_params.get(limit_key) if limit_key else None
 
         final_output = TokenOutput(

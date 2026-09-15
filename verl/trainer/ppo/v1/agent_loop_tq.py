@@ -213,11 +213,25 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             field["multi_modal_inputs"] = multi_modal_inputs
             # Promote partial_rollout piggyback fields (written by the llm_server
             # client into extra_fields as lists) to top-level tensor fields so
-            # they travel with the main put.
+            # they travel with the main put. Length must match the (possibly
+            # response_length-truncated) responses — a mismatch means the
+            # client's raw multi-segment total escaped the truncation applied
+            # to responses/response_mask/rollout_log_probs, and storing it
+            # would crash the trainer's offpolicy metrics downstream. Fail the
+            # trajectory here so the replay buffer evicts and regenerates it.
             extra = output.extra_fields or {}
+            response_len = field["responses"].size(0)
             if "token_versions" in extra:
+                assert len(extra["token_versions"]) == response_len, (
+                    f"token_versions length {len(extra['token_versions'])} != response length "
+                    f"{response_len} for {uid}_{session_id}_{i}"
+                )
                 field["token_versions"] = torch.tensor(extra["token_versions"], dtype=torch.int32)
             if "new_rollout_log_probs" in extra:
+                assert len(extra["new_rollout_log_probs"]) == response_len, (
+                    f"new_rollout_log_probs length {len(extra['new_rollout_log_probs'])} != response "
+                    f"length {response_len} for {uid}_{session_id}_{i}"
+                )
                 field["new_rollout_log_probs"] = torch.tensor(extra["new_rollout_log_probs"], dtype=torch.float32)
             fields.append(field)
             prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)

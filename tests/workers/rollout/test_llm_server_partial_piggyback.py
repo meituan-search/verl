@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 from verl.workers.rollout.llm_server import (
+    FullyAsyncLLMServerClient,
     LLMServerClient,
     _build_piggyback_fields,
     _populate_new_rollout_fields,
@@ -222,3 +223,95 @@ class TestBaseClientStripsGateKeys:
         assert received["sampling_params"] == {"temperature": 1.0, "top_p": 1.0}
         assert "enable_piggyback" not in received["sampling_params"]
         assert "emit_token_versions" not in received["sampling_params"]
+
+
+class TestResumeTotalCap:
+    @staticmethod
+    def _client(response_length=20480):
+        client = FullyAsyncLLMServerClient.__new__(FullyAsyncLLMServerClient)
+        client.config = SimpleNamespace(
+            actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(name="sglang", response_length=response_length))
+        )
+        client._only_hybrid = False
+        return client
+
+    def test_resume_total_capped_at_response_length(self):
+        # The abort-resume loop must cap the ACCUMULATED token count at
+        # rollout.response_length. Without the cap, each segment is
+        # individually clamped by the engine but the total grows unbounded
+        # (e.g. 20000 + 2400 = 22400 > 20480), and the piggyback
+        # new_rollout_log_probs built from the raw total is longer than the
+        # agent-loop-truncated response_mask — crashing the trainer's
+        # offpolicy metrics with a tensor size mismatch.
+        client = self._client(response_length=20480)
+        calls = []
+
+        def _fake_generate(**kwargs):
+            # Snapshot: the client mutates sampling_params[limit_key] in place
+            # between resume iterations (same dict object).
+            calls.append({**kwargs, "sampling_params": dict(kwargs["sampling_params"])})
+
+            async def _ret():
+                nth = len(calls)
+                if nth == 1:
+                    return TokenOutput(
+                        token_ids=[7] * 20000,
+                        log_probs=[-0.1] * 20000,
+                        stop_reason="aborted",
+                        num_preempted=0,
+                    )
+                # Emulate the engine honoring max_tokens: ask for the
+                # remaining budget, get exactly that.
+                budget = kwargs["sampling_params"]["max_tokens"]
+                return TokenOutput(
+                    token_ids=[9] * budget,
+                    log_probs=[-0.2] * budget,
+                    stop_reason="completed",
+                    num_preempted=0,
+                )
+
+            return _ret()
+
+        fake_server = SimpleNamespace(generate=SimpleNamespace(remote=_fake_generate))
+
+        async def _acquire(request_id):
+            return "s0", fake_server
+
+        client._acquire_server = _acquire
+        client._release_server = lambda server_id: None
+
+        out = asyncio.run(client.generate("req-0", prompt_ids=[1, 2, 3], sampling_params={"temperature": 1.0}))
+
+        assert len(calls) == 2
+        # First request carries the full budget; the resume request only the
+        # remainder.
+        assert calls[0]["sampling_params"]["max_tokens"] == 20480
+        assert calls[1]["sampling_params"]["max_tokens"] == 480
+        assert len(out.token_ids) == 20480
+        assert out.stop_reason == "length"
+
+    def test_explicit_max_tokens_respected(self):
+        # A caller-provided limit key (e.g. the reprefill path's
+        # max_new_tokens=0) keeps precedence over the injected cap.
+        client = self._client(response_length=20480)
+        calls = []
+
+        def _fake_generate(**kwargs):
+            calls.append(kwargs)
+
+            async def _ret():
+                return TokenOutput(token_ids=[], log_probs=[], stop_reason="length", num_preempted=0)
+
+            return _ret()
+
+        fake_server = SimpleNamespace(generate=SimpleNamespace(remote=_fake_generate))
+
+        async def _acquire(request_id):
+            return "s0", fake_server
+
+        client._acquire_server = _acquire
+        client._release_server = lambda server_id: None
+
+        out = asyncio.run(client.generate("req-0", prompt_ids=[1, 2, 3], sampling_params={"max_new_tokens": 0}))
+        assert len(calls) == 1
+        assert out.token_ids == []
