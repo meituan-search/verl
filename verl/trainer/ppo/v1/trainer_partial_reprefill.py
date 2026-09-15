@@ -122,11 +122,23 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
             self._add_batch_to_generate()
         logger.info(f"Added {num_warmup_batches} warmup batches (partial_reprefill)")
         if cfg.get("enable_prefill_pipeline", False):
-            self._prefill_dispatcher = _PrefillDispatcher()
-            self._prefill_dispatcher.start()
-            self._pending_prefill: dict[str, _PendingPrefill] = {}
-            self.replay_buffer.set_on_new_finished_callback(self._on_new_finished)
-            logger.info("partial_reprefill: pipelined re-prefill pre-dispatch enabled")
+            mode = cfg.get("case2_reprefill_mode", "engine")
+            if mode != "engine":
+                # copy/trainer modes never consume pre-dispatched futures (only
+                # the engine-mode branch of _compute_new_rollout_log_prob reads
+                # _pending), so pre-dispatching would fire engine re-prefill
+                # requests that always get cancelled in on_sampled — pure
+                # wasted engine load (see prefill_cancelled metric).
+                logger.info(
+                    f"partial_reprefill: pipelined re-prefill pre-dispatch disabled "
+                    f"(case2_reprefill_mode={mode}; only engine mode consumes prefills)"
+                )
+            else:
+                self._prefill_dispatcher = _PrefillDispatcher()
+                self._prefill_dispatcher.start()
+                self._pending_prefill: dict[str, _PendingPrefill] = {}
+                self.replay_buffer.set_on_new_finished_callback(self._on_new_finished)
+                logger.info("partial_reprefill: pipelined re-prefill pre-dispatch enabled")
 
     def on_train_end(self):
         # Shut the prefill dispatcher down if it was started (pipeline-

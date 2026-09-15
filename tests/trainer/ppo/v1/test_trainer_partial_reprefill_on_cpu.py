@@ -517,3 +517,33 @@ class TestEnablePrefillPipelineFlag:
         trainer.on_sampled(batch, {})
         assert called == ["pipelined"]
 
+    def test_flag_on_copy_mode_skips_dispatcher(self):
+        # copy/trainer modes never consume pre-dispatched futures (only the
+        # engine branch of _compute_new_rollout_log_prob reads _pending), so
+        # enabling the pipeline there pre-dispatches engine re-prefill
+        # requests that always get cancelled in on_sampled — wasted engine
+        # load (observed as prefill_cancelled=355/step and phantom-logprob
+        # request errors in the t10 run).
+        trainer = _make_trainer(enable_prefill_pipeline=True, case2_reprefill_mode="copy")
+        added = []
+        trainer._add_batch_to_generate = lambda: added.append(True)
+        callback_registered = []
+        rb = SimpleNamespace(set_on_new_finished_callback=lambda cb: callback_registered.append(cb))
+        trainer.replay_buffer = rb
+        trainer.on_train_begin()
+        assert getattr(trainer, "_prefill_dispatcher", None) is None
+        assert getattr(trainer, "_pending_prefill", None) is None
+        assert callback_registered == []
+
+    def test_flag_on_engine_mode_creates_dispatcher(self):
+        trainer = _make_trainer(enable_prefill_pipeline=True, case2_reprefill_mode="engine")
+        trainer._add_batch_to_generate = lambda: None
+        callback_registered = []
+        rb = SimpleNamespace(set_on_new_finished_callback=lambda cb: callback_registered.append(cb))
+        trainer.replay_buffer = rb
+        trainer.on_train_begin()
+        assert trainer._prefill_dispatcher is not None
+        assert trainer._pending_prefill == {}
+        assert callback_registered == [trainer._on_new_finished]
+        trainer.on_train_end()
+

@@ -283,7 +283,9 @@ trainer:
       num_warmup_batches: 1
 
       # Pre-dispatch re-prefill for samples as they finish during the
-      # replay-buffer poll loop (P2 pipelined path).
+      # replay-buffer poll loop (P2 pipelined path). Only effective when
+      # case2_reprefill_mode=engine — copy/trainer modes never consume
+      # pre-dispatched prefills.
       enable_prefill_pipeline: false
 
       # Case 3 fast path: skip reprefill for fully-fresh trajectories

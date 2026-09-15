@@ -59,6 +59,8 @@ NUM_WARMUP_BATCHES=${NUM_WARMUP_BATCHES:-1}
 # samples finish during the replay-buffer poll loop. false = P1 (post-hoc
 # re-prefill); true = P2 (pipelined pre-dispatch). Only case 2 trajectories
 # are pre-dispatched; case 1 (piggyback) and case 3 (fresh) take fast paths.
+# Only effective when CASE2_REPREFILL_MODE=engine — copy/trainer modes never
+# consume pre-dispatched prefills (the trainer skips dispatcher creation).
 ENABLE_PREFILL_PIPELINE=${ENABLE_PREFILL_PIPELINE:-True}
 
 # Case 3 fast path: skip reprefill for fully-fresh trajectories (all tokens
