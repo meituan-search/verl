@@ -264,7 +264,11 @@ class LLMServerClient:
             # Rollout-behavior gates smuggled through sampling_params by the
             # agent loop workers. Only FullyAsyncLLMServerClient consumes
             # them (resume branch); this base client just strips them so
-            # unknown keys never reach the engine's SamplingParams.
+            # unknown keys never reach the engine's SamplingParams. Copy
+            # first: callers may share the dict across sibling sessions
+            # (rollout.n), and stripping one sibling's gate must not strip
+            # the others'.
+            sampling_params = dict(sampling_params)
             sampling_params.pop("enable_piggyback", None)
             sampling_params.pop("emit_token_versions", None)
             output: TokenOutput = await server.generate.remote(
@@ -451,6 +455,16 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             TokenOutput: token output
         """
         prompt_ids = normalize_token_ids(prompt_ids)
+
+        # Callers may share one sampling_params dict across sibling sessions
+        # of the same uid (rollout.n); the gate pops, limit-key injection and
+        # budget updates below must stay local to this request. Mutating the
+        # shared dict races the siblings: the first session to pop
+        # enable_piggyback leaves the others reading the False default (every
+        # resumed sibling then lands in case 2 "no_resume_version"), and the
+        # injected max_tokens makes later siblings inherit this request's
+        # remaining budget as their original_max_tokens.
+        sampling_params = dict(sampling_params)
 
         # Pop the piggyback gate before forwarding to super().generate() —
         # SGLang/vLLM would choke on an unknown sampling_params key. The

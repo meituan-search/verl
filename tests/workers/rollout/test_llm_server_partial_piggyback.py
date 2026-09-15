@@ -223,6 +223,13 @@ class TestBaseClientStripsGateKeys:
         assert received["sampling_params"] == {"temperature": 1.0, "top_p": 1.0}
         assert "enable_piggyback" not in received["sampling_params"]
         assert "emit_token_versions" not in received["sampling_params"]
+        # the caller's dict is not mutated — stripping stays local
+        assert sampling_params == {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "enable_piggyback": True,
+            "emit_token_versions": True,
+        }
 
 
 class TestResumeTotalCap:
@@ -315,3 +322,114 @@ class TestResumeTotalCap:
         out = asyncio.run(client.generate("req-0", prompt_ids=[1, 2, 3], sampling_params={"max_new_tokens": 0}))
         assert len(calls) == 1
         assert out.token_ids == []
+
+
+class TestSharedSamplingParamsDict:
+    """Sibling sessions of one uid (rollout.n) share a single sampling_params
+    dict. The client must never mutate it in place: the first session to pop
+    enable_piggyback would leave the others reading the False default, and
+    every resumed sibling then lands in case 2 "no_resume_version" instead of
+    case 1 piggyback."""
+
+    @staticmethod
+    def _client(response_length=20480):
+        client = FullyAsyncLLMServerClient.__new__(FullyAsyncLLMServerClient)
+        client.config = SimpleNamespace(
+            actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(name="sglang", response_length=response_length))
+        )
+        client._only_hybrid = False
+        return client
+
+    @staticmethod
+    def _fake_server():
+        # Abort exactly once per session: the first call carries the bare
+        # prompt (no prompt_logprobs key, prompt_ids == original); the resume
+        # call arrives with the decoded prefix appended. Keying "aborted" on
+        # prompt_logprobs presence alone would loop forever for a session
+        # running with piggyback off (the pre-fix bug under test).
+        def _fake_generate(**kwargs):
+            async def _ret():
+                if "prompt_logprobs" in kwargs["sampling_params"]:
+                    return TokenOutput(
+                        token_ids=[9, 10],
+                        log_probs=[-0.2, -0.15],
+                        stop_reason="length",
+                        num_preempted=0,
+                        extra_fields={
+                            "global_steps": 5,
+                            "prefix_prompt_logprobs": [(None, 99), (-0.5, 7), (-0.4, 8)],
+                        },
+                    )
+                if len(kwargs["prompt_ids"]) == 3:  # original prompt, nothing decoded yet
+                    return TokenOutput(
+                        token_ids=[7, 8],
+                        log_probs=[-0.9, -0.8],
+                        stop_reason="aborted",
+                        num_preempted=0,
+                        extra_fields={"global_steps": 3},
+                    )
+                return TokenOutput(
+                    token_ids=[9, 10],
+                    log_probs=[-0.2, -0.15],
+                    stop_reason="length",
+                    num_preempted=0,
+                    extra_fields={
+                        "global_steps": 5,
+                        "prefix_prompt_logprobs": [(None, 99), (-0.5, 7), (-0.4, 8)],
+                    },
+                )
+
+            return _ret()
+
+        return SimpleNamespace(generate=SimpleNamespace(remote=_fake_generate))
+
+    def test_sibling_sessions_both_get_piggyback(self):
+        # Two sessions sharing ONE dict, run concurrently. Pre-fix, the first
+        # session's in-place pop removed enable_piggyback and the second
+        # session silently ran with piggyback off (no resume_version, no
+        # piggyback_marker). Both must observe the gate.
+        client = self._client()
+        fake_server = self._fake_server()
+
+        async def _acquire(request_id):
+            return "s0", fake_server
+
+        client._acquire_server = _acquire
+        client._release_server = lambda server_id: None
+
+        shared = {"temperature": 1.0, "enable_piggyback": True}
+
+        async def _run():
+            return await asyncio.gather(
+                client.generate("req-0", prompt_ids=[1, 2, 3], sampling_params=shared),
+                client.generate("req-1", prompt_ids=[1, 2, 3], sampling_params=shared),
+            )
+
+        out0, out1 = asyncio.run(_run())
+
+        for out in (out0, out1):
+            assert out.extra_fields["piggyback_marker"] is True
+            assert out.extra_fields["resume_version"] == 5
+            assert out.extra_fields["new_rollout_log_probs"] == [-0.5, -0.4, -0.2, -0.15]
+
+        # the shared dict is untouched: gate preserved, no injected max_tokens
+        assert shared == {"temperature": 1.0, "enable_piggyback": True}
+
+    def test_sequential_sessions_both_get_piggyback(self):
+        # Deterministic variant of the race: even fully sequential sessions
+        # must not consume the gate from the shared dict.
+        client = self._client()
+        fake_server = self._fake_server()
+
+        async def _acquire(request_id):
+            return "s0", fake_server
+
+        client._acquire_server = _acquire
+        client._release_server = lambda server_id: None
+
+        shared = {"temperature": 1.0, "enable_piggyback": True}
+        out0 = asyncio.run(client.generate("req-0", prompt_ids=[1, 2, 3], sampling_params=shared))
+        out1 = asyncio.run(client.generate("req-1", prompt_ids=[1, 2, 3], sampling_params=shared))
+        assert out0.extra_fields["piggyback_marker"] is True
+        assert out1.extra_fields["piggyback_marker"] is True
+        assert shared == {"temperature": 1.0, "enable_piggyback": True}

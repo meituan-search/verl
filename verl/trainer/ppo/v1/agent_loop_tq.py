@@ -132,9 +132,14 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
 
             tasks = []
             for i in range(n):
+                # Per-session copy, mirroring AgentLoopWorker.generate_sequences
+                # (agent_loop.py): the rollout clients pop/inject keys
+                # (enable_piggyback, max_tokens) in place, so sharing one dict
+                # across the n sibling sessions races — the first session to
+                # pop a key leaves the others with the default.
                 task = asyncio.create_task(
                     self._run_agent_loop(
-                        run_sampling_params, trajectory=trajectory, trace=trace, session_id=i, **prompt
+                        dict(run_sampling_params), trajectory=trajectory, trace=trace, session_id=i, **prompt
                     )
                 )
                 tasks.append(task)
