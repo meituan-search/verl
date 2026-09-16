@@ -645,6 +645,14 @@ class SGLangHttpServer:
         meta_info = output.get("meta_info", {})
         finish_reason = meta_info.get("finish_reason")
         finish_reason = finish_reason["type"] if finish_reason else None
+        # SGLang's retraction is the KV-cache-pressure preemption analog:
+        # the scheduler returns decoding requests to the waiting queue and
+        # re-prefills them later (Req.retraction_count -> meta_info
+        # "num_retractions"). Surface it as num_preempted so the trainer's
+        # agent_loop/num_preempted/* metrics can quantify how often retraction
+        # stretches rollout-n groups across weight updates. Older SGLang
+        # builds omit the key — leave None (reported as -1, not available).
+        num_preempted = meta_info.get("num_retractions")
         if return_logprob:
             token_ids = list(output.get("output_ids", []))
             output_token_logprobs = meta_info.get("output_token_logprobs") or []
@@ -725,6 +733,7 @@ class SGLangHttpServer:
             log_probs=log_probs,
             routed_experts=routed_experts,
             stop_reason=finish_reason,
+            num_preempted=num_preempted,
             extra_fields=extra_fields,
         )
 
