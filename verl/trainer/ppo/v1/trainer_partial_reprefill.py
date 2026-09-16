@@ -432,8 +432,10 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
         metrics["partial_reprefill/case_distribution.case_3"] = float(len(case3_indices))
         for reason, count in reason_counts.items():
             metrics[f"partial_reprefill/case_reason.{reason}"] = float(count)
-        for kind, count in group_staleness.items():
-            metrics[f"partial_reprefill/group_staleness.{kind}"] = float(count)
+        # Always emit both series (Counter yields 0 for missing kinds) so the
+        # TensorBoard curves stay continuous on steps with no stale groups.
+        metrics["partial_reprefill/group_staleness.all_stale"] = float(group_staleness["all_stale"])
+        metrics["partial_reprefill/group_staleness.partial_stale"] = float(group_staleness["partial_stale"])
         metrics["partial_reprefill/resume_version"] = float(resume_version)
         return batch
 
