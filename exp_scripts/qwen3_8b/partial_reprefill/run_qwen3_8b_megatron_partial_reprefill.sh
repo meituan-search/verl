@@ -26,6 +26,7 @@
 #   trainer.v1.partial_reprefill.enable_case_skip={true|false}  (default true — case 3 fast path)
 #   trainer.v1.partial_reprefill.enable_piggyback={true|false}  (default true — case 1)
 #   trainer.v1.partial_reprefill.case2_reprefill_mode={engine|trainer|copy}  (default engine — case 2)
+#   trainer.v1.partial_reprefill.max_resume_staleness=N  (default 0 — case 1/3 staleness budget)
 #
 # ⚠️ UNVERIFIED: Case 1 piggyback depends on SGLang emitting prompt_logprobs
 # during a max_new_tokens>0 resume prefill. The SGLang spike (spec Task 4)
@@ -84,7 +85,18 @@ COMPARE_TRAINER_OLD_LOG_PROB=${COMPARE_TRAINER_OLD_LOG_PROB:-False}
 # - trainer: skip the engine re-prefill; the trainer-side actor forward
 #   computes old_log_probs instead (zero rollout-engine load).
 # - copy: reuse stale rollout_log_probs (fastest, accepts off-policy data).
-CASE2_REPREFILL_MODE=${CASE2_REPREFILL_MODE:-copy}
+CASE2_REPREFILL_MODE=${CASE2_REPREFILL_MODE:-engine}
+
+# Max tolerated version gap between a trajectory's resume_version and the
+# current rollout weight for the piggyback/copy fast paths (case 1/3).
+# 0 (default) = strict: any trajectory not at the current weight falls to
+# case 2 ("stale"). Raise to 1-2 to absorb group-split staleness: sessions
+# finishing early in a rollout-n group lock resume_version=k while the uid
+# is only consumable once the slowest sibling finishes at k+1 — with budget
+# 1 those early finishers reuse their W_k logprobs (piggyback or copy)
+# instead of a full reprefill. Tradeoff: old_log_probs one step older,
+# watch offpolicy/staleness/* and actor/kl_loss.
+MAX_RESUME_STALENESS=${MAX_RESUME_STALENESS:-0}
 
 # Per-dataset defaults. Any knob can still be overridden via its env var
 # (TRAIN_FILES, TRAIN_BATCH_SIZE, ACTOR_LR, ...). DATASET just picks the base.
@@ -214,6 +226,7 @@ TRAINER=(
     trainer.v1.partial_reprefill.enable_case_skip=${ENABLE_CASE_SKIP}
     trainer.v1.partial_reprefill.enable_piggyback=${ENABLE_PIGGYBACK}
     trainer.v1.partial_reprefill.case2_reprefill_mode=${CASE2_REPREFILL_MODE}
+    trainer.v1.partial_reprefill.max_resume_staleness=${MAX_RESUME_STALENESS}
     trainer.v1.partial_reprefill.compare_trainer_old_log_prob=${COMPARE_TRAINER_OLD_LOG_PROB}
 )
 
