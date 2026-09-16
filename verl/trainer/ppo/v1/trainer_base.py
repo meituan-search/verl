@@ -359,9 +359,19 @@ class PPOTrainer(ABC):
             self.distillation_config = None
 
         # 9. initialize agent loop manager
-        self.llm_server_manager: LLMServerManager = LLMServerManager.create(
-            config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
-        )
+        # Trainers that opt out of colocated rollout replicas on the training
+        # GPUs (v1 separate_async with actor_rollout_ref.hybrid_engine=False)
+        # set ``self._enable_hybrid_replicas = False`` before super()._setup();
+        # they get an empty manager here and serve rollout from their
+        # standalone replicas only.
+        if getattr(self, "_enable_hybrid_replicas", True):
+            self.llm_server_manager: LLMServerManager = LLMServerManager.create(
+                config=self.config,
+                worker_group=self.actor_rollout_wg,
+                rollout_resource_pool=actor_rollout_resource_pool,
+            )
+        else:
+            self.llm_server_manager = LLMServerManager.create_empty(config=self.config)
 
         # 10. initialize checkpoint engine manager
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
@@ -607,13 +617,21 @@ class PPOTrainer(ABC):
         """Called before the training loop starts."""
         return
 
-    def _add_async_warmup_batches(self, num_warmup_batches: int) -> None:
-        """Fill the async prefetch window without duplicating checkpointed prompt groups."""
+    def _add_async_warmup_batches(self, num_warmup_batches: int | float) -> None:
+        """Fill the async prefetch window without duplicating checkpointed prompt groups.
+
+        Fractional values are supported: e.g. 1.5 with train_batch_size=64 adds
+        one full batch (64 prompts) plus half a batch (32 prompts); the fractional
+        part is rounded down to a whole number of gen_batch_size chunks (prompts
+        are fetched per gen_batch_size).
+        """
         if self.config.skip.rollout_tq.enable or num_warmup_batches <= 0:
             return
 
         restored_prompts = self._restored_tq_prompt_count
-        target_prompts = num_warmup_batches * self.config.data.train_batch_size
+        target_prompts = int(round(num_warmup_batches * self.config.data.train_batch_size))
+        gen_batch_size = self.config.data.get("gen_batch_size", None) or self.config.data.train_batch_size
+        target_prompts = target_prompts // gen_batch_size * gen_batch_size
         missing_prompts = max(0, target_prompts - restored_prompts)
         if missing_prompts == 0:
             logger.info(
@@ -1897,6 +1915,12 @@ class PPOTrainer(ABC):
         data["response_length"] = response_length.float()
         batch = DataProto(batch=data, meta_info={"global_token_num": global_token_num})
         metrics_batch = batch.select_idxs(non_padding_mask) if non_padding_mask.any() else batch
+        # Expose per-row turn counts under the V0 schema (agent_loop writes
+        # ``__num_turns__`` into the non-tensor batch) so compute_data_metrics
+        # emits the V0-compatible ``num_turns/{mean,max,min}`` tags in addition
+        # to the ``training/num_turns/*`` names computed below.
+        num_turns_for_metrics = num_turns[non_padding_mask] if non_padding_mask.any() else num_turns
+        metrics_batch.non_tensor_batch["__num_turns__"] = np.asarray(num_turns_for_metrics, dtype=np.int32)
 
         # 2. compute metrics
         metrics.update({"training/global_step": global_steps, "training/epoch": epoch})
