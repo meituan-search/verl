@@ -235,14 +235,21 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
             request_prefix=f"partial_reprefill_{self.global_steps}",
         )
 
-    def _classify_cases(self, batch: KVBatchMeta, meta) -> tuple[list[int], list[int], int, Counter]:
+    def _classify_cases(self, batch: KVBatchMeta, meta) -> tuple[list[int], list[int], int, Counter, Counter]:
         """Classify each trajectory in the batch into case 1/2/3.
 
-        Returns (case2_indices, case3_indices, case1_count, reason_counts).
-        `meta` is the kv_batch_get result holding `rollout_log_probs` (consumed
-        by the case 3 copy, not by the dispatch itself). `reason_counts` maps
-        each decide_case branch to its hit count, e.g. {"stale": 12} for a
-        batch of 12 too-stale case-2 trajectories.
+        Returns (case2_indices, case3_indices, case1_count, reason_counts,
+        group_staleness). `meta` is the kv_batch_get result holding
+        `rollout_log_probs` (consumed by the case 3 copy, not by the dispatch
+        itself). `reason_counts` maps each decide_case branch to its hit count,
+        e.g. {"stale": 12} for a batch of 12 too-stale case-2 trajectories.
+
+        `group_staleness` aggregates per rollout-n group (uid = key prefix,
+        see ReplayBuffer key format): among groups containing at least one
+        "stale" trajectory, counts "all_stale" (every trajectory in the group
+        is stale — the whole group was generated/consumed with delay) vs
+        "partial_stale" (the group split across a weight boundary — some
+        siblings finished inside the current step window, others crossed it).
         """
         cfg = self.config.trainer.v1.partial_reprefill
         current_version = self.global_steps - 1
@@ -250,6 +257,8 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
         case3_indices: list[int] = []
         case1_count = 0
         reason_counts: Counter = Counter()
+        group_total: Counter = Counter()
+        group_stale: Counter = Counter()
         for i, tag in enumerate(batch.tags):
             tag = tag or {}
             piggyback = bool(tag.get("piggyback_marker", False)) and cfg.enable_piggyback
@@ -263,13 +272,22 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
                 max_resume_staleness=cfg.max_resume_staleness,
             )
             reason_counts[reason] += 1
+            group_total[batch.keys[i].split("_")[0]] += 1
+            if reason == "stale":
+                group_stale[batch.keys[i].split("_")[0]] += 1
             if case == 1:
                 case1_count += 1
             elif case == 3:
                 case3_indices.append(i)
             else:
                 case2_indices.append(i)
-        return case2_indices, case3_indices, case1_count, reason_counts
+        group_staleness: Counter = Counter()
+        for uid, stale in group_stale.items():
+            if stale == group_total[uid]:
+                group_staleness["all_stale"] += 1
+            else:
+                group_staleness["partial_stale"] += 1
+        return case2_indices, case3_indices, case1_count, reason_counts, group_staleness
 
     def _reprefill_case2(
         self,
@@ -346,7 +364,7 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
             partition_id=batch.partition_id,
             select_fields=["rollout_log_probs"],
         )
-        case2_indices, case3_indices, case1_count, reason_counts = self._classify_cases(batch, meta)
+        case2_indices, case3_indices, case1_count, reason_counts, group_staleness = self._classify_cases(batch, meta)
 
         # Case 2: full reprefill for selected keys (pipelined path consumes
         # pre-dispatched futures when `_pending` is provided).
@@ -414,6 +432,8 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
         metrics["partial_reprefill/case_distribution.case_3"] = float(len(case3_indices))
         for reason, count in reason_counts.items():
             metrics[f"partial_reprefill/case_reason.{reason}"] = float(count)
+        for kind, count in group_staleness.items():
+            metrics[f"partial_reprefill/group_staleness.{kind}"] = float(count)
         metrics["partial_reprefill/resume_version"] = float(resume_version)
         return batch
 

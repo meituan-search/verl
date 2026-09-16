@@ -294,6 +294,60 @@ class TestComputeNewRolloutLogProbCase2:
         assert batch.tags[0]["resume_version"] == 5  # tagged as consumed, not refreshed
 
 
+class TestGroupStalenessMetric:
+    # current_version = global_steps - 1 = 5, max_resume_staleness = 1:
+    # resume_version=3 (gap 2) is stale; resume_version=5 (gap 0) is fresh.
+    @staticmethod
+    def _group_keys(uid, n):
+        return [f"{uid}_0_{i}" for i in range(n)]
+
+    def test_classify_counts_all_stale_vs_partial_stale(self):
+        trainer = _make_trainer()
+        uid_all, uid_part = uuid.uuid4().hex, uuid.uuid4().hex
+        keys = self._group_keys(uid_all, 4) + self._group_keys(uid_part, 4)
+        tags = (
+            [{"resume_version": 3}] * 4  # every sibling stale → all_stale
+            + [{"resume_version": 3}, {"resume_version": 3}, {"resume_version": 5}, {"resume_version": 5}]
+        )
+        batch = _make_batch("unused", keys, tags=tags)
+        _, _, _, reason_counts, group_staleness = trainer._classify_cases(batch, {"rollout_log_probs": [None] * 8})
+        assert reason_counts["stale"] == 6
+        assert group_staleness == {"all_stale": 1, "partial_stale": 1}
+
+    def test_group_without_stale_trajectories_not_counted(self):
+        trainer = _make_trainer()
+        uid_fresh = uuid.uuid4().hex
+        keys = self._group_keys(uid_fresh, 2)
+        batch = _make_batch("unused", keys, tags=[{"resume_version": 5}, {"resume_version": 4}])
+        _, _, _, reason_counts, group_staleness = trainer._classify_cases(batch, {"rollout_log_probs": [None] * 2})
+        assert "stale" not in reason_counts
+        assert group_staleness == {}
+
+    def test_metrics_emitted_from_compute(self, tq_init, partition_id):
+        # End-to-end through _compute_new_rollout_log_prob in copy mode so no
+        # engine call is needed; every key gets rollout_log_probs to copy.
+        trainer = _make_trainer(case2_reprefill_mode="copy")
+        uid_all, uid_part = uuid.uuid4().hex, uuid.uuid4().hex
+        keys = self._group_keys(uid_all, 2) + self._group_keys(uid_part, 2)
+        tags = (
+            [{"resume_version": 3}] * 2  # all_stale
+            + [{"resume_version": 3}, {"resume_version": 5}]  # partial_stale
+        )
+        tq.kv_batch_put(
+            keys=keys,
+            partition_id=partition_id,
+            fields=TensorDict(
+                {"rollout_log_probs": to_nested_jagged([[0.1, 0.2]] * 4)},
+                batch_size=len(keys),
+            ),
+        )
+        batch = _make_batch(partition_id, keys, tags=tags)
+        metrics = {}
+        trainer._compute_new_rollout_log_prob(batch, metrics)
+        assert metrics["partial_reprefill/group_staleness.all_stale"] == 1.0
+        assert metrics["partial_reprefill/group_staleness.partial_stale"] == 1.0
+
+
 class TestOnNewFinishedCaseAware:
     def test_skips_case1_and_case3_only_dispatches_case2(self, tq_init):
         # Uses partition "train" to match the production guard
