@@ -15,6 +15,7 @@ import logging
 import os
 import time
 from collections import deque
+from dataclasses import replace
 from enum import Enum
 
 import ray
@@ -85,6 +86,12 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         self.hybrid_rollout_config: HybridRolloutSwitchConfig = omega_conf_to_dataclass(
             self.config.trainer.v1.separate_async.hybrid_rollout
         )
+        if not self._enable_hybrid_replicas and self.hybrid_rollout_config.enable_switch:
+            logger.warning(
+                "trainer.v1.separate_async.hybrid_rollout.enable_switch is ignored because "
+                "actor_rollout_ref.hybrid_engine=False; disabling hybrid switching"
+            )
+            self.hybrid_rollout_config = replace(self.hybrid_rollout_config, enable_switch=False)
         if self.hybrid_rollout_config.enable_switch:
             # No support for PD disaggregation for switching
             rollout_cfg = self.config.get("actor_rollout_ref", {}).get("rollout", {})
@@ -108,8 +115,12 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         super()._init_resource_pool_mgr()
         # Replace ActorRolloutRefWorker with DetachActorWorker to get CPU save/restore
         # capability needed for Decoupled PPO when parameter_sync_step > 1.
-        # The base class adds exactly one of ActorRolloutRef or ActorRollout to the mapping.
-        if Role.ActorRolloutRef in self.role_worker_mapping:
+        # The base class uses a pure Actor role when hybrid replicas are disabled.
+        if Role.Actor in self.role_worker_mapping:
+            self.role_worker_mapping[Role.Actor] = ray.remote(DetachActorWorker)
+            if Role.RefPolicy in self.role_worker_mapping:
+                self.role_worker_mapping[Role.RefPolicy] = ray.remote(DetachActorWorker)
+        elif Role.ActorRolloutRef in self.role_worker_mapping:
             self.role_worker_mapping[Role.ActorRolloutRef] = ray.remote(DetachActorWorker)
         elif Role.ActorRollout in self.role_worker_mapping:
             self.role_worker_mapping[Role.ActorRollout] = ray.remote(DetachActorWorker)

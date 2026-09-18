@@ -24,6 +24,7 @@ from unittest.mock import MagicMock
 import pytest
 from omegaconf import OmegaConf
 
+from verl.trainer.ppo.utils import Role
 from verl.trainer.ppo.v1 import trainer_separate_async as separate_async_module
 from verl.trainer.ppo.v1.replay_buffer import ReplayBufferAsync
 from verl.trainer.ppo.v1.trainer_base import PPOTrainer
@@ -109,6 +110,74 @@ class TestUnconfiguredDefaultsPreserveBehavior:
 
 
 class TestHybridEngineDisabled:
+    def test_resource_mapping_uses_pure_actor_role(self):
+        trainer = object.__new__(PPOTrainerSeparateAsync)
+        trainer._enable_hybrid_replicas = False
+        trainer.config = OmegaConf.create(
+            {
+                "actor_rollout_ref": {
+                    "model": {"lora": {"rank": 0}, "lora_adapter_path": None},
+                    "actor": {"use_kl_loss": False},
+                },
+                "algorithm": {},
+                "critic": {"enable": False},
+                "trainer": {"nnodes": 1, "n_gpus_per_node": 4},
+                "reward": {"reward_model": {"enable": False, "enable_resource_pool": False}},
+                "distillation": None,
+            }
+        )
+
+        trainer._init_resource_pool_mgr()
+
+        assert Role.Actor in trainer.role_worker_mapping
+        assert Role.ActorRollout not in trainer.role_worker_mapping
+        assert Role.ActorRolloutRef not in trainer.role_worker_mapping
+
+    def test_switch_is_disabled_with_warning_when_hybrid_is_disabled(self, monkeypatch):
+        config = OmegaConf.create(
+            {
+                "data": {"train_batch_size": 64},
+                "actor_rollout_ref": {
+                    "hybrid_engine": False,
+                    "actor": {"ppo_mini_batch_size": 16},
+                    "rollout": {
+                        "nnodes": 1,
+                        "n_gpus_per_node": 8,
+                        "checkpoint_engine": {"backend": "nccl"},
+                        "disaggregation": {"enabled": True},
+                    },
+                },
+                "trainer": {
+                    "v1": {
+                        "separate_async": {
+                            "parameter_sync_step": 4,
+                            "hybrid_rollout": {
+                                "_target_": "verl.trainer.config.HybridRolloutSwitchConfig",
+                                "enable_switch": True,
+                            },
+                        }
+                    }
+                },
+                "reward": {"reward_model": {"enable": False}},
+            }
+        )
+
+        def mock_base_init(trainer, trainer_config):
+            trainer.config = trainer_config
+            trainer.replay_buffer = SimpleNamespace(
+                wait_for_sampleable=lambda *_args: None,
+                get_sampleable_count=lambda *_args: 0,
+            )
+
+        monkeypatch.setattr(separate_async_module.PPOTrainer, "__init__", mock_base_init)
+        warning = MagicMock()
+        monkeypatch.setattr(separate_async_module.logger, "warning", warning)
+
+        trainer = PPOTrainerSeparateAsync(config)
+
+        assert trainer.hybrid_rollout_config.enable_switch is False
+        warning.assert_called_once()
+
     def test_mode_switch_hooks_are_noops(self):
         trainer = _make_trainer(enable_hybrid_replicas=False)
         trainer.switch_to_rollout()
