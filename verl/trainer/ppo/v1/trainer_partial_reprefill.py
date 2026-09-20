@@ -304,11 +304,33 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
         keys). Returns (nested response logprobs, number of consumed futures).
         """
         resume_version = self.global_steps - 1
-        prompt_ids_list, real_lens, _ = build_reprefill_inputs(
+        prompt_ids_list, real_lens, data = build_reprefill_inputs(
             keys=keys,
             partition_id=partition_id,
             pad_id=self.tokenizer.pad_token_id,
         )
+        # VERIFICATION: detect pad_id filtering genuine (stop) tokens.
+        # If pad_token_id is also an eos_token_id (e.g. Qwen3-8B:
+        # pad=151643, eos=[151645,151643]), build_reprefill_inputs's
+        # `if x != pad_id` filter strips the stop token too, making
+        # real_lens[j][1] shorter than the true response length.
+        # Compare filtered len vs raw jagged len; log last 3 tokens.
+        pad_id = self.tokenizer.pad_token_id
+        for j, key in enumerate(keys):
+            raw_resp = data["responses"][j]
+            raw_len = int(raw_resp.numel())
+            filtered_len = real_lens[j][1]
+            if raw_len != filtered_len:
+                last_tokens = raw_resp[-3:].tolist()
+                msg = (
+                    f"case2_verify key={key} step={self.global_steps} "
+                    f"raw_len={raw_len} filtered_len={filtered_len} "
+                    f"diff={raw_len - filtered_len} last3={last_tokens} "
+                    f"pad_id={pad_id}"
+                )
+                logger.error(msg)
+                print(f"[VERIFY] {msg}", flush=True)
+                raise RuntimeError(msg)
 
         results: list = [None] * len(keys)
         reissue_indices: list[int] = []

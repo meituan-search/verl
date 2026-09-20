@@ -259,6 +259,20 @@ def compute_and_emit_token_staleness_metrics(batch, metrics, global_steps):
             # length mismatch (malformed) — skip this key's per-token stats.
             logger.debug(f"token staleness metrics: skipping key {batch.keys[i]} (no/mismatched token_versions)")
             continue
+        # VERIFICATION: log any length mismatch between rollout_log_probs
+        # and new_rollout/old_log_probs. If new_rollout is shorter, the
+        # j-loop below will IndexError at the tail — this log captures
+        # the exact key + lengths before the crash.
+        if len(new_rollout) != len(rollout):
+            msg = (
+                f"staleness_verify key={batch.keys[i]} "
+                f"rollout_len={len(rollout)} new_rollout_len={len(new_rollout)} "
+                f"tv_len={len(tv)} mask_len={len(mask)} "
+                f"diff={len(rollout) - len(new_rollout)}"
+            )
+            logger.error(msg)
+            print(f"[VERIFY] {msg}", flush=True)
+            raise RuntimeError(msg)
         for j in range(len(rollout)):
             if mask[j] == 0:
                 continue
