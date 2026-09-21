@@ -40,6 +40,12 @@
 set -xeuo pipefail
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export PATH="/usr/local/miniconda3/bin:$PATH"
+# Overlay local sglang source (third_party/sglang on branch dev/group_id-transmission)
+# over the wheel preinstalled in the image. main_ppo forwards the driver's
+# PYTHONPATH to Ray workers via verl/trainer/constants_ppo.py — do NOT set
+# PYTHONPATH in runtime_env.yaml, that conflicts with the driver-side forward
+# at ray.init merge time.
+export PYTHONPATH="third_party/sglang/python${PYTHONPATH:+:$PYTHONPATH}"
 
 ########################### user-adjustable ###########################
 INFER_BACKEND=${INFER_BACKEND:-sglang}
