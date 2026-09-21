@@ -46,6 +46,8 @@ export PATH="/usr/local/miniconda3/bin:$PATH"
 # PYTHONPATH in runtime_env.yaml, that conflicts with the driver-side forward
 # at ray.init merge time.
 export PYTHONPATH="third_party/sglang/python${PYTHONPATH:+:$PYTHONPATH}"
+# [VERIFY sglang path] confirm local source overlay is in effect
+python -c "import sglang, os; print('[VERIFY sglang path]', sglang.__file__)" || echo "[VERIFY sglang path] sglang not importable on driver"
 
 ########################### user-adjustable ###########################
 INFER_BACKEND=${INFER_BACKEND:-sglang}
