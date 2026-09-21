@@ -67,6 +67,7 @@ class AgentData:
         metrics: dict[str, Any],
         request_id: str,
         tools_kwargs: dict[str, Any],
+        group_id: Optional[str] = None,
     ):
         self.messages = messages
         self.image_data = image_data
@@ -76,6 +77,7 @@ class AgentData:
         self.metrics = metrics
         self.request_id = request_id
         self.tools_kwargs = tools_kwargs
+        self.group_id = group_id
 
         # State variables
         self.prompt_ids: list[int] = []
@@ -135,6 +137,7 @@ class ToolAgentLoop(AgentLoopBase):
         metrics = {}
         request_id = uuid4().hex
         tools_kwargs = kwargs.get("tools_kwargs", {})
+        group_id = kwargs.get("group_id")
 
         agent_data = AgentData(
             messages=messages,
@@ -145,6 +148,7 @@ class ToolAgentLoop(AgentLoopBase):
             metrics=metrics,
             request_id=request_id,
             tools_kwargs=tools_kwargs,
+            group_id=group_id,
         )
 
         # Per-sample tool selection: filter global tools by extra_info.tool_selection
@@ -240,6 +244,7 @@ class ToolAgentLoop(AgentLoopBase):
                 video_data=agent_data.video_data,
                 audio_data=agent_data.audio_data,
                 mm_processor_kwargs=agent_data.mm_processor_kwargs,
+                group_id=agent_data.group_id,
             )
         # first time to set num_preempted
         if agent_data.metrics.get("num_preempted") is None:

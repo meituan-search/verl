@@ -237,6 +237,7 @@ class LLMServerClient:
         video_data: Optional[list[Any]] = None,
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        group_id: Optional[str] = None,
         **kwargs: Any,
     ) -> TokenOutput:
         """Generate tokens from prompt ids.
@@ -245,11 +246,20 @@ class LLMServerClient:
             request_id (str): request id for sticky session.
             prompt_ids (List[int]): List of prompt token ids.
             sampling_params (Dict[str, Any]): Sampling parameters for the chat completion.
+            group_id (Optional[str]): stable identity shared by all sibling requests
+                in the same rollout.n group (verl partial_reprefill). Used as the
+                sticky-session key when present so siblings route to the same engine
+                replica (Q14); falls back to request_id when None.
 
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
-        server_id, server = await self._acquire_server(request_id)
+        # Q14: use group_id as the sticky key when present so all n siblings
+        # (and all multi-segment resume segments sharing the same group_id)
+        # route to the same engine replica. Fallback to request_id preserves
+        # existing behavior for non-group callers (distillation teacher, etc.).
+        sticky_key = group_id if group_id is not None else request_id
+        server_id, server = await self._acquire_server(sticky_key)
         try:
             multimodal_kwargs = {}
             if audio_data is not None:
@@ -277,6 +287,7 @@ class LLMServerClient:
                 sampling_params=sampling_params,
                 image_data=image_data,
                 video_data=video_data,
+                group_id=group_id,
                 **multimodal_kwargs,
                 **priority_kwargs,
                 **kwargs,
@@ -438,6 +449,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         video_data: Optional[list[Any]] = None,
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        group_id: Optional[str] = None,
         **kwargs: Any,
     ) -> TokenOutput:
         """Generate tokens from prompt ids.
@@ -498,6 +510,9 @@ class FullyAsyncLLMServerClient(LLMServerClient):
 
         while True:
             # 1. generate tokens
+            # group_id is passed on every segment so multi-segment resume
+            # keeps the same sticky-server routing (Q14) and the SGLang Req
+            # carries the same group_id for affinity scheduling (Q10).
             output = await super().generate(
                 request_id=request_id,
                 prompt_ids=prompt_ids + final_output.token_ids,
@@ -506,6 +521,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 video_data=video_data,
                 audio_data=audio_data,
                 mm_processor_kwargs=mm_processor_kwargs,
+                group_id=group_id,
                 **kwargs,
             )
 

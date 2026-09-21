@@ -534,6 +534,7 @@ class SGLangHttpServer:
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
+        group_id: Optional[str] = None,
     ) -> TokenOutput:
         # PD top-level dispatch: prefill mints a bootstrap_room and fans out
         # paired local-prefill + remote-decode calls; decode returns the tokens
@@ -551,6 +552,7 @@ class SGLangHttpServer:
                 bootstrap_host=self._pd_bootstrap_host,
                 bootstrap_port=self._disaggregation_bootstrap_port,
                 bootstrap_room=room,
+                group_id=group_id,
             )
             decode_coro = decode_peer.generate.remote(
                 prompt_ids,
@@ -561,6 +563,7 @@ class SGLangHttpServer:
                 bootstrap_host=self._pd_bootstrap_host,
                 bootstrap_port=self._disaggregation_bootstrap_port,
                 bootstrap_room=room,
+                group_id=group_id,
             )
             _, decode_output = await asyncio.gather(prefill_coro, decode_coro)
             return decode_output
@@ -617,6 +620,8 @@ class SGLangHttpServer:
             # TODO: support video input for sglang
             # video_data=video_data,
         }
+        if group_id is not None:
+            request["group_id"] = group_id
 
         if prompt_logprobs is not None:
             request["logprob_start_len"] = (

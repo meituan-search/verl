@@ -130,6 +130,13 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             if not trajectory["validate"] and not do_sample:
                 apply_greedy_sampling_params(run_sampling_params)
 
+            # group_id: one per rollout.n group, shared by all n siblings. Used by
+            # (a) SGLang group affinity retract/admission scheduling, (b) trainer
+            # P2 cohesion metric (group_version_set_jaccard_mean). Stable across
+            # multi-segment resume (Q10). Format f"{step}_{uid}" is debuggable
+            # (see docs/partial_reprefill_open_questions.md Q5/Q6).
+            prompt["group_id"] = f"{trajectory['step']}_{uid}"
+
             tasks = []
             for i in range(n):
                 # Per-session copy, mirroring AgentLoopWorker.generate_sequences
@@ -259,6 +266,11 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 tag["piggyback_marker"] = True
             if "resume_version" in field["extra_fields"]:
                 tag["resume_version"] = int(field["extra_fields"]["resume_version"])
+            # group_id travels as a tag (not field) because fields go through
+            # to_padded_tensor which a string would break. Trainer reads it via
+            # batch.tags[i].get("group_id") for the P2 cohesion metric.
+            if "group_id" in kwargs:
+                tag["group_id"] = kwargs["group_id"]
             # Record per-trajectory performance metrics in the tag so they
             # sync to the replay buffer for free (fields need an explicit
             # kv_batch_get) and the trainer can aggregate agent_loop/* timing

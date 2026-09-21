@@ -377,3 +377,39 @@ token_versions 如何赋值？可能产生 staleness 统计偏差。
   - 按 group_id 分组 + 两两 Jaccard 计算。
 
 - **辅助 metric**：不做 `group_staleness_span` —— 信息量不足，容易误导。
+
+---
+
+## Q14: group 路由亲和（verl LB 层）
+
+**问题**（实施 group_id 传递时发现）：
+- verl `GlobalLoadBalancer`（`llm_server.py:81 acquire_server`）用
+  `request_id` 做 sticky session key。
+- 现状每条 sibling 在 `single_turn_agent_loop.py:66` 用 `uuid4().hex`
+  独立生成 `request_id`，因此同 group 的 n 条 sibling **会被分散到不同
+  engine replica**。
+- Q8/Q9 的 group affinity 是 **SGLang scheduler 层**逻辑，前提是
+  sibling 在同一 engine 内被调度。若 verl LB 不做 group 亲和，scheduler
+  层的 affinity 调度效果会大打折扣——sibling 根本不在同一 scheduler 视野内。
+
+**决议**：**LB 用 group_id 做 sticky session key**（而非 request_id）。
+
+理由：
+- group_id 本来就是"逻辑标识"，天然适合做 sticky key。
+- 同 group sibling 集中到同一 engine → scheduler 层 group affinity 才能
+  充分发挥。
+- 单 engine KV 压力集中的风险由 scheduler 层 retract affinity 自然处理
+  （§3.1 集中 retract 同 group 本来就是语义）。
+- group_id 跨 multi-segment resume 保持稳定（Q10），所以 sticky 也跨
+  resume 生效——同一 request 的所有 segment 路由到同一 engine，符合
+  partial_rollout 的 KV 复用需求。
+
+**实施点**：
+- `LLMServerClient.generate`（`llm_server.py:230`）在调
+  `acquire_server(request_id=...)` 时，改用 `group_id`（若存在）作为
+  sticky key；fallback 到 `request_id`（group_id 为 None 时，如 distillation
+  teacher 等非 group 路径）。
+- `FullyAsyncLLMServerClient.generate` 继承同一行为，multi-segment resume
+  循环里每次 `super().generate()` 都传同一 `group_id`，sticky 自然稳定。
+- `GlobalLoadBalancer` 本身不需要改——它只看传入的 key 字符串，不关心
+  是 request_id 还是 group_id。
