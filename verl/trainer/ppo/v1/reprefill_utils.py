@@ -210,6 +210,11 @@ def compute_and_emit_token_staleness_metrics(batch, metrics, global_steps):
       - staleness_by_version_gap_1: ratio with gap 1.
       - staleness_by_version_gap_2_3: ratio with gap 2-3.
       - staleness_by_version_gap_4plus: ratio with gap ≥4.
+      - group_version_set_jaccard_mean: P2 group cohesion metric — mean
+        pairwise Jaccard of siblings' token_versions sets within each
+        rollout.n group, averaged across groups in the batch. 1.0 means
+        all siblings share the same set of weight versions (segments
+        were routed consistently); lower means siblings diverged.
 
     Best-effort diagnostics: fetch failures and per-key missing/malformed
     `token_versions` (e.g. a case-1 piggyback trajectory in a mixed batch)
@@ -289,6 +294,58 @@ def compute_and_emit_token_staleness_metrics(batch, metrics, global_steps):
                 gap_buckets["4plus"] += 1
             if gap > 0:
                 staleness_diffs.append(abs(rollout[j] - new_rollout[j]))
+
+    # P2 metric: group_version_set_jaccard_mean.
+    # For each rollout.n group, compute mean pairwise Jaccard of siblings'
+    # token_versions sets. Aggregate as mean across groups in the batch.
+    # Edge cases:
+    #   - group_id tag missing: skip that trajectory
+    #   - token_versions missing/malformed: skip that trajectory
+    #   - group with 1 sibling: trivially consistent (J=1.0)
+    #   - both sibling sets empty: trivially consistent (J=1.0)
+    group_sibling_versions: dict[str, list[set]] = {}
+    for i in range(len(batch.keys)):
+        tag = batch.tags[i] if i < len(batch.tags) else None
+        gid = (tag or {}).get("group_id")
+        if gid is None:
+            continue
+        tv_entry = token_versions_field[i] if token_versions_field is not None else None
+        if tv_entry is None:
+            continue
+        try:
+            V_i = set(int(v) for v in tv_entry.tolist())
+        except Exception as e:
+            logger.debug(
+                f"group jaccard: skipping key {batch.keys[i]} (malformed token_versions): {e}"
+            )
+            continue
+        group_sibling_versions.setdefault(gid, []).append(V_i)
+
+    jaccard_values: list[float] = []
+    for _gid, sibling_sets in group_sibling_versions.items():
+        n = len(sibling_sets)
+        if n == 1:
+            jaccard_values.append(1.0)
+            continue
+        pair_sum = 0.0
+        pair_count = 0
+        for a in range(n):
+            for b in range(a + 1, n):
+                V_a, V_b = sibling_sets[a], sibling_sets[b]
+                union = V_a | V_b
+                if not union:
+                    j = 1.0
+                else:
+                    j = len(V_a & V_b) / len(union)
+                pair_sum += j
+                pair_count += 1
+        if pair_count > 0:
+            jaccard_values.append(pair_sum / pair_count)
+
+    if jaccard_values:
+        metrics["offpolicy_token/group_version_set_jaccard_mean"] = (
+            sum(jaccard_values) / len(jaccard_values)
+        )
 
     if total_tokens == 0:
         return
