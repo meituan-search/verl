@@ -12,7 +12,10 @@ env_vars:
   https_proxy: "http://set-zw05-mlp-codelab-pc242:10181"
   HTTP_PROXY: "http://set-zw05-mlp-codelab-pc242:10181"
   HTTPS_PROXY: "http://set-zw05-mlp-codelab-pc242:10181"
-  PYTHONPATH: "third_party/sglang/python:$PYTHONPATH"
+  # PYTHONPATH intentionally omitted — verl/trainer/constants_ppo.py forwards
+  # the driver's PYTHONPATH (which already includes third_party/sglang/python
+  # via ray job submit's working_dir setup) to all workers. Setting it here
+  # conflicts with the driver-side runtime_env at ray.init merge time.
 
 excludes:
   - ".git/"
