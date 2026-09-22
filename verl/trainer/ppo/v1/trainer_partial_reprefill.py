@@ -235,10 +235,10 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
         so case 2 reprefill in on_sampled can run. The full abort + sleep
         still happens in on_sample_end.
 
-        Disabled when there are no case 2 trajectories expected (no-op
-        overhead). The gate is cheap (one Ray RPC per replica), so we
-        always fire it for simplicity — the SGLang side is a no-op if
-        no surplus generation is in flight.
+        SGLang's abort_except_prefill mode uses precise abort (per-rid
+        AbortReq) so pre-dispatched reprefill already in the scheduler is
+        preserved — on_sampled's pipelined path consumes their futures
+        normally without fallback.
         """
         cfg = self.config.trainer.v1.partial_reprefill
         if not cfg.get("enable_filtered_pause", True):
