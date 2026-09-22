@@ -274,6 +274,13 @@ class RolloutReplica(ABC):
         """Partial rollout: abort and save all unfinished requests in each rollout server."""
         await asyncio.gather(*[server.abort_all_requests.remote() for server in self.servers])
 
+    async def abort_all_requests_filtered(self):
+        """Q15 filtered pause: abort in-flight requests but let reprefill
+        requests through. Base implementation falls back to full abort
+        (backends without filtered-pause support). SGLang overrides this.
+        """
+        await self.abort_all_requests()
+
     async def resume_generation(self):
         """Resume generation on all servers after abort_all_requests."""
         await asyncio.gather(*[server.resume_generation.remote() for server in self.servers])

@@ -566,6 +566,7 @@ class PPOTrainer(ABC):
             )
             metrics.update(off_policy_metrics)
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+            self._on_sample_returned(batch, metrics)
             batch = self.on_sampled(batch, metrics=metrics)
             self.on_sample_end()
 
@@ -660,6 +661,16 @@ class PPOTrainer(ABC):
 
     def on_sample_begin(self):
         """Called at the beginning of sampling batch from replay buffer."""
+        return
+
+    def _on_sample_returned(self, batch: "KVBatchMeta", metrics: dict) -> None:
+        """Called right after replay_buffer.sample() returns, before on_sampled.
+
+        Override to inject pre-on_sampled actions while the rollout engine is
+        still awake and no reprefill requests are in flight yet. Default: no-op.
+        partial_reprefill uses this to trigger Q15 filtered pause (stop surplus
+        generation while letting case 2 reprefill through during on_sampled).
+        """
         return
 
     def on_sampled(self, batch: "KVBatchMeta", metrics: dict) -> "KVBatchMeta":

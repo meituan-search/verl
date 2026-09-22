@@ -460,6 +460,14 @@ class CheckpointEngineManager:
         await asyncio.gather(*[r.abort_all_requests() for r in self.replicas])
 
     @auto_await
+    async def abort_replicas_filtered(self):
+        """Q15 filtered pause: abort in-flight requests on every replica,
+        but let reprefill requests through. SGLang-only; other backends
+        fall back to full abort via RolloutReplica.abort_all_requests_filtered.
+        """
+        await asyncio.gather(*[r.abort_all_requests_filtered() for r in self.replicas])
+
+    @auto_await
     async def resume_generation_replicas(self):
         """Resume generation on all replicas after abort_all_requests."""
         await asyncio.gather(*[r.resume_generation() for r in self.replicas])

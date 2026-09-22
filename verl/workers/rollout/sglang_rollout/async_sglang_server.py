@@ -751,6 +751,21 @@ class SGLangHttpServer:
             return
         await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="abort"))
 
+    async def abort_all_requests_filtered(self):
+        """Q15 filtered pause: abort in-flight requests but let reprefill
+        requests (rid starts with 'reprefill_') through the cond gate.
+
+        Used by verl partial_reprefill trainer between replay_buffer.sample()
+        and on_sampled() to stop surplus generation while case 2 reprefill
+        runs. Caller must later call abort_all_requests (full abort) +
+        resume_generation to clear state.
+        """
+        if self.node_rank != 0:
+            return
+        await self.tokenizer_manager.pause_generation(
+            PauseGenerationReqInput(mode="abort_except_prefill")
+        )
+
     async def resume_generation(self):
         if self.node_rank != 0:
             return
@@ -903,6 +918,10 @@ class SGLangReplica(RolloutReplica):
         multi-node replica, so avoid broadcasting this call to every server.
         """
         await self.servers[0].abort_all_requests.remote()
+
+    async def abort_all_requests_filtered(self):
+        """Q15 filtered pause — see SGLangHttpServer.abort_all_requests_filtered."""
+        await self.servers[0].abort_all_requests_filtered.remote()
 
     async def resume_generation(self):
         """Resume generation on the primary server after abort_all_requests."""

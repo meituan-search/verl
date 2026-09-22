@@ -321,6 +321,14 @@ trainer:
       # trainer_old_log_probs.
       compare_trainer_old_log_prob: false
 
+      # Q15 filtered pause: when sample() returns, immediately send SGLang a
+      # filtered pause (abort in-flight surplus generation, let reprefill
+      # requests through) before running on_sampled's case 2 reprefill. Closes
+      # the sample→abort window where surplus generation would otherwise keep
+      # producing stale groups. SGLang-only; other backends fall back to full
+      # abort (no filtered-pause support).
+      enable_filtered_pause: true
+
     # Replay buffer sampling strategy
     sampler:
 

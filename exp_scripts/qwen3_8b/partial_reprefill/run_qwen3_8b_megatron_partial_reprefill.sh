@@ -27,6 +27,7 @@
 #   trainer.v1.partial_reprefill.enable_piggyback={true|false}  (default true — case 1)
 #   trainer.v1.partial_reprefill.case2_reprefill_mode={engine|trainer|copy}  (default engine — case 2)
 #   trainer.v1.partial_reprefill.max_resume_staleness=N  (default 0 — case 1/3 staleness budget)
+#   trainer.v1.partial_reprefill.enable_filtered_pause={true|false}  (default true — Q15)
 #
 # ⚠️ UNVERIFIED: Case 1 piggyback depends on SGLang emitting prompt_logprobs
 # during a max_new_tokens>0 resume prefill. The SGLang spike (spec Task 4)
@@ -105,6 +106,16 @@ CASE2_REPREFILL_MODE=${CASE2_REPREFILL_MODE:-engine}
 # instead of a full reprefill. Tradeoff: old_log_probs one step older,
 # watch offpolicy/staleness/* and actor/kl_loss.
 MAX_RESUME_STALENESS=${MAX_RESUME_STALENESS:-0}
+
+# Q15 filtered pause: when sample() returns, immediately send SGLang a
+# filtered pause (abort in-flight surplus generation, let reprefill requests
+# through) before on_sampled's case 2 reprefill. Closes the sample→abort
+# window where surplus generation would keep producing stale groups.
+# SGLang-only. Known regression: pre-dispatched reprefill (P2 pipelining)
+# that's still in-flight when the pause fires gets aborted → on_sampled
+# falls back to synchronous reissue (correct but slower). Disable if P2
+# pipelining regression is unacceptable.
+ENABLE_FILTERED_PAUSE=${ENABLE_FILTERED_PAUSE:-True}
 
 # Per-dataset defaults. Any knob can still be overridden via its env var
 # (TRAIN_FILES, TRAIN_BATCH_SIZE, ACTOR_LR, ...). DATASET just picks the base.
@@ -236,6 +247,7 @@ TRAINER=(
     trainer.v1.partial_reprefill.case2_reprefill_mode=${CASE2_REPREFILL_MODE}
     trainer.v1.partial_reprefill.max_resume_staleness=${MAX_RESUME_STALENESS}
     trainer.v1.partial_reprefill.compare_trainer_old_log_prob=${COMPARE_TRAINER_OLD_LOG_PROB}
+    trainer.v1.partial_reprefill.enable_filtered_pause=${ENABLE_FILTERED_PAUSE}
 )
 
 EXTRA=(

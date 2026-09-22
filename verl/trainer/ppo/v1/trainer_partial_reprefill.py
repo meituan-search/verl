@@ -227,6 +227,25 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
                 batch = self._compute_new_rollout_log_prob(batch, metrics)
         return batch
 
+    def _on_sample_returned(self, batch: KVBatchMeta, metrics: dict) -> None:
+        """Q15: filtered-pause SGLang right after sample() returns.
+
+        Abort in-flight surplus generation (stop the sample→abort window
+        from producing more surplus) but let reprefill requests through
+        so case 2 reprefill in on_sampled can run. The full abort + sleep
+        still happens in on_sample_end.
+
+        Disabled when there are no case 2 trajectories expected (no-op
+        overhead). The gate is cheap (one Ray RPC per replica), so we
+        always fire it for simplicity — the SGLang side is a no-op if
+        no surplus generation is in flight.
+        """
+        cfg = self.config.trainer.v1.partial_reprefill
+        if not cfg.get("enable_filtered_pause", True):
+            return
+        with marked_timer("filtered_pause", self.timing_raw, color="blue"):
+            self.checkpoint_manager.abort_replicas_filtered()
+
     @auto_await
     async def _reprefill_all(self, prompt_ids_list):
         return await reprefill_trajectories(
