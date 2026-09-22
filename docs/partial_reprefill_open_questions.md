@@ -413,3 +413,219 @@ token_versions 如何赋值？可能产生 staleness 统计偏差。
   循环里每次 `super().generate()` 都传同一 `group_id`，sticky 自然稳定。
 - `GlobalLoadBalancer` 本身不需要改——它只看传入的 key 字符串，不关心
   是 request_id 还是 group_id。
+
+---
+
+## Q15: step 边界硬切换 — 攒够 batch 数 group 即停止 rollout，partial group 留到下 step
+
+**group 内 sibling 的独立性**（前提）：
+- group 内 `rollout.n` 条 sibling **各自独立**向 SGLang 发 generate
+  请求，独立生成、独立被 retract、独立 multi-segment resume。
+- sibling 之间在 rollout 阶段无耦合——A sibling 被 retract 不影响
+  B sibling 的生成。
+- **唯一耦合点**：group 内所有 `rollout.n` 条 sibling 都 `finished`
+  后，整个 group 才能被 trainer 消费进入训练。`_classify_cases`
+  （`trainer_partial_reprefill.py:284-289`）按 group 聚合判
+  `all_stale` / `partial_stale`。
+
+**`all_stale` 的精确语义**（来自 `_classify_cases`）：
+- `group_stale[uid]` = 该 group 里 `reason == "stale"` 的 sibling 数
+  （`stale` 指该 sibling 被 resume 过，跨了权重版本）。
+- `all_stale`: `stale == total`（group 内所有 sibling 都 stale）。
+- `partial_stale`: `stale < total`（含 0 个 stale 的 group）。
+- `all_stale == 0` 的等价表述：每个被消费的 group 至少有 1 个 sibling
+  是本 step 完整生成（没 resume 过）。
+
+**问题**：当前 `partial_reprefill` 的 rollout 持续时间长（跑到所有
+group 完成或外部触发条件才进训练）。rollout 时间长 → SGLang KV 紧张
+频次高 → sibling 被 retract/resume 机会多 → stale token 累积 →
+`all_stale` 比例高。虽然 P2 度量 `group_version_set_jaccard_mean`
+高（sibling 一致 stale），但训练 step 里大量"全 stale group"是
+训练质量的不利信号。
+
+**目标新语义**：
+- **攒够 `train_batch_size` 个完整 group 时，立即触发 rollout→train
+  切换**：调 `abort_all` 清空 SGLang 在飞 request（含 partial group
+  的 sibling），已完成的 group 进入本 step 训练 batch。
+- **partial group 不丢弃**——被 abort 的 partial group sibling 通过
+  multi-segment resume 在下一 step 续传（已生成部分作为新 prompt
+  重新发给新权重的 SGLang），最终被后续 step 消费。
+- **缩短 rollout 持续时间** → 减少 retract/resume 频次 → 减少
+  stale token 累积 → `all_stale` 自然下降。Q15 不强制 `all_stale == 0`
+  （偶发噪声可接受），但通过缩短 rollout 时间使其趋近 0。
+- **允许 `partial_stale`**：group 内部分 sibling 跨 step 边界、
+  下一 step 完成，是 OK 的。
+
+**时序图**（Q15 跨 step 流程，以 step N → step N+1 为例）：
+
+```
+    verl trainer                  verl rollout client              SGLang engine
+    (rollout poll)                (LLMServerClient)                (Scheduler)
+        │                                │                              │
+   ─────┼──────── step N rollout 阶段 ───┼──────────────────────────────┼─────
+        │  发新 group g1..gk             │  generate(g1.s1..sk.sn)      │
+        │  (每 group n 条 sibling)       │ ───────────────────────────► │ prefill+decode
+        │                                │                              │ g1.s1 finished
+        │                                │ ◄──────────────────────────  │ g1.s2 finished
+        │  poll replay buffer            │                              │ ... g1.sn finished
+        │  g1 完整 ✓                     │                              │
+        │  poll... g2 完整 ✓             │                              │ g2.s1 retracted
+        │                                │                              │   ↳ waiting_queue
+        │                                │                              │ g2.s2 finished
+        │  ...                           │                              │ ... g2.sn finished
+        │  g2 完整 ✓ (g2.s1 partial)     │                              │
+        │  poll...                       │                              │ g3.s1 generating
+        │  g3 partial (s1 在飞)          │                              │ g3.s2 generating
+        │                                │                              │
+        │  完整 group 计数 == batch_size │                              │
+        │  触发切换 ────────────────────►│ abort_all() ──────────────► │ 清空 waiting_queue
+        │                                │                              │ 清空 running_batch
+        │                                │                              │ 清空 KV cache
+        │                                │                              │ (g3.s1/s2 被 abort)
+        │                                │                              │
+   ─────┼──────── step N train 阶段 ─────┼──────────────────────────────┼─────
+        │  用 batch_size 个完整 group 训练                              │
+        │  (含 g2.s1 partial stale)                                     │
+        │  得到新参数 W_{N+1}                                           │
+        │                                │                              │
+        │  参数同步 ──────────────────────────────────────────────────► │ 权重更新 → W_{N+1}
+        │                                │                              │
+   ─────┼──────── step N+1 rollout 阶段 ─┼──────────────────────────────┼─────
+        │  通知 rollout 恢复            │                              │
+        │  ◄─────────────────────────────│                              │
+        │                                │  resume g3.s1                │
+        │                                │  (已生成 prefix + 新 prompt) │
+        │                                │ ───────────────────────────► │ 用 W_{N+1} prefill prefix
+        │                                │                              │   ↳ radix cache 命中
+        │                                │                              │   ↳ 继续生成剩余 token
+        │  发新 group g4..               │  generate(g4.s1..)           │
+        │                                │ ───────────────────────────► │ prefill+decode
+        │                                │                              │ g3.s1 finished
+        │                                │ ◄──────────────────────────  │ g3.s2 finished
+        │  poll... g3 完整 ✓             │                              │
+        │  (g3.s1/s2 跨 step N+1 完成，   │                              │
+        │   partial_stale)               │                              │
+        │  ...                           │                              │
+```
+
+**时序图关键点**：
+- **step N rollout**：发 g1..gk，g1/g2 依次完整，g3 partial（s1/s2 还在飞）
+- **触发切换**：完整 group 计数 == `train_batch_size`（图中 g1+g2==2，假设 batch_size=2）→ 调 `abort_all`
+- **`abort_all` 行为**：清空 SGLang waiting_queue / running_batch / KV cache；g3.s1/s2 被 abort
+- **step N train**：用 g1+g2 训练（g2.s1 是 partial_stale，跨了 resume_version），得到 W_{N+1}
+- **参数同步**：W_{N+1} 同步给 SGLang
+- **step N+1 rollout**：
+  - g3.s1/s2 通过 multi-segment resume 续传（已生成 prefix 作为新 prompt 重新发给 W_{N+1} 的 SGLang，radix cache 命中 prefix）
+  - 同时发新 group g4
+  - g3 完成 → 写入 replay buffer，被 step N+1 或后续 step 消费（partial_stale）
+
+
+**与 Q8/Q9 retract/admit affinity 的关系**：
+- **Q8 retract affinity 语义不变**：SGLang 内部 retract 时优先
+  retract 已有 sibling 被 retract 的 group——目的是"集中 retract
+  同 group，让被 retract的 group 整体推迟、让其他 group 优先用 KV
+  资源完成"，即**优先保证 group 粒度的完成**。
+- **Q9 admit affinity 语义不变**：admit 时优先让已有 sibling 在飞
+  的 group 继续 admit，让 group 尽快完成。
+- Q15 不改动 SGLang 侧的 affinity 行为。Q15 只在 trainer 侧加一个
+  触发条件：攒够 `train_batch_size` 个完整 group 就停止本 step 的
+  rollout 消费。
+
+**与 Q11 决议的关系**：
+- Q11 决议：`abort_all` 后 multi-segment resume 继续生成，group 跨
+  segment 完成。这是现有机制。
+- Q15 依赖 Q11——partial group 的 sibling 被 `abort_all` 中断后，
+  靠 multi-segment resume 在下一 step 续传。Q15 不改这个机制，只改
+  触发 `abort_all` 的条件。
+- Q15 不冲突 Q11，也不冲突 Q8/Q9。
+
+**与 `max_resume_staleness` 的关系**：
+- Q15 模式下 `max_resume_staleness` 仍有意义——partial group 跨
+  step 续传，需要限制最多跨多少 step（避免老 group 永远完不成）。
+- 语义不变：限制单条 trajectory 跨多少权重版本。
+
+**与 P2 度量 `group_version_set_jaccard_mean` 的关系**：
+- Q15 模式下该度量仍是 P2 判据——`partial_stale` group 的 sibling
+  version set 部分重叠（有的 sibling 本 step 完成，有的跨 step 完成），
+  Jaccard 介于 0 和 1 之间。
+- `all_stale` 下降 + `jaccard_mean` 保持高位 = P2 目标达成（sibling
+  跨版本的版本集合尽量一致，且 group 内至少有 fresh sibling）。
+
+**实施方向（待定细节）**：
+
+- **当前 rollout/train 串行流程**（Q15 不改串行结构，只改触发条件）：
+  1. **rollout 阶段**：verl 发 generate 请求给 SGLang，SGLang 生成轨迹。
+  2. **切换触发**：攒够 `train_batch_size` 个完整 group → 调
+     `abort_all` 清空 SGLang 所有在飞 request（含 partial group 的
+     在飞 sibling）。
+  3. **train 阶段**：用这批完整 group 训练，得到新参数。
+  4. **参数同步**：新参数同步给 SGLang（权重更新）。
+  5. **下一 step rollout 恢复**：
+     - **partial group 的 sibling 续传**：被 abort 的 partial group
+       sibling 通过 multi-segment resume 续传——已生成部分作为新
+       prompt 重新发给新权重的 SGLang，继续生成剩余 token
+       （`FullyAsyncLLMServerClient.generate` 的 multi-segment while
+       循环天然处理）。
+     - **本 step 也可以发新 group**（取决于配置和 KV 容量）。
+
+- **`abort_all` 必须调**：不是可选——它清空 SGLang 状态以接收新权重。
+  partial group 的 sibling 被 abort 后不丢弃，靠 multi-segment resume
+  在下一 step 续传。
+
+- **触发点**：trainer 侧 replay buffer poll loop
+  （`trainer_partial_reprefill.py` 的 sample 消费路径）。
+  当前流程已经在某个条件触发 `abort_all` + 切换 train；Q15 改的是
+  触发条件——从"等所有 group 完成（或当前的其他条件）"改为"攒够
+  `train_batch_size` 个完整 group"。
+
+- **"完整 group" 判定**：group 的所有 `rollout.n` sibling 都已
+  `finished`。不要求 `resume_version == current_step_version`——
+  允许 partial stale（部分 sibling 跨 step 完成）。
+
+- **partial group 跨 step 续传**：在飞 sibling 的
+  `FullyAsyncLLMServerClient.generate` 多 segment 循环在 `abort_all`
+  后被中断，下一 step 用新权重重新发请求（已生成部分作为新 prompt），
+  继续生成剩余 token。完成后写入 replay buffer，等待后续 step 消费。
+  这是 Q11 决议的现有机制，Q15 不改。
+
+- **SGLang 侧无改动**：retract_decode / get_new_batch_prefill 的
+  affinity 行为保持 Q8/Q9 原方向（集中 retract/admit 同 group，
+  优先保证 group 粒度完成）。
+
+**代价**：
+- **partial group 的 prefix 重算开销**：`abort_all` 释放 KV cache，
+  下一 step resume 时需要重新 prefill 已生成部分。但 multi-segment
+  resume 有 prefix 复用（radix cache 命中），开销不等于全量重算。
+  Q11 决议已接受这个开销。
+- **step 延迟**：无额外延迟（攒够就停，比"等所有 group 完成"更快
+  进入训练）。
+- **rollout 吞吐下降**：每 step 只产出 `train_batch_size` 个完整
+  group + 若干 partial group，比"跑到所有 group 完成"产出少。但
+  这正是 Q15 的目的——用更少的 rollout 时间换取更少的 stale token。
+- **跨 step KV 状态**：`abort_all` 清空 KV，下一 step 从冷启动开始
+  （partial group resume 靠 radix cache 复用 prefix，不是跨 step KV
+  保持）。Q11 已处理。
+
+**与 Q14 LB 路由亲和的协同**：
+- Q14 把同 group sibling 路由到同一 engine——Q8/Q9 affinity 依赖
+  这一点才能生效。Q15 不直接依赖 Q14（Q15 是 trainer 侧触发逻辑），
+  但 Q15 的效果（`all_stale` 下降）依赖 Q8/Q9 affinity 的效果
+  （group 粒度优先完成），间接依赖 Q14。
+
+**不在本决议范围**：
+- partial group 跨多少 step 过期丢弃——由 `max_resume_staleness`
+  控制，本决议不改。
+- `train_batch_size` 动态调整——当前固定。
+- 跨 step 的 group 优先级调度——下 step 是否优先完成 partial group
+  vs 发新 group，由 SGLang admit affinity（Q9）自然处理（partial
+  group 的 sibling 已在飞，admit 优先）。
+- SGLang 侧 affinity 改动——Q15 不改 SGLang，Q8/Q9 保持原方向。
+
+**待定问题**：
+- 触发阈值：严格 `== train_batch_size` 还是 `>=`？严格等于更干净
+  （训练 batch 恰好是 batch_size 个 group），倾向严格等于。
+- warmup 阶段：`num_warmup_batches` 阶段是否也用 Q15 语义？倾向是，
+  保持一致。
+- `rollout.n=1` 退化为非 GRPO 场景：Q15 仍适用（group 即单条轨迹），
+  `all_stale` 含义退化为"该轨迹是否跨 step"，仍要求趋近 0。
+
