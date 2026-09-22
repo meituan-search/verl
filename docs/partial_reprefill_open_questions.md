@@ -443,6 +443,84 @@ group 完成或外部触发条件才进训练）。rollout 时间长 → SGLang 
 高（sibling 一致 stale），但训练 step 里大量"全 stale group"是
 训练质量的不利信号。
 
+### 现状诊断（dapo-math, t16_sglang_ga_test2 run, 2026-09-22）
+
+数据来源：`tmp/csv/run-qwen3_8B_dapo-math_partial_reprefill_t16_sglang_ga_test2-tag-*.csv`。
+4 条曲线：`group_staleness.all_stale` / `group_staleness.partial_stale` /
+`timing_s/gen` / `timing_s/new_rollout_log_prob`，共 24 步。
+
+| step | all_stale | partial_stale | gen(s) | new_rollout(s) | new_roll/gen |
+|------|-----------|---------------|--------|----------------|--------------|
+| 1  | 0  | 0  | 1263 | 2    | 0.2% (warmup) |
+| 2  | 0  | 44 | 1687 | 531  | 31.5% |
+| 3  | 75 | 29 | 1273 | 704  | 55.4% |
+| 4  | 94 | 15 | 941  | 374  | 39.8% |
+| 5  | 48 | 43 | 1135 | 414  | 36.5% |
+| 6  | 55 | 36 | **117** | 114 | **98%** ← fast |
+| 7  | 0  | 0  | 1108 | 0.5  | 0% ← reset |
+| 8  | 2  | 49 | 1229 | 274  | 22.4% |
+| 9  | 37 | 31 | 1187 | 237  | 20.0% |
+| 10 | 42 | 42 | 877  | 133  | 15.2% |
+| 11 | 17 | 30 | **57**  | 56  | **97%** ← fast |
+| 12 | 0  | 0  | 1106 | 0.6  | 0% ← reset |
+| 13 | 4  | 45 | 1236 | 233  | 18.9% |
+| 14 | 39 | 38 | 1268 | 353  | 27.9% |
+| 15 | 47 | 40 | 826  | 94   | 11.5% |
+| 16 | 19 | 49 | **77**  | 75  | **97.5%** ← fast |
+| 17 | 0  | 1  | 1095 | 12   | 1.1% ← reset |
+| 18 | 10 | 40 | 1466 | 544  | 37.1% |
+| 19 | 71 | 30 | 778  | 174  | 22.4% |
+| 20 | 18 | 45 | 1027 | 144  | 14.1% |
+| 21 | 35 | 42 | **83**  | 81  | **97.5%** ← fast |
+| 22 | 0  | 0  | 1068 | 0.6  | 0.1% ← reset |
+| 23 | 0  | 44 | 1010 | 11   | 1.1% |
+| 24 | 1  | 37 | 1061 | 129  | 12.2% |
+
+**5-step 周期**：4 步 stale 累积 + 1 步 fast drain + 1 步 reset，
+循环往复。具体表现：
+
+- **stale 累积期（step 3-5 / 8-10 / 13-15 / 18-20）**：
+  `gen ≈ 800-1500s`，`new_rollout ≈ 100-700s`（占 gen 20-55%），
+  `all_stale` 在 37-94 之间攀升。这是 sample→abort 窗口里 surplus
+  继续生成 + 跨 step 滞留累积的阶段。
+- **fast drain 步（step 6 / 11 / 16 / 21）**：`gen ≈ 60-120s`，
+  `new_rollout ≈ gen`（97-98%）。`sample()` 几乎没等就拿到
+  `train_batch_size` 个完成 group——说明 buffer 里**攒了 ≥ 1 batch
+  的 surplus**。消费最老的 surplus → `all_stale = 17-55`。
+- **reset 步（step 7 / 12 / 17 / 22）**：`gen ≈ 1100s`，
+  `new_rollout ≈ 0.5s`，`all_stale = 0`。上一 fast 步把 surplus
+  drain 干净，本步从 0 开始攒，新生成的 group 都在当前 weight 下，
+  case 3 命中、0 stale。
+
+**根因结论**：
+
+1. **surplus 跨 step 累积是 `all_stale` 的主因**，不是 sample→abort
+   窗口。证据：fast drain 步 `gen=60-120s` 说明 buffer 里有现成 ≥ 1
+   batch 的完成组；这些组是前几步累积下来的 surplus，`resume_version`
+   落后当前 weight 1 步 → `decide_case` 返回 `stale` → `all_stale` 高。
+2. **sample→abort 窗口贡献次要**：稳态 step `new_rollout_log_prob`
+   占 `gen` 的 20-55%，这段时间 SGLang 同时跑 reprefill 和 surplus
+   生成，会制造少量额外 surplus。但量级远小于跨 step 累积。
+3. **reset 步证明**：当 buffer 被 drain 干净、从 0 开始攒时，
+   `all_stale = 0`——说明只要没有跨 step surplus，rollout 时间长
+   本身不会导致 `all_stale`。
+
+**对 Q15 设计的启示**：
+
+- **仅"立即 abort"不够**：把 `abort_all` 提到 `has_enough_samples`
+  命中时执行，只能压缩 sample→abort 的 20-55% 窗口。fast drain 步
+  的 surplus 仍会跨 step 滞留 → `all_stale` 仍高。
+- **需控制 in-flight 深度**：当前 `on_train_begin` 加
+  `num_warmup_batches=1` 个 batch + 每 step `_add_batch_to_generate`
+  无条件加 1 batch + multi-segment resume 的 partial group 跨 step
+  延续，in-flight 会膨胀。Q15 需改为"只在 buffer 中
+  `finished + in-flight < train_batch_size` 时才 dispatch 新 prompt"。
+- **partial group 跨 step 是 surplus 的隐形来源**：abort_all 时
+  被 retract 的 sibling 下一 step resume，完成时序参差，会把同 group
+  的其他 sibling 拖到跨 step 才完成 → 整组成 surplus。Q15 的"攒够
+  就 abort"需配合"下一 step 不为这些 partial group dispatch 新
+  sibling"，否则组里又混入新 sibling，永远凑不齐。
+
 **目标新语义**：
 - **攒够 `train_batch_size` 个完整 group 时，立即触发 rollout→train
   切换**：调 `abort_all` 清空 SGLang 在飞 request（含 partial group
