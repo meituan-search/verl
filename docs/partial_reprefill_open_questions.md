@@ -629,57 +629,132 @@ group 完成或外部触发条件才进训练）。rollout 时间长 → SGLang 
 - `all_stale` 下降 + `jaccard_mean` 保持高位 = P2 目标达成（sibling
   跨版本的版本集合尽量一致，且 group 内至少有 fresh sibling）。
 
-**实施方向（待定细节）**：
+**实施方向（filtered pause 方案，2026-09-22 重新设计）**：
 
-- **当前 rollout/train 串行流程**（Q15 不改串行结构，只改触发条件）：
-  1. **rollout 阶段**：verl 发 generate 请求给 SGLang，SGLang 生成轨迹。
-  2. **切换触发**：攒够 `train_batch_size` 个完整 group → 调
-     `abort_all` 清空 SGLang 所有在飞 request（含 partial group 的
-     在飞 sibling）。
-  3. **train 阶段**：用这批完整 group 训练，得到新参数。
-  4. **参数同步**：新参数同步给 SGLang（权重更新）。
-  5. **下一 step rollout 恢复**：
-     - **partial group 的 sibling 续传**：被 abort 的 partial group
-       sibling 通过 multi-segment resume 续传——已生成部分作为新
-       prompt 重新发给新权重的 SGLang，继续生成剩余 token
-       （`FullyAsyncLLMServerClient.generate` 的 multi-segment while
-       循环天然处理）。
-     - **本 step 也可以发新 group**（取决于配置和 KV 容量）。
+**背景**：原"立即 abort"方案不可行——`abort_all` 会设
+`is_pause=True`（`tokenizer_manager.py:1489-1502`），新请求在
+`tokenizer_manager.py:544` 的 `is_pause_cond.wait_for` 阻塞，case 2
+reprefill 请求无法在 `on_sampled` 阶段发出。Q15 改用 filtered pause：
+abort in-flight surplus 生成请求，但放行 reprefill 请求。
 
-- **`abort_all` 必须调**：不是可选——它清空 SGLang 状态以接收新权重。
-  partial group 的 sibling 被 abort 后不丢弃，靠 multi-segment resume
-  在下一 step 续传。
+**case 2 reprefill 的定义**：`_classify_cases` 把每条 trajectory
+分成 3 类（`trainer_partial_reprefill.py:238-290`）：
+- case 1 (piggyback)：partial-rollout 轨迹，prefix 在 resume 时已
+  re-prefilled，client 已写 `new_rollout_log_probs`，trainer 直接读。
+- **case 2 (fully-stale)**：整条轨迹在旧权重下解码，logprobs 跨了
+  权重版本。trainer 必须在当前 SGLang 权重下重新 prefill 整条
+  prompt+response，取 `prompt_logprobs=0` → 切出
+  `new_rollout_log_probs`。这就是 "case 2 reprefill"。
+- case 3 (fully-fresh)：整条轨迹在当前权重下解码，
+  `rollout_log_probs` 就是 `new_rollout_log_probs`，直接 copy。
 
-- **触发点**：trainer 侧 replay buffer poll loop
-  （`trainer_partial_reprefill.py` 的 sample 消费路径）。
-  当前流程已经在某个条件触发 `abort_all` + 切换 train；Q15 改的是
-  触发条件——从"等所有 group 完成（或当前的其他条件）"改为"攒够
-  `train_batch_size` 个完整 group"。
+case 2 reprefill 在 `on_sampled` 里跑（`_compute_new_rollout_log_prob`
+→ `_reprefill_case2`），发 `max_new_tokens=0, prompt_logprobs=0` 的
+generate 请求给 SGLang，`request_id` 前缀 `"reprefill_"`
+（`reprefill_utils.py:79`）。case 1/3 不发请求。
 
-- **"完整 group" 判定**：group 的所有 `rollout.n` sibling 都已
-  `finished`。不要求 `resume_version == current_step_version`——
-  允许 partial stale（部分 sibling 跨 step 完成）。
+**filtered pause 方案流程**：
 
-- **partial group 跨 step 续传**：在飞 sibling 的
-  `FullyAsyncLLMServerClient.generate` 多 segment 循环在 `abort_all`
-  后被中断，下一 step 用新权重重新发请求（已生成部分作为新 prompt），
-  继续生成剩余 token。完成后写入 replay buffer，等待后续 step 消费。
-  这是 Q11 决议的现有机制，Q15 不改。
+```
+sample() 返回 (has_enough_samples 命中, oldest-first 已选 batch_size 个 group)
+  │
+  ├─► 立即发 filtered pause 给 SGLang
+  │     (PauseGenerationReqInput.mode="abort_except_prefill")
+  │     ↳ SGLang: is_pause=True
+  │     ↳ abort_request(abort_all=True) 清 in-flight surplus 生成
+  │     ↳ tokenizer_manager 的 cond 放行条件改为:
+  │         not is_pause OR request.is_reprefill
+  │
+  ├─► on_sampled: case 2 reprefill 请求 (request_id="reprefill_*")
+  │     ↳ 通过 filtered pause gate, 在 SGLang 上跑 prefill
+  │     ↳ case 1/3 无 SGLang 操作
+  │
+  ├─► on_sample_end: 全量 abort + sleep_replicas (此时 reprefill 已跑完)
+  │     ↳ 清掉 filtered pause 期间堆积的 surplus 生成请求 (如果有)
+  │
+  ├─► update_weights (NCCL 同步新权重)
+  │     ↳ 内部调 pause_generation(mode="abort") 兼容 filtered pause
+  │
+  └─► resume_generation_replicas: is_pause=False
+        ↳ 堆积的 surplus 生成请求放行 (或被 on_sample_end 的 abort 清掉)
+```
 
-- **SGLang 侧无改动**：retract_decode / get_new_batch_prefill 的
-  affinity 行为保持 Q8/Q9 原方向（集中 retract/admit 同 group，
-  优先保证 group 粒度完成）。
+**实施要点**：
+
+- **SGLang 侧改动**（`third_party/sglang/python/sglang/srt/managers/tokenizer_manager.py`）：
+  - 新增 `PauseGenerationReqInput.mode="abort_except_prefill"`。
+  - `pause_generation` 里：`is_pause=True` + `abort_request(abort_all=True)`
+    + 记录 `pause_except_prefill=True` 标记。
+  - `tokenizer_manager.py:544` 的 `wait_for` 条件改为
+    `lambda: not self.is_pause or self._is_prefill_request(obj)`
+    （`_is_prefill_request` 判 `request_id.startswith("reprefill_")`
+    或 `sampling_params.prompt_logprobs is not None`）。
+  - `continue_generation` 清 `pause_except_prefill=False`。
+
+- **verl 侧改动**（`verl/trainer/ppo/v1/trainer_partial_reprefill.py`）：
+  - 新增 `on_sample_immediate_abort` 钩子（或改 `_step_once`），
+    在 `replay_buffer.sample()` 返回后立即调 SGLang 的
+    `pause_generation(mode="abort_except_prefill")`。
+  - 通过 `checkpoint_manager.abort_replicas_filtered()`（新方法）
+    或直接调 replica 的 `abort_all_requests_filtered()`。
+  - `on_sample_end` 仍调原 `abort_replicas` + `sleep_replicas`
+    （全量 abort，清堆积 + sleep）。
+
+- **顺序保证**：filtered pause 必须在 `on_sampled` 发 reprefill 请求
+  之前完成。`_step_once` 改为：
+  ```python
+  batch = self.replay_buffer.sample(...)
+  self._filtered_pause()          # ← 新增: 立即 filtered pause
+  batch = self.on_sampled(batch)  # reprefill 请求通过 filtered gate
+  self.on_sample_end()            # 全量 abort + sleep
+  ```
+
+- **与 `update_weights` 的兼容**：`update_weights`
+  （`checkpoint_engine/base.py:498-499`）会调
+  `abort_replicas`（mode="abort"）。如果 filtered pause 仍在生效，
+  `update_weights` 的 abort 是二次 abort——安全（idempotent）。
+  `resume_generation_replicas` 在 `update_weights` 末尾调
+  （`base.py:536`），清 `is_pause=False`，filtered pause 标记也清掉。
+
+**触发条件**：不改——仍是 `has_enough_samples` 命中
+（`len(sampleable_keys) >= batch_size`，`replay_buffer.py:545`）。
+Q15 改的是命中后的动作（立即 filtered pause），不是触发条件本身。
+
+**"完整 group" 判定**：group 的所有 `rollout.n` sibling 都已
+`finished`。不要求 `resume_version == current_step_version`——
+允许 partial stale（部分 sibling 跨 step 完成）。
+
+**partial group 跨 step 续传**：在飞 sibling 的
+`FullyAsyncLLMServerClient.generate` 多 segment 循环在 `abort_all`
+后被中断，下一 step 用新权重重新发请求（已生成部分作为新 prompt），
+继续生成剩余 token。完成后写入 replay buffer，等待后续 step 消费。
+这是 Q11 决议的现有机制，Q15 不改。
+
+**SGLang 侧 affinity 不改**：retract_decode / get_new_batch_prefill 的
+affinity 行为保持 Q8/Q9 原方向（集中 retract/admit 同 group，
+优先保证 group 粒度完成）。
 
 **代价**：
+- **SGLang tokenizer_manager 改动**：新增 filtered pause mode +
+  cond gate 判断逻辑。改动面小（~20 行），但触及核心调度路径，需
+  充分测试。
+- **reprefill 延迟与 abort 时序耦合**：filtered pause 必须先于
+  reprefill 请求生效，否则 reprefill 会被 surplus 生成抢资源。
+  实现里要确保 `_filtered_pause()` 是同步等待 SGLang 确认后再返回。
+- **filtered pause 期间堆积的 surplus 生成请求**：agent_loop 在
+  `on_sampled` 跑期间可能继续 dispatch 新 prompt（`_add_batch_to_generate`
+  在 step 开头已加，agent_loop 异步消费）。这些请求在 tokenizer_manager
+  的 cond 队列里堆积。`on_sample_end` 的全量 abort 清掉 in-flight，
+  但 cond 队列里还没进 scheduler 的请求不被 abort 清——它们在
+  `resume_generation` 后涌入。需要 `on_sample_end` 额外清 cond 队列
+  （或 agent_loop 侧配合 cancel pending dispatch）。
 - **partial group 的 prefix 重算开销**：`abort_all` 释放 KV cache，
   下一 step resume 时需要重新 prefill 已生成部分。但 multi-segment
   resume 有 prefix 复用（radix cache 命中），开销不等于全量重算。
   Q11 决议已接受这个开销。
-- **step 延迟**：无额外延迟（攒够就停，比"等所有 group 完成"更快
-  进入训练）。
-- **rollout 吞吐下降**：每 step 只产出 `train_batch_size` 个完整
-  group + 若干 partial group，比"跑到所有 group 完成"产出少。但
-  这正是 Q15 的目的——用更少的 rollout 时间换取更少的 stale token。
+- **rollout 吞吐下降**：filtered pause 提前了 abort 时机，surplus
+  生成窗口缩短 → 本 step 产出的完整 group 更少。但这是 Q15 的目的
+  ——用更少的 rollout 时间换取更少的 stale token。
 - **跨 step KV 状态**：`abort_all` 清空 KV，下一 step 从冷启动开始
   （partial group resume 靠 radix cache 复用 prefix，不是跨 step KV
   保持）。Q11 已处理。
