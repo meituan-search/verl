@@ -1,11 +1,33 @@
 #!/usr/bin/env bash
-# GRPO | Qwen3-8B | Megatron training | NVIDIA GPUs
+# GRPO | Qwen3-8B | Megatron training | colocate_async trainer | NVIDIA GPUs
+#
+# V1 PPO colocate-async trainer. Rollout runs on SGLang colocated with the
+# Megatron actor; partial rollout is enabled (abort-resume across weight
+# updates). Each step aborts all in-flight requests at on_sample_end, then
+# update_weights + resume_generation on the next step.
+#
+# Group affinity (Q8 retract / Q9 admit) is wired through unconditionally:
+# agent_loop_tq sets group_id=f"{step}_{uid}" per rollout.n group, the LLM
+# client forwards it on every segment, and SGLang's scheduler concentrates
+# retract/admit decisions on siblings of the same group. To verify it fires,
+# watch the [VERIFY retract_affinity] / [VERIFY admit_affinity] logs.
+# Affinity only triggers when retract/admit actually happen, so pick a batch
+# size + rollout.n that stresses KV (e.g. dapo defaults: rollout.n=8,
+# max_response_length=20480).
 #
 # INFER_BACKEND controls rollout backend: vllm | sglang | trtllm.
 
 set -xeuo pipefail
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export PATH="/usr/local/miniconda3/bin:$PATH"
+# Overlay local sglang source (third_party/sglang) over the wheel preinstalled
+# in the image. Required for group affinity (Q8/Q9) and any other in-tree
+# sglang changes. main_ppo forwards the driver's PYTHONPATH to Ray workers via
+# verl/trainer/constants_ppo.py — do NOT set PYTHONPATH in runtime_env.yaml,
+# that conflicts with the driver-side forward at ray.init merge time.
+export PYTHONPATH="third_party/sglang/python${PYTHONPATH:+:$PYTHONPATH}"
+# [VERIFY sglang path] confirm local source overlay is in effect
+python -c "import sglang, os; print('[VERIFY sglang path]', sglang.__file__)" || echo "[VERIFY sglang path] sglang not importable on driver"
 
 ########################### user-adjustable ###########################
 INFER_BACKEND=${INFER_BACKEND:-sglang}
@@ -129,6 +151,7 @@ TRAINER=(
     trainer.test_freq=${test_freq}
     trainer.val_before_train=False
     trainer.total_epochs=${total_epochs}
+    trainer.use_v1=true
     trainer.v1.trainer_mode=colocate_async
     trainer.v1.colocate_async.num_warmup_batches=${NUM_WARMUP_BATCHES}
     transfer_queue.enable=True

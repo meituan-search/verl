@@ -5,9 +5,8 @@ env_vars:
   CUDA_CACHE_PATH: "/tmp/cuda_cache"
   TMPDIR: "/tmp"
   CUDA_TMPDIR: "/tmp"
-  CUDA_CACHE_PATH: "/tmp/cuda_cache"
   PATH: "/usr/local/miniconda3/bin:$PATH"
-  TENSORBOARD_DIR: "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-xt-ai-search/ai-search/deepsearch_files_xtssd/wangshulin02/tensorboard/v1_test/qwen3_8B_dapo-math_colocate_async_t8"
+  TENSORBOARD_DIR: "/mnt/dolphinfs/ssd_pool/docker/user/hadoop-xt-ai-search/ai-search/deepsearch_files_xtssd/wangshulin02/tensorboard/v1_test/qwen3_8B_dapo-math_colocate_async_t9_affinity"
   http_proxy: "http://set-zw05-mlp-codelab-pc242:10181"
   https_proxy: "http://set-zw05-mlp-codelab-pc242:10181"
   HTTP_PROXY: "http://set-zw05-mlp-codelab-pc242:10181"
@@ -15,7 +14,19 @@ env_vars:
 
 excludes:
   - ".git/"
-  - "third_party/"
+  - "third_party/rl-insight/"
+  - "third_party/vllm/"
+  - "third_party/sglang/.git/"
+  - "third_party/sglang/3rdparty/"
+  - "third_party/sglang/assets/"
+  - "third_party/sglang/benchmark/"
+  - "third_party/sglang/docker/"
+  - "third_party/sglang/docs/"
+  - "third_party/sglang/docs_new/"
+  - "third_party/sglang/examples/"
+  - "third_party/sglang/rust/"
+  - "third_party/sglang/scripts/"
+  - "third_party/sglang/test/"
 
 pip:
     - TransferQueue
