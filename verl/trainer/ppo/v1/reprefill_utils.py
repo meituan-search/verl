@@ -58,16 +58,27 @@ def to_nested_jagged(nested_list):
 
 def build_reprefill_inputs(keys, partition_id, pad_id):
     data = tq.kv_batch_get(keys=keys, partition_id=partition_id, select_fields=["prompts", "responses"])
-    prompts_padded = data["prompts"].to_padded_tensor(padding=pad_id)
-    responses_padded = data["responses"].to_padded_tensor(padding=pad_id)
+    prompts_jagged = data["prompts"]
+    responses_jagged = data["responses"]
+    prompts_padded = prompts_jagged.to_padded_tensor(padding=pad_id)
+    responses_padded = responses_jagged.to_padded_tensor(padding=pad_id)
+
+    # Slice by real lengths from jagged offsets instead of filtering by pad_id.
+    # Filtering strips genuine eos tokens when pad_id is also an eos_token_id
+    # (e.g. Qwen3-8B: pad=151643, eos=[151645, 151643]), making real_lens
+    # shorter than the true response length and breaking logprob alignment.
+    prompt_lens = prompts_jagged.offsets().diff().tolist()
+    response_lens = responses_jagged.offsets().diff().tolist()
 
     prompt_ids_list: list[list[int]] = []
     real_lens: list[tuple[int, int]] = []
     for i in range(len(keys)):
-        prompt_ids = [int(x) for x in prompts_padded[i].tolist() if x != pad_id]
-        response_ids = [int(x) for x in responses_padded[i].tolist() if x != pad_id]
+        p_len = int(prompt_lens[i])
+        r_len = int(response_lens[i])
+        prompt_ids = [int(x) for x in prompts_padded[i][:p_len].tolist()]
+        response_ids = [int(x) for x in responses_padded[i][:r_len].tolist()]
         prompt_ids_list.append(prompt_ids + response_ids)
-        real_lens.append((len(prompt_ids), len(response_ids)))
+        real_lens.append((p_len, r_len))
     return prompt_ids_list, real_lens, data
 
 

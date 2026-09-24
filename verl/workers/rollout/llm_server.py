@@ -23,8 +23,7 @@ import logging
 import os
 import time
 from typing import Any, Optional
-from uuid import uuid4
-
+from uuid import uuid4  # noqa: F401  (retained for callers that still generate rids)
 import numpy as np
 import ray
 from cachetools import LRUCache
@@ -281,8 +280,15 @@ class LLMServerClient:
             sampling_params = dict(sampling_params)
             sampling_params.pop("enable_piggyback", None)
             sampling_params.pop("emit_token_versions", None)
+            # Forward the caller's request_id to SGLang only for reprefill
+            # paths (rid contains "reprefill" — needed by Q15 filtered pause
+            # to spare these requests from abort). Other callers (rollout,
+            # teacher, tool-loop) still get a fresh uuid per turn, preserving
+            # the "new request_id for each turn" invariant that prevents
+            # rid collisions in multi-turn / full_determinism paths.
+            sglang_rid = request_id if "reprefill" in request_id else uuid4().hex
             output: TokenOutput = await server.generate.remote(
-                request_id=uuid4().hex,  # use new request_id for each turn
+                request_id=sglang_rid,
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
                 image_data=image_data,

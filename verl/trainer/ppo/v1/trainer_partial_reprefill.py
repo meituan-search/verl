@@ -357,21 +357,26 @@ class PPOTrainerPartialReprefill(PPOTrainerColocateAsync):
         for j, key in enumerate(keys):
             entry = pending.get(key) if pending is not None else None
             if entry is not None and entry.version == self.global_steps:
-                try:
-                    # One pre-dispatched request → 1-element result list.
-                    result = entry.future.result(timeout=600)[0]
-                    engine_version = result.extra_fields.get("global_steps", None)
-                    if engine_version is not None and engine_version != resume_version:
-                        logger.warning(
-                            f"partial_reprefill: prefill version mismatch for {key} "
-                            f"(engine={engine_version}, expected={resume_version}); re-issuing"
-                        )
-                    else:
-                        results[j] = result
-                        consumed += 1
-                        continue
-                except Exception as e:
-                    logger.warning(f"partial_reprefill: prefill future failed for {key}: {e}")
+                # One pre-dispatched request → 1-element result list.
+                # future.result() raises if the coroutine raised — treat as
+                # hard error, not a fallback trigger. A failed future means
+                # something unexpected happened on the engine side (e.g.
+                # SGLang returned empty logprobs after a retract); silently
+                # re-issuing would mask the bug.
+                result = entry.future.result(timeout=600)[0]
+                engine_version = result.extra_fields.get("global_steps", None)
+                if engine_version is not None and engine_version != resume_version:
+                    # Expected degradation: pre-dispatch ran at W_{k-1},
+                    # engine has since moved to W_k. Re-issue synchronously
+                    # at the current weight.
+                    logger.warning(
+                        f"partial_reprefill: prefill version mismatch for {key} "
+                        f"(engine={engine_version}, expected={resume_version}); re-issuing"
+                    )
+                else:
+                    results[j] = result
+                    consumed += 1
+                    continue
             reissue_indices.append(j)
 
         if reissue_indices:

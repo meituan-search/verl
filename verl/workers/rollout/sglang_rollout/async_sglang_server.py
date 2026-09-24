@@ -79,6 +79,19 @@ def _extract_prompt_logprobs_sglang(
     input_token_logprobs = meta_info.get("input_token_logprobs") or []
     if num_prompt_logprobs > 0:
         input_top_logprobs = meta_info.get("input_top_logprobs") or []
+    # Q15 diagnostic: catch empty-logprobs cases before the assertion to
+    # surface finish_reason / num_retractions for diagnosing retract vs
+    # abort vs other SGLang-side issues.
+    if len(input_token_logprobs) <= 1:
+        print(
+            f"[VERIFY empty_logprobs] "
+            f"input_token_logprobs_len={len(input_token_logprobs)} "
+            f"sequence_length={sequence_length} "
+            f"finish_reason={meta_info.get('finish_reason')} "
+            f"num_retractions={meta_info.get('num_retractions')} "
+            f"input_token_logprobs={input_token_logprobs}",
+            flush=True,
+        )
     prompt_ids_ls: list[list[int]] = []
     prompt_logprobs_ls: list[list[float]] = []
     # Entry 0 has logprob=None (no predicting context); skip it, matching vLLM.
