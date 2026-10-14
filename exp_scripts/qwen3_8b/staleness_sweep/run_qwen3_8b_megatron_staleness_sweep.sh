@@ -63,7 +63,7 @@ actor_lr=${ACTOR_LR:-1e-6}
 kl_loss_coef=${KL_LOSS_COEF:-0.001}
 entropy_coeff=${ENTROPY_COEFF:-0}
 project_name=${PROJECT_NAME:-verl_grpo_${DATASET}_math}
-experiment_name=${EXPERIMENT_NAME:-qwen3_8b_${INFER_BACKEND}_megatron_${DATASET}_staleness_sweep_n${NUM_STEPS}}
+experiment_name=${EXPERIMENT_NAME:-qwen3_8b_${INFER_BACKEND}_megatron_${DATASET}_staleness_sweep_n${NUM_STEPS}${affinity_tag}}
 
 actor_tp=${ACTOR_TP:-4}
 actor_pp=${ACTOR_PP:-2}
@@ -74,6 +74,14 @@ rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.6}
 total_epochs=${TOTAL_EPOCHS:-15}
 save_freq=${SAVE_FREQ:--1}
 test_freq=${TEST_FREQ:-5}
+
+# Group affinity ablation switch (Q16). When False (default): agent_loop_tq
+# does not stamp group_id, verl LB falls back to per-sibling request_id sticky
+# routing, SGLang scheduler retract/admit affinity no-ops, and the P2 cohesion
+# metric (offpolicy_token/group_version_set_jaccard_mean) is suppressed. When
+# True: current full affinity path is preserved.
+ENABLE_GROUP_AFFINITY=${ENABLE_GROUP_AFFINITY:-False}
+affinity_tag=$([ "$ENABLE_GROUP_AFFINITY" = "true" ] && echo "_affinity" || echo "_no_affinity")
 ########################### end user-adjustable ###########################
 
 ########################### parameter arrays ###########################
@@ -121,6 +129,8 @@ ROLLOUT=(
     actor_rollout_ref.rollout.disable_log_stats=False \
     actor_rollout_ref.rollout.prometheus.enable=True \
     actor_rollout_ref.rollout.prometheus.port=44398 \
+    # Q16 group affinity ablation switch.
+    actor_rollout_ref.rollout.enable_group_affinity=${ENABLE_GROUP_AFFINITY}
 )
 
 REF=(
