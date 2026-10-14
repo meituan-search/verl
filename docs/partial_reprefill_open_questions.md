@@ -782,3 +782,75 @@ affinity 行为保持 Q8/Q9 原方向（集中 retract/admit 同 group，
 - `rollout.n=1` 退化为非 GRPO 场景：Q15 仍适用（group 即单条轨迹），
   `all_stale` 含义退化为"该轨迹是否跨 step"，仍要求趋近 0。
 
+---
+
+## Q16: group affinity 开关 flag（消融实验）
+
+**问题**：group affinity 当前是硬编码——`agent_loop_tq.py:138`
+无条件设 `prompt["group_id"]`，`llm_server` 无条件用 `group_id` 做
+sticky key，SGLang scheduler 无条件按 `group_id` 预排序。无法做
+"开/关 affinity vs baseline"消融对比。
+
+**决议**：**加单一总开关 `actor_rollout_ref.rollout.enable_group_affinity`，
+默认 False，所有 v1 trainer 生效。**
+
+- **flag 落点**：`actor_rollout_ref.rollout.enable_group_affinity`
+  （`verl/workers/config/rollout.py` `RolloutConfig`）。
+  - 单一 source-of-truth，不走 partial_reprefill mirror sync 模式。
+  - 所有 v1 trainer 默认走 `AgentLoopManagerTQ`（`main_ppo.py:125`），
+    直接读 `config.actor_rollout_ref.rollout`，无需 trainer-specific
+    sync 逻辑。
+  - 适用范围：sync / colocate_async / partial_reprefill /
+    staleness_sweep / reprefill_decoupled 全部生效。
+
+- **三层联动退化**（flag=False 时）：
+  1. `agent_loop_tq.py:138` 不设 `prompt["group_id"]` → 下游
+     `_run_agent_loop` 没有 `group_id` kwarg → `client.generate`
+     收到 `group_id=None`。
+  2. `llm_server.py:260` `sticky_key = group_id if group_id is not
+     None else request_id` → 用 per-sibling `request_id`（每条
+     sibling 独立 uuid）→ sibling 分散到不同 engine replica。
+  3. SGLang scheduler `req.group_id is None` → retract/admit
+     affinity 退化到 `length_key` / FIFO。
+  - **不需要改 SGLang third_party 或 `llm_server.py`**——按
+    `group_id=None` 自然 no-op。
+
+- **P2 metric 影响**：
+  - `offpolicy_token/group_version_set_jaccard_mean`（Q13）依赖
+    `batch.tags[i].get("group_id")` 聚合 sibling——flag=False 时
+    tag 缺失，jaccard loop 全 skip，metric 不 emit。
+  - 其他 `offpolicy_token/*`（staleness_mean、fresh_token_ratio
+    等）只依赖 `token_versions`，不受 flag 影响。
+
+- **flag=True 时**：当前完整 affinity 行为（agent_loop_tq 设
+  group_id → LB sticky → SGLang affinity → P2 metric emit）。
+
+- **默认值选 False 的理由**：
+  - 当前代码硬编码 group_id 即"默认开"，但 group affinity 是
+    Q8/Q9/Q14 决议引入的实验性优化，不是 GRPO 算法的硬性需求
+    （GRPO 只要求 sibling 整组到齐，不要求 sibling 走同一 engine
+    或同 affinity 集中）。
+  - 默认关让用户必须显式 opt-in，避免新行为静默生效；做消融时
+    `enable_group_affinity=True/False` 两条路径对称可比。
+  - 现有 `partial_reprefill` 实验配置需要在 yaml 显式设 `True`
+    才能恢复 affinity 行为——这是一次性的迁移成本。
+
+- **不在本决议范围**：
+  - 分层开关（LB sticky / SGLang scheduler 各自独立）——未来
+    若要做"只 LB / 只 scheduler / 全开 / 全关" 2×2 消融，再加
+    分层 flag；当前 YAGNI。
+  - spec decoding 下 affinity 自动跳过的限制（`retract_decode`
+    注释，schedule_batch.py:2200）——这是 SGLang 侧的技术约束，
+    不受本 flag 控制；flag=True 下 spec decoding 仍会跳过
+    affinity，与之前一致。
+
+**实施点**：
+- `verl/workers/config/rollout.py`：`RolloutConfig` 加字段
+  `enable_group_affinity: bool = False`。
+- `verl/trainer/config/rollout/rollout.yaml`：加默认
+  `enable_group_affinity: False` + 注释。
+- `verl/trainer/ppo/v1/agent_loop_tq.py:138`：条件设置
+  `prompt["group_id"]`。
+- `bash scripts/generate_trainer_config.sh`：重新生成 4 个
+  `_generated_*.yaml`（不能手改）。
+

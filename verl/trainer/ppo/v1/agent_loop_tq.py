@@ -135,7 +135,13 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             # P2 cohesion metric (group_version_set_jaccard_mean). Stable across
             # multi-segment resume (Q10). Format f"{step}_{uid}" is debuggable
             # (see docs/partial_reprefill_open_questions.md Q5/Q6).
-            prompt["group_id"] = f"{trajectory['step']}_{uid}"
+            #
+            # Gated by config.enable_group_affinity (ablation switch). When
+            # False, group_id is absent → llm_server sticky falls back to
+            # per-sibling request_id, SGLang affinity no-ops, and the P2
+            # jaccard metric is naturally suppressed. See Q16.
+            if config.enable_group_affinity:
+                prompt["group_id"] = f"{trajectory['step']}_{uid}"
 
             tasks = []
             for i in range(n):

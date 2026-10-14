@@ -280,6 +280,15 @@ class RolloutConfig(BaseConfig):
     # list construction entirely.
     emit_token_versions: bool = False
 
+    # When True, agent_loop_tq stamps each prompt with a group_id shared by
+    # all rollout.n siblings. verl LB uses group_id as the sticky-session key
+    # (Q14) and SGLang scheduler applies retract/admit affinity (Q8/Q9).
+    # When False (default), group_id is absent, LB falls back to per-sibling
+    # request_id, SGLang affinity no-ops, and the P2 group cohesion metric
+    # (offpolicy_token/group_version_set_jaccard_mean) is suppressed.
+    # Ablation switch for group affinity on/off vs baseline.
+    enable_group_affinity: bool = False
+
     mtp: MtpConfig = field(default_factory=MtpConfig)
 
     qat: Optional[dict] = None

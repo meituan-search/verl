@@ -345,6 +345,7 @@ actor_rollout_ref:
     moe_load_balance_metrics_interval: 0
     enable_piggyback: false
     emit_token_versions: false
+    enable_group_affinity: false
     profiler:
       _target_: verl.utils.profiler.ProfilerConfig
       tool: ${oc.select:global_profiler.tool,null}
@@ -920,6 +921,7 @@ trainer:
       max_resume_staleness: 0
       case2_reprefill_mode: engine
       compare_trainer_old_log_prob: false
+      enable_filtered_pause: true
     sampler:
       max_off_policy_threshold: 8
       max_off_policy_strategy: drop
