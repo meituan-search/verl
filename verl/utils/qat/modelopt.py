@@ -23,67 +23,60 @@ import torch.nn as nn
 import torch.nn.functional as F
 from modelopt.torch.quantization.config import _default_disabled_quantizer_cfg
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import (
+    GroupedQuantizer,
+    TensorQuantizer,
     is_registered_quant_backend,
     register_quant_backend,
 )
 
 _FP8_BLOCK_BACKEND = "verl_fp8_block"
+_MXFP8_BACKEND = "verl_mxfp8"
 _MXFP4_BACKEND = "verl_mxfp4"
 _NVFP4_WEIGHT_BACKEND = "verl_nvfp4_weight"
 _NVFP4_INPUT_BACKEND = "verl_nvfp4_input"
-_FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
 
 
-class _FP8BlockFakeQuant(torch.autograd.Function):
-    """Dynamic FP8 E4M3 fake quantization over blocks of the last two dims, with straight-through grad."""
+class _Fp8FakeQuant(torch.autograd.Function):
+    """TileLang FP8 fake quantization over blocks of the last two dimensions."""
 
     @staticmethod
-    def forward(ctx, x: torch.Tensor, block_rows: int, block_cols: int) -> torch.Tensor:
-        shape = x.shape
-        x2d = x.reshape(-1, shape[-1]).float()
-        rows, cols = x2d.shape
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        block_rows: int,
+        block_cols: int,
+        scale_fmt: str | None,
+    ) -> torch.Tensor:
+        from verl.utils.qat.fp8 import fp8_quant
+
+        rows, cols = x.shape[-2:]
         pad_rows, pad_cols = -rows % block_rows, -cols % block_cols
-        xp = F.pad(x2d, (0, pad_cols, 0, pad_rows))
-        blocks = xp.reshape(xp.shape[0] // block_rows, block_rows, xp.shape[1] // block_cols, block_cols)
-        scale = blocks.abs().amax(dim=(1, 3), keepdim=True).clamp_min(1e-12) / _FP8_MAX
-        dq = (blocks / scale).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn).float() * scale
-        dq = dq.reshape(xp.shape)[:rows, :cols]
-        return dq.reshape(shape).to(x.dtype)
+        padded = F.pad(x, (0, pad_cols, 0, pad_rows)) if pad_rows or pad_cols else x
+        dq = fp8_quant(padded.detach(), (block_rows, block_cols), scale_fmt=scale_fmt, dequant=True)
+        return dq[..., :rows, :cols]
 
     @staticmethod
     def backward(ctx, grad):
-        return grad, None, None
+        return grad, None, None, None
 
 
 def _fp8_block_backend(inputs: torch.Tensor, quantizer) -> torch.Tensor:
     block_rows, block_cols = quantizer.backend_extra_args["block_sizes"]
-    return _FP8BlockFakeQuant.apply(inputs, block_rows, block_cols)
+    return _Fp8FakeQuant.apply(inputs, block_rows, block_cols, None)
+
+
+def _mxfp8_backend(inputs: torch.Tensor, quantizer) -> torch.Tensor:
+    return _Fp8FakeQuant.apply(inputs, 1, 32, "e8m0")
 
 
 class _Mxfp4FakeQuant(torch.autograd.Function):
-    """compressed-tensors-compatible MXFP4 fake quantization with STE."""
+    """TileLang MXFP4 fake quantization with STE."""
 
     @staticmethod
     def forward(ctx, x: torch.Tensor) -> torch.Tensor:
-        from compressed_tensors.quantization import QuantizationArgs
-        from compressed_tensors.quantization.lifecycle.forward import fake_quantize
-        from compressed_tensors.quantization.utils import calculate_qparams
+        from verl.utils.qat.fp4 import fp4_quant
 
-        args = QuantizationArgs(
-            num_bits=4,
-            type="float",
-            symmetric=True,
-            group_size=32,
-            strategy="group",
-            dynamic=False,
-            scale_dtype="torch.uint8",
-        )
-        shape = x.shape
-        x2d = x.reshape(-1, shape[-1])
-        groups = x2d.unflatten(-1, (-1, 32))
-        min_vals, max_vals = groups.amin(dim=-1), groups.amax(dim=-1)
-        scale, zero_point = calculate_qparams(min_vals.float(), max_vals.float(), args)
-        return fake_quantize(x2d, scale, zero_point, args).reshape(shape).to(x.dtype)
+        return fp4_quant(x.detach(), dequant=True)
 
     @staticmethod
     def backward(ctx, grad):
@@ -92,6 +85,34 @@ class _Mxfp4FakeQuant(torch.autograd.Function):
 
 def _mxfp4_backend(inputs: torch.Tensor, quantizer) -> torch.Tensor:
     return _Mxfp4FakeQuant.apply(inputs)
+
+
+class _GroupedFp8FakeQuant(torch.autograd.Function):
+    """Pointer-table FP8 QDQ with an STE back to separate expert parameters."""
+
+    @staticmethod
+    def forward(ctx, block_rows: int, block_cols: int, scale_fmt: str | None, *weights: torch.Tensor):
+        from verl.utils.qat.fp8 import fp8_grouped_fake_quant
+
+        return fp8_grouped_fake_quant(weights, (block_rows, block_cols), scale_fmt=scale_fmt)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return None, None, None, *grad.unbind(0)
+
+
+class _GroupedMxfp4FakeQuant(torch.autograd.Function):
+    """Pointer-table MXFP4 QDQ with an STE back to separate expert parameters."""
+
+    @staticmethod
+    def forward(ctx, *weights: torch.Tensor):
+        from verl.utils.qat.fp4 import fp4_grouped_fake_quant
+
+        return fp4_grouped_fake_quant(weights)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return tuple(grad.unbind(0))
 
 
 class _Nvfp4FakeQuant(torch.autograd.Function):
@@ -173,6 +194,8 @@ def _nvfp4_input_backend(inputs: torch.Tensor, quantizer) -> torch.Tensor:
 
 if not is_registered_quant_backend(_FP8_BLOCK_BACKEND):
     register_quant_backend(_FP8_BLOCK_BACKEND, _fp8_block_backend)
+if not is_registered_quant_backend(_MXFP8_BACKEND):
+    register_quant_backend(_MXFP8_BACKEND, _mxfp8_backend)
 if not is_registered_quant_backend(_MXFP4_BACKEND):
     register_quant_backend(_MXFP4_BACKEND, _mxfp4_backend)
 if not is_registered_quant_backend(_NVFP4_WEIGHT_BACKEND):
@@ -207,12 +230,23 @@ _SUPPORTED_QAT_MODES = {*_QUANTIZER_CFGS, "mxfp8", "mxfp4", "mxfp4_mxfp8", "nvfp
 
 _ROUTED_EXPERT_WEIGHT_QUANTIZER = "*mlp.experts*weight_quantizer"
 _ROUTED_EXPERT_INPUT_QUANTIZER = "*mlp.experts*input_quantizer"
+_GROUPABLE_WEIGHT_BACKENDS = {_FP8_BLOCK_BACKEND, _MXFP8_BACKEND, _MXFP4_BACKEND}
 
 
 def _modelopt_quantizer_cfg(preset: dict, quantizer_name: str) -> dict:
     """Copy one quantizer's numeric config from a native ModelOpt preset."""
     entries = mtq.normalize_quant_cfg_list(copy.deepcopy(preset["quant_cfg"]))
     return copy.deepcopy(next(entry["cfg"] for entry in entries if entry["quantizer_name"] == quantizer_name))
+
+
+def _mxfp8_quantize_config() -> tuple[list[dict], None]:
+    """ModelOpt MXFP8 numerics executed by verl's export-shared TileLang kernel."""
+    quant_cfg = mtq.normalize_quant_cfg_list(copy.deepcopy(mtq.MXFP8_DEFAULT_CFG["quant_cfg"]))
+    for entry in quant_cfg:
+        cfg = entry.get("cfg")
+        if cfg is not None and entry.get("enable", True):
+            cfg["backend"] = _MXFP8_BACKEND
+    return quant_cfg, None
 
 
 def _mxfp4_quantize_config(*, dense_mxfp8: bool) -> tuple[list[dict], None]:
@@ -223,15 +257,14 @@ def _mxfp4_quantize_config(*, dense_mxfp8: bool) -> tuple[list[dict], None]:
     from the former with the input numerics from the latter.
     """
     if dense_mxfp8:
-        quant_cfg = mtq.normalize_quant_cfg_list(copy.deepcopy(mtq.MXFP8_DEFAULT_CFG["quant_cfg"]))
+        quant_cfg, _ = _mxfp8_quantize_config()
     else:
         quant_cfg = [{"quantizer_name": "*", "enable": False}]
 
     weight_cfg = _modelopt_quantizer_cfg(mtq.MXFP4_DEFAULT_CFG, "*weight_quantizer")
-    # ModelOpt and compressed-tensors use different E2M1 tie handling for a
-    # small subset of values. Export is compressed-tensors, so QAT must use the
-    # same QDQ implementation to remain numerically identical.
     weight_cfg["backend"] = _MXFP4_BACKEND
+    input_cfg = _modelopt_quantizer_cfg(mtq.MXFP8_DEFAULT_CFG, "*input_quantizer")
+    input_cfg["backend"] = _MXFP8_BACKEND
     quant_cfg.extend(
         [
             {
@@ -240,7 +273,7 @@ def _mxfp4_quantize_config(*, dense_mxfp8: bool) -> tuple[list[dict], None]:
             },
             {
                 "quantizer_name": _ROUTED_EXPERT_INPUT_QUANTIZER,
-                "cfg": _modelopt_quantizer_cfg(mtq.MXFP8_DEFAULT_CFG, "*input_quantizer"),
+                "cfg": input_cfg,
             },
         ]
     )
@@ -308,11 +341,7 @@ def build_quantize_config(
     ignore_cfg = _ignore_patterns_to_quant_cfg(ignore_patterns)
 
     if qat_mode == "mxfp8":
-        # ModelOpt's native preset is exactly the compressed-tensors MXFP8
-        # numerics: dynamic groups of 32, E4M3 values and E8M0 scales.
-        modelopt_config = copy.deepcopy(mtq.MXFP8_DEFAULT_CFG)
-        quant_cfg = mtq.normalize_quant_cfg_list(modelopt_config["quant_cfg"])
-        algorithm = modelopt_config["algorithm"]
+        quant_cfg, algorithm = _mxfp8_quantize_config()
     elif qat_mode in ("mxfp4", "mxfp4_mxfp8"):
         quant_cfg, algorithm = _mxfp4_quantize_config(dense_mxfp8=qat_mode == "mxfp4_mxfp8")
     elif qat_mode == "nvfp4":
@@ -328,6 +357,117 @@ def build_quantize_config(
     return {"quant_cfg": quant_cfg, "algorithm": algorithm}
 
 
+# ---------------------------------------------------------------------------
+# Patch ModelOpt's grouped-linear weight fake quant
+# ---------------------------------------------------------------------------
+class _PrequantizedWeightsView:
+    """A grouped-linear view that prevents ModelOpt from quantizing weights twice."""
+
+    def __init__(self, module: nn.Module):
+        self._module = module
+
+    def __getattr__(self, name):
+        return getattr(self._module, name)
+
+    @staticmethod
+    def weight_quantizer(weight: torch.Tensor) -> torch.Tensor:
+        return weight
+
+
+def _grouped_weight_quantizers_are_compatible(quantizers: GroupedQuantizer) -> bool:
+    """Whether per-expert quantizers can share one stateless batched invocation."""
+    if not quantizers or not all(isinstance(quantizer, TensorQuantizer) for quantizer in quantizers):
+        return False
+    first = quantizers[0]
+    if first.backend not in _GROUPABLE_WEIGHT_BACKENDS:
+        return False
+    return all(
+        quantizer.is_enabled
+        and quantizer.fake_quant
+        and not getattr(quantizer, "_if_calib", False)
+        and quantizer.backend == first.backend
+        and quantizer.block_sizes == first.block_sizes
+        and quantizer.backend_extra_args == first.backend_extra_args
+        for quantizer in quantizers
+    )
+
+
+def _assert_grouped_scale_boundaries(weights: tuple[torch.Tensor, ...], quantizer: TensorQuantizer) -> None:
+    """Assert that every expert consists of complete, independent scale blocks."""
+    assert weights, "grouped fake quant requires at least one expert weight"
+    shape = weights[0].shape
+    assert len(shape) == 2, f"grouped fake quant expects 2D expert weights, got {shape}"
+    assert all(weight.shape == shape for weight in weights), "grouped fake quant requires equal expert shapes"
+
+    if quantizer.backend == _FP8_BLOCK_BACKEND:
+        block_rows, block_cols = quantizer.backend_extra_args["block_sizes"]
+    else:
+        assert quantizer.backend in (_MXFP8_BACKEND, _MXFP4_BACKEND)
+        assert quantizer.block_sizes.get("type") == "dynamic"
+        block_rows, block_cols = 1, quantizer.block_sizes[-1]
+
+    rows, cols = shape
+    assert rows % block_rows == 0, (
+        f"expert rows ({rows}) must be divisible by scale block rows ({block_rows}); "
+        "a scale block must not cross an expert boundary"
+    )
+    assert cols % block_cols == 0, f"expert columns ({cols}) must be divisible by scale block columns ({block_cols})"
+
+
+def _group_fake_quant_weights(
+    weights: tuple[torch.Tensor, ...],
+    quantizers: GroupedQuantizer,
+) -> tuple[torch.Tensor, ...]:
+    """Fake-quantize separate expert weights in one pointer-table kernel launch."""
+    first = quantizers[0]
+    _assert_grouped_scale_boundaries(weights, first)
+    if first.backend == _FP8_BLOCK_BACKEND:
+        block_rows, block_cols = first.backend_extra_args["block_sizes"]
+        quantized = _GroupedFp8FakeQuant.apply(block_rows, block_cols, None, *weights)
+    elif first.backend == _MXFP8_BACKEND:
+        quantized = _GroupedFp8FakeQuant.apply(1, first.block_sizes[-1], "e8m0", *weights)
+    else:
+        assert first.backend == _MXFP4_BACKEND
+        quantized = _GroupedMxfp4FakeQuant.apply(*weights)
+    assert quantized.shape == (len(weights), *weights[0].shape)
+    return quantized.unbind(0)
+
+
+def _patch_te_grouped_weight_fake_quant() -> None:
+    """Batch verl's stateless expert-weight QDQ backends inside TE grouped linears."""
+    try:
+        from modelopt.torch.quantization.plugins.transformer_engine import _QuantTEGroupedLinear
+    except ImportError:
+        return
+
+    original = _QuantTEGroupedLinear.__dict__.get("_quantized_linear_fn")
+    original_fn = getattr(original, "__func__", original)
+    if original_fn is None or getattr(original_fn, "_verl_grouped_weight_fake_quant", False):
+        return
+
+    def grouped_quantized_linear_fn(package, func_name, module, *args):
+        quantizers = module.weight_quantizer
+        num_gemms = module.num_gemms
+        if (
+            not isinstance(quantizers, GroupedQuantizer)
+            or len(quantizers) != num_gemms
+            or not _grouped_weight_quantizers_are_compatible(quantizers)
+        ):
+            return original_fn(package, func_name, module, *args)
+
+        weights_start = len(args) - 2 * num_gemms
+        weights = tuple(args[weights_start : weights_start + num_gemms])
+        if len(weights) != num_gemms or len({(weight.shape, weight.dtype, weight.device) for weight in weights}) != 1:
+            return original_fn(package, func_name, module, *args)
+
+        quantized_weights = _group_fake_quant_weights(weights, quantizers)
+        new_args = (*args[:weights_start], *quantized_weights, *args[weights_start + num_gemms :])
+        return original_fn(package, func_name, _PrequantizedWeightsView(module), *new_args)
+
+    grouped_quantized_linear_fn._verl_grouped_weight_fake_quant = True
+    _QuantTEGroupedLinear._quantized_linear_fn = staticmethod(grouped_quantized_linear_fn)
+
+
 def apply_qat(
     model: nn.Module,
     qat_mode: str,
@@ -335,6 +475,7 @@ def apply_qat(
 ) -> nn.Module:
     """Apply Quantization-Aware Training to a Megatron model."""
     config = build_quantize_config(qat_mode, ignore_patterns)
+    _patch_te_grouped_weight_fake_quant()
     mtq.quantize(model, config)
     return model
 
