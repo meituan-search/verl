@@ -56,8 +56,8 @@ case "$DATASET" in
     dapo)
         train_files=${TRAIN_FILES:-"['$DAPO_DIR/dapo-math-17k.parquet']"}
         val_files=${VAL_FILES:-"['$DAPO_DIR/aime-2024.parquet']"}
-        train_batch_size=${TRAIN_BATCH_SIZE:-128}
-        ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-32}
+        train_batch_size=${TRAIN_BATCH_SIZE:-64}
+        ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-16}
         max_prompt_length=${MAX_PROMPT_LENGTH:-2048}
         max_response_length=${MAX_RESPONSE_LENGTH:-20480}
         ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}
